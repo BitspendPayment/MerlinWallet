@@ -89,6 +89,7 @@ MPCWallet/
 │   ├── ark/              Ark protocol: boarding, VTXO send/settle, delegate/auto-settle, checkpoints
 │   ├── threshold/        FROST + DKG core (no_std, secp256k1)
 │   └── enclave-client/   Nitro attestation verification (COSE/X.509/PCR0) + signed-response client
+├── cli/                  `merlin` — Rust wallet REPL for driving a regtest stack by hand
 ├── ffi/                  Merged C-ABI shared library for Dart FFI (ark + threshold + enclave)
 ├── protocol/             gRPC stubs and proto definitions
 ├── infrastructure/       OpenTofu modules for enclave deployment (KMS, EC2, S3, SSM)
@@ -129,6 +130,17 @@ make e2e               # Ark E2E: builds ffi + cosigner-runtime, starts regtest 
 ```
 
 The local cosigner runtime runs as a plain Rust binary (no enclave, no attestation) — the per-user native-actor isolation still applies. Useful for fast iteration.
+
+### Driving a regtest stack from the CLI
+
+For exercising the protocol without the app. Needs only Rust and Docker.
+
+```bash
+make cli-up            # regtest + arkd + funded ASP + cosigner, foreground
+make cli               # second terminal: the wallet REPL
+```
+
+`make cli-stop` pauses and keeps state; `make cli-clear` wipes it. Regtest only — the keystore holds signing secrets in plaintext.
 
 ### Cloud deployment (signet / mutinynet / mainnet)
 
