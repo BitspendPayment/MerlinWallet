@@ -388,6 +388,8 @@ cli-up: runtime-build
 	./scripts/bitcoin.sh init
 	@echo "=== Initializing arkd ==="
 	./scripts/arkd_init.sh --fund
+	@echo "=== Waiting 10s for NBXplorer to index initial blocks ==="
+	@sleep 10
 	@echo ""
 	@echo "==> Cosigner on :7074. Drive it from another terminal:  make cli"
 	@echo "==> Mining a block every 10s. Ctrl+C stops both."
