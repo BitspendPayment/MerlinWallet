@@ -27,7 +27,7 @@
 	stress-test load-test \
 	signet-hardware-ark signet-down e2e-mutinynet e2e-mutinynet-ark \
 	e2e-test e2e-ark-test regtest regtest-ark regtest-down \
-	cli cli-build \
+	cli cli-build cli-up cli-stop cli-clear \
 	release release-apk release-apk-fat release-testers-add release-testers-remove
 
 # ── Variables ─────────────────────────────────────────────────────────────────
@@ -359,7 +359,7 @@ e2e-mutinynet-ark: ffi-build runtime-build
 
 # Interactive wallet REPL for driving a running stack by hand: onboard, fund,
 # board, send, contacts and payment requests. Point it at whatever cosigner is
-# up — `make regtest-ark` locally, or a deployment.
+# up — `make cli-up` locally, or a deployment.
 #
 # REGTEST ONLY. The keystore (~/.merlin-cli/wallets.json) holds PLAINTEXT
 # signing secrets.
@@ -368,6 +368,71 @@ e2e-mutinynet-ark: ffi-build runtime-build
 #   make cli URL=https://mutiny.vtxos.network
 CLI_URL ?= http://127.0.0.1:7074
 URL     ?= $(CLI_URL)
+
+# Everything the CLI needs, in one command: regtest + arkd, a funded ASP, a mine
+# loop, and the cosigner with ASP_URL and WEBAUTH_TOKEN_SECRET set. 
+#
+# Foreground, mining every 10s. Drive the wallet from `make cli` in another
+# terminal. Ctrl+C stops the cosigner and the mine loop; `make down` also stops
+# Docker.
+#
+# Deliberately does NOT reset the cosigner's SQLite: it holds the server's half
+# of every wallet in your CLI keystore, so wiping it here would silently orphan
+# them. `make cli-clear` when you want a clean slate.
+cli-up: runtime-build
+	@echo "=== Starting regtest + arkd ==="
+	docker compose -f docker-compose.yml -f docker-compose.ark.yml up -d
+	@echo "Waiting for services to stabilize (20s)..."
+	@sleep 20
+	@echo "=== Initializing Bitcoin chain ==="
+	./scripts/bitcoin.sh init
+	@echo "=== Initializing arkd ==="
+	./scripts/arkd_init.sh --fund
+	@echo "=== Waiting 10s for NBXplorer to index initial blocks ==="
+	@sleep 10
+	@echo ""
+	@echo "==> Cosigner on :7074. Drive it from another terminal:  make cli"
+	@echo "==> Mining a block every 10s. Ctrl+C stops both."
+	@echo ""
+	@bash -c 'set -m; \
+		(while true; do ./scripts/bitcoin.sh mine 2>/dev/null; sleep 10; done) & \
+		MINE_PID=$$!; \
+		trap "kill $$MINE_PID 2>/dev/null || true; wait $$MINE_PID 2>/dev/null || true" EXIT INT TERM; \
+		export ELECTRUM_URL=127.0.0.1 ELECTRUM_PORT=50001 \
+		       BITCOIN_RPC_USER=admin1 BITCOIN_RPC_PASSWORD=123 \
+		       ASP_URL=http://127.0.0.1:7070 \
+		       ESPLORA_URL=http://127.0.0.1:30000 \
+		       BITCOIN_NETWORK=regtest \
+		       WEBAUTH_TOKEN_SECRET=$${WEBAUTH_TOKEN_SECRET:-6d706377616c6c65742d6465762d746f6b656e2d7365637265742d3332622121}; \
+		cd cosigner-runtime && cargo run --release --bin cosigner-runtime -- \
+			--port 7074'
+
+# Pause. Stops the containers but keeps the chain, arkd's records, the cosigner's
+# database and your wallets, so `make cli-up` picks up where you left off.
+cli-stop:
+	@echo "Pausing the CLI stack..."
+	-@pkill -f "[t]arget/release/cosigner-runtime" || true
+	-@pkill -f "[b]itcoin.sh mine" || true
+	docker compose -f docker-compose.yml -f docker-compose.ark.yml stop
+	@echo "stopped, state kept. resume with: make cli-up"
+
+# Wipe everything the CLI created: chain, cosigner state, keystore. Use `cli-stop`
+# to pause instead. Stopping alone is not enough to reset — the chain goes with
+# the Docker volumes, but the database and the keystore survive, leaving wallets
+# whose coins no longer exist.
+#
+# Not built on `down`, which sudo-prompts for root-owned paths this flow never
+# creates. The `[t]` and `[b]` stop pkill from matching its own shell. SQLite is
+# removed here rather than by `db-reset` so it happens after the cosigner dies,
+# not before.
+cli-clear:
+	@echo "Stopping the CLI stack..."
+	-@pkill -f "[t]arget/release/cosigner-runtime" || true
+	-@pkill -f "[b]itcoin.sh mine" || true
+	-docker compose -f docker-compose.yml -f docker-compose.ark.yml down -v 2>/dev/null || true
+	@rm -f $(SQLITE_PATH) $(SQLITE_PATH)-wal $(SQLITE_PATH)-shm
+	@rm -f $(HOME)/.merlin-cli/wallets.json
+	@echo "chain, cosigner state and CLI keystore cleared"
 
 cli:
 	@echo "merlin CLI → $(URL)  (regtest only: keystore secrets are plaintext)"
