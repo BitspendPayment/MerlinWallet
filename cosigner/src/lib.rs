@@ -7,19 +7,16 @@
 
 pub mod cosigner;
 pub mod auth;
-pub mod bitcoin;
 pub mod config;
 pub mod fcm_client;
 pub mod handlers;
 pub mod kv_store;
 pub mod session;
 pub mod upstreams;
-pub mod state;
 pub mod store;
 pub mod types;
 
 pub use cosigner::Cosigner;
-pub use state::CosignerState;
 pub use types::ArkTxEntry;
 
 pub mod wallet_proto {

@@ -6,8 +6,7 @@ use tonic::Status;
 
 use crate::cosigner::Cosigner;
 use crate::handlers::parsers;
-use crate::store::run_blocking;
-use crate::state::DeviceToken;
+use crate::types::DeviceToken;
 use crate::wallet_proto::*;
 
 use super::helpers::{now_secs, save_user_device_tokens};
@@ -19,12 +18,8 @@ impl Cosigner {
         &mut self,
         req: RegisterDeviceTokenRequest,
     ) -> Result<RegisterDeviceTokenResponse, Status> {
-        let upstreams = self.upstreams.clone();
-        let span = tracing::info_span!("actor::register_device_token", user_id = %parsers::user_id_hex(&req.user_id));
-        run_blocking(self.state.clone(), move |state| {
-            let _enter = span.enter();
-            let upstreams = upstreams.as_ref();
-            let user_id_hex = parsers::user_id_hex(&req.user_id);
+        let user_id_hex = parsers::user_id_hex(&req.user_id);
+        {
             // Auth (OP_REGISTER_DEVICE_TOKEN) ran at the REST boundary.
 
             if req.fcm_token.trim().is_empty() {
@@ -37,10 +32,10 @@ impl Cosigner {
             }
 
             let now = now_secs();
-            state.device_tokens.retain(|t| {
+            self.device_tokens.retain(|t| {
                 t.fcm_token != req.fcm_token && now - t.registered_at < MAX_TOKEN_AGE_SECS
             });
-            state.device_tokens.push(DeviceToken {
+            self.device_tokens.push(DeviceToken {
                 fcm_token: req.fcm_token.clone(),
                 platform: req.platform.clone(),
                 registered_at: now,
@@ -48,18 +43,17 @@ impl Cosigner {
             });
 
             save_user_device_tokens(
-                upstreams.persistence.as_ref(),
+                self.upstreams.persistence.as_ref(),
                 &user_id_hex,
-                &state.device_tokens,
+                &self.device_tokens,
             );
             tracing::info!(
                 "[{user_id_hex}] register_device_token: platform={} version={} token_count={}",
                 req.platform,
                 req.app_version,
-                state.device_tokens.len()
+                self.device_tokens.len()
             );
-            Ok(RegisterDeviceTokenResponse { ok: true })
-        })
-        .await
+        }
+        Ok(RegisterDeviceTokenResponse { ok: true })
     }
 }

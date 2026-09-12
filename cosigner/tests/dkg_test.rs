@@ -122,7 +122,7 @@ async fn ceremony_derives_one_group_key() {
 /// gone, and a second ceremony starts from nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abandoned_ceremony_leaves_nothing() {
-    let Some(upstreams) = common::try_shared().await else {
+    let Some(_upstreams) = common::try_shared().await else {
         return;
     };
 

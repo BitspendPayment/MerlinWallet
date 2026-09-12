@@ -103,11 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| std::env::var("GRPC_PORT").ok().and_then(|s| s.parse().ok()))
         .unwrap_or(7075);
 
-    let wallet_state = std::sync::Arc::new(parking_lot::Mutex::new(
-        cosigner::state::CosignerState::new(group_key.clone()),
-    ));
     let cosigner = std::sync::Arc::new(tokio::sync::Mutex::new(
-        cosigner::Cosigner::open(upstreams.clone(), wallet_state).await?,
+        cosigner::Cosigner::open(upstreams.clone(), group_key.clone()).await?,
     ));
     let server_info = cosigner::wallet_proto::GetServerInfoResponse {
         bitcoin_network: cfg.bitcoin_network.clone(),

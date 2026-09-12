@@ -3,6 +3,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One VTXO this cosigner holds. `created_at`/`expires_at` come from the ASP and feed the
+/// delegate's renewal deadline; rows lacking them deserialize to 0 — unknown expiry, treated
+/// conservatively.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VtxoEntry {
+    pub txid: String,
+    pub vout: u32,
+    pub amount: u64,
+    pub exit_delay: u32,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub expires_at: i64,
+}
+
+/// One device registered for push notifications.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceToken {
+    pub fcm_token: String,
+    pub platform: String,
+    pub registered_at: i64,
+    #[serde(default)]
+    pub app_version: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArkTxEntry {
     /// "board", "send", "receive", "settle".
@@ -200,13 +225,7 @@ pub struct Commitment {
 
 
 
-/// Output of `public_policy`: the PUBLIC projection the host loads into its `policy_state`.
-#[derive(Debug)]
-pub struct PublicPolicy {
-    pub group_key: String,
-    pub public_key_package_json: String,
-    pub user_signing_identifier_hex: Option<String>,
-}
+
 
 /// Output of `sign_step1`: the combined commitments to sign over.
 #[derive(Debug)]

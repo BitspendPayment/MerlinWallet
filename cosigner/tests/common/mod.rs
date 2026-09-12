@@ -10,7 +10,6 @@
 //! `None` only if the ASP URL itself is malformed.
 
 use cosigner::Cosigner;
-use cosigner::state::CosignerState;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -95,11 +94,8 @@ pub fn dkg_2of2() -> (Vec<KeyPackage>, PublicKeyPackage) {
 
 /// Open the cosigner this process serves, loading whatever its seal already holds.
 pub async fn open_cosigner(upstreams: &Arc<Upstreams>, group_key: &str) -> tokio::sync::Mutex<Cosigner> {
-    let state = Arc::new(parking_lot::Mutex::new(CosignerState::new(
-        group_key.to_string(),
-    )));
     tokio::sync::Mutex::new(
-        Cosigner::open(upstreams.clone(), state)
+        Cosigner::open(upstreams.clone(), group_key.to_string())
             .await
             .expect("open cosigner"),
     )

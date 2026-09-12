@@ -6,7 +6,7 @@ use tonic::Status;
 
 use crate::cosigner::Cosigner;
 use crate::handlers::parsers;
-use crate::state::{CosignerState, VtxoEntry};
+use crate::types::VtxoEntry;
 use crate::types::VtxoInput;
 use crate::upstreams::Upstreams;
 use crate::wallet_proto::*;
@@ -22,18 +22,16 @@ use super::helpers::{
 // these only translate the host's VTXO projection in/out of the guest wires).
 // =============================================================================
 
-/// Guest-routed delegate-settle Phase 1 prep: the VTXOs to push into the guest + the
-/// host-computed intent renewal deadline (earliest VTXO expiry − safety margin). The guest
-/// computes the self-refresh output itself; the host only supplies what it alone knows.
+/// The VTXOs a delegate settles and the deadline its intent becomes valid at (earliest VTXO expiry
+/// − the safety margin). The self-refresh output is computed from the cosigner's own key.
 pub fn build_delegate_step1(
-    state: &CosignerState,
+    owned: &[VtxoEntry],
     upstreams: &Upstreams,
 ) -> Result<(Vec<VtxoInput>, Option<u64>), Status> {
-    if state.vtxos.is_empty() {
+    if owned.is_empty() {
         return Err(Status::failed_precondition("no VTXOs to settle"));
     }
-    let vtxos = state
-        .vtxos
+    let vtxos = owned
         .iter()
         .map(|e| VtxoInput {
             txid: e.txid.clone(),
@@ -42,8 +40,7 @@ pub fn build_delegate_step1(
             exit_delay: e.exit_delay,
         })
         .collect();
-    let earliest = state
-        .vtxos
+    let earliest = owned
         .iter()
         .filter_map(|e| (e.expires_at > 0).then_some(e.expires_at))
         .min()
@@ -57,32 +54,25 @@ pub fn build_delegate_step1(
     Ok((vtxos, intent_valid_at))
 }
 
-/// Phase 2: apply the guest's `SendVtxoStep2` result to the host VTXO/history projection
-/// (drop spent VTXOs, add the guest-reported change, invalidate delegate, record history)
-/// and produce the `Settled` gRPC response.
+/// Apply a completed send to the owned VTXO set: the send spent everything, so clear it and add
+/// back whatever change it produced.
 pub fn apply_send_result(
-    state: &mut CosignerState,
+    owned: &mut Vec<VtxoEntry>,
     upstreams: &Upstreams,
     req: &SendVtxoRequest,
     ark_txid: String,
     change: Option<(String, u32, u64, u32)>,
 ) -> SendVtxoResponse {
     let user_id_hex = parsers::user_id_hex(&req.user_id);
-    state.vtxos.clear();
-    state.delegate_session = None;
+    owned.clear();
+    // The send consumed the VTXOs a stored delegate may cover, so it can no longer be settled.
     delete_user_delegate(upstreams.persistence.as_ref(), &user_id_hex);
-    // The off-chain send consumed VTXOs the stored guest delegate may reference; its host-side marker
-    // carries no coverage info, so clear it (else `has_active_delegate` stays true + the auto-settle
-    // tick could submit signatures over now-spent VTXOs).
-    if state.guest_delegate_threshold.take().is_some() {
-        super::helpers::delete_guest_delegate_threshold(upstreams.persistence.as_ref(), &user_id_hex);
-        tracing::info!("[{user_id_hex}] guest delegate marker invalidated by off-chain send");
-    }
+    super::helpers::delete_guest_delegate_threshold(upstreams.persistence.as_ref(), &user_id_hex);
     if let Some((txid, vout, amount, exit_delay)) = change {
         tracing::info!(
             "[{user_id_hex}] SendVtxo: change VTXO txid={txid}, vout={vout}, amount={amount}, exit_delay={exit_delay}"
         );
-        state.vtxos.push(VtxoEntry {
+        owned.push(VtxoEntry {
             txid,
             vout,
             amount,
@@ -91,7 +81,7 @@ pub fn apply_send_result(
             expires_at: 0,
         });
     }
-    save_user_vtxos(upstreams.persistence.as_ref(), &user_id_hex, &state.vtxos);
+    save_user_vtxos(upstreams.persistence.as_ref(), &user_id_hex, owned);
     SendVtxoResponse {
         status: send_vtxo_response::Status::Settled as i32,
         messages_to_sign: vec![],

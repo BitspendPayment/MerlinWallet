@@ -79,7 +79,7 @@ impl Cosigner {
         // Prune here too: otherwise it only runs when a NEW request arrives, so a payer who just
         // reads their inbox keeps seeing long-lapsed ones. Re-seal only if something changed.
         if self.prune_intents(now) {
-            let group_key = self.state.lock().cosigner_id.clone();
+            let group_key = self.group_key().to_string();
             crate::store::seal_snapshot_for(self, &group_key).await;
         }
         let mut intents: Vec<_> = self
@@ -184,7 +184,7 @@ impl Cosigner {
         // must never fail the request.
         if let Some(fcm) = self.upstreams.fcm.clone() {
             let persistence = self.upstreams.persistence.clone();
-            let payer = self.state.lock().cosigner_id.clone();
+            let payer = self.group_key().to_string();
             let (amount, id) = (intent.amount_sats, intent.id.clone());
             tokio::spawn(async move {
                 let tokens = super::helpers::load_user_device_tokens(persistence.as_ref(), &payer);

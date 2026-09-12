@@ -10,20 +10,18 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use rand::rngs::OsRng;
 use zeroize::Zeroizing;
 
 use tonic::Status;
 
 use crate::handlers;
-use crate::state::CosignerState;
 
 use crate::types::{
     ApplyDelegateSigs, BoardingSettleSubmitted, Commitment,
-    Contact, IntentStatus, PaymentIntent, PublicPolicy,
+    Contact, DeviceToken, IntentStatus, PaymentIntent,
     SendVtxoStep1, SendVtxoSubmitted, SignStep1, SignStep1Out, SignStep2,
-    SignStep2Out, SnapshotState, VtxoInput,
+    SignStep2Out, SnapshotState, VtxoEntry, VtxoInput,
 };
 
 use ark::client::batch::{DelegateSettleSession, PersistedDelegate};
@@ -112,7 +110,12 @@ pub struct Cosigner {
     pub(crate) upstreams: Arc<Upstreams>,
     /// This user's public projection (VTXOs / history / device tokens / policy metadata). The
     /// non-signing query + stream + inbox handlers are `impl Cosigner` methods over it.
-    pub(crate) state: Arc<Mutex<CosignerState>>,
+    /// The group key this cosigner serves. Configuration, not something a caller names.
+    pub(crate) group_key: String,
+    /// The owned VTXO set, with the expiry a delegate's renewal deadline is computed from.
+    pub(crate) owned_vtxos: Vec<VtxoEntry>,
+    /// Devices to push to. Pushes go to all of them.
+    pub(crate) device_tokens: Vec<DeviceToken>,
 }
 
 /// In-flight boarding settle, held across the commitment-FROST pause (the client FROST-signs the
@@ -137,57 +140,41 @@ impl Cosigner {
     ///
     /// No seal yet is not an error. Before onboarding there is nothing to read, and DKG is what
     /// writes the first one.
-    pub async fn open(
-        upstreams: Arc<Upstreams>,
-        state: Arc<Mutex<CosignerState>>,
-    ) -> Result<Self, Status> {
-        let group_key = state.lock().cosigner_id.clone();
-        let mut cosigner = Self::new(upstreams.clone(), state.clone());
-        if crate::store::restore_snapshot(&mut cosigner, &upstreams, &group_key).await {
-            crate::store::load_policy_projection(&state, &mut cosigner).await?;
-        }
-        cosigner.load_projection(&group_key);
+    pub async fn open(upstreams: Arc<Upstreams>, group_key: String) -> Result<Self, Status> {
+        let mut cosigner = Self::new(upstreams.clone(), group_key.clone());
+        crate::store::restore_snapshot(&mut cosigner, &upstreams, &group_key).await;
+        cosigner.load_owned(&group_key);
         Ok(cosigner)
     }
 
-    /// Read the host projection back from storage: the VTXO set, the transaction log, the device
-    /// tokens and any stored delegate threshold.
-    ///
-    /// Separate from the seal, and not redundant with it. The seal carries the VTXOs as
-    /// `VtxoInput`, which has no expiry; the projection carries `VtxoEntry`, which does, and expiry
-    /// is what decides when a delegate must settle. Until that moves into the seal, both are
-    /// needed, and this is where the cheaper one is read.
-    fn load_projection(&mut self, group_key: &str) {
+    /// Read back what is stored outside the seal: the VTXO set with its expiry, and the devices to
+    /// push to.
+    fn load_owned(&mut self, group_key: &str) {
         use crate::handlers::helpers as h;
         let persistence = self.upstreams.persistence.as_ref();
         let vtxos = h::load_user_vtxos(persistence, group_key);
         let device_tokens = h::load_user_device_tokens(persistence, group_key);
-        let threshold = h::load_guest_delegate_threshold(persistence, group_key);
-
-        if vtxos.is_empty() && device_tokens.is_empty() && threshold.is_none() {
+        if vtxos.is_empty() && device_tokens.is_empty() {
             return;
         }
         tracing::info!(
             vtxos = vtxos.len(),
             device_tokens = device_tokens.len(),
-            delegate = threshold.is_some(),
-            "restored projection"
+            "restored owned state"
         );
-        let mut st = self.state.lock();
-        st.vtxos = vtxos;
-        st.device_tokens = device_tokens;
-        st.guest_delegate_threshold = threshold;
+        self.owned_vtxos = vtxos;
+        self.device_tokens = device_tokens;
     }
 
-    pub fn group_key(&self) -> String {
-        self.state.lock().cosigner_id.clone()
+    pub fn group_key(&self) -> &str {
+        &self.group_key
     }
 
     pub fn upstreams(&self) -> &Arc<Upstreams> {
         &self.upstreams
     }
 
-    fn new(upstreams: Arc<Upstreams>, state: Arc<Mutex<CosignerState>>) -> Self {
+    fn new(upstreams: Arc<Upstreams>, group_key: String) -> Self {
         Self {
             policy: None,
             delegate_session: None,
@@ -198,7 +185,9 @@ impl Cosigner {
             contacts: Vec::new(),
             payment_intents: Vec::new(),
             upstreams,
-            state,
+            group_key,
+            owned_vtxos: Vec::new(),
+            device_tokens: Vec::new(),
         }
     }
 
@@ -284,15 +273,14 @@ impl Cosigner {
     pub fn prepare_delegate(
         &self,
     ) -> Result<(Vec<VtxoInput>, Option<u64>), Status> {
-        let st = self.state.lock();
-        handlers::ark_send::build_delegate_step1(&st, &self.upstreams)
+        handlers::ark_send::build_delegate_step1(&self.owned_vtxos, &self.upstreams)
     }
 
     /// Seal this actor's state. Storage is the whole of the persistence now, so a method that
     /// mutates durable state seals here rather than trusting its caller to remember.
     pub async fn seal(&mut self) {
         let upstreams = self.upstreams.clone();
-        let group_key = self.state.lock().cosigner_id.clone();
+        let group_key = self.group_key.clone();
         crate::store::seal_snapshot(self, &upstreams, &group_key).await;
     }
 
@@ -304,10 +292,9 @@ impl Cosigner {
         sub: BoardingSettleSubmitted,
     ) -> String {
         let now = crate::store::now_secs();
-        let mut st = self.state.lock();
-        st.vtxos
+        self.owned_vtxos
             .retain(|e| !(e.txid == sub.vtxo_txid && e.vout == sub.vtxo_vout));
-        st.vtxos.push(crate::state::VtxoEntry {
+        self.owned_vtxos.push(VtxoEntry {
             txid: sub.vtxo_txid.clone(),
             vout: sub.vtxo_vout,
             amount: sub.amount_sats,
@@ -315,7 +302,11 @@ impl Cosigner {
             created_at: now,
             expires_at: 0,
         });
-        handlers::helpers::save_user_vtxos(self.upstreams.persistence.as_ref(), user_id_hex, &st.vtxos);
+        handlers::helpers::save_user_vtxos(
+            self.upstreams.persistence.as_ref(),
+            user_id_hex,
+            &self.owned_vtxos,
+        );
         sub.commitment_txid
     }
 
@@ -329,16 +320,13 @@ impl Cosigner {
         submitted: SendVtxoSubmitted,
     ) -> crate::wallet_proto::SendVtxoResponse {
         let SendVtxoSubmitted { ark_txid, change } = submitted;
-        let resp = {
-            let mut st = self.state.lock();
-            crate::handlers::ark_send::apply_send_result(
-                &mut st,
-                &self.upstreams,
-                req,
-                ark_txid.clone(),
-                change,
-            )
-        };
+        let resp = crate::handlers::ark_send::apply_send_result(
+            &mut self.owned_vtxos,
+            &self.upstreams,
+            req,
+            ark_txid.clone(),
+            change,
+        );
         if let Some(id) =
             self.fulfil_matching_intent(&req.recipient_ark_address, req.amount, &ark_txid)
         {
@@ -596,18 +584,7 @@ impl Cosigner {
         Ok(())
     }
 
-    /// Return the PUBLIC policy projection the host loads into its `policy_state`.
-    pub(crate) fn public_policy(&self) -> Result<PublicPolicy, String> {
-        let p = self.policy.as_ref().ok_or("no policy installed")?;
-        Ok(PublicPolicy {
-            group_key: p.group_key.clone(),
-            public_key_package_json: p.public_key_package.to_json(),
-            user_signing_identifier_hex: p
-                .user_signing_identifier
-                .as_ref()
-                .map(|id| hex::encode(id.serialize())),
-        })
-    }
+
 
     /// Whether `user_id` (a compressed pubkey, hex) may drive a signing ceremony on this actor.
     fn is_authorized_signer(&self, user_id: &[u8]) -> bool {
