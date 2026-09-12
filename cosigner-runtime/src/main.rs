@@ -89,31 +89,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let session_authority = std::sync::Arc::new(
-        cosigner_runtime::auth::session::SessionAuthority::from_secret_hex(&cfg.webauth_token_secret),
-    );
-    if session_authority.enabled() {
-        tracing::info!("Session-token auth enabled (WEBAUTH_TOKEN_SECRET configured)");
-    } else {
-        // Not merely informational: a passkey-GATED wallet authenticates by
-        // session token alone (its Schnorr signature is empty), so without a
-        // token secret every request from a gated wallet is rejected.
-        tracing::warn!(
-            "Session-token auth DISABLED (no WEBAUTH_TOKEN_SECRET); Schnorr-only — \
-             passkey-gated wallets cannot authenticate against this deployment"
-        );
-    }
-
-    let mut shared = shared::SharedServices::new(
+    let shared = Arc::new(shared::SharedServices::new(
         persistence,
         asp_client,
         fcm,
         cfg.auto_settle_safety_margin_secs,
-        cfg.actor_idle_threshold_secs,
-        session_authority,
-    );
-
-    let shared = Arc::new(shared);
+    ));
 
     // One cosigner per process, named by COSIGNER_GROUP_KEY. Not optional: a cosigner serves one
     // wallet, and which wallet is configuration rather than something a caller names per request.

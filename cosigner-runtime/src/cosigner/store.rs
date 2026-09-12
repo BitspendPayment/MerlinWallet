@@ -8,7 +8,6 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use futures::FutureExt;
 use parking_lot::Mutex;
 use tonic::Status;
 
@@ -181,41 +180,6 @@ pub(crate) async fn load_policy_state_from_actor(
 
 
 
-/// Send a "vtxo_received" VISIBLE notification to every registered device for
-/// this user. The wallet share is passkey-gated, so the device can't silently
-/// sign a fresh delegate from a background push — the notification asks the
-/// user to open the app, where the Ark tab offers a delegate button (one
-/// passkey gesture). Best-effort: failures are logged and ignored — the
-/// stream handler has already persisted state, the open-app fallback closes
-/// any gap.
-pub(crate) async fn push_vtxo_received(
-    shared: &SharedServices,
-    user_id_hex: &str,
-    tokens: &[DeviceToken],
-) {
-    let Some(fcm) = shared.fcm.as_ref() else {
-        return;
-    };
-    if tokens.is_empty() {
-        return;
-    }
-    let mut data = std::collections::HashMap::new();
-    data.insert("type".to_string(), "vtxo_received".to_string());
-    data.insert("user_id".to_string(), user_id_hex.to_string());
-    for token in tokens {
-        if let Err(e) = fcm
-            .send_notification(
-                &token.fcm_token,
-                "Funds received",
-                "Tap to activate auto-settle protection",
-                &data,
-            )
-            .await
-        {
-            tracing::warn!("[{user_id_hex}] FCM push to {} failed: {e}", token.platform);
-        }
-    }
-}
 
 /// Notify the payer that an allowlisted contact has asked them to pay. Best-effort — the intent is
 /// already sealed, and the app also polls on resume.

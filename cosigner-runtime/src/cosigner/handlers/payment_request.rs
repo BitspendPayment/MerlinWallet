@@ -183,20 +183,12 @@ impl CosignerActor {
             .map_err(Status::invalid_argument)?;
         self.seal().await;
 
-        // Best-effort nudge on two channels; the sealed intent is the durable record, so a failed
-        // notification must never fail the request.
-        let group_key = self.state.lock().cosigner_id.clone();
-        self.shared.events.publish(
-            &group_key,
-            crate::events::CosignerEvent::PaymentRequest {
-                id: intent.id.clone(),
-                from_vk_hex: intent.from_vk_hex.clone(),
-                amount_sats: intent.amount_sats,
-            },
-        );
+        // Best-effort nudge: the sealed intent is the durable record, so a failed notification
+        // must never fail the request.
         if let Some(fcm) = self.shared.fcm.clone() {
             let persistence = self.shared.persistence.clone();
-            let (payer, amount, id) = (group_key, intent.amount_sats, intent.id.clone());
+            let payer = self.state.lock().cosigner_id.clone();
+            let (amount, id) = (intent.amount_sats, intent.id.clone());
             tokio::spawn(async move {
                 let tokens = super::helpers::load_user_device_tokens(persistence.as_ref(), &payer);
                 crate::cosigner::store::push_payment_request(&fcm, &payer, &tokens, &id, amount)

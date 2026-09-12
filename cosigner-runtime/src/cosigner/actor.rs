@@ -13,12 +13,11 @@ use zeroize::Zeroizing;
 use tonic::Status;
 
 use crate::cosigner::handlers;
-use crate::cosigner::store::push_vtxo_received;
 use crate::cosigner::state::CosignerState;
 
 use crate::cosigner::types::{
     ApplyDelegateSigs, ArkTxEntry, BoardingSettleOutcome, BoardingSettleSubmitted, Commitment,
-    Contact, ContractPairing, ContractRefreshed, IntentStatus, PaymentIntent, PublicPolicy,
+    Contact, ContractPairing, IntentStatus, PaymentIntent, PublicPolicy,
     SendVtxoStep1, SendVtxoSubmitted, SettleSubmitted, SignStep1, SignStep1Out, SignStep2,
     SignStep2Out, SnapshotState, VtxoInput,
 };
@@ -28,7 +27,6 @@ use ark::client::send::{SendSession, SendVtxoInput};
 use ark::client::types::ArkInfo;
 
 use threshold::commitment::SigningPackage;
-use threshold::dkg;
 use threshold::identifier::Identifier;
 use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::nonce::{self, SigningCommitments, SigningNonce};
@@ -84,14 +82,16 @@ pub struct Ceremony {
     shares: BTreeMap<Identifier, SignatureShare>,
     /// The cosigner's single-use nonce for this round (set in step1, consumed in step2).
     nonce: Option<SigningNonce>,
-    /// The full transaction being signed (from step1), passed to the contract gate in step2
-    /// before the cosigner produces its share.
+    /// The full transaction being signed, carried from the open. NOTHING READS IT. It fed the
+    /// contract gate in `sign_finish`, which went with the contract layer, and it is kept because
+    /// it is exactly what a policy has to see: the bytes the signature will authorize, rather than
+    /// the sighash alone. The policy IR is what makes it live again.
+    #[allow(dead_code)]
     full_transaction: Vec<u8>,
 }
 
 pub struct CosignerActor {
     policy: Option<Policy>,
-    /// In-flight off-chain send: `(session, change_exit_delay)`.
     /// A `ReadyToSettle` delegate session the core can drive autonomously (auto-settle).
     delegate_session: Option<DelegateSettleSession>,
     /// In-flight GUEST-style boarding settle, held across the commitment-FROST pause (the client
@@ -227,6 +227,14 @@ impl CosignerActor {
 
     pub fn set_vtxos(&mut self, vtxos: Vec<VtxoInput>) {
         self.vtxos = vtxos;
+    }
+
+    /// The VTXO set to refresh and the renewal deadline the delegate becomes valid at.
+    pub fn prepare_delegate(
+        &self,
+    ) -> Result<(Vec<VtxoInput>, Option<u64>), Status> {
+        let st = self.state.lock();
+        handlers::ark_send::build_delegate_step1(&st, &self.shared)
     }
 
     /// Seal this actor's state. Storage is the whole of the persistence now, so a method that
@@ -558,48 +566,6 @@ impl CosignerActor {
         Ok(())
     }
 
-    /// Key-preserving REFRESH of this core's `V` onto a `{receiver, cosigner}` pairing, computed
-    /// in-process so `V` never leaves it (Plan A). Returns the public pairing PKP + the receiver's
-    /// half + the cosigner's pairing key package (the host relays the latter to seed the pairing
-    /// actor; it is never persisted host-side).
-    pub(crate) fn contract_refresh(
-        &mut self,
-        receiver_id_hex: &str,
-        receiver_partial_point: &[u8],
-        wallet_id_hex: &str,
-        a_at_cosigner: &[u8],
-        min_signers: usize,
-    ) -> Result<ContractRefreshed, String> {
-        let policy = self.policy.as_ref().ok_or("no policy installed")?;
-        let receiver_id = parse_identifier_hex(receiver_id_hex)?;
-        let wallet_id = parse_identifier_hex(wallet_id_hex)?;
-        let partial_point: [u8; 33] = receiver_partial_point
-            .try_into()
-            .map_err(|_| "receiver_partial_point must be 33 bytes")?;
-        let a_at_cos: [u8; 32] = a_at_cosigner
-            .try_into()
-            .map_err(|_| "a_at_cosigner must be 32 bytes")?;
-
-        let mut id_partial_share = BTreeMap::new();
-        id_partial_share.insert(wallet_id, a_at_cos);
-        let receiver = dkg::Receiver {
-            id: receiver_id,
-            partial_verifying_share: partial_point,
-        };
-        let pairing = dkg::refresh_to_receiver(
-            &policy.key_package,
-            &receiver,
-            &id_partial_share,
-            min_signers,
-            &mut OsRng,
-        )
-        .map_err(|e| format!("refresh_to_receiver: {e:?}"))?;
-        Ok(ContractRefreshed {
-            pairing_public_key_package_json: pairing.pairing_pkp.to_json(),
-            receiver_half: pairing.receiver_half.to_vec(),
-            my_key_package_json: pairing.my_kp.to_json(),
-        })
-    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn install_policy(

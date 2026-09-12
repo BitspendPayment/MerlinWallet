@@ -15,12 +15,6 @@ use threshold::scalar::scalar_from_bytes;
 /// A parked reply for a participant waiting on a ceremony round to complete.
 pub type Reply<T> = oneshot::Sender<Result<T, Status>>;
 
-/// Fail every parked single reply (used on eviction / fatal error).
-pub fn drain_with_err<T>(pool: &mut Vec<Reply<T>>, msg: &str) {
-    for s in pool.drain(..) {
-        let _ = s.send(Err(Status::aborted(msg.to_string())));
-    }
-}
 
 /// Fail every parked `(id, reply)` pair (step3 pools carry the sender id).
 pub fn drain_pairs_with_err<K, T>(pool: &mut Vec<(K, Reply<T>)>, msg: &str) {

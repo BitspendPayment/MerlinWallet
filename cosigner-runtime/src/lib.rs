@@ -5,7 +5,6 @@ pub mod auth;
 pub mod bitcoin;
 pub mod config;
 pub mod cosigner;
-pub mod events;
 pub mod fcm_client;
 pub mod onboarding;
 pub mod kv_store;

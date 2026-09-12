@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
 use crate::auth::message::{build_auth_message, MAX_TIMESTAMP_DRIFT_MS};
-use crate::auth::session::SessionClaims;
 use crate::cosigner::state::CosignerState;
 use crate::kv_store::KvStore;
 
@@ -20,17 +19,7 @@ pub fn auth_check(
     signature: &[u8],
     timestamp_ms: i64,
     operation: &str,
-    session: Option<&SessionClaims>,
 ) -> Result<(), Status> {
-    if let Some(claims) = session {
-        if claims.authenticates(user_id_bytes) {
-            return Ok(());
-        }
-        return Err(Status::unauthenticated(
-            "session token does not match request user",
-        ));
-    }
-
     // A gated wallet sends an EMPTY signature and authenticates via the session
     // token alone — reaching here means that token was missing or invalid. Say
     // so, instead of the misleading generic 64-byte complaint below.
@@ -63,25 +52,15 @@ pub fn auth_check(
     Ok(())
 }
 
-/// Stateless variant of [`auth_check`] for endpoints that run OUTSIDE an actor (e.g. the SSE
-/// event stream): verifies the BIP-340 signature + the timestamp drift without a `CosignerState`.
+/// Stateless variant of [`auth_check`]: verifies the BIP-340 signature + the timestamp drift
+/// without a `CosignerState`.
 /// (The replay window is the same; auth carries no replay cache — see `timestamp_check`.)
 pub fn verify_auth(
     user_id_bytes: &[u8],
     signature: &[u8],
     timestamp_ms: i64,
     operation: &str,
-    session: Option<&SessionClaims>,
 ) -> Result<(), Status> {
-    if let Some(claims) = session {
-        if claims.authenticates(user_id_bytes) {
-            return Ok(());
-        }
-        return Err(Status::unauthenticated(
-            "session token does not match request user",
-        ));
-    }
-
     // See auth_check: an empty signature means "session token expected".
     if signature.is_empty() {
         return Err(Status::unauthenticated(
@@ -163,16 +142,7 @@ pub fn auth_check_group(
             "signer not authorized for this group",
         ));
     }
-    // Group/contract ops identify by the claimed verifying share, not by the token's `sub`, so they
-    // stay on Schnorr — a session token (bound to the main group key) does not apply here.
-    auth_check(
-        state,
-        claimed_share_bytes,
-        signature,
-        timestamp_ms,
-        operation,
-        None,
-    )
+    auth_check(state, claimed_share_bytes, signature, timestamp_ms, operation)
 }
 
 /// Ensure the host `policy_state` projection is present. Plan A: the native `CosignerActor`'s seal

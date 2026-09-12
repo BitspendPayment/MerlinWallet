@@ -48,6 +48,8 @@ type DkgStream = Pin<Box<dyn Stream<Item = Result<proto::DkgServerMsg, Status>> 
 type SendStream = Pin<Box<dyn Stream<Item = Result<proto::SendServerMsg, Status>> + Send + 'static>>;
 type SettleStream =
     Pin<Box<dyn Stream<Item = Result<proto::SettleServerMsg, Status>> + Send + 'static>>;
+type SettleDelegateStream =
+    Pin<Box<dyn Stream<Item = Result<proto::DelegateServerMsg, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl SigningSession for SessionService {
@@ -55,6 +57,7 @@ impl SigningSession for SessionService {
     type DkgStream = DkgStream;
     type SendStream = SendStream;
     type SettleStream = SettleStream;
+    type SettleDelegateStream = SettleDelegateStream;
 
     async fn sign(
         &self,
@@ -481,6 +484,94 @@ impl SigningSession for SessionService {
 
         Ok(Response::new(Box::pin(out) as SettleStream))
     }
+
+    /// Delegating a settle, as one session.
+    ///
+    /// The unary form also had a `store_only` mode: seal a `ReadyToSettle` delegate and let a 60s
+    /// background tick drive it later. That tick assumed an always-on process and is gone, and the
+    /// durable background task meant to replace it is not built, so there is no unattended path
+    /// here yet — this settles while the caller is on the stream.
+    async fn settle_delegate(
+        &self,
+        request: Request<Streaming<proto::DelegateClientMsg>>,
+    ) -> Result<Response<SettleDelegateStream>, Status> {
+        let cosigner = self.cosigner.clone();
+        let mut inbound = request.into_inner();
+
+        let out = async_stream::try_stream! {
+            let first = inbound
+                .next()
+                .await
+                .ok_or_else(|| Status::invalid_argument("stream closed before it opened"))??;
+            let session_id = first.session_id.clone();
+            let open = match first.body {
+                Some(proto::delegate_client_msg::Body::Open(o)) => o,
+                _ => Err(Status::invalid_argument("a session must open with DelegateOpen"))?,
+            };
+
+            // --- Build the delegate --------------------------------------------------------
+            let sighashes = {
+                let mut actor = cosigner.actor().await;
+                let (vtxos, intent_valid_at) = actor.prepare_delegate()?;
+                actor.set_vtxos(vtxos);
+                actor
+                    .generate_delegate(crate::cosigner::types::GenerateDelegate {
+                        user_id: open.user_id.clone(),
+                        signature: open.signature.clone(),
+                        timestamp_ms: open.timestamp_ms,
+                        intent_valid_at,
+                    })
+                    .await
+                    .map_err(|m| Status::internal(format!("GenerateDelegate: {m}")))?
+            };
+
+            yield proto::DelegateServerMsg {
+                session_id: session_id.clone(),
+                seq: 1,
+                body: Some(proto::delegate_server_msg::Body::Sighashes(
+                    proto::DelegateSighashes { messages_to_sign: sighashes, script_path_spend: true },
+                )),
+            };
+
+            // --- Apply the signatures and settle -------------------------------------------
+            let second = inbound
+                .next()
+                .await
+                .ok_or_else(|| Status::cancelled("stream closed before the signatures arrived"))??;
+            let signed = match second.body {
+                Some(proto::delegate_client_msg::Body::Signed(s)) => s,
+                _ => Err(Status::invalid_argument("expected DelegateSigned"))?,
+            };
+
+            let commitment_txid = {
+                let mut actor = cosigner.actor().await;
+                actor
+                    .apply_delegate_sigs(crate::cosigner::types::ApplyDelegateSigs {
+                        user_id: open.user_id,
+                        signature: open.signature,
+                        timestamp_ms: open.timestamp_ms,
+                        signed_messages: signed.signed_messages,
+                    })
+                    .map_err(|m| Status::internal(format!("ApplyDelegateSigs: {m}")))?;
+                let submitted = actor
+                    .settle_delegate()
+                    .await
+                    .map_err(|m| Status::internal(format!("SettleDelegate: {m}")))?;
+                cosigner.persist(&mut actor).await;
+                submitted.commitment_txid
+            };
+
+            yield proto::DelegateServerMsg {
+                session_id,
+                seq: 2,
+                body: Some(proto::delegate_server_msg::Body::Complete(
+                    proto::DelegateComplete { commitment_txid },
+                )),
+            };
+        };
+
+        Ok(Response::new(Box::pin(out) as SettleDelegateStream))
+    }
 }
 // ===========================================================================
 // The wallet API, over gRPC.
@@ -524,7 +615,7 @@ fn use_a_session(name: &str) -> Status {
 
 /// Check the caller's auth signature, exactly as `dispatch_json!` did before it.
 fn check(user_id: &[u8], signature: &[u8], timestamp_ms: i64, op: &str) -> Result<(), Status> {
-    crate::cosigner::handlers::helpers::verify_auth(user_id, signature, timestamp_ms, op, None)
+    crate::cosigner::handlers::helpers::verify_auth(user_id, signature, timestamp_ms, op)
 }
 
 #[tonic::async_trait]
@@ -645,8 +736,24 @@ impl MpcWallet for WalletService {
     async fn settle_delegate(&self, _r: Request<wp::SettleDelegateRequest>) -> Result<Response<wp::SettleDelegateResponse>, Status> {
         Err(use_a_session("SettleDelegate"))
     }
-    async fn submit_ark_send(&self, _r: Request<wp::SubmitArkSendRequest>) -> Result<Response<wp::SubmitArkSendResponse>, Status> {
-        Err(use_a_session("SubmitArkSend"))
+    /// The client-built send path: the wallet constructs and signs the transaction, and the
+    /// cosigner only submits it. One round, so it stays a call rather than a session.
+    async fn submit_ark_send(
+        &self,
+        request: Request<wp::SubmitArkSendRequest>,
+    ) -> Result<Response<wp::SubmitArkSendResponse>, Status> {
+        let req = request.into_inner();
+        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_SEND_VTXO)?;
+        let mut actor = self.cosigner.actor().await;
+        let (resp, paid_outputs) = actor.submit_ark_send(req).await?;
+        // If the tx pays an outstanding request, mark it fulfilled — recognised from the tx's own
+        // outputs, so the sealed intent stays the authority and the client never says which
+        // request it is paying.
+        if let Some(id) = actor.fulfil_intent_from_outputs(&paid_outputs, &resp.ark_txid) {
+            tracing::info!("payment request {id} fulfilled by {}", resp.ark_txid);
+            self.cosigner.persist(&mut actor).await;
+        }
+        Ok(Response::new(resp))
     }
 
     // --- Gone with the contract layer ----------------------------------------------------------

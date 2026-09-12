@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use rand::rngs::OsRng;
 
-use cosigner_runtime::auth::session::SessionAuthority;
 use cosigner_runtime::kv_store::SqliteStore;
 use cosigner_runtime::shared::SharedServices;
 
@@ -43,8 +42,6 @@ pub async fn try_shared() -> Option<Arc<SharedServices>> {
         asp,
         None, // fcm
         1800, // auto_settle_safety_margin_secs
-        1800, // actor_idle_threshold_secs
-        Arc::new(SessionAuthority::from_secret_hex("")),
     )))
 }
 

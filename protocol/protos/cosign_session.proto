@@ -32,6 +32,47 @@ service SigningSession {
   // `SIGNING_REQUIRED` and having the client call again. A loop states that directly: the server
   // yields sighashes until it has none left, then yields the result.
   rpc Settle(stream SettleClientMsg) returns (stream SettleServerMsg);
+
+  // Delegating a settle: the wallet refreshes its own VTXOs, signing an intent the cosigner can
+  // submit. Two rounds, same reason as the rest.
+  rpc SettleDelegate(stream DelegateClientMsg) returns (stream DelegateServerMsg);
+}
+
+message DelegateClientMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    DelegateOpen open = 3;
+    DelegateSigned signed = 4;
+  }
+}
+
+message DelegateOpen {
+  bytes user_id = 1;
+  bytes signature = 2;
+  int64 timestamp_ms = 3;
+}
+
+message DelegateSigned {
+  repeated bytes signed_messages = 1;
+}
+
+message DelegateServerMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    DelegateSighashes sighashes = 3;
+    DelegateComplete complete = 4;
+  }
+}
+
+message DelegateSighashes {
+  repeated bytes messages_to_sign = 1;
+  bool script_path_spend = 2;
+}
+
+message DelegateComplete {
+  string commitment_txid = 1;
 }
 
 message SettleClientMsg {
