@@ -1,0 +1,66 @@
+[package]
+name = "cosigner"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cosigner"
+path = "src/main.rs"
+
+[features]
+default = []
+
+[dependencies]
+http = "1"
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+# Persistence — single embedded SQLite KV backend. `bundled` compiles SQLite from source so the
+# build needs no system libsqlite3 (matters for the Nix/enclave build and for CI images).
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Bitcoin
+bitcoin = { version = "0.32", features = ["serde"] }
+
+# Ark protocol
+ark = { path = "../crates/ark", features = ["client"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# FCM HTTP v1 OAuth (service-account JWT bearer flow)
+jsonwebtoken = "9"
+
+# Streaming
+tokio-stream = { version = "0.1", features = ["sync"] }
+# Streaming ceremony sessions: lets the handler own a ceremony across rounds as ordinary
+# local state, which is the whole point of moving off the unary API.
+async-stream = "0.3"
+
+# Crypto
+sha2 = "0.10"
+# Zeroize secret key material on drop.
+zeroize = "1"
+threshold = { path = "../crates/threshold", features = ["std"] }
+parking_lot = "0.12"
+k256 = { version = "0.13", features = ["arithmetic"] }
+
+# Misc
+rand = "0.8"
+base64 = "0.22"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+hex = "0.4"
+tonic = "0.12"
+
+[build-dependencies]
+tonic-build = "0.12"

@@ -29,8 +29,8 @@ app:
   nix_vendor_hash: "sha256-FoCcAI8Fgj/GLbOWvmC42L+JbT6xNXkwokjVHAQk560="            # Go vendor hash (required)
   nix_sub_packages:              # Go sub-packages to build
     - "."
-  nix_subdir: "cosigner-runtime"       # Subdirectory for monorepo
-  binary_name: "cosigner-runtime"  # Must match [[bin]] name in Cargo.toml
+  nix_subdir: "cosigner"       # Subdirectory for monorepo
+  binary_name: "cosigner"  # Must match [[bin]] name in Cargo.toml
 
   # Extra nixpkgs attrs added to the build sandbox.
   nix_build_inputs: ["openssl"]

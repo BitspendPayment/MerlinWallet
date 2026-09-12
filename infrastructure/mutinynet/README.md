@@ -1,6 +1,6 @@
 # mutinynet — host-mode deployment
 
-Runs `cosigner-runtime` as a plain systemd service on one EC2 instance, with its
+Runs `cosigner` as a plain systemd service on one EC2 instance, with its
 SQLite KV on a dedicated EBS volume and Caddy terminating TLS in front.
 
 > **Testnet only.** There is no Nitro enclave here. The actor's sealed state —
@@ -65,7 +65,7 @@ Roughly $16/month. All three are variables, so none of this needs a code change:
 - A release build of the runtime:
 
 ```bash
-cd cosigner-runtime && cargo build --release
+cd cosigner && cargo build --release
 ```
 
 ## Configuration
@@ -193,7 +193,7 @@ Rebuild and apply. A changed binary does **not** replace the instance — the
 new ACME issuance and no downtime beyond the restart:
 
 ```bash
-(cd ../../../cosigner-runtime && cargo build --release)
+(cd ../../../cosigner && cargo build --release)
 tofu apply
 ```
 
@@ -226,7 +226,7 @@ control rather than only in SSM.
 aws ssm start-session --target "$(tofu output -raw instance_id)"
 
 # Logs
-sudo journalctl -u cosigner-runtime -f
+sudo journalctl -u cosigner -f
 sudo journalctl -u caddy -f
 sudo cat /var/log/user-data.log      # bootstrap
 

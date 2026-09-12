@@ -1,4 +1,4 @@
-//! Thin REST client for the cosigner-runtime, mirroring what the Flutter app does.
+//! Thin REST client for the cosigner, mirroring what the Flutter app does.
 //!
 //! Every authenticated call carries `user_id` / `signature` / `timestamp_ms`, where the signature
 //! is BIP-340 over `sha256("MPC_WALLET_AUTH_V1:<op>:<ts>:<user_id_hex>")` — the same canonical

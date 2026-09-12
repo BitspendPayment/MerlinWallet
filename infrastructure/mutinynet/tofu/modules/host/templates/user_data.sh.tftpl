@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bootstrap for the host-mode cosigner-runtime.
+# Bootstrap for the host-mode cosigner.
 #
 # Order matters in two places:
 #   1. the data volume mounts before anything writes to it — a write to an
@@ -123,7 +123,7 @@ CADDYFILE
 
 cat > /etc/systemd/system/caddy.service <<'UNIT'
 [Unit]
-Description=Caddy (TLS termination for cosigner-runtime)
+Description=Caddy (TLS termination for cosigner)
 After=network-online.target
 Wants=network-online.target
 
@@ -186,19 +186,19 @@ chmod 0755 /usr/local/sbin/cosigner-env.sh
 cat > /usr/local/sbin/cosigner-deploy.sh <<DEPLOY
 #!/bin/bash
 set -euo pipefail
-aws s3 cp "$${BINARY_S3_URL}" /usr/local/bin/cosigner-runtime.new --region "$${REGION}"
-chmod 0755 /usr/local/bin/cosigner-runtime.new
-mv /usr/local/bin/cosigner-runtime.new /usr/local/bin/cosigner-runtime
+aws s3 cp "$${BINARY_S3_URL}" /usr/local/bin/cosigner.new --region "$${REGION}"
+chmod 0755 /usr/local/bin/cosigner.new
+mv /usr/local/bin/cosigner.new /usr/local/bin/cosigner
 /usr/local/sbin/cosigner-env.sh
-systemctl restart cosigner-runtime
+systemctl restart cosigner
 DEPLOY
 chmod 0755 /usr/local/sbin/cosigner-deploy.sh
 
 # RequiresMountsFor implies both Requires= and After= on the mount unit, so the
 # service can never start against an unmounted data directory.
-cat > /etc/systemd/system/cosigner-runtime.service <<UNIT
+cat > /etc/systemd/system/cosigner.service <<UNIT
 [Unit]
-Description=MPC cosigner-runtime
+Description=MPC cosigner
 After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=$${DATA_MOUNT}
@@ -207,7 +207,7 @@ RequiresMountsFor=$${DATA_MOUNT}
 User=cosigner
 Group=cosigner
 EnvironmentFile=/etc/cosigner/env
-ExecStart=/usr/local/bin/cosigner-runtime --port $${APP_PORT}
+ExecStart=/usr/local/bin/cosigner --port $${APP_PORT}
 Restart=always
 RestartSec=5s
 NoNewPrivileges=true
@@ -223,9 +223,9 @@ UNIT
 # Start
 # ---------------------------------------------------------------------------
 # daemon-reload BEFORE the first deploy: cosigner-deploy.sh ends in
-# `systemctl restart cosigner-runtime`, which needs the unit to already exist.
+# `systemctl restart cosigner`, which needs the unit to already exist.
 systemctl daemon-reload
-systemctl enable caddy cosigner-runtime
+systemctl enable caddy cosigner
 systemctl start caddy
 
 # IAM is eventually consistent and the instance profile can land after boot, so

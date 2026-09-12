@@ -63,7 +63,7 @@ module "host" {
   # Anchored to the stack directory rather than the process CWD, so `tofu apply`
   # works from anywhere. `filemd5` in the module would otherwise resolve a bare
   # relative path against wherever you happened to be standing.
-  binary_path = var.binary_path != "" ? var.binary_path : "${path.module}/../../../cosigner-runtime/target/release/cosigner-runtime"
+  binary_path = var.binary_path != "" ? var.binary_path : "${path.module}/../../../cosigner/target/release/cosigner"
 
   asp_url     = var.asp_url
   esplora_url = var.esplora_url
@@ -157,7 +157,7 @@ variable "route53_zone_id" {
 }
 
 variable "binary_path" {
-  description = "Path to the release cosigner-runtime binary to deploy. Empty uses the in-repo release build."
+  description = "Path to the release cosigner binary to deploy. Empty uses the in-repo release build."
   type        = string
   default     = ""
 }

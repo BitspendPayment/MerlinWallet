@@ -22,7 +22,7 @@ jobs:
 
       - name: Install enclave CLI
         # Pinned (not @latest) so the verifier can't drift under us. Keep in sync
-        # with release-eif.yml and runtime.rev in cosigner-runtime/enclave/enclave.yaml.
+        # with release-eif.yml and runtime.rev in cosigner/enclave/enclave.yaml.
         run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@v0.0.79
 
       - name: Fetch deployment manifest

@@ -255,7 +255,7 @@ class MpcService extends ChangeNotifier {
     super.dispose();
   }
 
-  /// Fetch deployment metadata from the cosigner-runtime with bounded
+  /// Fetch deployment metadata from the cosigner with bounded
   /// retry. Address rendering depends on `bitcoinNetwork`, so we refuse
   /// to proceed without a non-empty value — silently defaulting was the
   /// regression that the empty-string check guards against.

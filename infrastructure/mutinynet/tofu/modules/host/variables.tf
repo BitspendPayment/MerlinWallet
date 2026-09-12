@@ -51,7 +51,7 @@ variable "route53_zone_id" {
 }
 
 variable "binary_path" {
-  description = "Local path to the release cosigner-runtime binary, uploaded to S3 and pulled by the instance at boot."
+  description = "Local path to the release cosigner binary, uploaded to S3 and pulled by the instance at boot."
   type        = string
 }
 

@@ -104,7 +104,7 @@ class ArkdAdmin {
   }
 }
 
-/// Spawn the cosigner-runtime binary against the shared regtest fixtures.
+/// Spawn the cosigner binary against the shared regtest fixtures.
 /// Same `serverTempDir` across calls reuses the same sled `data_dir`, so
 /// killing + restarting exercises persistence rehydration paths.
 /// `extraEnv` lets the caller layer additional env vars on top (used by
@@ -126,7 +126,7 @@ Future<Process> startCosignerRuntime(
     'ESPLORA_URL': 'http://127.0.0.1:30000',
     'BOARDING_WATCH_INTERVAL_SECS': '3',
     // Asserted by the GetServerInfo test — set explicitly so the
-    // expectation isn't dependent on the cosigner-runtime default.
+    // expectation isn't dependent on the cosigner default.
     'BITCOIN_NETWORK': 'regtest',
     // Force the auto-settle threshold to be "always crossed" for any
     // VTXO_TREE_EXPIRY. The tick task fires when
@@ -143,7 +143,7 @@ Future<Process> startCosignerRuntime(
     ...extraEnv,
   };
   final proc = await Process.start(
-    '../cosigner-runtime/target/release/cosigner-runtime',
+    '../cosigner/target/release/cosigner',
     [
       '--port',
       port.toString(),
@@ -285,7 +285,7 @@ void main() {
     // 4. Mock Firebase Cloud Messaging
     //
     // Stand up a local HTTP server that impersonates both endpoints the
-    // cosigner-runtime hits during a push: the OAuth2 token endpoint and
+    // cosigner hits during a push: the OAuth2 token endpoint and
     // the `messages:send` endpoint. The cosigner signs an OAuth JWT with
     // the fixture private key — the mock doesn't verify the signature,
     // since real Firebase isn't in the loop.
@@ -1030,7 +1030,7 @@ void main() {
   //   * Ark transaction history reloads (`load_user_ark_history`) — the
   //     previously-gone-on-restart entries we just wired up
   //   * Per-user RPCs (getArkAddress) work again after rehydration
-  test('Ark: cosigner-runtime restart preserves rehydrated state', () async {
+  test('Ark: cosigner restart preserves rehydrated state', () async {
     print('1. Alice DKG');
     final alice = createClient(storageId: "alice");
     await alice.doDkg();
@@ -1073,15 +1073,15 @@ void main() {
     print(
         '   pre-restart: ${preVtxos.vtxos.length} VTXOs, ${preTxs.transactions.length} history entries');
 
-    print('4. Kill cosigner-runtime');
+    print('4. Kill cosigner');
     final oldProcess = serverProcess!;
     serverProcess = null;
     oldProcess.kill(ProcessSignal.sigterm);
     // Wait for actual exit so the sled lock releases before we restart.
     await oldProcess.exitCode;
-    print('   cosigner-runtime exited; sled lock should be released');
+    print('   cosigner exited; sled lock should be released');
 
-    print('5. Restart cosigner-runtime against the same data_dir');
+    print('5. Restart cosigner against the same data_dir');
     serverProcess = await startCosignerRuntime(
       serverPort,
       serverTempDir,
@@ -1150,7 +1150,7 @@ void main() {
     await sealed.sign(warmMsg, applyTweak: false); // throws on an invalid aggregate
     print('2. Warm sign OK');
 
-    print('3. Kill cosigner-runtime');
+    print('3. Kill cosigner');
     final oldProcess = serverProcess!;
     serverProcess = null;
     oldProcess.kill(ProcessSignal.sigterm);
@@ -1172,7 +1172,7 @@ void main() {
     print('5. COLD sign OK — share restored from the seal alone');
   }, timeout: Timeout(Duration(minutes: 4)));
 
-  // FCM push delivery: the cosigner-runtime is configured (via setUpAll) to
+  // FCM push delivery: the cosigner is configured (via setUpAll) to
   // direct all FCM traffic at `MockFcmServer`. This test:
   //   1. Registers a fake device token for the recipient (Bob)
   //   2. Triggers a receive (Alice → Bob via off-chain send)
@@ -1371,7 +1371,7 @@ void main() {
   // the sled `delegate_sessions` tree. The rehydration path reattaches
   // it from `SecretStore` (`dkg-secret.<canonical>`), which already
   // existed in sled from the original DKG.
-  test('Ark: delegate intent survives cosigner-runtime restart + auto-settles',
+  test('Ark: delegate intent survives cosigner restart + auto-settles',
       () async {
     print('1. Alice DKG');
     final alice = createClient(storageId: "alice");
@@ -1422,12 +1422,12 @@ void main() {
     expect(beforeRestart.hasActiveDelegate, isTrue,
         reason: 'pre-restart: cosigner should report delegate as active');
 
-    print('5. Kill cosigner-runtime');
+    print('5. Kill cosigner');
     final oldProcess = serverProcess!;
     serverProcess = null;
     oldProcess.kill(ProcessSignal.sigterm);
     await oldProcess.exitCode;
-    print('   cosigner-runtime exited; sled lock should be released');
+    print('   cosigner exited; sled lock should be released');
 
     print('6. Restart against same data_dir — must rehydrate delegate');
     serverProcess = await startCosignerRuntime(
@@ -1492,7 +1492,7 @@ void main() {
   // Cold-spawn auto-settle: prove the tick task itself spawns the actor
   // from sled, not by reading the in-memory DashMap.
   //
-  // The previous test ('delegate intent survives cosigner-runtime restart')
+  // The previous test ('delegate intent survives cosigner restart')
   // calls `listVtxos` immediately after restart, which warms Alice's actor.
   // The tick would find her in the DashMap and fire — even if the sled-
   // iteration code were broken. This test instead waits for the tick to
@@ -1555,13 +1555,13 @@ void main() {
     final pre = await alice.listVtxos();
     expect(pre.hasActiveDelegate, isTrue);
 
-    print('4. Kill cosigner-runtime');
+    print('4. Kill cosigner');
     final oldProcess = serverProcess!;
     serverProcess = null;
     oldProcess.kill(ProcessSignal.sigterm);
     await oldProcess.exitCode;
 
-    print('5. Restart cosigner-runtime');
+    print('5. Restart cosigner');
     serverProcess = await startCosignerRuntime(
       serverPort,
       serverTempDir,

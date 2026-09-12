@@ -33,7 +33,7 @@ import 'package:test/test.dart';
 ///    - over-limit / bad-arg: the cosigner withholds its share → throws at sign.
 ///
 /// Prereqs (mirrors `make e2e`): bitcoind + arkd +
-/// cosigner.wasm/cosigner-runtime/ffi/contracts built. The contract wasm is handed to
+/// cosigner.wasm/cosigner/ffi/contracts built. The contract wasm is handed to
 /// the cosigner at eVTXO creation.
 
 const oracleGateWasmPath =
@@ -111,7 +111,7 @@ Future<Process> startCosignerRuntime(
     ...extraEnv,
   };
   final proc = await Process.start(
-    '../cosigner-runtime/target/release/cosigner-runtime',
+    '../cosigner/target/release/cosigner',
     ['--port', port.toString()],
     environment: env,
   );

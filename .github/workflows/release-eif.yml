@@ -27,17 +27,17 @@ jobs:
 
       - name: Install enclave CLI
         # Pinned (not @latest) so the build tool can't drift under us. Keep in
-        # sync with runtime.rev in cosigner-runtime/enclave/enclave.yaml.
+        # sync with runtime.rev in cosigner/enclave/enclave.yaml.
         run: go install github.com/ArkLabsHQ/introspector-enclave/cli/cmd/enclave@v0.0.79
 
       - name: Build EIF
-        working-directory: cosigner-runtime
+        working-directory: cosigner
         run: enclave build
 
       - name: Extract PCR values
         id: pcr
         run: |
-          PCR0=$(jq -r '.PCR0 // .pcr0' cosigner-runtime/.enclave/artifacts/pcr.json)
+          PCR0=$(jq -r '.PCR0 // .pcr0' cosigner/.enclave/artifacts/pcr.json)
           echo "pcr0=${PCR0}" >> "$GITHUB_OUTPUT"
           echo "PCR0: ${PCR0:0:32}..."
 
@@ -46,9 +46,9 @@ jobs:
         with:
           name: enclave-eif
           path: |
-            cosigner-runtime/.enclave/artifacts/image.eif
-            cosigner-runtime/.enclave/artifacts/pcr.json
-            cosigner-runtime/.enclave/artifacts/supervisor
+            cosigner/.enclave/artifacts/image.eif
+            cosigner/.enclave/artifacts/pcr.json
+            cosigner/.enclave/artifacts/supervisor
           retention-days: 7
 
       - name: Upload to latest release
@@ -64,17 +64,17 @@ jobs:
             --notes "Auto-built EIF from commit ${COMMIT_SHA::8}
           PCR0: ${PCR0}" \
             --prerelease \
-            cosigner-runtime/.enclave/artifacts/image.eif \
-            cosigner-runtime/.enclave/artifacts/pcr.json \
-            cosigner-runtime/.enclave/artifacts/supervisor
+            cosigner/.enclave/artifacts/image.eif \
+            cosigner/.enclave/artifacts/pcr.json \
+            cosigner/.enclave/artifacts/supervisor
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: |
-            cosigner-runtime/.enclave/artifacts/image.eif
-            cosigner-runtime/.enclave/artifacts/pcr.json
-            cosigner-runtime/.enclave/artifacts/supervisor
+            cosigner/.enclave/artifacts/image.eif
+            cosigner/.enclave/artifacts/pcr.json
+            cosigner/.enclave/artifacts/supervisor
 
       - name: Publish deployment manifest
         continue-on-error: true
@@ -83,9 +83,9 @@ jobs:
           REPO: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          PCR0=$(jq -r '.PCR0 // .pcr0' cosigner-runtime/.enclave/artifacts/pcr.json)
-          PCR1=$(jq -r '.PCR1 // .pcr1' cosigner-runtime/.enclave/artifacts/pcr.json)
-          PCR2=$(jq -r '.PCR2 // .pcr2' cosigner-runtime/.enclave/artifacts/pcr.json)
+          PCR0=$(jq -r '.PCR0 // .pcr0' cosigner/.enclave/artifacts/pcr.json)
+          PCR1=$(jq -r '.PCR1 // .pcr1' cosigner/.enclave/artifacts/pcr.json)
+          PCR2=$(jq -r '.PCR2 // .pcr2' cosigner/.enclave/artifacts/pcr.json)
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           TAG="build-$(date -u +%Y%m%d-%H%M%S)"
 

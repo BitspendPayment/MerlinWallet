@@ -1,7 +1,7 @@
 /// In-process mock for Firebase Cloud Messaging used by e2e tests.
 ///
 /// Listens on a random localhost port and answers the two requests the
-/// cosigner-runtime makes during a push:
+/// cosigner makes during a push:
 ///
 ///   * `POST /token` — the OAuth2 JWT-bearer token endpoint. Returns a
 ///     fake access token. The mock does NOT verify the JWT signature —
@@ -12,7 +12,7 @@
 ///     send endpoint. Records the request body in `recordedSends` and
 ///     returns a 200 with a fake message-name response.
 ///
-/// Tests configure the cosigner-runtime to point at this mock via two env
+/// Tests configure the cosigner to point at this mock via two env
 /// vars:
 ///
 ///   * `FCM_BASE_URL` — overrides the `https://fcm.googleapis.com` base.

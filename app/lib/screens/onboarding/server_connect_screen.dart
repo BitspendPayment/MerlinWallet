@@ -75,7 +75,7 @@ class _ServerConnectionScreenState extends State<ServerConnectionScreen> {
                 icon: Icons.developer_board,
                 title: 'Regtest (local)',
                 subtitle:
-                    'Local cosigner-runtime on $_regtestHost — emulator',
+                    'Local cosigner on $_regtestHost — emulator',
                 busy: _selecting == _regtestHost,
                 disabled: _selecting != null && _selecting != _regtestHost,
                 onTap: () => _pick(_regtestHost),
@@ -86,7 +86,7 @@ class _ServerConnectionScreenState extends State<ServerConnectionScreen> {
                 icon: Icons.phone_android,
                 title: 'Regtest (phone)',
                 subtitle:
-                    'Local cosigner-runtime on $_regtestPhoneHost — physical phone via adb reverse',
+                    'Local cosigner on $_regtestPhoneHost — physical phone via adb reverse',
                 busy: _selecting == _regtestPhoneHost,
                 disabled:
                     _selecting != null && _selecting != _regtestPhoneHost,

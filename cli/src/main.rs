@@ -1,4 +1,4 @@
-//! Merlin regtest REPL — a scriptable wallet for driving the cosigner-runtime end to end.
+//! Merlin regtest REPL — a scriptable wallet for driving the cosigner end to end.
 //!
 //! Holds several named wallets in one process (`use <name>` switches the active identity), so both
 //! sides of a payment request can be driven from a single session.

@@ -29,14 +29,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ffi/target
-            cosigner-runtime/target
+            cosigner/target
           key: e2e-rust-merged-ffi-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: e2e-rust-merged-ffi-
 
       - name: Build all
         run: |
           cargo build --release --manifest-path ffi/Cargo.toml
-          cargo build --release --manifest-path cosigner-runtime/Cargo.toml
+          cargo build --release --manifest-path cosigner/Cargo.toml
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -45,7 +45,7 @@ jobs:
           retention-days: 1
           path: |
             ffi/target/release/libmpcwallet_ffi.so
-            cosigner-runtime/target/release/cosigner-runtime
+            cosigner/target/release/cosigner
 
 
   ark-e2e:
@@ -68,7 +68,7 @@ jobs:
 
       - name: Make binaries executable
         run: |
-          chmod +x cosigner-runtime/target/release/cosigner-runtime
+          chmod +x cosigner/target/release/cosigner
 
       - name: Setup Dart
         uses: dart-lang/setup-dart@v1

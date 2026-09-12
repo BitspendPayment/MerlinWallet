@@ -1,4 +1,4 @@
-# Host-mode cosigner-runtime deployment.
+# Host-mode cosigner deployment.
 #
 # The runtime runs as an ordinary systemd service on an EC2 instance, with its
 # SQLite KV on a dedicated EBS volume and Caddy terminating TLS in front of it.
@@ -122,7 +122,7 @@ resource "aws_route_table_association" "public" {
 # no SSH ingress and no key pair to manage.
 resource "aws_security_group" "host" {
   name_prefix = "${local.name}-"
-  description = "cosigner-runtime host: public HTTPS via Caddy"
+  description = "cosigner host: public HTTPS via Caddy"
   vpc_id      = aws_vpc.main.id
 
   # HTTP is required for the ACME http-01 challenge and for the ->HTTPS redirect.
@@ -270,7 +270,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "assets" {
 
 resource "aws_s3_object" "runtime" {
   bucket = aws_s3_bucket.assets.id
-  key    = "cosigner-runtime"
+  key    = "cosigner"
   source = var.binary_path
 
   # Re-uploads whenever the local build changes; also the trigger for the
@@ -481,7 +481,7 @@ resource "terraform_data" "redeploy" {
         --instance-ids ${aws_instance.host.id} \
         --document-name AWS-RunShellScript \
         --region ${var.region} \
-        --comment "redeploy cosigner-runtime" \
+        --comment "redeploy cosigner" \
         --parameters 'commands=["/usr/local/sbin/cosigner-deploy.sh"]' \
         --output text >/dev/null
     EOT

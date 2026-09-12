@@ -73,7 +73,7 @@ void main() {
     final serverReady = Completer<void>();
     final serverFailed = Completer<void>();
     serverProcess = await Process.start(
-      '../cosigner-runtime/target/release/cosigner-runtime',
+      '../cosigner/target/release/cosigner',
       [
         '--port', serverPort.toString(),
       ],

@@ -33,7 +33,7 @@
 # ── Variables ─────────────────────────────────────────────────────────────────
 
 export DATA_DIR=/tmp/mpc_wallet_stress
-# The cosigner-runtime's single embedded SQLite KV backend — a file on local disk.
+# The cosigner's single embedded SQLite KV backend — a file on local disk.
 export SQLITE_PATH=/tmp/mpc_cosigner/cosigner.db
 
 NDK_VERSION ?= 27.0.12077973
@@ -131,19 +131,19 @@ up: runtime-build ffi-build ffi-android
 		       WEBAUTH_RP_ORIGIN=https://vtxos.com \
 		       WEBAUTH_ANDROID_ORIGIN=android:apk-key-hash:u1pNepeObJUpSkSqH964HvFRqbhC_ejQP3GHA3-lreI,android:apk-key-hash:Lf1QIwQnlPBYPwDFhloUkYC-0tYAKSpKCQbEiyz118s \
 		       WEBAUTH_TOKEN_SECRET=$${WEBAUTH_TOKEN_SECRET:-6d706377616c6c65742d6465762d746f6b656e2d7365637265742d3332622121}; \
-		cd cosigner-runtime && cargo run --release --bin cosigner-runtime -- \
+		cd cosigner && cargo run --release --bin cosigner -- \
 			--port 7074'
 
 # Stop everything (cosigner, mine loop, Docker)
 down:
 	@echo "Stopping all services..."
-	-pkill -f "target/release/cosigner-runtime" || true
+	-pkill -f "target/release/cosigner" || true
 	-pkill -f "bitcoin.sh mine" || true
 	-pkill -f "bob_proxy" || true
 	-sudo fuser -k 7074/tcp 2>/dev/null || true
 	-sudo fuser -k 7090/tcp 2>/dev/null || true
 	-docker compose -f docker-compose.yml -f docker-compose.ark.yml down -v 2>/dev/null || true
-	sudo rm -rf /root/.mpc_wallet/cosigner-runtime/db 2>/dev/null || true
+	sudo rm -rf /root/.mpc_wallet/cosigner/db 2>/dev/null || true
 	sudo rm -rf $(DATA_DIR) 2>/dev/null || true
 	@echo "All stopped."
 
@@ -234,7 +234,7 @@ contracts-build:
 
 runtime-build:
 	@echo "Building server..."
-	cd cosigner-runtime && cargo build --release
+	cd cosigner && cargo build --release
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  INFRASTRUCTURE
@@ -266,7 +266,7 @@ runtime-run: runtime-build
 	export ELECTRUM_PORT=50001 && \
 	export BITCOIN_RPC_USER=admin1 && \
 	export BITCOIN_RPC_PASSWORD=123 && \
-	cd cosigner-runtime && cargo run --release --bin cosigner-runtime -- \
+	cd cosigner && cargo run --release --bin cosigner -- \
 		--port 7074 &
 	@sleep 2
 	@echo "MPC Wallet Server running in background."
@@ -274,9 +274,9 @@ runtime-run: runtime-build
 runtime-stop:
 	@echo "Stopping MPC Wallet Server..."
 	-sudo fuser -k 7074/tcp || true
-	-sudo pkill -9 -f "target/release/cosigner-runtime" || true
-	-sudo pkill -9 -f "cosigner-runtime" || true
-	-sudo pkill -9 cosigner-runtime || true
+	-sudo pkill -9 -f "target/release/cosigner" || true
+	-sudo pkill -9 -f "cosigner" || true
+	-sudo pkill -9 cosigner || true
 	sudo rm -rf $(DATA_DIR) || true
 	@sleep 2
 
@@ -286,7 +286,7 @@ arkd-up:
 	@echo "Waiting for arkd to start (30s)..."
 	@sleep 30
 
-# Reset the cosigner-runtime's SQLite KV file for a clean test run. The reset is per-target
+# Reset the cosigner's SQLite KV file for a clean test run. The reset is per-target
 # (NOT on runtime restart), so the `sealed_state` snapshot survives the ark_e2e restart — the
 # same guarantee the old FLUSHALL-on-redis-up gave. `-wal`/`-shm` are SQLite's sidecar files;
 # leaving them behind next to a deleted DB would resurrect stale pages.
@@ -364,12 +364,12 @@ signet-hardware-ark: runtime-build ffi-build ffi-android
 	export ELECTRUM_PORT=50001 && \
 	export BITCOIN_NETWORK=signet && \
 	export ASP_URL=$(MUTINYNET_ASP_URL) && \
-	cd cosigner-runtime && cargo run --release --bin cosigner-runtime -- \
+	cd cosigner && cargo run --release --bin cosigner -- \
 		--port 7074
 
 signet-down:
 	@echo "Stopping MPC server..."
-	-pkill -f "target/release/cosigner-runtime" || true
+	-pkill -f "target/release/cosigner" || true
 	@echo "Stopped."
 
 e2e-mutinynet: ffi-build runtime-build

@@ -64,7 +64,7 @@ services:
       retries: 30
     restart: unless-stopped
 
-  # NOTE: the `redis` service above belongs to arkd. The cosigner-runtime no longer has a
+  # NOTE: the `redis` service above belongs to arkd. The cosigner no longer has a
   # service here — its KV backend is an embedded SQLite file (`SQLITE_PATH`, see the Makefile's
   # `db-reset` target), so there is nothing to start or wait on.
 
