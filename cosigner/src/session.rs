@@ -622,25 +622,7 @@ fn check(user_id: &[u8], signature: &[u8], timestamp_ms: i64, op: &str) -> Resul
 
 #[tonic::async_trait]
 impl MpcWallet for WalletService {
-    async fn get_ark_info(
-        &self,
-        request: Request<wp::GetArkInfoRequest>,
-    ) -> Result<Response<wp::GetArkInfoResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_GET_ARK_INFO)?;
-        let out = self.cosigner.lock().await.get_ark_info(req).await?;
-        Ok(Response::new(out))
-    }
 
-    async fn list_vtxos(
-        &self,
-        request: Request<wp::ListVtxosRequest>,
-    ) -> Result<Response<wp::ListVtxosResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_LIST_VTXOS)?;
-        let out = self.cosigner.lock().await.list_vtxos(req).await?;
-        Ok(Response::new(out))
-    }
 
 
     async fn contact_list(
@@ -673,35 +655,7 @@ impl MpcWallet for WalletService {
         Ok(Response::new(out))
     }
 
-    async fn get_ark_address(
-        &self,
-        request: Request<wp::GetArkAddressRequest>,
-    ) -> Result<Response<wp::GetArkAddressResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_GET_ARK_ADDRESS)?;
-        let out = self
-            .cosigner
-            .lock()
-            .await
-            .get_ark_address(req)
-            .await?;
-        Ok(Response::new(out))
-    }
 
-    async fn get_boarding_address(
-        &self,
-        request: Request<wp::GetBoardingAddressRequest>,
-    ) -> Result<Response<wp::GetBoardingAddressResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_GET_BOARDING_ADDRESS)?;
-        let out = self
-            .cosigner
-            .lock()
-            .await
-            .get_boarding_address(req)
-            .await?;
-        Ok(Response::new(out))
-    }
 
     async fn get_server_info(
         &self,

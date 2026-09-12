@@ -41,10 +41,10 @@ service MPCWallet {
   // nothing to replay.
 
   // Ark Protocol
-  rpc GetArkInfo (GetArkInfoRequest) returns (GetArkInfoResponse);
-  rpc GetArkAddress (GetArkAddressRequest) returns (GetArkAddressResponse);
-  rpc GetBoardingAddress (GetBoardingAddressRequest) returns (GetBoardingAddressResponse);
-  rpc ListVtxos (ListVtxosRequest) returns (ListVtxosResponse);
+  // GetArkInfo, GetArkAddress, GetBoardingAddress and ListVtxos removed. Each was the cosigner
+  // fetching public ASP parameters and deriving from a key the client already holds, or listing
+  // VTXOs it can no longer observe. The client reads the ASP and derives its own addresses; the
+  // cosigner co-signs and verifies.
   // ListArkTransactions removed. The cosigner is called, not running, so it can only log what it
   // performed — a send or a board. Receives were written by a VTXO stream it no longer runs, so
   // the log it could serve is a wallet that never received anything. The client watches its own

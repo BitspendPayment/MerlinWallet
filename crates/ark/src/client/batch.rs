@@ -61,6 +61,7 @@ use crate::client::proto;
 /// (see [`batch_includes_intent`]), and it is what establishes the batch id
 /// everything else is matched against. Heartbeat/StreamStarted are not
 /// batch-scoped.
+#[cfg(feature = "client")]
 pub fn foreign_batch_id<F>(event: &Event, is_ours: F) -> Option<String>
 where
     F: Fn(&str) -> bool,
@@ -542,6 +543,7 @@ impl SettleSession {
 
 #[cfg(feature = "client")]
 impl SettleSession {
+    #[cfg(feature = "client")]
     /// Submit FROST signatures for the intent proof and register with the ASP.
     ///
     /// `signatures` must be in the same order as the sighashes returned by
@@ -623,6 +625,7 @@ impl SettleSession {
         Ok(())
     }
 
+    #[cfg(feature = "client")]
     /// Drive the event stream forward.
     ///
     /// Call this repeatedly until it returns [`SettleAction::Settled`] or
@@ -729,6 +732,7 @@ impl SettleSession {
         }
     }
 
+    #[cfg(feature = "client")]
     /// Submit FROST signatures for the commitment PSBT and finalize.
     pub async fn submit_commitment_signatures(
         &mut self,
@@ -808,6 +812,7 @@ impl SettleSession {
         self.batch_id.as_deref() == Some(id)
     }
 
+    #[cfg(feature = "client")]
     async fn handle_batch_started(
         &mut self,
         asp: &mut AspClient,
@@ -2036,6 +2041,7 @@ impl DelegateSettleSession {
 
 #[cfg(feature = "client")]
 impl DelegateSettleSession {
+    #[cfg(feature = "client")]
     /// Drive the entire batch protocol autonomously.
     ///
     /// This registers the pre-signed intent, subscribes to the event stream,

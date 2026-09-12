@@ -6,7 +6,6 @@
 //! some backends) goes via `tokio::runtime::Handle::block_on` from inside the
 //! blocking task, which is the safe pattern for tokio's blocking pool.
 
-pub mod ark;
 pub mod ark_send;
 pub mod device_token;
 pub mod helpers;
