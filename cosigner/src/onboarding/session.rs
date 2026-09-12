@@ -1,18 +1,17 @@
-//! Per-user Onboarding ceremony state. Native Rust — no WASM. Owned by the
-//! `OnboardingManager`, accessed under a `parking_lot::Mutex`, evicted on TTL
-//! or after step3 finalizes. The FROST round state lives in the upstreams
-//! [`CeremonyRounds`] core; this adds only the Onboarding-specific bits.
+//! One DKG ceremony's state, owned by the stream driving it.
+//!
+//! It used to live in an `OnboardingManager`'s map behind a mutex, with a TTL and an eviction
+//! sweep, because the ceremony spanned three separate requests and the key material had to survive
+//! between them. On one stream it is a local: created at open, dropped when the stream ends. An
+//! abandoned ceremony leaves nothing for a sweep to find.
+//!
+//! The FROST round state lives in [`CeremonyRounds`]; this adds only the DKG-specific bits.
 
-use std::time::Instant;
+use super::ceremony::CeremonyRounds;
 
-use threshold::identifier::Identifier;
-
-use super::ceremony::{CeremonyRounds, Reply};
-use crate::wallet_proto::{DkgStep1Response, DkgStep3Response};
-
-/// Freshly-minted DKG key material captured at step3 finalize, so the manager can seed it
-/// straight into the guest IN-MEMORY (Plan A — the host persists only the public projection, so
-/// there's no plaintext to read back from `policies`).
+/// Freshly-minted DKG key material, captured when round 3 finalizes so the caller can install it
+/// straight from memory. The host persists only the public projection, so there is no plaintext to
+/// read back from `policies`.
 pub struct SeedMaterial {
     pub group_key: String,
     pub key_package_json: String,
@@ -26,12 +25,8 @@ pub struct OnboardingSession {
     pub rounds: CeremonyRounds,
     /// Server's Onboarding secret (hex 32-byte scalar), persisted to the policy at finalize.
     pub server_internal_secret_hex: String,
-    /// Set at step3 finalize: the in-memory key material the manager seeds into the guest.
+    /// Set when round 3 finalizes: the key material to install.
     pub seed_material: Option<SeedMaterial>,
-    // Rendezvous pools: replies parked until a 2-party round completes.
-    pub pending_step1: Vec<Reply<DkgStep1Response>>,
-    pub pending_step3: Vec<(Identifier, Reply<DkgStep3Response>)>,
-    pub last_touch: Instant,
 }
 
 impl OnboardingSession {
@@ -41,9 +36,6 @@ impl OnboardingSession {
             rounds: CeremonyRounds::default(),
             server_internal_secret_hex: String::new(),
             seed_material: None,
-            pending_step1: Vec::new(),
-            pending_step3: Vec::new(),
-            last_touch: Instant::now(),
         }
     }
 }

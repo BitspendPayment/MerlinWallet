@@ -1,30 +1,16 @@
-//! Shared FROST ceremony machinery for the DKG (`onboarding`) and contract-create
-//! (`contract`) flows. Holds the round state as REAL `threshold` structs (keyed by
-//! `Identifier`, which is `Ord` but not `Hash`, so `BTreeMap`), converting to/from
-//! JSON only at the wire boundary (proto `map<string,string>` of id_hex → pkg_json).
+//! FROST round state for the DKG ceremony, as real `threshold` structs — keyed by `Identifier`,
+//! which is `Ord` but not `Hash`, so `BTreeMap` — converting to and from JSON only at the wire
+//! boundary (proto `map<string,string>` of id_hex → pkg_json).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use tokio::sync::oneshot;
 use tonic::Status;
 
 use threshold::dkg::{Round1Package, Round1SecretPackage, Round2Package, Round2SecretPackage};
 use threshold::identifier::Identifier;
 use threshold::scalar::scalar_from_bytes;
 
-/// A parked reply for a participant waiting on a ceremony round to complete.
-pub type Reply<T> = oneshot::Sender<Result<T, Status>>;
-
-
-/// Fail every parked `(id, reply)` pair (step3 pools carry the sender id).
-pub fn drain_pairs_with_err<K, T>(pool: &mut Vec<(K, Reply<T>)>, msg: &str) {
-    for (_, s) in pool.drain(..) {
-        let _ = s.send(Err(Status::aborted(msg.to_string())));
-    }
-}
-
-/// The typed FROST round state upstreams by both ceremonies. `server_id` is the
-/// cosigner's own FROST identifier (the key under which its round1 package lives).
+/// `server_id` is the cosigner's own FROST identifier — the key its round1 package lives under.
 #[derive(Default)]
 pub struct CeremonyRounds {
     pub round1_packages: BTreeMap<Identifier, Round1Package>,

@@ -11,7 +11,6 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::rngs::OsRng;
@@ -21,7 +20,7 @@ use cosigner::types::{SignStep1, SignStep2};
 use threshold::auth::AuthSigner;
 use threshold::commitment::SigningPackage;
 use threshold::identifier::Identifier;
-use threshold::keys::{KeyPackage, PublicKeyPackage};
+use threshold::keys::KeyPackage;
 use threshold::nonce::{self, SigningCommitments};
 use threshold::point;
 use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};

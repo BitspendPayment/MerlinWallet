@@ -150,16 +150,16 @@ impl SigningSession for SessionService {
 
     /// DKG as one session.
     ///
-    /// The unary form needed a `sessions` map keyed by user, with a TTL and an eviction loop, purely
-    /// to hold round-1 and round-2 material between three requests — and that material is how the
-    /// key is born. Here the session is a LOCAL: created at open, dropped when the stream ends.
-    /// There is no map to evict from, no TTL to tune, and an abandoned ceremony leaves nothing
-    /// behind rather than leaving key material sitting in a map until a sweep notices.
+    /// The unary form needed a `sessions` map keyed by user, with a TTL and an eviction loop,
+    /// purely to hold round-1 and round-2 material between three requests — and that material is
+    /// how the key is born. Here the session is a LOCAL: created at open, dropped when the stream
+    /// ends. There is no map to evict from, no TTL to tune, and an abandoned ceremony leaves
+    /// nothing behind rather than key material sitting in a map until a sweep notices.
     async fn dkg(
         &self,
         request: Request<Streaming<proto::DkgClientMsg>>,
     ) -> Result<Response<DkgStream>, Status> {
-        let upstreams = self.cosigner.lock().await.upstreams().clone().clone();
+        let upstreams = { self.cosigner.lock().await.upstreams().clone() };
         let cosigner = self.cosigner.clone();
         let mut inbound = request.into_inner();
 
@@ -175,26 +175,19 @@ impl SigningSession for SessionService {
                 Some(proto::dkg_client_msg::Body::Open(o)) => o,
                 _ => Err(Status::invalid_argument("a session must open with DkgOpen"))?,
             };
-            let user_id_hex = hex::encode(&open.user_id);
 
-            // The ceremony, owned here.
-            let mut sess = OnboardingSession::new(user_id_hex.clone());
+            // The ceremony, owned here. Round-1 and round-2 secrets live on this stack and die
+            // with the stream.
+            let mut sess = OnboardingSession::new(hex::encode(&open.user_id));
 
-            // --- round 1 ---
-            let r1 = {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                ob::onboarding_step1(
-                    &mut sess,
-                    &upstreams,
-                    wp::DkgStep1Request {
-                        user_id: open.user_id.clone(),
-                        identifier: open.identifier.clone(),
-                        round1_package: open.round1_package,
-                    },
-                    tx,
-                );
-                rx.await.map_err(|_| Status::internal("dkg round 1 dropped its reply"))??
-            };
+            let r1 = ob::dkg_open(
+                &mut sess,
+                wp::DkgStep1Request {
+                    user_id: open.user_id.clone(),
+                    identifier: open.identifier.clone(),
+                    round1_package: open.round1_package,
+                },
+            )?;
             yield proto::DkgServerMsg {
                 session_id: session_id.clone(),
                 seq: 1,
@@ -203,86 +196,50 @@ impl SigningSession for SessionService {
                 })),
             };
 
-            // --- round 2 ---
+            // --- The wallet's round 2, and the key ------------------------------------------
             let msg = inbound
                 .next()
                 .await
                 .ok_or_else(|| Status::cancelled("stream closed before round 2"))??;
-            let round1 = match msg.body {
-                Some(proto::dkg_client_msg::Body::Round1(r)) => r,
-                _ => Err(Status::invalid_argument("expected DkgRound1"))?,
-            };
-            let r2 = {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                ob::onboarding_step2(
-                    &mut sess,
-                    &upstreams,
-                    wp::DkgStep2Request {
-                        user_id: open.user_id.clone(),
-                        identifier: round1.identifier,
-                        round1_package: round1.round1_package,
-                    },
-                    tx,
-                );
-                rx.await.map_err(|_| Status::internal("dkg round 2 dropped its reply"))??
-            };
-            yield proto::DkgServerMsg {
-                session_id: session_id.clone(),
-                seq: 2,
-                body: Some(proto::dkg_server_msg::Body::Round2(proto::DkgRound2Out {
-                    all_round1_packages: r2.all_round1_packages,
-                })),
-            };
-
-            // --- round 3, and the key ---
-            let msg = inbound
-                .next()
-                .await
-                .ok_or_else(|| Status::cancelled("stream closed before round 3"))??;
             let round2 = match msg.body {
                 Some(proto::dkg_client_msg::Body::Round2(r)) => r,
                 _ => Err(Status::invalid_argument("expected DkgRound2"))?,
             };
-            let (r3, seed) = {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let finalized = ob::onboarding_step3(
-                    &mut sess,
-                    &upstreams,
-                    wp::DkgStep3Request {
-                        user_id: open.user_id.clone(),
-                        identifier: round2.identifier,
-                        round2_packages_for_others: round2.round2_packages_for_others,
-                    },
-                    tx,
-                );
-                let out = rx.await.map_err(|_| Status::internal("dkg round 3 dropped its reply"))??;
-                (out, if finalized { sess.seed_material.take() } else { None })
-            };
+            let r3 = ob::dkg_finish(
+                &mut sess,
+                &upstreams,
+                wp::DkgStep3Request {
+                    user_id: open.user_id.clone(),
+                    identifier: round2.identifier,
+                    round2_packages_for_others: round2.round2_packages_for_others,
+                },
+            )?;
+            let mat = sess
+                .seed_material
+                .take()
+                .ok_or_else(|| Status::internal("DKG finished without key material"))?;
+            let group_key = mat.group_key.clone();
 
-            // Seed the key into the actor and seal it. No plaintext fallback: if this fails,
-            // onboarding fails rather than leaving a wallet whose key exists only in a reply.
-            let mut group_key = String::new();
-            if let Some(mat) = seed {
-                group_key = mat.group_key.clone();
-                let mut actor = cosigner.lock().await;
-                actor
-                    .install_policy(
-                        mat.group_key.clone(),
-                        &mat.key_package_json,
-                        &mat.public_key_package_json,
-                        mat.user_signing_identifier_hex.as_deref(),
-                        mat.server_dkg_secret_hex.clone(),
-                        // A normal wallet actor has no pairing conditioning and no contracts.
-                        None,
-                        String::new(),
-                    )
-                    .map_err(Status::internal)?;
-                actor.seal().await;
+            // Install the key and seal it. No plaintext fallback: if this fails the ceremony
+            // fails, rather than leaving a wallet whose key exists only in a reply.
+            {
+                let mut c = cosigner.lock().await;
+                c.install_policy(
+                    mat.group_key,
+                    &mat.key_package_json,
+                    &mat.public_key_package_json,
+                    mat.user_signing_identifier_hex.as_deref(),
+                    mat.server_dkg_secret_hex,
+                    None,
+                    String::new(),
+                )
+                .map_err(Status::internal)?;
+                c.seal().await;
             }
 
             yield proto::DkgServerMsg {
                 session_id,
-                seq: 3,
+                seq: 2,
                 body: Some(proto::dkg_server_msg::Body::Complete(proto::DkgComplete {
                     round2_packages_for_me: r3.round2_packages_for_me,
                     group_key,
@@ -292,6 +249,7 @@ impl SigningSession for SessionService {
 
         Ok(Response::new(Box::pin(out) as DkgStream))
     }
+
 
     /// A send as one session, with the caller submitting.
     ///
@@ -712,16 +670,6 @@ impl MpcWallet for WalletService {
         Ok(Response::new(self.server_info.clone()))
     }
 
-    // --- Ceremonies: sessions, not calls ------------------------------------------------------
-    async fn dkg_step1(&self, _r: Request<wp::DkgStep1Request>) -> Result<Response<wp::DkgStep1Response>, Status> {
-        Err(use_a_session("DKG"))
-    }
-    async fn dkg_step2(&self, _r: Request<wp::DkgStep2Request>) -> Result<Response<wp::DkgStep2Response>, Status> {
-        Err(use_a_session("DKG"))
-    }
-    async fn dkg_step3(&self, _r: Request<wp::DkgStep3Request>) -> Result<Response<wp::DkgStep3Response>, Status> {
-        Err(use_a_session("DKG"))
-    }
     async fn send_vtxo(&self, _r: Request<wp::SendVtxoRequest>) -> Result<Response<wp::SendVtxoResponse>, Status> {
         Err(use_a_session("SendVtxo"))
     }

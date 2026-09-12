@@ -16,10 +16,13 @@ service SigningSession {
   // Both directions open at once: the server answers each round as it arrives.
   rpc Sign(stream SignClientMsg) returns (stream SignServerMsg);
 
-  // DKG is the same problem with more rounds, and the higher stakes: three unary calls today
-  // (DKGStep1/2/3), with the server holding round-1 and round-2 secrets between them. Those
-  // secrets are how the key is born, so parking them on a server between requests is the last
-  // thing that should survive the move to a per-request runtime.
+  // DKG is the same problem with higher stakes: three unary calls (DKGStep1/2/3) had the server
+  // holding round-1 and round-2 secrets between them, and those secrets are how the key is born.
+  //
+  // Two exchanges here, not three. Step 2 did nothing a caller needed — it recomputed the server's
+  // round 2 and returned the round-1 packages step 1 had already returned — so it existed only to
+  // give the unary API somewhere to trigger that from. What is left is the ceremony itself: the
+  // wallet's round 1 in and everybody's out, then its round 2 in and the server's out with the key.
   rpc Dkg(stream DkgClientMsg) returns (stream DkgServerMsg);
 
   // A send is two phases wearing one RPC: `SendVtxoRequest` means "build it" when its
@@ -303,13 +306,13 @@ message DkgClientMsg {
   string session_id = 1;
   uint64 seq = 2;
   oneof body {
-    DkgOpen open = 3;       // was DKGStep1Request
-    DkgRound1 round1 = 4;   // was DKGStep2Request
-    DkgRound2 round2 = 5;   // was DKGStep3Request
+    DkgOpen open = 3;
+    DkgRound2 round2 = 4;
   }
 }
 
-// Opens the session and authenticates it once, for the whole ceremony.
+// Opens the session and authenticates it once, for the whole ceremony, carrying the wallet's
+// round-1 package.
 message DkgOpen {
   bytes user_id = 1;
   bytes signature = 2;
@@ -318,11 +321,7 @@ message DkgOpen {
   string round1_package = 5; // JSON
 }
 
-message DkgRound1 {
-  bytes identifier = 1;
-  string round1_package = 2; // JSON
-}
-
+// The wallet's round-2 packages, one per recipient.
 message DkgRound2 {
   bytes identifier = 1;
   map<string, string> round2_packages_for_others = 2; // JSON per recipient
@@ -333,17 +332,17 @@ message DkgServerMsg {
   uint64 seq = 2;
   oneof body {
     DkgRound1Out round1 = 3;
-    DkgRound2Out round2 = 4;
-    DkgComplete complete = 5;
+    DkgComplete complete = 4;
   }
 }
 
-// Field names mirror the unary DKGStep*Response messages exactly, so the round semantics are the
-// ones the ceremony already had; only the transport changed.
+// Every dealer's round-1 package, id_hex → JSON.
 message DkgRound1Out { map<string, string> round1_packages = 1; }
-message DkgRound2Out { map<string, string> all_round1_packages = 1; }
+
 message DkgComplete {
+  // The round-2 packages addressed to the wallet, sender id_hex → JSON.
   map<string, string> round2_packages_for_me = 1;
-  // Known only once the ceremony finalizes, from the seed material the server keeps in the session.
+  // The group key the ceremony produced. The wallet derives the same one from its own part 3;
+  // this is here so it can check them against each other rather than discover a mismatch later.
   string group_key = 2;
 }

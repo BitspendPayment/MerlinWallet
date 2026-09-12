@@ -1,17 +1,22 @@
-//! Native-Rust Onboarding handlers — call `threshold::dkg::*` directly on the typed
-//! round state in `OnboardingSession.rounds`, persist `policy_state` to sled on
-//! step3 success.
+//! The DKG ceremony: `threshold::dkg::*` called directly on the typed round state in
+//! `OnboardingSession.rounds`.
 //!
-//! Rendezvous: every caller whose round isn't yet complete has its reply oneshot
-//! stashed in `pending_*`; the participant whose arrival closes the round fulfils
-//! every stashed sender, then its own.
+//! Two exchanges, not three. `DKGStep1/2/3` were three unary calls because each had to be a
+//! request; step 2 did nothing a caller needed — it recomputed the cosigner's round 2 and returned
+//! the round-1 packages step 1 had already returned. On a stream the cosigner does that itself,
+//! leaving what the ceremony actually is: the wallet's round 1 in and everybody's out, then its
+//! round 2 in and ours out with the key.
 //!
-//! Onboarding handlers deliberately do NOT call `auth_check`/`timestamp_check`: the
-//! user's owner key only exists once Onboarding completes, so there's no upstreams secret to
-//! verify against during the ceremony. Integrity comes from FROST itself plus
-//! TTL-bounded session state (`OnboardingManager::sweep_stale`).
-
-use std::time::Instant;
+//! Each step answers its caller directly. It used to park a `oneshot` in a `pending_*` pool and
+//! wait for whichever participant closed the round to fulfil it — a rendezvous for a ceremony
+//! several parties joined by separate requests. The ceremony is 2-of-2 and one of the two is this
+//! cosigner, so there is exactly one remote participant and it always closes the round on arrival:
+//! the pools could never fill. One stream per ceremony leaves nothing for them to do either way.
+//!
+//! These handlers deliberately do NOT call `auth_check`/`timestamp_check`: the user's owner key
+//! only exists once onboarding completes, so there is no shared secret to verify against during
+//! the ceremony. Integrity comes from FROST itself, and from the ceremony living on one stream —
+//! an abandoned one leaves nothing behind.
 
 use rand::rngs::OsRng;
 use rand::Rng;
@@ -22,11 +27,11 @@ use threshold::identifier::Identifier;
 use threshold::random;
 use threshold::scalar::scalar_to_bytes;
 
-use super::ceremony::{self, drain_pairs_with_err, Reply};
+use super::ceremony::{self};
 use crate::handlers::parsers;
 use crate::upstreams::Upstreams;
 use crate::wallet_proto::{
-    DkgStep1Request, DkgStep1Response, DkgStep2Request, DkgStep2Response, DkgStep3Request,
+    DkgStep1Request, DkgStep1Response, DkgStep3Request,
     DkgStep3Response,
 };
 
@@ -41,21 +46,14 @@ fn req_identifier(bytes: &[u8]) -> Result<Identifier, Status> {
     ceremony::parse_identifier_hex(&hex::encode(bytes))
 }
 
-// ============================================================================
-// Onboarding Step 1
-// ============================================================================
-
-#[tracing::instrument(skip_all, name = "onboarding::step1", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
-pub fn onboarding_step1(
+#[tracing::instrument(skip_all, name = "dkg::open", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
+pub fn dkg_open(
     sess: &mut OnboardingSession,
-    _shared: &Upstreams,
     req: DkgStep1Request,
-    reply: Reply<DkgStep1Response>,
-) {
-    sess.last_touch = Instant::now();
+) -> Result<DkgStep1Response, Status> {
     let user_id_hex = parsers::user_id_hex(&req.user_id);
     tracing::info!(
-        "[{user_id_hex}] OnboardingStep1 from {}",
+        "[{user_id_hex}] DKG open from {}",
         hex::encode(&req.identifier)
     );
 
@@ -63,12 +61,11 @@ pub fn onboarding_step1(
     let id = match req_identifier(&req.identifier) {
         Ok(id) => id,
         Err(e) => {
-            let _ = reply.send(Err(e));
-            return;
-        }
+            return Err(e);
+            }
     };
     if req.round1_package.is_empty() {
-        tracing::info!("[{user_id_hex}] OnboardingStep1: registered passive receiver");
+        tracing::info!("[{user_id_hex}] DKG: registered passive receiver");
         sess.rounds.receiver_identifiers.insert(id);
     } else {
         match ceremony::round1_pkg_from_json(&req.round1_package) {
@@ -76,9 +73,8 @@ pub fn onboarding_step1(
                 sess.rounds.round1_packages.insert(id, pkg);
             }
             Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
+                return Err(e);
+                }
         }
     }
 
@@ -104,9 +100,8 @@ pub fn onboarding_step1(
         let (r1_secret, r1_pub) = match dealt {
             Ok(v) => v,
             Err(e) => {
-                let _ = reply.send(Err(e));
-                return;
-            }
+                return Err(e);
+                }
         };
         let server_id = r1_secret.identifier.clone();
         sess.rounds.server_id = Some(server_id.clone());
@@ -115,107 +110,77 @@ pub fn onboarding_step1(
         sess.rounds.round1_secret = Some(r1_secret);
     }
 
-    if sess.rounds.total_participants() >= TOTAL_PARTICIPANTS {
-        let response = DkgStep1Response {
-            round1_packages: sess.rounds.round1_packages_wire(),
-        };
-        for s in sess.pending_step1.drain(..) {
-            let _ = s.send(Ok(response.clone()));
-        }
-        let _ = reply.send(Ok(response));
-    } else {
-        sess.pending_step1.push(reply);
+    if sess.rounds.total_participants() < TOTAL_PARTICIPANTS {
+        return Err(Status::failed_precondition(
+            "round 1 is short a participant: 2-of-2 completes on the first caller",
+        ));
     }
+    Ok(DkgStep1Response {
+        round1_packages: sess.rounds.round1_packages_wire(),
+    })
 }
 
-// ============================================================================
-// Onboarding Step 2
-// ============================================================================
-
-#[tracing::instrument(skip_all, name = "onboarding::step2", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
-pub fn onboarding_step2(
-    sess: &mut OnboardingSession,
-    _shared: &Upstreams,
-    req: DkgStep2Request,
-    reply: Reply<DkgStep2Response>,
-) {
-    sess.last_touch = Instant::now();
-    let user_id_hex = parsers::user_id_hex(&req.user_id);
-    tracing::info!("[{user_id_hex}] OnboardingStep2");
-
-    // No rendezvous: every caller drives the SAME server-side round2 computation;
-    // the first does the work, the rest get the same response inline.
+/// Compute the cosigner's own round-2 packages from everybody's round 1.
+///
+/// This was `DKGStep2`, a whole round of its own — and it returned the round-1 packages the
+/// previous call had already returned. The round existed to give the unary API somewhere to
+/// trigger this computation from; in a session the cosigner simply does it when it needs it.
+fn compute_local_round2(sess: &mut OnboardingSession, user_id_hex: &str) -> Result<(), Status> {
     if sess.rounds.round1_secret.is_none() {
-        let _ = reply.send(Err(Status::internal("no onboarding session")));
-        return;
+        return Err(Status::internal("no onboarding session"));
     }
 
     if sess.rounds.is_round2_local_empty() {
-        tracing::info!("[{user_id_hex}] OnboardingStep2: server computing round2");
+        tracing::info!("[{user_id_hex}] DKG: computing round 2");
         let Some(server_id) = sess.rounds.server_id.clone() else {
-            let _ = reply.send(Err(Status::internal("server ID not initialized")));
-            return;
-        };
+            return Err(Status::internal("server ID not initialized"));
+            };
         let round1_pkgs = sess.rounds.round1_packages_excluding(&server_id);
         let receiver_ids = sess.rounds.receiver_ids();
         let Some(round1_secret) = sess.rounds.round1_secret.take() else {
-            let _ = reply.send(Err(Status::internal("round1 secret missing")));
-            return;
-        };
+            return Err(Status::internal("round1 secret missing"));
+            };
         let (r2_secret, r2_pkgs) = match dkg::dkg_part2(&round1_secret, &round1_pkgs, &receiver_ids)
         {
             Ok(v) => v,
             Err(e) => {
-                let _ = reply.send(Err(Status::internal(format!("dkg_part2: {e}"))));
-                return;
-            }
+                return Err(Status::internal(format!("dkg_part2: {e}")));
+                }
         };
         sess.rounds.round2_secret = Some(r2_secret);
         sess.rounds.round2_local = r2_pkgs;
     }
-
-    let _ = reply.send(Ok(DkgStep2Response {
-        all_round1_packages: sess.rounds.round1_packages_wire(),
-    }));
+    Ok(())
 }
 
-// ============================================================================
-// Onboarding Step 3
-// ============================================================================
-
-/// Returns `finalized` — `true` means the caller should remove the session.
-#[tracing::instrument(skip_all, name = "onboarding::step3", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
-pub fn onboarding_step3(
+#[tracing::instrument(skip_all, name = "dkg::finish", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
+pub fn dkg_finish(
     sess: &mut OnboardingSession,
     upstreams: &Upstreams,
     req: DkgStep3Request,
-    reply: Reply<DkgStep3Response>,
-) -> bool {
-    sess.last_touch = Instant::now();
+) -> Result<DkgStep3Response, Status> {
     let user_id_hex = parsers::user_id_hex(&req.user_id);
+    compute_local_round2(sess, &user_id_hex)?;
     let sender_id = match req_identifier(&req.identifier) {
         Ok(id) => id,
         Err(e) => {
-            let _ = reply.send(Err(e));
-            return false;
-        }
+            return Err(e);
+            }
     };
     tracing::info!(
-        "[{user_id_hex}] OnboardingStep3 from {}",
+        "[{user_id_hex}] DKG finish from {}",
         hex::encode(&req.identifier)
     );
 
     // Register the sender's round2 packages: keep the one addressed to us, relay all.
     let Some(server_id) = sess.rounds.server_id.clone() else {
-        let _ = reply.send(Err(Status::internal("server ID not initialized")));
-        return false;
-    };
+        return Err(Status::internal("server ID not initialized"));
+        };
     let pkgs = match ceremony::round2_pkgs_from_wire(&req.round2_packages_for_others) {
         Ok(p) => p,
         Err(e) => {
-            let _ = reply.send(Err(e));
-            return false;
-        }
+            return Err(e);
+            }
     };
     if let Some(for_server) = pkgs.get(&server_id) {
         sess.rounds
@@ -225,15 +190,16 @@ pub fn onboarding_step3(
     sess.rounds.insert_relay_packages(sender_id.clone(), pkgs);
 
     if sess.rounds.relay_sender_count() < TOTAL_PARTICIPANTS - 1 {
-        sess.pending_step3.push((sender_id, reply));
-        return false;
+        return Err(Status::failed_precondition(
+            "round 3 is short a participant: 2-of-2 completes on the first caller",
+        ));
     }
 
     sess.rounds.insert_relay_from_local(server_id.clone());
 
     // Finalize: derive the group key V, persist the policy + the member→group index.
     let finalized = (|| -> Result<(), Status> {
-        tracing::info!("[{user_id_hex}] OnboardingStep3: server computing KeyPackage");
+        tracing::info!("[{user_id_hex}] DKG: computing KeyPackage");
 
         // 2-of-2 {wallet, cosigner}: the wallet is the only non-server dealer.
         let wallet_id = sess
@@ -301,21 +267,9 @@ pub fn onboarding_step3(
         tracing::info!("[{user_id_hex}] Onboarding complete; cosigner_id (group key)={group_key}");
         Ok(())
     })();
-    if let Err(e) = finalized {
-        let _ = reply.send(Err(e));
-        drain_pairs_with_err(&mut sess.pending_step3, "step3 finalize failed");
-        return false;
-    }
+    finalized?;
 
-    let pending: Vec<(Identifier, Reply<DkgStep3Response>)> =
-        sess.pending_step3.drain(..).collect();
-    for (id, sender) in pending {
-        let _ = sender.send(Ok(DkgStep3Response {
-            round2_packages_for_me: sess.rounds.relay_packages_for(&id),
-        }));
-    }
-    let _ = reply.send(Ok(DkgStep3Response {
+    Ok(DkgStep3Response {
         round2_packages_for_me: sess.rounds.relay_packages_for(&sender_id),
-    }));
-    true
+    })
 }

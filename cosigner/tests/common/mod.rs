@@ -25,8 +25,6 @@ use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::random;
 
 pub async fn try_shared() -> Option<Arc<Upstreams>> {
-    let asp_url = std::env::var("ASP_URL").unwrap_or_else(|_| "http://127.0.0.1:7070".to_string());
-
     // `:memory:` — a fresh, private store per caller. Tests no longer share one namespace, so a
     // leftover key from a failed run can't leak into the next one.
     let store = Arc::new(SqliteStore::open(":memory:").expect("open in-memory store"));

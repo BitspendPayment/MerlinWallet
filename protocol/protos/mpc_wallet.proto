@@ -4,9 +4,12 @@ package mpc_wallet;
 
 service MPCWallet {
   // DKG
-  rpc DKGStep1 (DKGStep1Request) returns (DKGStep1Response);
-  rpc DKGStep2 (DKGStep2Request) returns (DKGStep2Response);
-  rpc DKGStep3 (DKGStep3Request) returns (DKGStep3Response);
+  // DKGStep1/2/3 removed. Three unary calls meant the server held the round-1 and round-2 secrets
+  // between them, and those secrets are how the key is born. The ceremony is one bidirectional
+  // session now — `SigningSession.Dkg` in cosign_session.proto — so it lives on a stream and dies
+  // with it. Two exchanges there, not three: step 2 only recomputed the server's round 2 and
+  // returned what step 1 had already returned. DKGStep1Request/DKGStep3Request stay as the
+  // internal shapes those exchanges carry.
 
   // Contract creation (PEER model). NO reshare and NO new key: the wallet's existing 2-of-2
   // key V is reused; the contract is enforced by the cosigner gate (WASM evaluate +
