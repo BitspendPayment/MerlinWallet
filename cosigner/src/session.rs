@@ -164,7 +164,8 @@ impl SigningSession for SessionService {
         let mut inbound = request.into_inner();
 
         let out = async_stream::try_stream! {
-            use crate::onboarding::{handlers as ob, session::OnboardingSession};
+            use crate::handlers::onboarding as ob;
+            use crate::handlers::onboarding::OnboardingSession;
 
             let first = inbound
                 .next()
@@ -230,9 +231,7 @@ impl SigningSession for SessionService {
                     &mat.public_key_package_json,
                     mat.user_signing_identifier_hex.as_deref(),
                     mat.server_dkg_secret_hex,
-                    None,
-                    String::new(),
-                )
+                    )
                 .map_err(Status::internal)?;
                 c.seal().await;
             }
@@ -400,7 +399,7 @@ impl SigningSession for SessionService {
         &self,
         request: Request<Streaming<proto::SettleClientMsg>>,
     ) -> Result<Response<SettleStream>, Status> {
-        use crate::settle::SettleStep;
+        use crate::handlers::settle::SettleStep;
 
         let cosigner = self.cosigner.clone();
         let mut inbound = request.into_inner();
@@ -550,8 +549,8 @@ fn ark_info_from_proto(i: proto::ArkInfo) -> ark::client::types::ArkInfo {
     }
 }
 
-fn asp_submit(call: crate::settle::AspCall) -> proto::AspSubmit {
-    use crate::settle::AspCall;
+fn asp_submit(call: crate::handlers::settle::AspCall) -> proto::AspSubmit {
+    use crate::handlers::settle::AspCall;
     use proto::asp_submit::Call;
     let call = match call {
         AspCall::ConfirmRegistration { intent_id } => {

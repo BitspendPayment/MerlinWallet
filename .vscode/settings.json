@@ -1,8 +1,6 @@
 {
   "rust-analyzer.linkedProjects": [
-    "cosigner-runtime/Cargo.toml",
-    "contracts/contract-sdk/Cargo.toml",
-    "contracts/examples/spending-limit/Cargo.toml",
+    "cosigner/Cargo.toml",
     "crates/threshold/Cargo.toml",
     "crates/ark/Cargo.toml",
     "crates/enclave-client/Cargo.toml",

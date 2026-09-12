@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 
 use rand::rngs::OsRng;
 
-use cosigner::onboarding::handlers as ob;
-use cosigner::onboarding::session::OnboardingSession;
+use cosigner::handlers::onboarding as ob;
+use cosigner::handlers::onboarding::OnboardingSession;
 use cosigner::wallet_proto::{DkgStep1Request, DkgStep3Request};
 
 use threshold::dkg::{self, Round1Package, Round2Package};

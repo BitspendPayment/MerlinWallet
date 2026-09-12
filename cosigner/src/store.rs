@@ -144,19 +144,13 @@ pub(crate) async fn restore_snapshot(
 
 /// Populate the host `policy_state` projection from the native actor (Plan A: the actor's seal is
 /// the single source of truth — there is no `policies` sled tree). The host keeps no secret key
-/// (`key_package_json` blank, `server_dkg_secret_hex` None); `contract_pairing` stays in the actor.
+/// (`key_package_json` blank, `server_dkg_secret_hex` None).
 pub(crate) async fn load_policy_projection(
     state: &Arc<Mutex<CosignerState>>,
     actor: &mut Cosigner,
 ) -> Result<(), Status> {
     match actor.public_policy() {
         Ok(pp) => {
-            let contracts = if pp.contracts_json.is_empty() {
-                Default::default()
-            } else {
-                serde_json::from_str(&pp.contracts_json)
-                    .map_err(|e| Status::internal(format!("bad contracts json: {e}")))?
-            };
             let mut st = state.lock();
             st.policy_state = Some(crate::state::PolicyState {
                 cosigner_id: pp.group_key,
@@ -167,8 +161,6 @@ pub(crate) async fn load_policy_projection(
                     key_package_json: String::new(),
                     public_key_package_json: pp.public_key_package_json,
                 },
-                contracts,
-                contract_pairing: None,
             });
             Ok(())
         }

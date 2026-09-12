@@ -21,7 +21,7 @@ use crate::state::CosignerState;
 
 use crate::types::{
     ApplyDelegateSigs, BoardingSettleSubmitted, Commitment,
-    Contact, ContractPairing, IntentStatus, PaymentIntent, PublicPolicy,
+    Contact, IntentStatus, PaymentIntent, PublicPolicy,
     SendVtxoStep1, SendVtxoSubmitted, SignStep1, SignStep1Out, SignStep2,
     SignStep2Out, SnapshotState, VtxoInput,
 };
@@ -70,12 +70,6 @@ struct Policy {
     key_package: KeyPackage,
     public_key_package: PublicKeyPackage,
     user_signing_identifier: Option<Identifier>,
-    /// Set ONLY for a `{service, cosigner}` pairing actor: the core then rebuilds + binds the
-    /// cooperative-leaf sighash itself in `sign_step1` (Plan A 1C). `None` for a normal wallet.
-    contract_pairing: Option<ContractPairing>,
-    /// The wallet's contract registry as JSON (kept so the sealed snapshot is the single source of
-    /// the public projection). Empty string ⇒ no contracts.
-    contracts_json: String,
 }
 
 /// In-flight FROST ceremony state (cleared between rounds).
@@ -104,7 +98,7 @@ pub struct Cosigner {
     pub(crate) boarding_settle: Option<BoardingSettleInFlight>,
     /// The settle the caller is driving: which FROST round is open, the registered intent id, and
     /// the ASP parameters it supplied. See [`crate::settle`].
-    pub(crate) settle_inflight: Option<crate::settle::InFlight>,
+    pub(crate) settle_inflight: Option<crate::handlers::settle::InFlight>,
     /// The Ark cosigner (MuSig2) secret, hex — zeroized on drop. Used for tree signing.
     ark_cosigner_secret_hex: Option<Zeroizing<String>>,
     /// The owned spendable VTXO set.
@@ -221,8 +215,6 @@ impl Cosigner {
                 .as_ref()
                 .map(|id| hex::encode(id.serialize())),
             ark_cosigner_secret_hex: self.ark_secret().map(|s| s.to_string()),
-            contract_pairing: policy.contract_pairing.clone(),
-            contracts_json: policy.contracts_json.clone(),
             vtxos: self.vtxos.clone(),
             // Persist a ReadyToSettle delegate (to_persisted errors for other phases → None).
             delegate_json: self
@@ -253,8 +245,6 @@ impl Cosigner {
             key_package,
             public_key_package,
             user_signing_identifier,
-            contract_pairing: snap.contract_pairing,
-            contracts_json: snap.contracts_json,
         });
         self.ark_cosigner_secret_hex = snap.ark_cosigner_secret_hex.map(Zeroizing::new);
         self.vtxos = snap.vtxos;
@@ -358,12 +348,7 @@ impl Cosigner {
     }
 
 
-    /// Replace the stored contract registry (opaque host JSON). Errors if no policy is installed.
-    pub fn set_contracts(&mut self, contracts_json: String) -> Result<(), String> {
-        let p = self.policy.as_mut().ok_or("no policy installed")?;
-        p.contracts_json = contracts_json;
-        Ok(())
-    }
+
 
     // -----------------------------------------------------------------------
     // Request-to-pay: contacts (allowlist) + the payer's payment-request inbox
@@ -592,8 +577,6 @@ impl Cosigner {
         public_key_package_json: &str,
         user_signing_identifier_hex: Option<&str>,
         server_dkg_secret_hex: Option<String>,
-        contract_pairing: Option<ContractPairing>,
-        contracts_json: String,
     ) -> Result<(), String> {
         let key_package =
             KeyPackage::from_json(key_package_json).map_err(|e| format!("bad key package: {e}"))?;
@@ -608,8 +591,6 @@ impl Cosigner {
             key_package,
             public_key_package,
             user_signing_identifier,
-            contract_pairing,
-            contracts_json,
         });
         self.ark_cosigner_secret_hex = server_dkg_secret_hex.map(Zeroizing::new);
         Ok(())
@@ -625,8 +606,6 @@ impl Cosigner {
                 .user_signing_identifier
                 .as_ref()
                 .map(|id| hex::encode(id.serialize())),
-            contract_pairing: p.contract_pairing.clone(),
-            contracts_json: p.contracts_json.clone(),
         })
     }
 
@@ -678,37 +657,10 @@ impl Cosigner {
 
         let key_package = policy.key_package.clone();
 
-        // Plan A 1C: a `{service, cosigner}` pairing actor is AUTHORITATIVE about WHAT it signs. A
-        // contract eVTXO's cooperative leaf is ONLY ever spent through arkd as an ark transaction
-        // (two-leg), so `ark_tx` is REQUIRED — the on-chain escape is the exit leaf, which never
-        // routes through this pairing actor. The core rebuilds the cooperative-leaf sighash (leg 1)
-        // from its OWN sealed params plus the ark-tx leg sighash (leg 2), and binds the requested
-        // message to leg 1 OR leg 2. A normal (non-pairing) actor signs the requested message as-is.
-        let message = match policy.contract_pairing.as_ref() {
-            None => req.message_to_sign.clone(),
-            Some(pairing) => {
-                if req.ark_tx.is_empty() {
-                    return Err(
-                        "pairing co-sign: a contract eVTXO can only be spent via an ark transaction (ark_tx required)"
-                            .into(),
-                    );
-                }
-                let leg1 = build_checkpoint_sighash(
-                    pairing,
-                    &policy.public_key_package,
-                    &req.full_transaction,
-                )?;
-                let leg2 = build_arktx_sighash(&req.full_transaction, &req.ark_tx)?;
-                if req.message_to_sign == leg1 || req.message_to_sign == leg2 {
-                    req.message_to_sign.clone()
-                } else {
-                    return Err(
-                        "pairing co-sign: message is neither leg-1 nor leg-2 of an eVTXO spend"
-                            .into(),
-                    );
-                }
-            }
-        };
+        // The requested message, as asked. A `{service, cosigner}` pairing actor used to rebuild
+        // a contract eVTXO's cooperative-leaf sighash here and sign only that; there are no
+        // pairing actors now, and a normal wallet always took this branch anyway.
+        let message = req.message_to_sign.clone();
 
         let mut new_signing_ceremony = Ceremony {
             message,
@@ -1164,60 +1116,9 @@ pub(crate) fn sigs_from_wire(wire: &[Vec<u8>]) -> Result<Vec<[u8; 64]>, String> 
 
 use bitcoin::hashes::Hash;
 use bitcoin::sighash::{Prevouts, SighashCache};
-use bitcoin::taproot::LeafVersion;
 use bitcoin::{TapLeafHash, TapSighashType};
-use sha2::{Digest, Sha256};
 
-/// the cooperative-leaf script-path sighash of the input that spends this actor's eVTXO.
-/// The leaf is rebuilt from the cosigner's own registration params (NOT the client PSBT scripts),
-/// so the only thing this can ever produce a signature over is a spend of its own eVTXO. `pkp` is
-/// the pairing PKP (its group key is `V`, the cooperative key). Errs if the spend doesn't touch it.
-pub fn build_checkpoint_sighash(
-    pairing: &ContractPairing,
-    pkp: &PublicKeyPackage,
-    full_transaction: &[u8],
-) -> Result<[u8; 32], String> {
-    let psbt =
-        bitcoin::Psbt::deserialize(full_transaction).map_err(|e| format!("not a PSBT: {e}"))?;
 
-    let prevouts: Vec<bitcoin::TxOut> = psbt
-        .inputs
-        .iter()
-        .map(|i| {
-            i.witness_utxo.clone().unwrap_or_else(|| bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat(0),
-                script_pubkey: bitcoin::ScriptBuf::new(),
-            })
-        })
-        .collect();
-    let input_idx = prevouts
-        .iter()
-        .position(|p| hex::encode(p.script_pubkey.as_bytes()) == pairing.evtxo_spk_hex)
-        .ok_or("service pairing may only co-sign a spend of its own eVTXO")?;
-
-    let commit: [u8; 32] = Sha256::digest(pairing.contract_id).into();
-    let evtxo_pk = threshold::point::serialize_x_only(&pkp.verifying_key.point);
-    let (coop_script, _cb) = ark::evtxo_cooperative_spend_info(
-        &commit,
-        &pairing.server_pk,
-        &evtxo_pk,
-        &pairing.owner_pk,
-        pairing.exit_delay,
-    )
-    .ok_or("evtxo_cooperative_spend_info failed")?;
-    let coop_script_buf = bitcoin::ScriptBuf::from_bytes(coop_script);
-
-    let leaf_hash = TapLeafHash::from_script(&coop_script_buf, LeafVersion::TapScript);
-    let sighash = SighashCache::new(&psbt.unsigned_tx)
-        .taproot_script_spend_signature_hash(
-            input_idx,
-            &Prevouts::All(&prevouts),
-            leaf_hash,
-            TapSighashType::Default,
-        )
-        .map_err(|e| format!("coop sighash: {e}"))?;
-    Ok(sighash.to_byte_array())
-}
 
 /// the script-path sighash of the `ark_tx` input that spends an
 /// OUTPUT of the verified `checkpoint_tx`. We don't re-derive ark-core's protocol; we CHAIN leg 2

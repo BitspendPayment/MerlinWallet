@@ -1,25 +1,7 @@
-//! Durable, non-secret domain types shared across the cosigner's state, handlers and
-//! persistence layers. Plain data (no crypto material) — the sealed snapshot and
-//! the host's public projections are built from these.
+//! Durable, non-secret domain types. Plain data, no crypto material — the sealed snapshot is built
+//! from these.
 
 use serde::{Deserialize, Serialize};
-
-/// Serde helper: a `[u8; 32]` (x-only key / contract id) as a lowercase-hex string, so JSON
-/// projections + the sealed snapshot carry a readable hex string instead of a byte array.
-pub(crate) mod arr32_hex {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&hex::encode(b))
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
-        let h = String::deserialize(d)?;
-        let bytes = hex::decode(&h).map_err(serde::de::Error::custom)?;
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArkTxEntry {
@@ -41,26 +23,7 @@ pub struct VtxoInput {
     pub exit_delay: u32,
 }
 
-/// Binds a `{service, cosigner}` pairing actor to the single eVTXO it may co-sign. Carries every
-/// param needed to rebuild that eVTXO's cooperative-leaf script (and thus its script-path sighash)
-/// independent of the spend PSBT (Plan A 1C). Seeded at contract-create, sealed in the snapshot,
-/// and used by the actor's `build_checkpoint_sighash`. `None` for a normal wallet actor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContractPairing {
-    /// The eVTXO scriptPubKey hex this actor is allowed to co-sign spends of.
-    pub evtxo_spk_hex: String,
-    /// sha256(component_wasm) — the gate's contract id (also the cooperative-leaf hashlock seed).
-    #[serde(with = "arr32_hex")]
-    pub contract_id: [u8; 32],
-    /// ASP signer x-only key (cooperative leaf).
-    #[serde(with = "arr32_hex")]
-    pub server_pk: [u8; 32],
-    /// Exit-leaf owner x-only key (part of the taptree).
-    #[serde(with = "arr32_hex")]
-    pub owner_pk: [u8; 32],
-    /// Unilateral-exit CSV delay (part of the taptree).
-    pub exit_delay: u32,
-}
+
 
 /// A party authorized to bill this wallet. One-way — the contact gives no consent. An
 /// AUTHORIZATION list, so it lives in the seal.
@@ -128,13 +91,6 @@ pub struct SnapshotState {
     pub public_key_package_json: String,
     pub user_signing_identifier_hex: Option<String>,
     pub ark_cosigner_secret_hex: Option<String>,
-    /// Pairing-actor conditioning params (Plan A 1C), so the actor stays authoritative about
-    /// what it co-signs across cold spawns. `None` for a normal wallet actor.
-    #[serde(default)]
-    pub contract_pairing: Option<ContractPairing>,
-    /// The wallet's contract registry as OPAQUE host JSON (see `InstallPolicy::contracts_json`).
-    #[serde(default)]
-    pub contracts_json: String,
     pub vtxos: Vec<VtxoInput>,
     /// A `ReadyToSettle` delegate session serialized via ark `PersistedDelegate` (JSON), if
     /// one is pending. Lets durable auto-settle survive actor eviction. Only ever
@@ -242,14 +198,7 @@ pub struct Commitment {
 // calls directly. Plain in-process data — no serde needed (never crosses a boundary).
 // ===========================================================================
 
-/// Output of `contract_refresh`: the PUBLIC pairing PKP, the receiver's half scalar, and the
-/// cosigner's pairing key package (the host relays the last to seed the pairing actor).
-#[derive(Debug)]
-pub struct ContractRefreshed {
-    pub pairing_public_key_package_json: String,
-    pub receiver_half: Vec<u8>,
-    pub my_key_package_json: String,
-}
+
 
 /// Output of `public_policy`: the PUBLIC projection the host loads into its `policy_state`.
 #[derive(Debug)]
@@ -257,8 +206,6 @@ pub struct PublicPolicy {
     pub group_key: String,
     pub public_key_package_json: String,
     pub user_signing_identifier_hex: Option<String>,
-    pub contract_pairing: Option<ContractPairing>,
-    pub contracts_json: String,
 }
 
 /// Output of `sign_step1`: the combined commitments to sign over.

@@ -123,9 +123,7 @@ pub async fn seed_policy(
             &pkp.to_json(),
             Some(&hex::encode(kp_user.identifier.serialize())),
             ark_cosigner_secret_hex,
-            None,
-            String::new(),
-        )
+            )
         .expect("install policy");
     actor.seal().await;
 }

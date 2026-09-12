@@ -18,7 +18,7 @@
 .PHONY: e2e up down \
 	bob-up bob-down bob-send \
 	ffi-build ffi-test ffi-android ffi-android-arm32 ffi-android-x86_64 ffi-android-all \
-	contracts-build runtime-build \
+	runtime-build \
 	regtest-up regtest-down bitcoin-init mine-loop adb-reverse \
 	runtime-run runtime-stop \
 	arkd-up arkd-down arkd-init db-reset \
@@ -216,21 +216,6 @@ ffi-test:
 	cargo test --release --manifest-path ffi/Cargo.toml
 
 # Server & cosigner
-
-# WASI sysroot for cross-compiling the C deps (secp256k1-sys) of the wasm guest.
-# System clang targeting wasm32-wasip2 has no sysroot, so its stdint.h falls through
-# to /usr/include (glibc) and fails on bits/libc-header-start.h. wasi-sdk 24 ships an
-# LLVM-18 sysroot matching the system clang-18; point clang at it via --sysroot.
-contracts-build:
-	@echo "Building example WASM contracts (wasm32-wasip2 components)..."
-	cd contracts/examples/spending-limit && cargo build --release
-	@echo "Built: contracts/examples/spending-limit/target/wasm32-wasip2/release/spending_limit.wasm"
-	cd contracts/examples/oracle-gate && cargo build --release
-	@echo "Built: contracts/examples/oracle-gate/target/wasm32-wasip2/release/oracle_gate.wasm"
-	cd contracts/examples/oracle-gate-template && cargo build --release
-	@echo "Built: oracle-gate-template (Phase 2 template, imports oracle:gate/config)"
-	cd contracts/examples/config-provider && cargo build --release
-	@echo "Built: config-provider (Phase 2 provider stub, patchable config slot)"
 
 runtime-build:
 	@echo "Building server..."

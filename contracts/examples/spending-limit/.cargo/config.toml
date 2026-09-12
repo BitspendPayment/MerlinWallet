@@ -1,4 +1,0 @@
-# Contracts compile to wasm32-wasip2 components. They are #![no_std] and import
-# only `crypto` — no wasi:* — so the host's strict (no-WASI) linker accepts them.
-[build]
-target = "wasm32-wasip2"

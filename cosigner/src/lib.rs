@@ -12,8 +12,6 @@ pub mod config;
 pub mod fcm_client;
 pub mod handlers;
 pub mod kv_store;
-pub mod onboarding;
-pub mod settle;
 pub mod session;
 pub mod upstreams;
 pub mod state;

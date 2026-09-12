@@ -1,5 +1,7 @@
-//! The DKG ceremony: `threshold::dkg::*` called directly on the typed round state in
-//! `OnboardingSession.rounds`.
+//! Onboarding: the DKG ceremony that mints this cosigner's key.
+//!
+//! `threshold::dkg::*` called directly on typed round state, converting to and from JSON only at
+//! the wire boundary (proto `map<string,string>` of id_hex → pkg_json).
 //!
 //! Two exchanges, not three. `DKGStep1/2/3` were three unary calls because each had to be a
 //! request; step 2 did nothing a caller needed — it recomputed the cosigner's round 2 and returned
@@ -7,35 +9,183 @@
 //! leaving what the ceremony actually is: the wallet's round 1 in and everybody's out, then its
 //! round 2 in and ours out with the key.
 //!
-//! Each step answers its caller directly. It used to park a `oneshot` in a `pending_*` pool and
-//! wait for whichever participant closed the round to fulfil it — a rendezvous for a ceremony
-//! several parties joined by separate requests. The ceremony is 2-of-2 and one of the two is this
-//! cosigner, so there is exactly one remote participant and it always closes the round on arrival:
-//! the pools could never fill. One stream per ceremony leaves nothing for them to do either way.
+//! The session is a local on the stream that drives it. It used to live in an `OnboardingManager`'s
+//! map behind a mutex, with a TTL and an eviction sweep, because the ceremony spanned three
+//! separate requests and the key material had to survive between them. Dropped with the stream now,
+//! so an abandoned ceremony leaves nothing for a sweep to find.
 //!
-//! These handlers deliberately do NOT call `auth_check`/`timestamp_check`: the user's owner key
-//! only exists once onboarding completes, so there is no shared secret to verify against during
-//! the ceremony. Integrity comes from FROST itself, and from the ceremony living on one stream —
-//! an abandoned one leaves nothing behind.
+//! No `auth_check`/`timestamp_check` here, deliberately: the user's owner key only exists once
+//! onboarding completes, so there is no shared secret to verify against during the ceremony.
+//! Integrity comes from FROST itself, and from the ceremony living on one stream.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rand::rngs::OsRng;
 use rand::Rng;
 use tonic::Status;
 
-use threshold::dkg::{self, Round1SecretPackage};
+use threshold::dkg::{
+    self, Round1Package, Round1SecretPackage, Round2Package, Round2SecretPackage,
+};
 use threshold::identifier::Identifier;
 use threshold::random;
-use threshold::scalar::scalar_to_bytes;
+use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};
 
-use super::ceremony::{self};
 use crate::handlers::parsers;
 use crate::upstreams::Upstreams;
-use crate::wallet_proto::{
-    DkgStep1Request, DkgStep1Response, DkgStep3Request,
-    DkgStep3Response,
-};
+use crate::wallet_proto::{DkgStep1Request, DkgStep1Response, DkgStep3Request, DkgStep3Response};
 
-use super::session::OnboardingSession;
+/// Freshly-minted DKG key material, captured when round 3 finalizes so the caller can install it
+/// straight from memory. The host persists only the public projection, so there is no plaintext to
+/// read back from `policies`.
+pub struct SeedMaterial {
+    pub group_key: String,
+    pub key_package_json: String,
+    pub public_key_package_json: String,
+    pub user_signing_identifier_hex: Option<String>,
+    pub server_dkg_secret_hex: Option<String>,
+}
+
+pub struct OnboardingSession {
+    pub user_id_hex: String,
+    pub rounds: CeremonyRounds,
+    /// Server's Onboarding secret (hex 32-byte scalar), persisted to the policy at finalize.
+    pub server_internal_secret_hex: String,
+    /// Set when round 3 finalizes: the key material to install.
+    pub seed_material: Option<SeedMaterial>,
+}
+
+impl OnboardingSession {
+    pub fn new(user_id_hex: String) -> Self {
+        Self {
+            user_id_hex,
+            rounds: CeremonyRounds::default(),
+            server_internal_secret_hex: String::new(),
+            seed_material: None,
+        }
+    }
+}
+
+/// `server_id` is the cosigner's own FROST identifier — the key its round1 package lives under.
+#[derive(Default)]
+pub struct CeremonyRounds {
+    pub round1_packages: BTreeMap<Identifier, Round1Package>,
+    /// Round2 packages addressed TO the cosigner, keyed by sender id.
+    pub round2_received: BTreeMap<Identifier, Round2Package>,
+    /// The cosigner's own round2 packages FOR each recipient.
+    pub round2_local: BTreeMap<Identifier, Round2Package>,
+    /// All round2 packages for relay: sender id → { recipient id → package }.
+    pub round2_relay: BTreeMap<Identifier, BTreeMap<Identifier, Round2Package>>,
+    /// Passive receivers (no round1 package). Empty in 2-of-2.
+    pub receiver_identifiers: BTreeSet<Identifier>,
+    pub server_id: Option<Identifier>,
+    pub round1_secret: Option<Round1SecretPackage>,
+    pub round2_secret: Option<Round2SecretPackage>,
+}
+
+impl CeremonyRounds {
+    pub fn total_participants(&self) -> usize {
+        self.round1_packages.len() + self.receiver_identifiers.len()
+    }
+
+    pub fn relay_sender_count(&self) -> usize {
+        self.round2_relay.len()
+    }
+
+    pub fn is_round2_local_empty(&self) -> bool {
+        self.round2_local.is_empty()
+    }
+
+    pub fn receiver_ids(&self) -> Vec<Identifier> {
+        self.receiver_identifiers.iter().cloned().collect()
+    }
+
+    /// All round1 packages except the one keyed by `exclude` (the cosigner's own,
+    /// when feeding `dkg_part2`/`dkg_part3`).
+    pub fn round1_packages_excluding(
+        &self,
+        exclude: &Identifier,
+    ) -> BTreeMap<Identifier, Round1Package> {
+        self.round1_packages
+            .iter()
+            .filter(|(id, _)| *id != exclude)
+            .map(|(id, pkg)| (id.clone(), pkg.clone()))
+            .collect()
+    }
+
+    pub fn insert_relay_packages(
+        &mut self,
+        sender: Identifier,
+        pkgs: BTreeMap<Identifier, Round2Package>,
+    ) {
+        self.round2_relay.insert(sender, pkgs);
+    }
+
+    /// Fold the cosigner's own round2 packages into the relay under its id.
+    pub fn insert_relay_from_local(&mut self, server: Identifier) {
+        self.round2_relay.insert(server, self.round2_local.clone());
+    }
+
+    // --- wire (egress) serializers: typed → proto `map<string,string>` ---
+
+    /// All round1 packages as `{id_hex: pkg_json}`.
+    pub fn round1_packages_wire(&self) -> HashMap<String, String> {
+        self.round1_packages
+            .iter()
+            .map(|(id, pkg)| (hex::encode(id.serialize()), pkg.to_json()))
+            .collect()
+    }
+
+    /// Round2 packages destined for `recipient`, as `{sender_id_hex: pkg_json}`.
+    pub fn relay_packages_for(&self, recipient: &Identifier) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for (sender, by_recipient) in &self.round2_relay {
+            if let Some(pkg) = by_recipient.get(recipient) {
+                out.insert(hex::encode(sender.serialize()), pkg.to_json());
+            }
+        }
+        out
+    }
+}
+
+// --- wire (ingress) + hex helpers ---
+
+fn hex_decode_32(s: &str) -> Result<[u8; 32], Status> {
+    let bytes = hex::decode(s).map_err(|e| Status::internal(format!("bad hex: {e}")))?;
+    let out: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| Status::internal("expected 32 bytes"))?;
+    Ok(out)
+}
+
+pub fn parse_identifier_hex(hex: &str) -> Result<Identifier, Status> {
+    let bytes = hex_decode_32(hex)?;
+    Identifier::deserialize(&bytes).map_err(|e| Status::internal(format!("bad identifier: {e}")))
+}
+
+pub fn parse_scalar_hex(hex: &str) -> Result<k256::Scalar, Status> {
+    let bytes = hex_decode_32(hex)?;
+    scalar_from_bytes(&bytes).map_err(|e| Status::internal(format!("bad scalar: {e}")))
+}
+
+pub fn round1_pkg_from_json(json: &str) -> Result<Round1Package, Status> {
+    Round1Package::from_json(json).map_err(|e| Status::internal(format!("bad R1 pkg: {e}")))
+}
+
+/// Parse a proto `map<string,string>` of `recipient_id_hex → round2 pkg_json` into a
+/// typed map. Used at step3 ingress.
+pub fn round2_pkgs_from_wire(
+    wire: &HashMap<String, String>,
+) -> Result<BTreeMap<Identifier, Round2Package>, Status> {
+    let mut out = BTreeMap::new();
+    for (id_hex, pkg_json) in wire {
+        let id = parse_identifier_hex(id_hex)?;
+        let pkg = Round2Package::from_json(pkg_json)
+            .map_err(|e| Status::internal(format!("bad R2 pkg: {e}")))?;
+        out.insert(id, pkg);
+    }
+    Ok(out)
+}
 
 // Real 2-of-2 {wallet, cosigner}: both parties deal, both hold a share, no
 // recovery/hardware third party. `receiver_identifiers` stays empty.
@@ -43,7 +193,7 @@ const TOTAL_PARTICIPANTS: usize = 2;
 const THRESHOLD_COUNT: usize = 2;
 
 fn req_identifier(bytes: &[u8]) -> Result<Identifier, Status> {
-    ceremony::parse_identifier_hex(&hex::encode(bytes))
+    parse_identifier_hex(&hex::encode(bytes))
 }
 
 #[tracing::instrument(skip_all, name = "dkg::open", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
@@ -68,7 +218,7 @@ pub fn dkg_open(
         tracing::info!("[{user_id_hex}] DKG: registered passive receiver");
         sess.rounds.receiver_identifiers.insert(id);
     } else {
-        match ceremony::round1_pkg_from_json(&req.round1_package) {
+        match round1_pkg_from_json(&req.round1_package) {
             Ok(pkg) => {
                 sess.rounds.round1_packages.insert(id, pkg);
             }
@@ -87,7 +237,7 @@ pub fn dkg_open(
         rng.fill(&mut seed);
         let coefficients = random::generate_coefficients_seeded(THRESHOLD_COUNT - 1, &seed);
 
-        let dealt = ceremony::parse_scalar_hex(&secret_hex).and_then(|secret| {
+        let dealt = parse_scalar_hex(&secret_hex).and_then(|secret| {
             dkg::dkg_part1(
                 TOTAL_PARTICIPANTS,
                 THRESHOLD_COUNT,
@@ -176,7 +326,7 @@ pub fn dkg_finish(
     let Some(server_id) = sess.rounds.server_id.clone() else {
         return Err(Status::internal("server ID not initialized"));
         };
-    let pkgs = match ceremony::round2_pkgs_from_wire(&req.round2_packages_for_others) {
+    let pkgs = match round2_pkgs_from_wire(&req.round2_packages_for_others) {
         Ok(p) => p,
         Err(e) => {
             return Err(e);
@@ -249,7 +399,7 @@ pub fn dkg_finish(
         let user_signing_identifier_hex = Some(wallet_identifier_hex);
         let server_dkg_secret_hex = Some(sess.server_internal_secret_hex.clone());
 
-        sess.seed_material = Some(crate::onboarding::session::SeedMaterial {
+        sess.seed_material = Some(SeedMaterial {
             group_key: group_key.clone(),
             key_package_json: kp_json,
             public_key_package_json: pkp_json,
