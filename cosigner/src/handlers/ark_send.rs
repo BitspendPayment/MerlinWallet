@@ -1,6 +1,6 @@
 //! Heavy Ark RPCs (send/redeem/settle/settle_delegate/submit_ark_send).
 //! Each handler runs synchronously in `spawn_blocking`; ASP gRPC calls are
-//! awaited via `Handle::current().block_on(...)` against the shared client.
+//! awaited via `Handle::current().block_on(...)` against the upstreams client.
 
 use tokio::runtime::Handle;
 use tonic::Status;
@@ -9,12 +9,12 @@ use crate::cosigner::Cosigner;
 use crate::handlers::parsers;
 use crate::store::run_blocking;
 use crate::state::{CosignerState, VtxoEntry};
-use crate::types::{ArkTxEntry, VtxoInput};
-use crate::shared::SharedServices;
+use crate::types::VtxoInput;
+use crate::upstreams::Upstreams;
 use crate::wallet_proto::*;
 
 use super::helpers::{
-    delete_user_delegate, now_secs, save_user_ark_history, save_user_vtxos,
+    delete_user_delegate, now_secs, save_user_vtxos,
 };
 
 fn fetch_asp_info(
@@ -43,7 +43,7 @@ fn fetch_asp_info(
 /// computes the self-refresh output itself; the host only supplies what it alone knows.
 pub fn build_delegate_step1(
     state: &CosignerState,
-    shared: &SharedServices,
+    upstreams: &Upstreams,
 ) -> Result<(Vec<VtxoInput>, Option<u64>), Status> {
     if state.vtxos.is_empty() {
         return Err(Status::failed_precondition("no VTXOs to settle"));
@@ -64,7 +64,7 @@ pub fn build_delegate_step1(
         .filter_map(|e| (e.expires_at > 0).then_some(e.expires_at))
         .min()
         .unwrap_or(0);
-    let margin = shared.auto_settle_safety_margin_secs;
+    let margin = upstreams.auto_settle_safety_margin_secs;
     let intent_valid_at = if earliest > margin {
         Some((earliest - margin) as u64)
     } else {
@@ -78,7 +78,7 @@ pub fn build_delegate_step1(
 /// and produce the `Settled` gRPC response.
 pub fn apply_send_result(
     state: &mut CosignerState,
-    shared: &SharedServices,
+    upstreams: &Upstreams,
     req: &SendVtxoRequest,
     ark_txid: String,
     change: Option<(String, u32, u64, u32)>,
@@ -86,12 +86,12 @@ pub fn apply_send_result(
     let user_id_hex = parsers::user_id_hex(&req.user_id);
     state.vtxos.clear();
     state.delegate_session = None;
-    delete_user_delegate(shared.persistence.as_ref(), &user_id_hex);
+    delete_user_delegate(upstreams.persistence.as_ref(), &user_id_hex);
     // The off-chain send consumed VTXOs the stored guest delegate may reference; its host-side marker
     // carries no coverage info, so clear it (else `has_active_delegate` stays true + the auto-settle
     // tick could submit signatures over now-spent VTXOs).
     if state.guest_delegate_threshold.take().is_some() {
-        super::helpers::delete_guest_delegate_threshold(shared.persistence.as_ref(), &user_id_hex);
+        super::helpers::delete_guest_delegate_threshold(upstreams.persistence.as_ref(), &user_id_hex);
         tracing::info!("[{user_id_hex}] guest delegate marker invalidated by off-chain send");
     }
     if let Some((txid, vout, amount, exit_delay)) = change {
@@ -107,18 +107,7 @@ pub fn apply_send_result(
             expires_at: 0,
         });
     }
-    save_user_vtxos(shared.persistence.as_ref(), &user_id_hex, &state.vtxos);
-    state.ark_tx_history.push(ArkTxEntry {
-        tx_type: "send".into(),
-        amount_sats: -(req.amount as i64),
-        txid: ark_txid.clone(),
-        timestamp: now_secs(),
-    });
-    save_user_ark_history(
-        shared.persistence.as_ref(),
-        &user_id_hex,
-        &state.ark_tx_history,
-    );
+    save_user_vtxos(upstreams.persistence.as_ref(), &user_id_hex, &state.vtxos);
     SendVtxoResponse {
         status: send_vtxo_response::Status::Settled as i32,
         messages_to_sign: vec![],
@@ -137,18 +126,18 @@ impl Cosigner {
         &mut self,
         req: SubmitArkSendRequest,
     ) -> Result<(SubmitArkSendResponse, Vec<(String, u64)>), Status> {
-        let shared = self.shared.clone();
+        let upstreams = self.upstreams.clone();
         let span = tracing::info_span!("actor::submit_ark_send", user_id = %parsers::user_id_hex(&req.user_id));
         run_blocking(self.state.clone(), move |state| {
     let _enter = span.enter();
-    let shared = shared.as_ref();
+    let upstreams = upstreams.as_ref();
     use bitcoin::base64::{self, Engine as _};
 
     let user_id_hex = parsers::user_id_hex(&req.user_id);
     tracing::info!("[{user_id_hex}] SubmitArkSend");
     // Auth (OP_SEND_VTXO) ran at the REST boundary.
 
-    let asp = shared.asp_client.clone();
+    let asp = upstreams.asp_client.clone();
 
     // Decode client's signed ark tx (base64 PSBT).
     let signed_ark_bytes = base64::engine::general_purpose::STANDARD
@@ -263,15 +252,6 @@ impl Cosigner {
 
     // Update local VTXO state. The off-chain send consumed VTXOs, so any
     // stored delegate intent is now stale — invalidate it.
-    let spent_total: u64 = state
-        .vtxos
-        .iter()
-        .filter(|e| {
-            req.spent_outpoints
-                .contains(&format!("{}:{}", e.txid, e.vout))
-        })
-        .map(|e| e.amount)
-        .sum();
     state.vtxos.retain(|e| {
         !req.spent_outpoints
             .contains(&format!("{}:{}", e.txid, e.vout))
@@ -283,7 +263,7 @@ impl Cosigner {
             .any(|(t, v)| req.spent_outpoints.contains(&format!("{t}:{v}")));
         if any_covered_spent {
             state.delegate_session = None;
-            delete_user_delegate(shared.persistence.as_ref(), &user_id_hex);
+            delete_user_delegate(upstreams.persistence.as_ref(), &user_id_hex);
             tracing::info!(
                 "[{user_id_hex}] delegate invalidated: covered VTXO consumed by off-chain send"
             );
@@ -294,7 +274,7 @@ impl Cosigner {
     // can't auto-settle it safely. Clear the marker so `has_active_delegate` reflects reality and the
     // tick task won't submit signatures over now-spent VTXOs.
     if state.guest_delegate_threshold.take().is_some() {
-        super::helpers::delete_guest_delegate_threshold(shared.persistence.as_ref(), &user_id_hex);
+        super::helpers::delete_guest_delegate_threshold(upstreams.persistence.as_ref(), &user_id_hex);
         tracing::info!("[{user_id_hex}] guest delegate marker invalidated by off-chain send");
     }
     if change_amount > 0 {
@@ -315,20 +295,8 @@ impl Cosigner {
     tracing::info!(
         "[{user_id_hex}] SubmitArkSend: ark_txid={ark_txid}, change=({change_txid}, {change_vout}, {change_amount})"
     );
-    save_user_vtxos(shared.persistence.as_ref(), &user_id_hex, &state.vtxos);
+    save_user_vtxos(upstreams.persistence.as_ref(), &user_id_hex, &state.vtxos);
 
-    let sent_amount = spent_total.saturating_sub(change_amount);
-    state.ark_tx_history.push(ArkTxEntry {
-        tx_type: "send".into(),
-        amount_sats: -(sent_amount as i64),
-        txid: ark_txid.clone(),
-        timestamp: now_secs(),
-    });
-    save_user_ark_history(
-        shared.persistence.as_ref(),
-        &user_id_hex,
-        &state.ark_tx_history,
-    );
 
     // Hand back every output as (scriptPubKey hex, sats) so the caller can recognise a payment
     // that settles an outstanding request — this path never says which request it pays.

@@ -101,7 +101,7 @@ impl Cosigner {
     ) -> Result<crate::wallet_proto::ContactAddResponse, Status> {
         self.require_owner(&req.user_id)?;
         let vk_hex = super::helpers::group_key_of(
-            self.shared.persistence.as_ref(),
+            self.upstreams.persistence.as_ref(),
             &hex::encode(&req.contact_verifying_key),
         );
         self.add_contact(vk_hex, req.label, crate::store::now_secs())
@@ -117,7 +117,7 @@ impl Cosigner {
     ) -> Result<crate::wallet_proto::ContactRemoveResponse, Status> {
         self.require_owner(&req.user_id)?;
         let vk_hex = super::helpers::group_key_of(
-            self.shared.persistence.as_ref(),
+            self.upstreams.persistence.as_ref(),
             &hex::encode(&req.contact_verifying_key),
         );
         self.remove_contact(&vk_hex).map_err(Status::not_found)?;
@@ -137,7 +137,7 @@ impl Cosigner {
         // identity, and the key the payee address MUST derive from — a share key yields an address
         // the requester cannot spend, while the payment still appears to succeed.
         let from_vk_hex = super::helpers::group_key_of(
-            self.shared.persistence.as_ref(),
+            self.upstreams.persistence.as_ref(),
             &hex::encode(&req.user_id),
         );
         if !self.is_contact(&from_vk_hex) {
@@ -155,7 +155,7 @@ impl Cosigner {
         }
         let owner_xonly = from_vk_hex[2..].to_string();
         let info = {
-            let asp_arc = self.shared.asp_client.clone();
+            let asp_arc = self.upstreams.asp_client.clone();
             let mut asp = asp_arc.lock().await;
             asp.get_info()
                 .await
@@ -185,8 +185,8 @@ impl Cosigner {
 
         // Best-effort nudge: the sealed intent is the durable record, so a failed notification
         // must never fail the request.
-        if let Some(fcm) = self.shared.fcm.clone() {
-            let persistence = self.shared.persistence.clone();
+        if let Some(fcm) = self.upstreams.fcm.clone() {
+            let persistence = self.upstreams.persistence.clone();
             let payer = self.state.lock().cosigner_id.clone();
             let (amount, id) = (intent.amount_sats, intent.id.clone());
             tokio::spawn(async move {

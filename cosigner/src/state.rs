@@ -1,10 +1,10 @@
-//! Per-user mutable state. Owned by the user's actor task; never shared.
+//! Per-user mutable state. Owned by the user's actor task; never upstreams.
 
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
-use crate::types::{arr32_hex, ArkTxEntry, ContractPairing};
+use crate::types::{arr32_hex, ContractPairing};
 
 /// One VTXO owned by the user. Persisted in `vtxo_store`. `created_at` and
 /// `expires_at` come from the ASP `Vtxo` event and feed the auto-settle
@@ -77,8 +77,6 @@ pub struct CosignerState {
     pub delegate_session: Option<DelegateRecord>,
 
     pub vtxos: Vec<VtxoEntry>,
-    /// Ark transaction history (oldest first).
-    pub ark_tx_history: Vec<ArkTxEntry>,
     /// VTXO scriptPubKeys this user owns. Used by the registry's reverse index.
     pub owned_scripts: Vec<String>,
     /// Registered FCM/APNS device tokens. Pushes go to all of them.
@@ -105,7 +103,6 @@ impl CosignerState {
             cosigner_id,
             delegate_session: None,
             vtxos: Vec::new(),
-            ark_tx_history: Vec::new(),
             owned_scripts: Vec::new(),
             device_tokens: Vec::new(),
             guest_delegate_threshold: None,

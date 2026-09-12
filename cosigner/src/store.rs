@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use tonic::Status;
 
-use crate::shared::SharedServices;
+use crate::upstreams::Upstreams;
 
 use super::cosigner::Cosigner;
 use super::state::{CosignerState, DeviceToken};
@@ -78,19 +78,19 @@ pub(crate) async fn seal_snapshot_for(
     actor: &mut Cosigner,
     group_key: &str,
 ) {
-    // The actor holds its own `shared`, so callers don't have to thread it through.
-    let shared = actor.shared.clone();
-    seal_snapshot(actor, &shared, group_key).await;
+    // The cosigner holds its own `upstreams`, so callers don't have to thread it through.
+    let upstreams = actor.upstreams.clone();
+    seal_snapshot(actor, &upstreams, group_key).await;
 }
 
 pub(crate) async fn seal_snapshot(
     actor: &mut Cosigner,
-    shared: &SharedServices,
+    upstreams: &Upstreams,
     group_key: &str,
 ) {
     match actor.to_snapshot() {
         Ok(blob) => {
-            if let Err(e) = shared
+            if let Err(e) = upstreams
                 .persistence
                 .put(SEALED_STATE_TREE, group_key, &hex::encode(blob))
             {
@@ -107,10 +107,10 @@ pub(crate) async fn seal_snapshot(
 /// `false` when there's no stored blob (first run) or restore failed.
 pub(crate) async fn restore_snapshot(
     actor: &mut Cosigner,
-    shared: &SharedServices,
+    upstreams: &Upstreams,
     group_key: &str,
 ) -> bool {
-    let stored = shared.persistence.get(SEALED_STATE_TREE, group_key);
+    let stored = upstreams.persistence.get(SEALED_STATE_TREE, group_key);
     let Ok(Some(hex_blob)) = stored else {
         return false;
     };

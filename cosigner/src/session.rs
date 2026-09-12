@@ -162,7 +162,7 @@ impl SigningSession for SessionService {
         &self,
         request: Request<Streaming<proto::DkgClientMsg>>,
     ) -> Result<Response<DkgStream>, Status> {
-        let shared = self.cosigner.lock().await.shared().clone().clone();
+        let upstreams = self.cosigner.lock().await.upstreams().clone().clone();
         let cosigner = self.cosigner.clone();
         let mut inbound = request.into_inner();
 
@@ -188,7 +188,7 @@ impl SigningSession for SessionService {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 ob::onboarding_step1(
                     &mut sess,
-                    &shared,
+                    &upstreams,
                     wp::DkgStep1Request {
                         user_id: open.user_id.clone(),
                         identifier: open.identifier.clone(),
@@ -219,7 +219,7 @@ impl SigningSession for SessionService {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 ob::onboarding_step2(
                     &mut sess,
-                    &shared,
+                    &upstreams,
                     wp::DkgStep2Request {
                         user_id: open.user_id.clone(),
                         identifier: round1.identifier,
@@ -250,7 +250,7 @@ impl SigningSession for SessionService {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let finalized = ob::onboarding_step3(
                     &mut sess,
-                    &shared,
+                    &upstreams,
                     wp::DkgStep3Request {
                         user_id: open.user_id.clone(),
                         identifier: round2.identifier,
@@ -642,15 +642,6 @@ impl MpcWallet for WalletService {
         Ok(Response::new(out))
     }
 
-    async fn list_ark_transactions(
-        &self,
-        request: Request<wp::ListArkTransactionsRequest>,
-    ) -> Result<Response<wp::ListArkTransactionsResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_LIST_ARK_TXS)?;
-        let out = self.cosigner.lock().await.list_ark_transactions(req).await?;
-        Ok(Response::new(out))
-    }
 
     async fn contact_list(
         &self,

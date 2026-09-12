@@ -1,7 +1,7 @@
 // Shared test helpers: each integration binary compiles this module and uses only part of it.
 #![allow(dead_code)]
 
-//! Shared setup for the integration tests. Builds `SharedServices` against the local dev stack.
+//! Shared setup for the integration tests. Builds `Upstreams` against the local dev stack.
 //!
 //! Persistence is an in-process SQLite store, so there is no external dependency to reach and each
 //! `try_shared` call gets its own isolated database. The ASP channel is created lazily, so a
@@ -17,14 +17,14 @@ use std::sync::Arc;
 use rand::rngs::OsRng;
 
 use cosigner::kv_store::SqliteStore;
-use cosigner::shared::SharedServices;
+use cosigner::upstreams::Upstreams;
 
 use threshold::dkg::{self, Round1Package, Round2Package};
 use threshold::identifier::Identifier;
 use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::random;
 
-pub async fn try_shared() -> Option<Arc<SharedServices>> {
+pub async fn try_shared() -> Option<Arc<Upstreams>> {
     let asp_url = std::env::var("ASP_URL").unwrap_or_else(|_| "http://127.0.0.1:7070".to_string());
 
     // `:memory:` — a fresh, private store per caller. Tests no longer share one namespace, so a
@@ -37,7 +37,7 @@ pub async fn try_shared() -> Option<Arc<SharedServices>> {
             return None;
         }
     };
-    Some(Arc::new(SharedServices::new(
+    Some(Arc::new(Upstreams::new(
         store,
         asp,
         None, // fcm
@@ -104,12 +104,12 @@ pub fn dkg_2of2() -> (Vec<KeyPackage>, PublicKeyPackage) {
 }
 
 /// Open the cosigner this process serves, loading whatever its seal already holds.
-pub async fn open_cosigner(shared: &Arc<SharedServices>, group_key: &str) -> tokio::sync::Mutex<Cosigner> {
+pub async fn open_cosigner(upstreams: &Arc<Upstreams>, group_key: &str) -> tokio::sync::Mutex<Cosigner> {
     let state = Arc::new(parking_lot::Mutex::new(CosignerState::new(
         group_key.to_string(),
     )));
     tokio::sync::Mutex::new(
-        Cosigner::open(shared.clone(), state)
+        Cosigner::open(upstreams.clone(), state)
             .await
             .expect("open cosigner"),
     )

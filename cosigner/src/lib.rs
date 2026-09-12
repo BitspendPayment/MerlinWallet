@@ -14,7 +14,7 @@ pub mod handlers;
 pub mod kv_store;
 pub mod onboarding;
 pub mod session;
-pub mod shared;
+pub mod upstreams;
 pub mod state;
 pub mod store;
 pub mod types;

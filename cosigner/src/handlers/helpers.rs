@@ -1,5 +1,5 @@
 //! Shared helpers for actor command handlers. Each function takes plain references to
-//! `CosignerState` and shared services so handlers can compose without locking.
+//! `CosignerState` and upstreams services so handlers can compose without locking.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -228,39 +228,7 @@ pub fn save_user_device_tokens(
     }
 }
 
-/// Persist a user's Ark transaction history.
-pub fn save_user_ark_history(
-    persistence: &dyn KvStore,
-    user_id_hex: &str,
-    entries: &[crate::types::ArkTxEntry],
-) {
-    let user_id_hex = &group_key_of(persistence, user_id_hex);
-    if let Ok(json) = serde_json::to_string(entries) {
-        if let Err(e) = persistence.put("ark_tx_history", user_id_hex, &json) {
-            tracing::warn!("persist ark_tx_history/{user_id_hex} failed: {e}");
-        }
-    }
-}
 
-/// Read back a user's Ark transaction history from persistence. Returns an
-/// empty vec on miss or parse failure (best-effort — history isn't safety-
-/// critical, just user-facing).
-pub fn load_user_ark_history(
-    persistence: &dyn KvStore,
-    user_id_hex: &str,
-) -> Vec<crate::types::ArkTxEntry> {
-    let user_id_hex = &group_key_of(persistence, user_id_hex);
-    match persistence.get("ark_tx_history", user_id_hex) {
-        Ok(Some(json)) => match serde_json::from_str(&json) {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!("parse ark_tx_history/{user_id_hex} failed: {e}");
-                Vec::new()
-            }
-        },
-        _ => Vec::new(),
-    }
-}
 
 /// Read back a user's stored VTXOs from persistence. Returns an empty vec on
 /// miss or parse failure. The vtxo_stream subscription will reconcile via its

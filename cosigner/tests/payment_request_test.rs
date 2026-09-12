@@ -34,7 +34,7 @@ fn create_req(receiver_vk: &[u8]) -> PaymentRequestCreateRequest {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn allowlist_gates_requests_and_survives_cold_spawn() {
-    let Some(shared) = common::try_shared().await else {
+    let Some(upstreams) = common::try_shared().await else {
         return;
     };
 
@@ -45,7 +45,7 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
     let (_receiver_kps, receiver_pkp) = common::dkg_2of2();
     let receiver_vk = receiver_pkp.verifying_key.serialize().to_vec();
 
-    let cosigner = common::open_cosigner(&shared, &payer_group).await;
+    let cosigner = common::open_cosigner(&upstreams, &payer_group).await;
     common::seed_policy(
         &cosigner,
         &payer_group,
@@ -87,7 +87,7 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
     // The allowlist is sealed: drop the cosigner so nothing survives in memory, then read it back
     // from a fresh one (restored from the snapshot).
     drop(cosigner);
-    let cosigner = common::open_cosigner(&shared, &payer_group).await;
+    let cosigner = common::open_cosigner(&upstreams, &payer_group).await;
     let list = cosigner
         .lock()
         .await
@@ -123,7 +123,7 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
         .expect_err("a revoked contact must not be able to create a request");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
-    let _ = shared.persistence.delete("sealed_state", &payer_group);
+    let _ = upstreams.persistence.delete("sealed_state", &payer_group);
 }
 
 /// The owner-only routes must reject a caller who authenticated as a DIFFERENT wallet.
@@ -134,7 +134,7 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
 /// allowlist is the only gate on PaymentRequestCreate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_only_routes_reject_another_wallets_key() {
-    let Some(shared) = common::try_shared().await else {
+    let Some(upstreams) = common::try_shared().await else {
         return;
     };
 
@@ -144,7 +144,7 @@ async fn owner_only_routes_reject_another_wallets_key() {
     let (_att_kps, attacker_pkp) = common::dkg_2of2();
     let attacker_id = attacker_pkp.verifying_key.serialize().to_vec();
 
-    let cosigner = common::open_cosigner(&shared, &payer_group).await;
+    let cosigner = common::open_cosigner(&upstreams, &payer_group).await;
     common::seed_policy(
         &cosigner,
         &payer_group,
@@ -182,5 +182,5 @@ async fn owner_only_routes_reject_another_wallets_key() {
         .expect_err("another wallet's key must not read this wallet's contacts");
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
 
-    let _ = shared.persistence.delete("sealed_state", &payer_group);
+    let _ = upstreams.persistence.delete("sealed_state", &payer_group);
 }

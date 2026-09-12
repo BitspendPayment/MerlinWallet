@@ -1,5 +1,5 @@
-//! Durable, non-secret domain types shared across the cosigner's state, actor, and
-//! persistence layers. Plain data (no crypto material) — the actor's sealed snapshot and
+//! Durable, non-secret domain types shared across the cosigner's state, handlers and
+//! persistence layers. Plain data (no crypto material) — the sealed snapshot and
 //! the host's public projections are built from these.
 
 use serde::{Deserialize, Serialize};
@@ -136,7 +136,6 @@ pub struct SnapshotState {
     #[serde(default)]
     pub contracts_json: String,
     pub vtxos: Vec<VtxoInput>,
-    pub history: Vec<ArkTxEntry>,
     /// A `ReadyToSettle` delegate session serialized via ark `PersistedDelegate` (JSON), if
     /// one is pending. Lets durable auto-settle survive actor eviction. Only ever
     /// `ReadyToSettle` (never a `Settling`-phase session — MuSig2 nonces must not persist).

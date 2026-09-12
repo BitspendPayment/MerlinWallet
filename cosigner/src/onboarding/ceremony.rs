@@ -23,7 +23,7 @@ pub fn drain_pairs_with_err<K, T>(pool: &mut Vec<(K, Reply<T>)>, msg: &str) {
     }
 }
 
-/// The typed FROST round state shared by both ceremonies. `server_id` is the
+/// The typed FROST round state upstreams by both ceremonies. `server_id` is the
 /// cosigner's own FROST identifier (the key under which its round1 package lives).
 #[derive(Default)]
 pub struct CeremonyRounds {

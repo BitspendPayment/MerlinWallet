@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use cosigner::{config, fcm_client, kv_store, shared};
+use cosigner::{config, fcm_client, kv_store, upstreams};
 
 #[derive(Parser)]
 #[command(
@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let shared = Arc::new(shared::SharedServices::new(
+    let upstreams = Arc::new(upstreams::Upstreams::new(
         persistence,
         asp_client,
         fcm,
@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cosigner::state::CosignerState::new(group_key.clone()),
     ));
     let cosigner = std::sync::Arc::new(tokio::sync::Mutex::new(
-        cosigner::Cosigner::open(shared.clone(), wallet_state).await?,
+        cosigner::Cosigner::open(upstreams.clone(), wallet_state).await?,
     ));
     let server_info = cosigner::wallet_proto::GetServerInfoResponse {
         bitcoin_network: cfg.bitcoin_network.clone(),

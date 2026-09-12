@@ -1,5 +1,5 @@
 //! Pure JSON / hex parsing helpers used across handlers. All static — no
-//! `&self`, no shared services.
+//! `&self`, no upstreams services.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};

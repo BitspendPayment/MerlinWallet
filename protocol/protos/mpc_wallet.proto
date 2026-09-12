@@ -45,7 +45,10 @@ service MPCWallet {
   rpc GetArkAddress (GetArkAddressRequest) returns (GetArkAddressResponse);
   rpc GetBoardingAddress (GetBoardingAddressRequest) returns (GetBoardingAddressResponse);
   rpc ListVtxos (ListVtxosRequest) returns (ListVtxosResponse);
-  rpc ListArkTransactions (ListArkTransactionsRequest) returns (ListArkTransactionsResponse);
+  // ListArkTransactions removed. The cosigner is called, not running, so it can only log what it
+  // performed — a send or a board. Receives were written by a VTXO stream it no longer runs, so
+  // the log it could serve is a wallet that never received anything. The client watches its own
+  // scripts and owns the history.
   rpc SendVtxo (SendVtxoRequest) returns (SendVtxoResponse);
   rpc RedeemVtxo (RedeemVtxoRequest) returns (RedeemVtxoResponse);
 

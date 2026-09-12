@@ -20,7 +20,7 @@ use crate::handlers;
 use crate::state::CosignerState;
 
 use crate::types::{
-    ApplyDelegateSigs, ArkTxEntry, BoardingSettleOutcome, BoardingSettleSubmitted, Commitment,
+    ApplyDelegateSigs, BoardingSettleOutcome, BoardingSettleSubmitted, Commitment,
     Contact, ContractPairing, IntentStatus, PaymentIntent, PublicPolicy,
     SendVtxoStep1, SendVtxoSubmitted, SettleSubmitted, SignStep1, SignStep1Out, SignStep2,
     SignStep2Out, SnapshotState, VtxoInput,
@@ -38,7 +38,7 @@ use threshold::point;
 use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};
 use threshold::signing::{self, SignatureShare};
 
-use crate::shared::SharedServices;
+use crate::upstreams::Upstreams;
 
 const THRESHOLD_COUNT: usize = 2;
 
@@ -106,15 +106,13 @@ pub struct Cosigner {
     ark_cosigner_secret_hex: Option<Zeroizing<String>>,
     /// The owned spendable VTXO set.
     vtxos: Vec<VtxoInput>,
-    /// The owned Ark transaction history (display log; non-secret).
-    history: Vec<ArkTxEntry>,
     /// Parties authorized to bill this wallet — the only authorization for an incoming request.
     contacts: Vec<Contact>,
     /// Request-to-pay records held for the payer (bounded; see `prune_intents`).
     payment_intents: Vec<PaymentIntent>,
     /// Global services (contract gate + ASP url). Held so `command()` is a drop-in for the old
-    /// `GuestInstance::command` — no per-call-site `shared` threading.
-    pub(crate) shared: Arc<SharedServices>,
+    /// `GuestInstance::command` — no per-call-site `upstreams` threading.
+    pub(crate) upstreams: Arc<Upstreams>,
     /// This user's public projection (VTXOs / history / device tokens / policy metadata). The
     /// non-signing query + stream + inbox handlers are `impl Cosigner` methods over it.
     pub(crate) state: Arc<Mutex<CosignerState>>,
@@ -143,36 +141,65 @@ impl Cosigner {
     /// No seal yet is not an error. Before onboarding there is nothing to read, and DKG is what
     /// writes the first one.
     pub async fn open(
-        shared: Arc<SharedServices>,
+        upstreams: Arc<Upstreams>,
         state: Arc<Mutex<CosignerState>>,
     ) -> Result<Self, Status> {
         let group_key = state.lock().cosigner_id.clone();
-        let mut cosigner = Self::new(shared.clone(), state.clone());
-        if crate::store::restore_snapshot(&mut cosigner, &shared, &group_key).await {
+        let mut cosigner = Self::new(upstreams.clone(), state.clone());
+        if crate::store::restore_snapshot(&mut cosigner, &upstreams, &group_key).await {
             crate::store::load_policy_projection(&state, &mut cosigner).await?;
         }
+        cosigner.load_projection(&group_key);
         Ok(cosigner)
+    }
+
+    /// Read the host projection back from storage: the VTXO set, the transaction log, the device
+    /// tokens and any stored delegate threshold.
+    ///
+    /// Separate from the seal, and not redundant with it. The seal carries the VTXOs as
+    /// `VtxoInput`, which has no expiry; the projection carries `VtxoEntry`, which does, and expiry
+    /// is what decides when a delegate must settle. Until that moves into the seal, both are
+    /// needed, and this is where the cheaper one is read.
+    fn load_projection(&mut self, group_key: &str) {
+        use crate::handlers::helpers as h;
+        let persistence = self.upstreams.persistence.as_ref();
+        let vtxos = h::load_user_vtxos(persistence, group_key);
+        let device_tokens = h::load_user_device_tokens(persistence, group_key);
+        let threshold = h::load_guest_delegate_threshold(persistence, group_key);
+
+        if vtxos.is_empty() && device_tokens.is_empty() && threshold.is_none() {
+            return;
+        }
+        tracing::info!(
+            vtxos = vtxos.len(),
+            device_tokens = device_tokens.len(),
+            delegate = threshold.is_some(),
+            "restored projection"
+        );
+        let mut st = self.state.lock();
+        st.vtxos = vtxos;
+        st.device_tokens = device_tokens;
+        st.guest_delegate_threshold = threshold;
     }
 
     pub fn group_key(&self) -> String {
         self.state.lock().cosigner_id.clone()
     }
 
-    pub fn shared(&self) -> &Arc<SharedServices> {
-        &self.shared
+    pub fn upstreams(&self) -> &Arc<Upstreams> {
+        &self.upstreams
     }
 
-    fn new(shared: Arc<SharedServices>, state: Arc<Mutex<CosignerState>>) -> Self {
+    fn new(upstreams: Arc<Upstreams>, state: Arc<Mutex<CosignerState>>) -> Self {
         Self {
             policy: None,
             delegate_session: None,
             boarding_settle: None,
             ark_cosigner_secret_hex: None,
             vtxos: Vec::new(),
-            history: Vec::new(),
             contacts: Vec::new(),
             payment_intents: Vec::new(),
-            shared,
+            upstreams,
             state,
         }
     }
@@ -193,7 +220,6 @@ impl Cosigner {
             contract_pairing: policy.contract_pairing.clone(),
             contracts_json: policy.contracts_json.clone(),
             vtxos: self.vtxos.clone(),
-            history: self.history.clone(),
             // Persist a ReadyToSettle delegate (to_persisted errors for other phases → None).
             delegate_json: self
                 .delegate_session
@@ -228,7 +254,6 @@ impl Cosigner {
         });
         self.ark_cosigner_secret_hex = snap.ark_cosigner_secret_hex.map(Zeroizing::new);
         self.vtxos = snap.vtxos;
-        self.history = snap.history;
         self.contacts = snap.contacts;
         self.payment_intents = snap.payment_intents;
         // Restore a pending ReadyToSettle delegate (needs the cosigner secret to re-derive its kp).
@@ -266,15 +291,15 @@ impl Cosigner {
         &self,
     ) -> Result<(Vec<VtxoInput>, Option<u64>), Status> {
         let st = self.state.lock();
-        handlers::ark_send::build_delegate_step1(&st, &self.shared)
+        handlers::ark_send::build_delegate_step1(&st, &self.upstreams)
     }
 
     /// Seal this actor's state. Storage is the whole of the persistence now, so a method that
     /// mutates durable state seals here rather than trusting its caller to remember.
     pub async fn seal(&mut self) {
-        let shared = self.shared.clone();
+        let upstreams = self.upstreams.clone();
         let group_key = self.state.lock().cosigner_id.clone();
-        crate::store::seal_snapshot(self, &shared, &group_key).await;
+        crate::store::seal_snapshot(self, &upstreams, &group_key).await;
     }
 
     /// Record a settled boarding output: replace it in the host projection with the VTXO it
@@ -296,18 +321,7 @@ impl Cosigner {
             created_at: now,
             expires_at: 0,
         });
-        handlers::helpers::save_user_vtxos(self.shared.persistence.as_ref(), user_id_hex, &st.vtxos);
-        st.ark_tx_history.push(ArkTxEntry {
-            tx_type: "board".into(),
-            amount_sats: sub.amount_sats as i64,
-            txid: sub.vtxo_txid,
-            timestamp: now,
-        });
-        handlers::helpers::save_user_ark_history(
-            self.shared.persistence.as_ref(),
-            user_id_hex,
-            &st.ark_tx_history,
-        );
+        handlers::helpers::save_user_vtxos(self.upstreams.persistence.as_ref(), user_id_hex, &st.vtxos);
         sub.commitment_txid
     }
 
@@ -321,17 +335,11 @@ impl Cosigner {
         submitted: SendVtxoSubmitted,
     ) -> crate::wallet_proto::SendVtxoResponse {
         let SendVtxoSubmitted { ark_txid, change } = submitted;
-        self.append_history(ArkTxEntry {
-            tx_type: "send".to_string(),
-            amount_sats: -(req.amount as i64),
-            txid: ark_txid.clone(),
-            timestamp: crate::store::now_secs(),
-        });
         let resp = {
             let mut st = self.state.lock();
             crate::handlers::ark_send::apply_send_result(
                 &mut st,
-                &self.shared,
+                &self.upstreams,
                 req,
                 ark_txid.clone(),
                 change,
@@ -345,10 +353,6 @@ impl Cosigner {
         resp
     }
 
-    /// Append one entry to the owned Ark transaction history (after a send/settle).
-    pub fn append_history(&mut self, entry: ArkTxEntry) {
-        self.history.push(entry);
-    }
 
     /// Replace the stored contract registry (opaque host JSON). Errors if no policy is installed.
     pub fn set_contracts(&mut self, contracts_json: String) -> Result<(), String> {
@@ -843,7 +847,7 @@ impl Cosigner {
         boarding_utxo: Option<(String, u32, u64)>,
         signed_messages: Vec<Vec<u8>>,
     ) -> Result<BoardingSettleOutcome, String> {
-        let asp_arc = self.shared.asp_client.clone();
+        let asp_arc = self.upstreams.asp_client.clone();
         let mut asp = asp_arc.lock().await;
         if signed_messages.is_empty() {
             self.boarding_settle = None; // poll-without-sigs ⇒ abandon any in-flight, restart
@@ -960,7 +964,7 @@ impl Cosigner {
         req: GenerateDelegate,
     ) -> Result<Vec<Vec<u8>>, String> {
         // Auth (OP_SETTLE_DELEGATE) ran at the REST boundary.
-        let asp_arc = self.shared.asp_client.clone();
+        let asp_arc = self.upstreams.asp_client.clone();
         let mut asp = asp_arc.lock().await;
         let (owner_pk_hex, cosigner_secret_hex, vtxos) = {
             let owner = match self.owner_pk_hex() {
@@ -1037,7 +1041,7 @@ impl Cosigner {
     /// `ReadyToSettle` delegate session. Each arm runs a sync (secret-using) session step then an
     /// `asp.*().await` — `self` and `asp` are disjoint, no held cross-await borrow.
     pub(crate) async fn settle_delegate(&mut self) -> Result<SettleSubmitted, String> {
-        let asp_arc = self.shared.asp_client.clone();
+        let asp_arc = self.upstreams.asp_client.clone();
         let mut asp = asp_arc.lock().await;
         let (proof, message, topics) = match self
             .delegate_session
@@ -1397,7 +1401,7 @@ impl Cosigner {
         req: SendVtxoStep1,
     ) -> Result<(SendSession, u32, Vec<Vec<u8>>), String> {
         // Auth (OP_SEND_VTXO) ran at the REST boundary.
-        let asp_arc = self.shared.asp_client.clone();
+        let asp_arc = self.upstreams.asp_client.clone();
         let mut asp = asp_arc.lock().await;
         let total: u64 = req.vtxos.iter().map(|v| v.amount_sats).sum();
         if total < req.amount {
@@ -1426,7 +1430,7 @@ impl Cosigner {
     ) -> Result<SendVtxoSubmitted, String> {
         let (mut session, change_exit_delay) = session;
         // Auth (OP_SEND_VTXO) ran at the REST boundary.
-        let asp_arc = self.shared.asp_client.clone();
+        let asp_arc = self.upstreams.asp_client.clone();
         let mut asp = asp_arc.lock().await;
         let signatures = match sigs_from_wire(&req.signed_messages) {
             Ok(s) => s,

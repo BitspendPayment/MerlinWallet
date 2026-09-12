@@ -19,11 +19,11 @@ impl Cosigner {
         &mut self,
         req: RegisterDeviceTokenRequest,
     ) -> Result<RegisterDeviceTokenResponse, Status> {
-        let shared = self.shared.clone();
+        let upstreams = self.upstreams.clone();
         let span = tracing::info_span!("actor::register_device_token", user_id = %parsers::user_id_hex(&req.user_id));
         run_blocking(self.state.clone(), move |state| {
             let _enter = span.enter();
-            let shared = shared.as_ref();
+            let upstreams = upstreams.as_ref();
             let user_id_hex = parsers::user_id_hex(&req.user_id);
             // Auth (OP_REGISTER_DEVICE_TOKEN) ran at the REST boundary.
 
@@ -48,7 +48,7 @@ impl Cosigner {
             });
 
             save_user_device_tokens(
-                shared.persistence.as_ref(),
+                upstreams.persistence.as_ref(),
                 &user_id_hex,
                 &state.device_tokens,
             );

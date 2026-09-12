@@ -9,7 +9,7 @@ use crate::cosigner::Cosigner;
 use crate::handlers::parsers;
 use crate::store::run_blocking;
 use crate::state::CosignerState;
-use crate::shared::SharedServices;
+use crate::upstreams::Upstreams;
 use crate::wallet_proto::*;
 
 use super::helpers::{get_user_xonly_pubkey, save_user_vtxos};
@@ -36,15 +36,15 @@ impl Cosigner {
         &mut self,
         req: GetArkInfoRequest,
     ) -> Result<GetArkInfoResponse, Status> {
-        let shared = self.shared.clone();
+        let upstreams = self.upstreams.clone();
         let span = tracing::info_span!("actor::get_ark_info", user_id = %parsers::user_id_hex(&req.user_id));
         run_blocking(self.state.clone(), move |_state| {
             let _enter = span.enter();
-            let shared = shared.as_ref();
+            let upstreams = upstreams.as_ref();
             let user_id_hex = parsers::user_id_hex(&req.user_id);
             tracing::info!("[{user_id_hex}] GetArkInfo");
             // Auth (OP_GET_ARK_INFO) ran at the REST boundary.
-            let asp = shared.asp_client.clone();
+            let asp = upstreams.asp_client.clone();
             let info = fetch_asp_info(&asp)?;
             Ok(GetArkInfoResponse {
                 signer_pubkey: info.signer_pubkey,
@@ -57,7 +57,7 @@ impl Cosigner {
                 dust: info.dust,
                 checkpoint_tapscript: info.checkpoint_tapscript,
                 forfeit_address: info.forfeit_address,
-                auto_settle_safety_margin_secs: shared.auto_settle_safety_margin_secs,
+                auto_settle_safety_margin_secs: upstreams.auto_settle_safety_margin_secs,
             })
         })
         .await
@@ -78,7 +78,7 @@ impl Cosigner {
 /// So: query by the outpoints we already hold (no derivation to get wrong), and remove only on an
 /// explicit `is_spent`/`is_swept`/`is_unrolled`. Silence is never treated as evidence, and nothing
 /// is ever added.
-fn drop_spent_vtxos(state: &mut CosignerState, shared: &SharedServices, user_id_hex: &str) {
+fn drop_spent_vtxos(state: &mut CosignerState, upstreams: &Upstreams, user_id_hex: &str) {
     if state.vtxos.is_empty() {
         return;
     }
@@ -88,7 +88,7 @@ fn drop_spent_vtxos(state: &mut CosignerState, shared: &SharedServices, user_id_
         .map(|e| format!("{}:{}", e.txid, e.vout))
         .collect();
 
-    let asp = shared.asp_client.clone();
+    let asp = upstreams.asp_client.clone();
     let queried = Handle::current().block_on(async move {
         let mut guard = asp.lock().await;
         guard.get_vtxos_by_outpoints(&outpoints).await
@@ -119,7 +119,7 @@ fn drop_spent_vtxos(state: &mut CosignerState, shared: &SharedServices, user_id_
             "[{user_id_hex}] dropped {} spent VTXO(s) the stream had missed",
             before - state.vtxos.len()
         );
-        save_user_vtxos(shared.persistence.as_ref(), user_id_hex, &state.vtxos);
+        save_user_vtxos(upstreams.persistence.as_ref(), user_id_hex, &state.vtxos);
     }
 }
 
@@ -128,19 +128,19 @@ impl Cosigner {
         &mut self,
         req: GetArkAddressRequest,
     ) -> Result<GetArkAddressResponse, Status> {
-        let shared = self.shared.clone();
+        let upstreams = self.upstreams.clone();
         let span = tracing::info_span!("actor::get_ark_address", user_id = %parsers::user_id_hex(&req.user_id));
         run_blocking(self.state.clone(), move |state| {
             let _enter = span.enter();
-            let shared = shared.as_ref();
+            let upstreams = upstreams.as_ref();
             let user_id_hex = parsers::user_id_hex(&req.user_id);
             tracing::info!("[{user_id_hex}] GetArkAddress");
             // Auth (OP_GET_ARK_ADDRESS) ran at the REST boundary.
-            let asp = shared.asp_client.clone();
+            let asp = upstreams.asp_client.clone();
             let info = fetch_asp_info(&asp)?;
 
             let owner_pk_hex =
-                get_user_xonly_pubkey(state, shared.persistence.as_ref(), &user_id_hex)?;
+                get_user_xonly_pubkey(state, upstreams.persistence.as_ref(), &user_id_hex)?;
 
             let network = ark::client::parse_network(&info.network).map_err(Status::internal)?;
             let exit_delay = info.unilateral_exit_delay as u32;
@@ -162,18 +162,18 @@ impl Cosigner {
         &mut self,
         req: GetBoardingAddressRequest,
     ) -> Result<GetBoardingAddressResponse, Status> {
-        let shared = self.shared.clone();
+        let upstreams = self.upstreams.clone();
         let span = tracing::info_span!("actor::get_boarding_address", user_id = %parsers::user_id_hex(&req.user_id));
         run_blocking(self.state.clone(), move |state| {
             let _enter = span.enter();
-            let shared = shared.as_ref();
+            let upstreams = upstreams.as_ref();
             let user_id_hex = parsers::user_id_hex(&req.user_id);
             tracing::info!("[{user_id_hex}] GetBoardingAddress");
             // Auth (OP_GET_BOARDING_ADDRESS) ran at the REST boundary.
-            let asp = shared.asp_client.clone();
+            let asp = upstreams.asp_client.clone();
             let info = fetch_asp_info(&asp)?;
             let owner_pk_hex =
-                get_user_xonly_pubkey(state, shared.persistence.as_ref(), &user_id_hex)?;
+                get_user_xonly_pubkey(state, upstreams.persistence.as_ref(), &user_id_hex)?;
             let network = ark::client::parse_network(&info.network).map_err(Status::internal)?;
             let exit_delay = info.boarding_exit_delay as u32;
             let boarding_addr = ark::client::boarding_address(
@@ -184,7 +184,7 @@ impl Cosigner {
             )
             .map_err(|e| Status::internal(format!("boarding_address: {e}")))?;
             super::helpers::save_user_boarding_address(
-                shared.persistence.as_ref(),
+                upstreams.persistence.as_ref(),
                 &user_id_hex,
                 &boarding_addr,
             );
@@ -201,23 +201,23 @@ impl Cosigner {
         &mut self,
         req: ListVtxosRequest,
     ) -> Result<ListVtxosResponse, Status> {
-        let shared = self.shared.clone();
+        let upstreams = self.upstreams.clone();
         let span =
             tracing::info_span!("actor::list_vtxos", user_id = %parsers::user_id_hex(&req.user_id));
         run_blocking(self.state.clone(), move |state| {
             let _enter = span.enter();
-            let shared = shared.as_ref();
+            let upstreams = upstreams.as_ref();
             let user_id_hex = parsers::user_id_hex(&req.user_id);
             // Auth (OP_LIST_VTXOS) ran at the REST boundary.
-            let asp = shared.asp_client.clone();
+            let asp = upstreams.asp_client.clone();
             let info = fetch_asp_info(&asp)?;
             let network = ark::client::parse_network(&info.network).map_err(Status::internal)?;
 
             let owner_pk_hex =
-                get_user_xonly_pubkey(state, shared.persistence.as_ref(), &user_id_hex)?;
+                get_user_xonly_pubkey(state, upstreams.persistence.as_ref(), &user_id_hex)?;
 
             // Clients pick send inputs from this list, so spent entries must not survive it.
-            drop_spent_vtxos(state, shared, &user_id_hex);
+            drop_spent_vtxos(state, upstreams, &user_id_hex);
 
             let mut vtxos = Vec::new();
             let mut total_balance: u64 = 0;
@@ -262,27 +262,4 @@ impl Cosigner {
 }
 
 impl Cosigner {
-    pub async fn list_ark_transactions(
-        &mut self,
-        req: ListArkTransactionsRequest,
-    ) -> Result<ListArkTransactionsResponse, Status> {
-        let span = tracing::info_span!("actor::list_ark_transactions", user_id = %parsers::user_id_hex(&req.user_id));
-        run_blocking(self.state.clone(), move |state| {
-            let _enter = span.enter();
-            let _user_id_hex = parsers::user_id_hex(&req.user_id);
-            // Auth (OP_LIST_ARK_TXS) ran at the REST boundary.
-            let transactions = state
-                .ark_tx_history
-                .iter()
-                .map(|e| ArkTransactionSummary {
-                    tx_type: e.tx_type.clone(),
-                    amount_sats: e.amount_sats,
-                    txid: e.txid.clone(),
-                    timestamp: e.timestamp,
-                })
-                .collect();
-            Ok(ListArkTransactionsResponse { transactions })
-        })
-        .await
-    }
 }

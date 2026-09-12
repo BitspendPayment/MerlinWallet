@@ -1,6 +1,6 @@
 //! Per-user Onboarding ceremony state. Native Rust — no WASM. Owned by the
 //! `OnboardingManager`, accessed under a `parking_lot::Mutex`, evicted on TTL
-//! or after step3 finalizes. The FROST round state lives in the shared
+//! or after step3 finalizes. The FROST round state lives in the upstreams
 //! [`CeremonyRounds`] core; this adds only the Onboarding-specific bits.
 
 use std::time::Instant;

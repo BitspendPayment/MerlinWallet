@@ -7,7 +7,7 @@
 //! every stashed sender, then its own.
 //!
 //! Onboarding handlers deliberately do NOT call `auth_check`/`timestamp_check`: the
-//! user's owner key only exists once Onboarding completes, so there's no shared secret to
+//! user's owner key only exists once Onboarding completes, so there's no upstreams secret to
 //! verify against during the ceremony. Integrity comes from FROST itself plus
 //! TTL-bounded session state (`OnboardingManager::sweep_stale`).
 
@@ -24,7 +24,7 @@ use threshold::scalar::scalar_to_bytes;
 
 use super::ceremony::{self, drain_pairs_with_err, Reply};
 use crate::handlers::parsers;
-use crate::shared::SharedServices;
+use crate::upstreams::Upstreams;
 use crate::wallet_proto::{
     DkgStep1Request, DkgStep1Response, DkgStep2Request, DkgStep2Response, DkgStep3Request,
     DkgStep3Response,
@@ -48,7 +48,7 @@ fn req_identifier(bytes: &[u8]) -> Result<Identifier, Status> {
 #[tracing::instrument(skip_all, name = "onboarding::step1", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
 pub fn onboarding_step1(
     sess: &mut OnboardingSession,
-    _shared: &SharedServices,
+    _shared: &Upstreams,
     req: DkgStep1Request,
     reply: Reply<DkgStep1Response>,
 ) {
@@ -135,7 +135,7 @@ pub fn onboarding_step1(
 #[tracing::instrument(skip_all, name = "onboarding::step2", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
 pub fn onboarding_step2(
     sess: &mut OnboardingSession,
-    _shared: &SharedServices,
+    _shared: &Upstreams,
     req: DkgStep2Request,
     reply: Reply<DkgStep2Response>,
 ) {
@@ -187,7 +187,7 @@ pub fn onboarding_step2(
 #[tracing::instrument(skip_all, name = "onboarding::step3", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
 pub fn onboarding_step3(
     sess: &mut OnboardingSession,
-    shared: &SharedServices,
+    upstreams: &Upstreams,
     req: DkgStep3Request,
     reply: Reply<DkgStep3Response>,
 ) -> bool {
@@ -291,7 +291,7 @@ pub fn onboarding_step3(
             server_dkg_secret_hex,
         });
 
-        shared
+        upstreams
             .persistence
             .put("policy_owner_idx", &policy_user_id, &group_key)
             .map_err(|e| {
