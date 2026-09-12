@@ -50,8 +50,6 @@ type DkgStream = Pin<Box<dyn Stream<Item = Result<proto::DkgServerMsg, Status>> 
 type SendStream = Pin<Box<dyn Stream<Item = Result<proto::SendServerMsg, Status>> + Send + 'static>>;
 type SettleStream =
     Pin<Box<dyn Stream<Item = Result<proto::SettleServerMsg, Status>> + Send + 'static>>;
-type SettleDelegateStream =
-    Pin<Box<dyn Stream<Item = Result<proto::DelegateServerMsg, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl SigningSession for SessionService {
@@ -59,7 +57,6 @@ impl SigningSession for SessionService {
     type DkgStream = DkgStream;
     type SendStream = SendStream;
     type SettleStream = SettleStream;
-    type SettleDelegateStream = SettleDelegateStream;
 
     async fn sign(
         &self,
@@ -296,12 +293,14 @@ impl SigningSession for SessionService {
         Ok(Response::new(Box::pin(out) as DkgStream))
     }
 
-    /// A send as one session.
+    /// A send as one session, with the caller submitting.
     ///
     /// The unary form parked the half-built transactions on the actor between "build it" and
-    /// "submit it", discriminated by whether `signed_messages` was empty. Here the session is a
-    /// local: an abandoned send drops its half-signed transactions instead of leaving them
-    /// addressable by whoever sends the next request.
+    /// "submit it", and called the ASP itself for both `SubmitTx` and `FinalizeTx`. Here the
+    /// session is a local on this handler and the caller makes those two calls: the cosigner hands
+    /// over what to send and seals only once the ASP has accepted it, so an interrupted send leaves
+    /// neither a half-signed transaction addressable by the next request nor a recorded spend that
+    /// never happened.
     async fn send(
         &self,
         request: Request<Streaming<proto::SendClientMsg>>,
@@ -319,23 +318,24 @@ impl SigningSession for SessionService {
                 Some(proto::send_client_msg::Body::Open(o)) => o,
                 _ => Err(Status::invalid_argument("a session must open with SendOpen"))?,
             };
+            let info = open
+                .ark_info
+                .map(ark_info_from_proto)
+                .ok_or_else(|| Status::invalid_argument("SendOpen carried no ark_info"))?;
 
-            // --- Build ---------------------------------------------------------------------
-            //
             // The inputs come from the set the cosigner already holds, not from the request: a
             // caller cannot nominate VTXOs it does not own.
-            let (session, sighashes) = {
-                let mut actor = cosigner.lock().await;
+            let (mut session, change_exit_delay, sighashes) = {
+                let mut c = cosigner.lock().await;
                 let step1 = crate::types::SendVtxoStep1 {
                     user_id: open.user_id.clone(),
                     signature: open.signature.clone(),
                     timestamp_ms: open.timestamp_ms,
                     recipient_ark_address: open.recipient_ark_address.clone(),
                     amount: open.amount,
-                    vtxos: actor.vtxos().to_vec(),
+                    vtxos: c.vtxos().to_vec(),
                 };
-                let (s, delay, sighashes) = actor.send_open(step1).await.map_err(Status::internal)?;
-                ((s, delay), sighashes)
+                c.send_open(step1, &info).map_err(Status::internal)?
             };
 
             yield proto::SendServerMsg {
@@ -347,47 +347,79 @@ impl SigningSession for SessionService {
                 })),
             };
 
-            // --- Submit --------------------------------------------------------------------
-            let second = inbound
-                .next()
-                .await
-                .ok_or_else(|| Status::cancelled("stream closed before the signatures arrived"))??;
-            let signed = match second.body {
-                Some(proto::send_client_msg::Body::Signed(s)) => s,
+            // --- The caller's signatures, then what it must submit --------------------------
+            let signed = match next_send(&mut inbound).await? {
+                proto::send_client_msg::Body::Signed(s) => s,
                 _ => Err(Status::invalid_argument("expected SendSigned"))?,
             };
+            let (ark_tx_b64, checkpoint_txs) = {
+                let mut c = cosigner.lock().await;
+                c.send_prepare(
+                    &mut session,
+                    crate::types::SendVtxoStep2 {
+                        user_id: open.user_id.clone(),
+                        signature: open.signature.clone(),
+                        timestamp_ms: open.timestamp_ms,
+                        signed_messages: signed.signed_messages,
+                    },
+                )
+                .map_err(Status::internal)?
+            };
 
+            yield proto::SendServerMsg {
+                session_id: session_id.clone(),
+                seq: 2,
+                body: Some(proto::send_server_msg::Body::Submit(proto::SendSubmit {
+                    ark_tx_b64,
+                    checkpoint_txs,
+                })),
+            };
+
+            // --- What the ASP returned, turned into the finalize call -----------------------
+            let submitted = match next_send(&mut inbound).await? {
+                proto::send_client_msg::Body::Submitted(s) => s,
+                _ => Err(Status::invalid_argument("expected SendSubmitted"))?,
+            };
+            let final_checkpoint_txs = {
+                let mut c = cosigner.lock().await;
+                c.send_finalize(&mut session, &submitted.signed_checkpoint_txs)
+                    .map_err(Status::internal)?
+            };
+
+            yield proto::SendServerMsg {
+                session_id: session_id.clone(),
+                seq: 3,
+                body: Some(proto::send_server_msg::Body::Finalize(proto::SendFinalize {
+                    ark_txid: submitted.ark_txid.clone(),
+                    final_checkpoint_txs,
+                })),
+            };
+
+            // --- Accepted. Only now is it ours to record -----------------------------------
+            match next_send(&mut inbound).await? {
+                proto::send_client_msg::Body::Finalized(_) => {}
+                _ => Err(Status::invalid_argument("expected SendFinalized"))?,
+            }
             let req = wp::SendVtxoRequest {
                 user_id: open.user_id.clone(),
                 signature: open.signature.clone(),
                 timestamp_ms: open.timestamp_ms,
                 recipient_ark_address: open.recipient_ark_address.clone(),
                 amount: open.amount,
-                signed_messages: signed.signed_messages.clone(),
+                signed_messages: Vec::new(),
             };
-
             let resp = {
-                let mut actor = cosigner.lock().await;
-                let submitted = actor
-                    .send_finish(
-                        session,
-                        crate::types::SendVtxoStep2 {
-                            user_id: open.user_id,
-                            signature: open.signature,
-                            timestamp_ms: open.timestamp_ms,
-                            signed_messages: signed.signed_messages,
-                        },
-                    )
-                    .await
-                    .map_err(Status::internal)?;
-                let resp = actor.apply_send(&req, submitted);
-                actor.seal().await;
+                let mut c = cosigner.lock().await;
+                let submitted =
+                    c.send_complete((session, change_exit_delay), submitted.ark_txid);
+                let resp = c.apply_send(&req, submitted);
+                c.seal().await;
                 resp
             };
 
             yield proto::SendServerMsg {
                 session_id,
-                seq: 2,
+                seq: 4,
                 body: Some(proto::send_server_msg::Body::Complete(proto::SendComplete {
                     ark_txid: resp.ark_txid,
                     change: None,
@@ -398,19 +430,20 @@ impl SigningSession for SessionService {
         Ok(Response::new(Box::pin(out) as SendStream))
     }
 
-    /// Settling a boarding output, as one session.
+
+
+
+    /// Settling, with the caller driving the ASP round.
     ///
-    /// The rounds are driven by the actor's in-flight session rather than counted here: it yields
-    /// sighashes while it still needs signatures and a result when it does not, so the loop ends
-    /// when the ceremony does.
-    ///
-    /// The in-flight state still lives on the actor (`boarding_settle`), unlike `Sign` and `Send`
-    /// whose sessions are values now. That is the remaining instance of the same problem and it
-    /// wants the same fix; the transport moving first is what makes the fix expressible.
+    /// The cosigner answers each relayed event with what to send the ASP next and never opens a
+    /// socket of its own. `ark_info` arrives from the caller for the same reason: it is the one
+    /// talking to the ASP. See `settle.rs` for why that cannot redirect funds.
     async fn settle(
         &self,
         request: Request<Streaming<proto::SettleClientMsg>>,
     ) -> Result<Response<SettleStream>, Status> {
+        use crate::settle::SettleStep;
+
         let cosigner = self.cosigner.clone();
         let mut inbound = request.into_inner();
 
@@ -424,157 +457,172 @@ impl SigningSession for SessionService {
                 Some(proto::settle_client_msg::Body::Open(o)) => o,
                 _ => Err(Status::invalid_argument("a session must open with SettleOpen"))?,
             };
-            let boarding_utxo = open
-                .boarding_utxo
-                .map(|u| (u.txid, u.vout, u.amount_sats));
-
+            let info = open
+                .ark_info
+                .map(ark_info_from_proto)
+                .ok_or_else(|| Status::invalid_argument("SettleOpen carried no ark_info"))?;
+            let boarding_utxo = open.boarding_utxo.map(|u| (u.txid, u.vout, u.amount_sats));
             let user_id_hex = crate::handlers::parsers::user_id_hex(&open.user_id);
-            let mut signed_messages: Vec<Vec<u8>> = Vec::new();
-            let mut seq = 0u64;
+
+            let sighashes = {
+                let mut c = cosigner.lock().await;
+                c.settle_open(boarding_utxo, info).await.map_err(Status::internal)?
+            };
+
+            let mut seq = 1u64;
+            let mut step = SettleStep::Sighashes(sighashes);
 
             loop {
-                let outcome = {
-                    let mut actor = cosigner.lock().await;
-                    let utxo = if signed_messages.is_empty() { boarding_utxo.clone() } else { None };
-                    actor
-                        .boarding_settle(utxo, std::mem::take(&mut signed_messages))
-                        .await
-                        .map_err(|m| Status::internal(format!("BoardingSettle: {m}")))?
-                };
-                seq += 1;
-
-                match outcome {
-                    crate::types::BoardingSettleOutcome::Sighashes(messages_to_sign) => {
-                        yield proto::SettleServerMsg {
-                            session_id: session_id.clone(),
-                            seq,
-                            body: Some(proto::settle_server_msg::Body::Sighashes(
-                                proto::SettleSighashes { messages_to_sign, script_path_spend: true },
-                            )),
-                        };
-                        let next = inbound
-                            .next()
-                            .await
-                            .ok_or_else(|| Status::cancelled("stream closed mid-settle"))??;
-                        signed_messages = match next.body {
-                            Some(proto::settle_client_msg::Body::Signed(s)) => s.signed_messages,
-                            _ => Err(Status::invalid_argument("expected SettleSigned"))?,
-                        };
-                        if signed_messages.is_empty() {
-                            Err(Status::invalid_argument("SettleSigned carried no signatures"))?;
-                        }
+                // Say what we need, then read what the caller did about it.
+                let body = match step {
+                    SettleStep::Sighashes(messages_to_sign) => Some(
+                        proto::settle_server_msg::Body::Sighashes(proto::SettleSighashes {
+                            messages_to_sign,
+                            script_path_spend: true,
+                        }),
+                    ),
+                    SettleStep::Register { proof, message, topics } => Some(
+                        proto::settle_server_msg::Body::Register(proto::RegisterIntent {
+                            proof,
+                            message,
+                            topics,
+                        }),
+                    ),
+                    SettleStep::Submit(call) => {
+                        Some(proto::settle_server_msg::Body::Submit(asp_submit(call)))
                     }
-                    crate::types::BoardingSettleOutcome::Submitted(sub) => {
-                        let commitment_txid = {
-                            let mut actor = cosigner.lock().await;
-                            let txid = actor.apply_boarding_settle(&user_id_hex, sub);
-                            actor.seal().await;
-                            txid
+                    SettleStep::Idle => {
+                        Some(proto::settle_server_msg::Body::Idle(proto::SettleIdle {}))
+                    }
+                    SettleStep::Complete(sub) => {
+                        let complete = proto::SettleComplete {
+                            commitment_txid: sub.commitment_txid.clone(),
+                            vtxo_txid: sub.vtxo_txid.clone(),
+                            vtxo_vout: sub.vtxo_vout,
+                            amount_sats: sub.amount_sats,
+                            exit_delay: sub.exit_delay,
                         };
+                        {
+                            let mut c = cosigner.lock().await;
+                            c.apply_boarding_settle(&user_id_hex, sub);
+                            c.seal().await;
+                        }
                         yield proto::SettleServerMsg {
                             session_id,
                             seq,
-                            body: Some(proto::settle_server_msg::Body::Complete(
-                                proto::SettleComplete { commitment_txid },
-                            )),
+                            body: Some(proto::settle_server_msg::Body::Complete(complete)),
                         };
                         break;
                     }
-                }
+                };
+
+                yield proto::SettleServerMsg {
+                    session_id: session_id.clone(),
+                    seq,
+                    body,
+                };
+                seq += 1;
+
+                let msg = inbound
+                    .next()
+                    .await
+                    .ok_or_else(|| Status::cancelled("stream closed mid-settle"))??;
+                let body = msg
+                    .body
+                    .ok_or_else(|| Status::invalid_argument("empty SettleClientMsg"))?;
+
+                let mut c = cosigner.lock().await;
+                step = match body {
+                    proto::settle_client_msg::Body::Signed(s) => {
+                        c.settle_signed(s.signed_messages).map_err(Status::internal)?
+                    }
+                    proto::settle_client_msg::Body::Registered(r) => {
+                        c.settle_registered(r.intent_id).map_err(Status::internal)?;
+                        SettleStep::Idle
+                    }
+                    proto::settle_client_msg::Body::Event(e) => match decode_event(&e.encoded)? {
+                        Some(ev) => c.settle_on_event(ev).map_err(Status::internal)?,
+                        None => SettleStep::Idle,
+                    },
+                    proto::settle_client_msg::Body::Open(_) => {
+                        Err(Status::invalid_argument("the session is already open"))?
+                    }
+                };
             }
         };
 
         Ok(Response::new(Box::pin(out) as SettleStream))
     }
+}
 
-    /// Delegating a settle, as one session.
-    ///
-    /// The unary form also had a `store_only` mode: seal a `ReadyToSettle` delegate and let a 60s
-    /// background tick drive it later. That tick assumed an always-on process and is gone, and the
-    /// durable background task meant to replace it is not built, so there is no unattended path
-    /// here yet — this settles while the caller is on the stream.
-    async fn settle_delegate(
-        &self,
-        request: Request<Streaming<proto::DelegateClientMsg>>,
-    ) -> Result<Response<SettleDelegateStream>, Status> {
-        let cosigner = self.cosigner.clone();
-        let mut inbound = request.into_inner();
+async fn next_send(
+    inbound: &mut Streaming<proto::SendClientMsg>,
+) -> Result<proto::send_client_msg::Body, Status> {
+    let msg = inbound
+        .next()
+        .await
+        .ok_or_else(|| Status::cancelled("stream closed mid-send"))??;
+    msg.body
+        .ok_or_else(|| Status::invalid_argument("empty SendClientMsg"))
+}
 
-        let out = async_stream::try_stream! {
-            let first = inbound
-                .next()
-                .await
-                .ok_or_else(|| Status::invalid_argument("stream closed before it opened"))??;
-            let session_id = first.session_id.clone();
-            let open = match first.body {
-                Some(proto::delegate_client_msg::Body::Open(o)) => o,
-                _ => Err(Status::invalid_argument("a session must open with DelegateOpen"))?,
-            };
+/// One `GetEventStreamResponse` as it came off the ASP. `None` when the response carried no event,
+/// which the ASP does send — a keepalive is not an error.
+fn decode_event(
+    encoded: &[u8],
+) -> Result<Option<ark::client::proto::get_event_stream_response::Event>, Status> {
+    use prost::Message as _;
+    let resp = ark::client::proto::GetEventStreamResponse::decode(encoded)
+        .map_err(|e| Status::invalid_argument(format!("undecodable ASP event: {e}")))?;
+    Ok(resp.event)
+}
 
-            // --- Build the delegate --------------------------------------------------------
-            let sighashes = {
-                let mut actor = cosigner.lock().await;
-                let (vtxos, intent_valid_at) = actor.prepare_delegate()?;
-                actor.set_vtxos(vtxos);
-                actor
-                    .generate_delegate(crate::types::GenerateDelegate {
-                        user_id: open.user_id.clone(),
-                        signature: open.signature.clone(),
-                        timestamp_ms: open.timestamp_ms,
-                        intent_valid_at,
-                    })
-                    .await
-                    .map_err(|m| Status::internal(format!("GenerateDelegate: {m}")))?
-            };
-
-            yield proto::DelegateServerMsg {
-                session_id: session_id.clone(),
-                seq: 1,
-                body: Some(proto::delegate_server_msg::Body::Sighashes(
-                    proto::DelegateSighashes { messages_to_sign: sighashes, script_path_spend: true },
-                )),
-            };
-
-            // --- Apply the signatures and settle -------------------------------------------
-            let second = inbound
-                .next()
-                .await
-                .ok_or_else(|| Status::cancelled("stream closed before the signatures arrived"))??;
-            let signed = match second.body {
-                Some(proto::delegate_client_msg::Body::Signed(s)) => s,
-                _ => Err(Status::invalid_argument("expected DelegateSigned"))?,
-            };
-
-            let commitment_txid = {
-                let mut actor = cosigner.lock().await;
-                actor
-                    .apply_delegate_sigs(crate::types::ApplyDelegateSigs {
-                        user_id: open.user_id,
-                        signature: open.signature,
-                        timestamp_ms: open.timestamp_ms,
-                        signed_messages: signed.signed_messages,
-                    })
-                    .map_err(|m| Status::internal(format!("ApplyDelegateSigs: {m}")))?;
-                let submitted = actor
-                    .settle_delegate()
-                    .await
-                    .map_err(|m| Status::internal(format!("SettleDelegate: {m}")))?;
-                actor.seal().await;
-                submitted.commitment_txid
-            };
-
-            yield proto::DelegateServerMsg {
-                session_id,
-                seq: 2,
-                body: Some(proto::delegate_server_msg::Body::Complete(
-                    proto::DelegateComplete { commitment_txid },
-                )),
-            };
-        };
-
-        Ok(Response::new(Box::pin(out) as SettleDelegateStream))
+fn ark_info_from_proto(i: proto::ArkInfo) -> ark::client::types::ArkInfo {
+    ark::client::types::ArkInfo {
+        signer_pubkey: i.signer_pubkey,
+        forfeit_pubkey: i.forfeit_pubkey,
+        forfeit_address: i.forfeit_address,
+        checkpoint_tapscript: i.checkpoint_tapscript,
+        network: i.network,
+        session_duration: i.session_duration,
+        unilateral_exit_delay: i.unilateral_exit_delay,
+        boarding_exit_delay: i.boarding_exit_delay,
+        vtxo_min_amount: i.vtxo_min_amount,
+        dust: i.dust,
     }
 }
+
+fn asp_submit(call: crate::settle::AspCall) -> proto::AspSubmit {
+    use crate::settle::AspCall;
+    use proto::asp_submit::Call;
+    let call = match call {
+        AspCall::ConfirmRegistration { intent_id } => {
+            Call::ConfirmRegistration(proto::ConfirmRegistration { intent_id })
+        }
+        AspCall::TreeNonces { batch_id, pubkey, nonces } => Call::TreeNonces(proto::TreeNonces {
+            batch_id,
+            pubkey,
+            nonces: nonces.into_iter().collect(),
+        }),
+        AspCall::TreeSignatures { batch_id, pubkey, signatures } => {
+            Call::TreeSignatures(proto::TreeSignatures {
+                batch_id,
+                pubkey,
+                signatures: signatures.into_iter().collect(),
+            })
+        }
+        // The signed commitment rides the same call as the forfeits; the ASP takes both.
+        AspCall::ForfeitTxs { signed_txs, signed_commitment_b64 } => {
+            let mut signed = signed_txs;
+            if !signed_commitment_b64.is_empty() {
+                signed.push(signed_commitment_b64);
+            }
+            Call::ForfeitTxs(proto::ForfeitTxs { signed_txs: signed })
+        }
+    };
+    proto::AspSubmit { call: Some(call) }
+}
+
 // ===========================================================================
 // The wallet API, over gRPC.
 //
@@ -683,25 +731,7 @@ impl MpcWallet for WalletService {
     async fn settle_delegate(&self, _r: Request<wp::SettleDelegateRequest>) -> Result<Response<wp::SettleDelegateResponse>, Status> {
         Err(use_a_session("SettleDelegate"))
     }
-    /// The client-built send path: the wallet constructs and signs the transaction, and the
-    /// cosigner only submits it. One round, so it stays a call rather than a session.
-    async fn submit_ark_send(
-        &self,
-        request: Request<wp::SubmitArkSendRequest>,
-    ) -> Result<Response<wp::SubmitArkSendResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_SEND_VTXO)?;
-        let mut actor = self.cosigner.lock().await;
-        let (resp, paid_outputs) = actor.submit_ark_send(req).await?;
-        // If the tx pays an outstanding request, mark it fulfilled — recognised from the tx's own
-        // outputs, so the sealed intent stays the authority and the client never says which
-        // request it is paying.
-        if let Some(id) = actor.fulfil_intent_from_outputs(&paid_outputs, &resp.ark_txid) {
-            tracing::info!("payment request {id} fulfilled by {}", resp.ark_txid);
-            actor.seal().await;
-        }
-        Ok(Response::new(resp))
-    }
+
 
     // --- Gone with the contract layer ----------------------------------------------------------
     async fn contract_create(&self, _r: Request<wp::ContractCreateRequest>) -> Result<Response<wp::ContractCreateResponse>, Status> {

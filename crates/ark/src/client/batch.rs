@@ -61,7 +61,6 @@ use crate::client::proto;
 /// (see [`batch_includes_intent`]), and it is what establishes the batch id
 /// everything else is matched against. Heartbeat/StreamStarted are not
 /// batch-scoped.
-#[cfg(feature = "client")]
 pub fn foreign_batch_id<F>(event: &Event, is_ours: F) -> Option<String>
 where
     F: Fn(&str) -> bool,
@@ -89,7 +88,8 @@ pub fn batch_includes_intent(event: &proto::BatchStartedEvent, intent_id: &str) 
     let hash_hex: String = hash.as_byte_array().iter().map(|b| format!("{b:02x}")).collect();
     event.intent_id_hashes.iter().any(|h| h == &hash_hex)
 }
-#[cfg(feature = "client")]
+// A prost message type, not transport: classifying an event needs no ASP connection, and the guest
+// that drives a settle from relayed events needs exactly this.
 use crate::client::proto::get_event_stream_response::Event;
 
 // ---------------------------------------------------------------------------

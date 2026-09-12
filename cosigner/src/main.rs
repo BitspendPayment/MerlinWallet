@@ -50,9 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("ASP_URL is required".into());
     }
     tracing::info!("Connecting to ASP at {}", cfg.asp_url);
-    let asp_client = ark::client::AspClient::connect(&cfg.asp_url)
-        .await
-        .map_err(|e| format!("Failed to connect to ASP at {}: {e}", cfg.asp_url))?;
     tracing::info!("Connected to ASP");
 
     // FCM push client (optional; auto-settle still works without it).
@@ -91,7 +88,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let upstreams = Arc::new(upstreams::Upstreams::new(
         persistence,
-        asp_client,
         fcm,
         cfg.auto_settle_safety_margin_secs,
     ));

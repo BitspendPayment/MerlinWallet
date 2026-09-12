@@ -27,52 +27,14 @@ service SigningSession {
   // wait on the server in between. Same shape as the sign nonce, same answer.
   rpc Send(stream SendClientMsg) returns (stream SendServerMsg);
 
-  // Settling a boarding output takes a variable number of FROST rounds — the intent proof, then
-  // the commitment sighashes — which the unary `SettleRequest` expressed by returning
-  // `SIGNING_REQUIRED` and having the client call again. A loop states that directly: the server
-  // yields sighashes until it has none left, then yields the result.
+  // Settling, with the client driving the ASP round.
+  //
+  // The cosigner used to hold the ASP connection: it registered the intent, opened the event
+  // stream, and reacted to each event itself. That made it the Ark client as well as the signer.
+  // Here the client drives the round and relays each event; the cosigner answers with what to
+  // submit next, and never opens a socket. One RPC covers both shapes — a boarding output settles
+  // when `boarding_utxo` is set, a self-refresh when it is not.
   rpc Settle(stream SettleClientMsg) returns (stream SettleServerMsg);
-
-  // Delegating a settle: the wallet refreshes its own VTXOs, signing an intent the cosigner can
-  // submit. Two rounds, same reason as the rest.
-  rpc SettleDelegate(stream DelegateClientMsg) returns (stream DelegateServerMsg);
-}
-
-message DelegateClientMsg {
-  string session_id = 1;
-  uint64 seq = 2;
-  oneof body {
-    DelegateOpen open = 3;
-    DelegateSigned signed = 4;
-  }
-}
-
-message DelegateOpen {
-  bytes user_id = 1;
-  bytes signature = 2;
-  int64 timestamp_ms = 3;
-}
-
-message DelegateSigned {
-  repeated bytes signed_messages = 1;
-}
-
-message DelegateServerMsg {
-  string session_id = 1;
-  uint64 seq = 2;
-  oneof body {
-    DelegateSighashes sighashes = 3;
-    DelegateComplete complete = 4;
-  }
-}
-
-message DelegateSighashes {
-  repeated bytes messages_to_sign = 1;
-  bool script_path_spend = 2;
-}
-
-message DelegateComplete {
-  string commitment_txid = 1;
 }
 
 message SettleClientMsg {
@@ -81,17 +43,37 @@ message SettleClientMsg {
   oneof body {
     SettleOpen open = 3;
     SettleSigned signed = 4;
+    IntentRegistered registered = 5;
+    AspEvent event = 6;
   }
 }
 
-// One boarding output per settle. A longer list used to be silently truncated to its first
-// element, boarding one deposit and stranding the rest while the caller was told the batch
-// settled; the client settles them one at a time instead.
+// Opens the settle. `boarding_utxo` set settles that one output; absent refreshes the VTXOs the
+// cosigner already holds.
+//
+// `ark_info` comes from the caller because the caller is the one talking to the ASP. Lying about it
+// yields a transaction the ASP will not accept, or an address the liar cannot spend from — the
+// cosigner still derives every output from ITS OWN key, so a wrong `signer_pubkey` cannot redirect
+// funds, only waste a round.
 message SettleOpen {
   bytes user_id = 1;
   bytes signature = 2;
   int64 timestamp_ms = 3;
   BoardingUtxo boarding_utxo = 4;
+  ArkInfo ark_info = 5;
+}
+
+message ArkInfo {
+  string signer_pubkey = 1;
+  string forfeit_pubkey = 2;
+  string forfeit_address = 3;
+  string checkpoint_tapscript = 4;
+  string network = 5;
+  int64 session_duration = 6;
+  int64 unilateral_exit_delay = 7;
+  int64 boarding_exit_delay = 8;
+  int64 vtxo_min_amount = 9;
+  int64 dust = 10;
 }
 
 message BoardingUtxo {
@@ -104,12 +86,26 @@ message SettleSigned {
   repeated bytes signed_messages = 1;
 }
 
+// The id the ASP returned for `RegisterIntent`. The cosigner needs it to tell its own batch from
+// the ones a public ASP broadcasts for everybody else.
+message IntentRegistered {
+  string intent_id = 1;
+}
+
+// One `GetEventStreamResponse`, as it came off the ASP stream.
+message AspEvent {
+  bytes encoded = 1;
+}
+
 message SettleServerMsg {
   string session_id = 1;
   uint64 seq = 2;
   oneof body {
     SettleSighashes sighashes = 3;
-    SettleComplete complete = 4;
+    RegisterIntent register = 4;
+    AspSubmit submit = 5;
+    SettleIdle idle = 6;
+    SettleComplete complete = 7;
   }
 }
 
@@ -118,8 +114,45 @@ message SettleSighashes {
   bool script_path_spend = 2;
 }
 
+// What the caller must send the ASP as `RegisterIntent`, followed by `GetEventStream(topics)`.
+message RegisterIntent {
+  string proof = 1;
+  string message = 2;
+  repeated string topics = 3;
+}
+
+// The event was consumed and produced nothing to send. The caller relays the next one.
+message SettleIdle {}
+
+// One ASP call the caller must make on the cosigner's behalf.
+message AspSubmit {
+  oneof call {
+    ConfirmRegistration confirm_registration = 1;
+    TreeNonces tree_nonces = 2;
+    TreeSignatures tree_signatures = 3;
+    ForfeitTxs forfeit_txs = 4;
+  }
+}
+
+message ConfirmRegistration { string intent_id = 1; }
+message TreeNonces {
+  string batch_id = 1;
+  string pubkey = 2;
+  map<string, string> nonces = 3;
+}
+message TreeSignatures {
+  string batch_id = 1;
+  string pubkey = 2;
+  map<string, string> signatures = 3;
+}
+message ForfeitTxs { repeated string signed_txs = 1; }
+
 message SettleComplete {
   string commitment_txid = 1;
+  string vtxo_txid = 2;
+  uint32 vtxo_vout = 3;
+  uint64 amount_sats = 4;
+  uint32 exit_delay = 5;
 }
 
 message SendClientMsg {
@@ -128,8 +161,19 @@ message SendClientMsg {
   oneof body {
     SendOpen open = 3;
     SendSigned signed = 4;
+    SendSubmitted submitted = 5;
+    SendFinalized finalized = 6;
   }
 }
+
+// What the ASP returned for `SubmitTx`.
+message SendSubmitted {
+  string ark_txid = 1;
+  repeated string signed_checkpoint_txs = 2;
+}
+
+// `FinalizeTx` was accepted. Only now is the send durable enough to seal.
+message SendFinalized {}
 
 // Opens the send. The VTXOs to spend are not listed: the cosigner selects them from the set it
 // already holds, so a caller cannot nominate inputs it does not own.
@@ -139,6 +183,7 @@ message SendOpen {
   int64 timestamp_ms = 3;
   string recipient_ark_address = 4;
   uint64 amount = 5;
+  ArkInfo ark_info = 6;
 }
 
 message SendSigned {
@@ -150,8 +195,22 @@ message SendServerMsg {
   uint64 seq = 2;
   oneof body {
     SendSighashes sighashes = 3;
-    SendComplete complete = 4;
+    SendSubmit submit = 4;
+    SendFinalize finalize = 5;
+    SendComplete complete = 6;
   }
+}
+
+// Send these to the ASP as `SubmitTx`.
+message SendSubmit {
+  string ark_tx_b64 = 1;
+  repeated string checkpoint_txs = 2;
+}
+
+// Send these to the ASP as `FinalizeTx`.
+message SendFinalize {
+  string ark_txid = 1;
+  repeated string final_checkpoint_txs = 2;
 }
 
 message SendSighashes {

@@ -29,6 +29,7 @@ fn create_req(receiver_vk: &[u8]) -> PaymentRequestCreateRequest {
         expires_in_secs: 0,
         signature: vec![],
         timestamp_ms: 0,
+        ark_info: None,
     }
 }
 

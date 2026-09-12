@@ -30,16 +30,8 @@ pub async fn try_shared() -> Option<Arc<Upstreams>> {
     // `:memory:` — a fresh, private store per caller. Tests no longer share one namespace, so a
     // leftover key from a failed run can't leak into the next one.
     let store = Arc::new(SqliteStore::open(":memory:").expect("open in-memory store"));
-    let asp = match ark::client::AspClient::connect_lazy(&asp_url) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("skip: invalid ASP url {asp_url}: {e:?}");
-            return None;
-        }
-    };
     Some(Arc::new(Upstreams::new(
         store,
-        asp,
         None, // fcm
         1800, // auto_settle_safety_margin_secs
     )))

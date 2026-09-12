@@ -154,13 +154,10 @@ impl Cosigner {
             ));
         }
         let owner_xonly = from_vk_hex[2..].to_string();
-        let info = {
-            let asp_arc = self.upstreams.asp_client.clone();
-            let mut asp = asp_arc.lock().await;
-            asp.get_info()
-                .await
-                .map_err(|e| Status::unavailable(format!("ASP GetInfo: {e}")))?
-        };
+        let info = req
+            .ark_info
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("request carried no ark_info"))?;
         let network = ark::client::parse_network(&info.network).map_err(Status::internal)?;
         let to_ark_address = ark::client::ark_address(
             &owner_xonly,

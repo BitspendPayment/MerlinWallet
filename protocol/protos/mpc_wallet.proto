@@ -66,7 +66,9 @@ service MPCWallet {
   rpc SettleDelegate (SettleDelegateRequest) returns (SettleDelegateResponse);
 
   // Ark SubmitArkSend: client-built off-chain send, server proxies to ASP.
-  rpc SubmitArkSend (SubmitArkSendRequest) returns (SubmitArkSendResponse);
+  // SubmitArkSend removed. It relayed a client-built transaction to the ASP and counter-signed
+  // the checkpoints it returned — the cosigner acting as the caller's Ark client. The caller talks
+  // to the ASP itself now, and the Send session records what it paid.
 
   // Server deployment metadata. Unauthenticated — returns the cosigner-runtime's
   // configured Bitcoin network so clients render addresses with the right HRP
@@ -536,6 +538,19 @@ message PaymentIntent {
 
 // Sent by the REQUESTER but routed to the PAYER's actor: `user_id` is the requester (who signs),
 // while the URL/actor id is the payer. The payer's allowlist is the only authorization.
+message ArkInfo {
+  string signer_pubkey = 1;
+  string forfeit_pubkey = 2;
+  string forfeit_address = 3;
+  string checkpoint_tapscript = 4;
+  string network = 5;
+  int64 session_duration = 6;
+  int64 unilateral_exit_delay = 7;
+  int64 boarding_exit_delay = 8;
+  int64 vtxo_min_amount = 9;
+  int64 dust = 10;
+}
+
 message PaymentRequestCreateRequest {
   bytes user_id = 1;                 // the REQUESTER (signer) — not the payer
   uint64 amount_sats = 2;
@@ -543,6 +558,10 @@ message PaymentRequestCreateRequest {
   int64 expires_in_secs = 4;         // 0 ⇒ cosigner default
   bytes signature = 5;
   int64 timestamp_ms = 6;
+  // The ASP parameters the payee address is derived with. From the caller, because the caller is
+  // the one talking to the ASP — and it cannot redirect the payment with them: the address is
+  // derived from the ALLOWLISTED key, never a supplied one.
+  ArkInfo ark_info = 7;
 }
 message PaymentRequestCreateResponse {
   PaymentIntent intent = 1;

@@ -20,9 +20,9 @@ use crate::handlers;
 use crate::state::CosignerState;
 
 use crate::types::{
-    ApplyDelegateSigs, BoardingSettleOutcome, BoardingSettleSubmitted, Commitment,
+    ApplyDelegateSigs, BoardingSettleSubmitted, Commitment,
     Contact, ContractPairing, IntentStatus, PaymentIntent, PublicPolicy,
-    SendVtxoStep1, SendVtxoSubmitted, SettleSubmitted, SignStep1, SignStep1Out, SignStep2,
+    SendVtxoStep1, SendVtxoSubmitted, SignStep1, SignStep1Out, SignStep2,
     SignStep2Out, SnapshotState, VtxoInput,
 };
 
@@ -97,11 +97,14 @@ pub struct Ceremony {
 pub struct Cosigner {
     policy: Option<Policy>,
     /// A `ReadyToSettle` delegate session the core can drive autonomously (auto-settle).
-    delegate_session: Option<DelegateSettleSession>,
+    pub(crate) delegate_session: Option<DelegateSettleSession>,
     /// In-flight GUEST-style boarding settle, held across the commitment-FROST pause (the client
     /// must FROST-sign the commitment sighashes between step 2 and step 3). Native: no held stream
     /// (step 3 finalizes optimistically). Transient — never snapshotted.
-    boarding_settle: Option<BoardingSettleInFlight>,
+    pub(crate) boarding_settle: Option<BoardingSettleInFlight>,
+    /// The settle the caller is driving: which FROST round is open, the registered intent id, and
+    /// the ASP parameters it supplied. See [`crate::settle`].
+    pub(crate) settle_inflight: Option<crate::settle::InFlight>,
     /// The Ark cosigner (MuSig2) secret, hex — zeroized on drop. Used for tree signing.
     ark_cosigner_secret_hex: Option<Zeroizing<String>>,
     /// The owned spendable VTXO set.
@@ -195,6 +198,7 @@ impl Cosigner {
             policy: None,
             delegate_session: None,
             boarding_settle: None,
+            settle_inflight: None,
             ark_cosigner_secret_hex: None,
             vtxos: Vec::new(),
             contacts: Vec::new(),
@@ -529,30 +533,7 @@ impl Cosigner {
         Some(id)
     }
 
-    /// Fulfil a pending request from a settled tx's OUTPUTS — the client-built send path never
-    /// says which request it pays, so recognise it by what the tx actually pays. Matching the
-    /// stored intent (not a client claim) keeps the seal the authority.
-    pub(crate) fn fulfil_intent_from_outputs(
-        &mut self,
-        outputs: &[(String, u64)],
-        ark_txid: &str,
-    ) -> Option<String> {
-        let id = self
-            .payment_intents
-            .iter()
-            .filter(|i| i.status == IntentStatus::Pending)
-            .find(|i| {
-                let Ok(spk) = ark::client::ark_address_script_pubkey_hex(&i.to_ark_address) else {
-                    return false;
-                };
-                outputs
-                    .iter()
-                    .any(|(out_spk, amount)| *out_spk == spk && *amount == i.amount_sats)
-            })
-            .map(|i| i.id.clone())?;
-        self.fulfil_intent(&id, ark_txid).ok()?;
-        Some(id)
-    }
+
 
     /// Expire stale pending intents and drop old terminal ones; keeps the sealed list bounded.
     pub(crate) fn prune_intents(&mut self, now: i64) -> bool {
@@ -838,33 +819,6 @@ impl Cosigner {
         Ok(SignStep2Out { r_point, z_scalar })
     }
 
-    /// Boarding settle — the actor owns the phase via its in-flight session. No `signed_messages`
-    /// ⇒ START (abandon any in-flight session and rebuild). With sigs ⇒ advance the held session:
-    /// the commitment round if the event stream is still held, else the intent round. Acquires the
-    /// ASP client itself.
-    pub(crate) async fn boarding_settle(
-        &mut self,
-        boarding_utxo: Option<(String, u32, u64)>,
-        signed_messages: Vec<Vec<u8>>,
-    ) -> Result<BoardingSettleOutcome, String> {
-        let asp_arc = self.upstreams.asp_client.clone();
-        let mut asp = asp_arc.lock().await;
-        if signed_messages.is_empty() {
-            self.boarding_settle = None; // poll-without-sigs ⇒ abandon any in-flight, restart
-            let sighashes = self.boarding_settle_start(boarding_utxo, &mut asp).await?;
-            Ok(BoardingSettleOutcome::Sighashes(sighashes))
-        } else {
-            match self.boarding_settle.as_ref().map(|b| b.stream.is_some()) {
-                Some(true) => Ok(BoardingSettleOutcome::Submitted(
-                    self.boarding_settle_step3(signed_messages, &mut asp).await?,
-                )),
-                Some(false) => Ok(BoardingSettleOutcome::Sighashes(
-                    self.boarding_settle_step2(signed_messages, &mut asp).await?,
-                )),
-                None => Err("no active boarding settle".into()),
-            }
-        }
-    }
 
     /// Boarding settle START: derive the owner key (from the installed policy), the ASP info, and
     /// the boarding address ourselves, then build the session from the wallet-scanned `boarding_utxo`
@@ -872,15 +826,11 @@ impl Cosigner {
     pub(crate) async fn boarding_settle_start(
         &mut self,
         boarding_utxo: Option<(String, u32, u64)>,
-        asp: &mut AspClient,
+        info: &ArkInfo,
     ) -> Result<Vec<Vec<u8>>, String> {
         let owner_pk_hex = match self.owner_pk_hex() {
             Ok(o) => o,
             Err(e) => return Err(e),
-        };
-        let info = match asp.get_info().await {
-            Ok(i) => i,
-            Err(e) => return Err(format!("GetInfo: {e}")),
         };
         let network = match ark::client::parse_network(&info.network) {
             Ok(n) => n,
@@ -959,13 +909,16 @@ impl Cosigner {
 
     /// Delegate phase 1: build the pre-authorized intent + forfeit PSBTs (after `GetInfo`) and return
     /// the sighashes the client must FROST-sign. The Ark cosigner secret never leaves the core.
-    pub(crate) async fn generate_delegate(
+    pub(crate) async fn generate_delegate_for(
         &mut self,
-        req: GenerateDelegate,
+        info: &ArkInfo,
     ) -> Result<Vec<Vec<u8>>, String> {
-        // Auth (OP_SETTLE_DELEGATE) ran at the REST boundary.
-        let asp_arc = self.upstreams.asp_client.clone();
-        let mut asp = asp_arc.lock().await;
+        let req = GenerateDelegate {
+            user_id: Vec::new(),
+            signature: Vec::new(),
+            timestamp_ms: 0,
+            intent_valid_at: self.prepare_delegate().map(|(_, v)| v).unwrap_or(None),
+        };
         let (owner_pk_hex, cosigner_secret_hex, vtxos) = {
             let owner = match self.owner_pk_hex() {
                 Ok(o) => o,
@@ -976,11 +929,6 @@ impl Cosigner {
                 None => return Err("no Ark cosigner secret installed".into()),
             };
             (owner, secret, self.vtxos().to_vec())
-        };
-
-        let info = match asp.get_info().await {
-            Ok(i) => i,
-            Err(e) => return Err(format!("GetInfo: {e}")),
         };
 
         if vtxos.is_empty() {
@@ -1036,373 +984,19 @@ impl Cosigner {
         }
     }
 
-    /// Drive a delegate/auto-settle batch: register the pre-authorized intent, open the ASP event
-    /// stream, and run the MuSig2 tree-signing + forfeit loop to completion. Requires an installed
-    /// `ReadyToSettle` delegate session. Each arm runs a sync (secret-using) session step then an
-    /// `asp.*().await` — `self` and `asp` are disjoint, no held cross-await borrow.
-    pub(crate) async fn settle_delegate(&mut self) -> Result<SettleSubmitted, String> {
-        let asp_arc = self.upstreams.asp_client.clone();
-        let mut asp = asp_arc.lock().await;
-        let (proof, message, topics) = match self
-            .delegate_session
-            .as_ref()
-            .ok_or_else(|| "no delegate session installed".to_string())
-            .and_then(|s| s.register_payload())
-        {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
 
-        let intent_id = match asp.register_intent(proof, message).await {
-            Ok(id) => id,
-            Err(e) => return Err(format!("RegisterIntent: {e}")),
-        };
-        // The settled output uses the ASP's unilateral_exit_delay; capture it so the host
-        // records the right exit_delay on the consolidated VTXO (a wrong one re-derives a
-        // bad scriptPubKey → unspendable).
-        let settled_exit_delay = match asp.get_info().await {
-            Ok(i) => i.unilateral_exit_delay as u32,
-            Err(e) => return Err(format!("GetInfo (exit_delay): {e}")),
-        };
-        let mut stream = match asp.get_event_stream(topics).await {
-            Ok(s) => s,
-            Err(e) => return Err(format!("GetEventStream: {e}")),
-        };
 
-        loop {
-            let resp = match stream.message().await {
-                Ok(Some(r)) => r,
-                Ok(None) => return Err("event stream ended unexpectedly".into()),
-                Err(e) => return Err(format!("event stream: {e}")),
-            };
-            let Some(event) = resp.event else { continue };
-            // A foreign batch's Finalized/Failed/Tree* events must not drive this
-            // session: Finalized would be recorded as our settlement (wiping the
-            // VTXO set for a phantom outpoint) and Failed would abort a settle that
-            // is still waiting for its own batch.
-            let joined = self
-                .delegate_session
-                .as_ref()
-                .and_then(|s| s.joined_batch_id())
-                .map(str::to_owned);
-            if let Some(other) =
-                ark::client::batch::foreign_batch_id(&event, |id| joined.as_deref() == Some(id))
-            {
-                tracing::debug!("ignoring event for foreign batch {other}");
-                continue;
-            }
-            match event {
-                Event::BatchStarted(e) => {
-                    // A public ASP broadcasts BatchStarted for batches we are not in.
-                    // Confirming into one of those aborts it for its real participants
-                    // ("not enough intent confirmations received") and never settles ours.
-                    if !ark::client::batch::batch_includes_intent(&e, &intent_id) {
-                        continue;
-                    }
-                    if let Err(e) = self
-                        .delegate_session_mut()
-                        .ok_or_else(|| "no delegate session".to_string())
-                        .and_then(|s| s.on_batch_started(e))
-                    {
-                        return Err(e);
-                    }
-                    if let Err(e) = asp.confirm_registration(intent_id.clone()).await {
-                        return Err(format!("ConfirmRegistration: {e}"));
-                    }
-                }
-                Event::TreeTx(e) => {
-                    if let Err(e) = self
-                        .delegate_session_mut()
-                        .ok_or_else(|| "no delegate session".to_string())
-                        .and_then(|s| s.on_tree_tx(e))
-                    {
-                        return Err(e);
-                    }
-                }
-                Event::TreeSigningStarted(e) => {
-                    let (batch_id, pubkey, tree_nonces) = match self
-                        .delegate_session_mut()
-                        .ok_or_else(|| "no delegate session".to_string())
-                        .and_then(|s| s.on_tree_signing_started(e))
-                    {
-                        Ok(v) => v,
-                        Err(e) => return Err(e),
-                    };
-                    if let Err(e) = asp.submit_tree_nonces(&batch_id, pubkey, tree_nonces).await {
-                        return Err(format!("SubmitTreeNonces: {e}"));
-                    }
-                }
-                Event::TreeNonces(e) => {
-                    let maybe = match self
-                        .delegate_session_mut()
-                        .ok_or_else(|| "no delegate session".to_string())
-                        .and_then(|s| s.on_tree_nonces(e))
-                    {
-                        Ok(v) => v,
-                        Err(e) => return Err(e),
-                    };
-                    if let Some((batch_id, pubkey, tree_signatures)) = maybe {
-                        if let Err(e) = asp
-                            .submit_tree_signatures(&batch_id, pubkey, tree_signatures)
-                            .await
-                        {
-                            return Err(format!("SubmitTreeSignatures: {e}"));
-                        }
-                    }
-                }
-                Event::BatchFinalization(e) => {
-                    let maybe = match self
-                        .delegate_session_mut()
-                        .ok_or_else(|| "no delegate session".to_string())
-                        .and_then(|s| s.on_batch_finalization(e))
-                    {
-                        Ok(v) => v,
-                        Err(e) => return Err(e),
-                    };
-                    if let Some(signed_forfeit_txs) = maybe {
-                        if let Err(e) = asp
-                            .submit_signed_forfeit_txs(signed_forfeit_txs, String::new())
-                            .await
-                        {
-                            return Err(format!("SubmitSignedForfeitTxs: {e}"));
-                        }
-                    }
-                }
-                Event::BatchFinalized(e) => {
-                    let finalized = self.delegate_session_mut().map(|s| s.on_batch_finalized(e));
-                    self.delegate_session = None;
-                    return match finalized {
-                        Some((commitment_txid, vtxo_outpoint)) => Ok(SettleSubmitted {
-                            commitment_txid,
-                            vtxo_outpoint,
-                            exit_delay: settled_exit_delay,
-                        }),
-                        None => Err("no delegate session at finalize".into()),
-                    };
-                }
-                Event::BatchFailed(e) => {
-                    return Err(format!("batch failed: {}", e.reason))
-                }
-                _ => {}
-            }
-        }
-    }
 
-    /// Boarding settle step 2: insert the intent FROST sigs, RegisterIntent + open the event stream,
-    /// drive the batch (tree-signing in-core) to BatchFinalization, and return the commitment
-    /// sighashes (the pause — the client FROST-signs them, then calls step 3). The stream is dropped
-    /// at the pause; step 3 finalizes optimistically.
-    pub(crate) async fn boarding_settle_step2(
-        &mut self,
-        intent_sigs_wire: Vec<Vec<u8>>,
-        asp: &mut AspClient,
-    ) -> Result<Vec<Vec<u8>>, String> {
-        let intent_sigs = match sigs_from_wire(&intent_sigs_wire) {
-            Ok(s) => s,
-            Err(e) => return Err(e),
-        };
-        let inflight = match self.boarding_settle.as_mut() {
-            Some(b) => b,
-            None => return Err("no boarding settle in flight".into()),
-        };
-        if let Err(e) = inflight.session.insert_intent_signatures(intent_sigs) {
-            return Err(e);
-        }
-        let (proof, message, topics) = match inflight.session.register_payload() {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
-        let intent_id = match asp.register_intent(proof, message).await {
-            Ok(id) => id,
-            Err(e) => return Err(format!("RegisterIntent: {e}")),
-        };
-        let mut stream = match asp.get_event_stream(topics).await {
-            Ok(s) => s,
-            Err(e) => return Err(format!("GetEventStream: {e}")),
-        };
 
-        // Drive to BatchFinalization, returning the commitment sighashes (the pause).
-        loop {
-            let resp = match stream.message().await {
-                Ok(Some(r)) => r,
-                Ok(None) => return Err("event stream ended unexpectedly".into()),
-                Err(e) => return Err(format!("event stream: {e}")),
-            };
-            let Some(event) = resp.event else { continue };
-            let inflight = self.boarding_settle.as_mut().unwrap();
-            // Same gate as the delegate path — a foreign batch must not finalize or
-            // abort this boarding settle.
-            let joined = inflight.session.batch_id();
-            if let Some(other) =
-                ark::client::batch::foreign_batch_id(&event, |id| !joined.is_empty() && joined == id)
-            {
-                tracing::debug!("ignoring event for foreign batch {other}");
-                continue;
-            }
-            match event {
-                Event::BatchStarted(e) => {
-                    // Same filter as the delegate path: only join a batch that lists our
-                    // intent, or the ASP aborts it and boarding never settles.
-                    if !ark::client::batch::batch_includes_intent(&e, &intent_id) {
-                        continue;
-                    }
-                    if let Err(e) = inflight.session.on_batch_started(e) {
-                        return Err(e);
-                    }
-                    if let Err(e) = asp.confirm_registration(intent_id.clone()).await {
-                        return Err(format!("ConfirmRegistration: {e}"));
-                    }
-                }
-                Event::TreeTx(e) => {
-                    if let Err(e) = inflight.session.handle_tree_tx(e) {
-                        return Err(e);
-                    }
-                }
-                Event::TreeSigningStarted(e) => match inflight.session.on_tree_signing_started(e) {
-                    Ok(SettleAction::NeedTreeNonces {
-                        tree_tx_chunks,
-                        commitment_psbt_b64,
-                    }) => {
-                        let (pubkey, nonce_map) = match inflight
-                            .signer
-                            .gen_nonces(&tree_tx_chunks, &commitment_psbt_b64)
-                        {
-                            Ok(v) => v,
-                            Err(e) => return Err(e),
-                        };
-                        let batch_id = inflight.session.batch_id();
-                        if let Err(e) = asp
-                            .submit_tree_nonces(&batch_id, pubkey, nonce_map.into_iter().collect())
-                            .await
-                        {
-                            return Err(format!("SubmitTreeNonces: {e}"));
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => return Err(e),
-                },
-                Event::TreeNonces(e) => match inflight.session.on_tree_nonces(e) {
-                    Ok(Some(SettleAction::NeedTreeSign {
-                        pending_nonces,
-                        batch_expiry,
-                        forfeit_pk_hex,
-                    })) => {
-                        let (pubkey, sig_map) = match inflight.signer.sign(
-                            &pending_nonces,
-                            batch_expiry,
-                            &forfeit_pk_hex,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => return Err(e),
-                        };
-                        let batch_id = inflight.session.batch_id();
-                        if let Err(e) = asp
-                            .submit_tree_signatures(
-                                &batch_id,
-                                pubkey,
-                                sig_map.into_iter().collect(),
-                            )
-                            .await
-                        {
-                            return Err(format!("SubmitTreeSignatures: {e}"));
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => return Err(e),
-                },
-                Event::BatchFinalization(e) => {
-                    return match inflight.session.handle_batch_finalization(e) {
-                        Ok(sighashes) => {
-                            // Hold the open stream across the pause; step 3 drives it to BatchFinalized.
-                            inflight.stream = Some(stream);
-                            Ok(sighashes.iter().map(|s| s.to_vec()).collect())
-                        }
-                        Err(e) => Err(e),
-                    };
-                }
-                Event::BatchFinalized(_) => {
-                    return Err("batch finalized before commitment signing".into())
-                }
-                Event::BatchFailed(e) => {
-                    return Err(format!("batch failed: {}", e.reason))
-                }
-                _ => {}
-            }
-        }
-    }
 
-    /// Boarding settle step 3: insert the commitment FROST sigs, submit the signed commitment, and
-    /// finalize optimistically — returning the new VTXO.
-    pub(crate) async fn boarding_settle_step3(
-        &mut self,
-        commitment_sigs_wire: Vec<Vec<u8>>,
-        asp: &mut AspClient,
-    ) -> Result<BoardingSettleSubmitted, String> {
-        let commitment_sigs = match sigs_from_wire(&commitment_sigs_wire) {
-            Ok(s) => s,
-            Err(e) => return Err(e),
-        };
-        let mut inflight = match self.boarding_settle.take() {
-            Some(b) => b,
-            None => return Err("no boarding settle in flight".into()),
-        };
-        let signed_commitment_b64 = match inflight
-            .session
-            .insert_commitment_signatures(commitment_sigs)
-        {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
-        if let Err(e) = asp
-            .submit_signed_forfeit_txs(vec![], signed_commitment_b64)
-            .await
-        {
-            return Err(format!("SubmitSignedForfeitTxs: {e}"));
-        }
-        // Drive the held event stream to BatchFinalized so the new VTXO is settled + ASP-indexed
-        // before we return — an immediate send must find it (the optimistic txid is already correct;
-        // this just waits for the batch to commit).
-        // Only OUR batch finalizing means the VTXO is settled; a foreign one
-        // finishing first would otherwise end this wait early and report success.
-        let joined = inflight.session.batch_id();
-        if let Some(mut stream) = inflight.stream.take() {
-            loop {
-                match stream.message().await {
-                    Ok(Some(resp)) => match resp.event {
-                        Some(Event::BatchFinalized(e)) if e.id == joined => break,
-                        Some(Event::BatchFailed(e)) if e.id == joined => {
-                            return Err(format!("batch failed: {}", e.reason))
-                        }
-                        _ => continue,
-                    },
-                    Ok(None) => break,
-                    Err(e) => return Err(format!("event stream: {e}")),
-                }
-            }
-        }
-        let (commitment_txid, vtxo) = match inflight.session.finalize_optimistic() {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
-        let (vtxo_txid, vtxo_vout) = vtxo.unwrap_or_else(|| (commitment_txid.clone(), 0));
-        Ok(BoardingSettleSubmitted {
-            commitment_txid,
-            vtxo_txid,
-            vtxo_vout,
-            amount_sats: inflight.amount_sats,
-            exit_delay: inflight.exit_delay,
-        })
-    }
 
     /// Open a send: build the off-chain send tx (after `GetInfo`) and hand back the session
     /// alongside the sighashes the client must FROST-sign. Nothing about it is stored here.
-    pub async fn send_open(
+    pub fn send_open(
         &mut self,
         req: SendVtxoStep1,
+        info: &ArkInfo,
     ) -> Result<(SendSession, u32, Vec<Vec<u8>>), String> {
-        // Auth (OP_SEND_VTXO) ran at the REST boundary.
-        let asp_arc = self.upstreams.asp_client.clone();
-        let mut asp = asp_arc.lock().await;
         let total: u64 = req.vtxos.iter().map(|v| v.amount_sats).sum();
         if total < req.amount {
             return Err(format!(
@@ -1414,76 +1008,63 @@ impl Cosigner {
             Ok(o) => o,
             Err(e) => return Err(e),
         };
-        let info = match asp.get_info().await {
-            Ok(i) => i,
-            Err(e) => return Err(format!("GetInfo: {e}")),
-        };
-        build_send(&owner_pk_hex, &req.vtxos, &req, &info).map_err(|e| format!("build send: {e}"))
+        build_send(&owner_pk_hex, &req.vtxos, &req, info).map_err(|e| format!("build send: {e}"))
     }
 
-    /// Finish a send the caller opened. Takes the session by value: it holds the half-signed
-    /// transactions, so consuming it is what stops a second submit from reaching the same session.
-    pub async fn send_finish(
+    /// Insert the caller's signatures and hand back the transactions it must submit.
+    ///
+    /// The cosigner used to call `SubmitTx` itself. It signs; the caller submits.
+    pub fn send_prepare(
+        &mut self,
+        session: &mut SendSession,
+        req: SendVtxoStep2,
+    ) -> Result<(String, Vec<String>), String> {
+        let signatures = sigs_from_wire(&req.signed_messages)?;
+        session.sign_with_frost(signatures)?;
+        session
+            .prepare_submit()
+            .map_err(|e| format!("prepare submit: {e}"))
+    }
+
+    /// Turn the ASP's signed checkpoints into the final ones the caller sends back as `FinalizeTx`.
+    pub fn send_finalize(
+        &mut self,
+        session: &mut SendSession,
+        signed_checkpoint_txs: &[String],
+    ) -> Result<Vec<String>, String> {
+        session
+            .finalize_checkpoints(signed_checkpoint_txs)
+            .map_err(|e| format!("finalize checkpoints: {e}"))
+    }
+
+    /// Close the send once the ASP has accepted it.
+    ///
+    /// Takes the session by value: it holds the half-signed transactions, so consuming it is what
+    /// stops a second submit from reaching the same session. Only called after `FinalizeTx`
+    /// succeeded, so nothing is recorded for a send the ASP never took.
+    pub fn send_complete(
         &mut self,
         session: (SendSession, u32),
-        req: SendVtxoStep2,
-    ) -> Result<SendVtxoSubmitted, String> {
+        ark_txid: String,
+    ) -> SendVtxoSubmitted {
         let (mut session, change_exit_delay) = session;
-        // Auth (OP_SEND_VTXO) ran at the REST boundary.
-        let asp_arc = self.upstreams.asp_client.clone();
-        let mut asp = asp_arc.lock().await;
-        let signatures = match sigs_from_wire(&req.signed_messages) {
-            Ok(s) => s,
-            Err(e) => return Err(e),
-        };
-
-        let (ark_b64, checkpoints) = match session
-            .sign_with_frost(signatures)
-            .and_then(|_| session.prepare_submit())
-        {
-            Ok(x) => x,
-            Err(e) => return Err(format!("prepare submit: {e}")),
-        };
-
-        let submit = match asp.submit_tx(ark_b64, checkpoints).await {
-            Ok(r) => r,
-            Err(e) => return Err(format!("SubmitTx: {e}")),
-        };
-
-        let final_checkpoints = match session.finalize_checkpoints(&submit.signed_checkpoint_txs) {
-            Ok(c) => c,
-            Err(e) => return Err(format!("finalize checkpoints: {e}")),
-        };
-
-        if let Err(e) = asp
-            .finalize_tx(submit.ark_txid.clone(), final_checkpoints)
-            .await
-        {
-            return Err(format!("FinalizeTx: {e}"));
+        let change = session
+            .change_vtxo()
+            .map(|(txid, vout, amount)| (txid, vout, amount, change_exit_delay));
+        session.mark_done();
+        // The send spent all current VTXOs; re-add the change VTXO to the owned set, if any.
+        self.vtxos.clear();
+        if let Some((txid, vout, amount_sats, exit_delay)) = change.clone() {
+            self.vtxos.push(VtxoInput {
+                txid,
+                vout,
+                amount_sats,
+                exit_delay,
+            });
         }
-
-        let change = {
-            let change = session
-                .change_vtxo()
-                .map(|(txid, vout, amount)| (txid, vout, amount, change_exit_delay));
-            session.mark_done();
-            // The send spent all current VTXOs; re-add the change VTXO to the owned set, if any.
-            self.vtxos.clear();
-            if let Some((txid, vout, amount_sats, exit_delay)) = change.clone() {
-                self.vtxos.push(VtxoInput {
-                    txid,
-                    vout,
-                    amount_sats,
-                    exit_delay,
-                });
-            }
-            change
-        };
-        Ok(SendVtxoSubmitted {
-            ark_txid: submit.ark_txid,
-            change,
-        })
+        SendVtxoSubmitted { ark_txid, change }
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,13 +1150,11 @@ fn commitments_from_bytes(hiding: &[u8], binding: &[u8]) -> Result<SigningCommit
     })
 }
 
-use ark::client::batch::{DelegateOutput, DelegateVtxoInput, SettleAction};
-use ark::client::proto::get_event_stream_response::Event;
-use ark::client::AspClient;
+use ark::client::batch::{DelegateOutput, DelegateVtxoInput};
 
 use crate::types::{GenerateDelegate, SendVtxoStep2};
 
-fn sigs_from_wire(wire: &[Vec<u8>]) -> Result<Vec<[u8; 64]>, String> {
+pub(crate) fn sigs_from_wire(wire: &[Vec<u8>]) -> Result<Vec<[u8; 64]>, String> {
     wire.iter()
         .map(|v| {
             <[u8; 64]>::try_from(v.as_slice()).map_err(|_| "signature must be 64 bytes".to_string())
