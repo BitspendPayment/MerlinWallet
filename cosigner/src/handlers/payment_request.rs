@@ -180,19 +180,11 @@ impl Cosigner {
             .map_err(Status::invalid_argument)?;
         self.seal().await;
 
-        // Best-effort nudge: the sealed intent is the durable record, so a failed notification
-        // must never fail the request.
-        if let Some(fcm) = self.upstreams.fcm.clone() {
-            let persistence = self.upstreams.persistence.clone();
-            let payer = self.group_key().to_string();
-            let (amount, id) = (intent.amount_sats, intent.id.clone());
-            tokio::spawn(async move {
-                let tokens = super::helpers::load_user_device_tokens(persistence.as_ref(), &payer);
-                crate::store::push_payment_request(&fcm, &payer, &tokens, &id, amount)
-                    .await;
-            });
-        }
-
+        // No nudge from here. The cosigner used to push to the payer's device, which needed an
+        // FCM client, an outbound socket, and a detached task that outlived the call — in a
+        // per-request runtime it would fire after the instance was gone. Waking a device is the
+        // host's, through its task queue. The sealed intent is the durable record either way, and
+        // the app polls on resume.
         Ok(crate::wallet_proto::PaymentRequestCreateResponse {
             intent: Some(intent_to_proto(&intent, now)),
         })

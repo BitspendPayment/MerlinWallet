@@ -18,15 +18,7 @@ pub struct VtxoEntry {
     pub expires_at: i64,
 }
 
-/// One device registered for push notifications.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceToken {
-    pub fcm_token: String,
-    pub platform: String,
-    pub registered_at: i64,
-    #[serde(default)]
-    pub app_version: String,
-}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArkTxEntry {

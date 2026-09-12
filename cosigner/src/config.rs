@@ -17,15 +17,6 @@ pub struct ServerConfig {
     /// Auto-settle threshold: submit a stored delegate intent when
     /// `now > earliest_expires_at - this`. Default 30 minutes.
     pub auto_settle_safety_margin_secs: i64,
-    /// Decrypted FCM service-account JSON. Empty = push disabled.
-    /// In production this is filled by the enclave KMS-decrypt step before
-    /// the runtime starts; in dev set `FCM_SERVICE_ACCOUNT_JSON` directly.
-    pub fcm_service_account_json: String,
-    /// Override the FCM base URL (default `https://fcm.googleapis.com`).
-    /// Set in e2e tests to point at a local mock server. The OAuth token
-    /// endpoint is overridden separately via the `token_uri` field of the
-    /// service-account JSON itself.
-    pub fcm_base_url: String,
 }
 
 impl ServerConfig {
@@ -43,8 +34,6 @@ impl ServerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1800),
-            fcm_service_account_json: env::var("FCM_SERVICE_ACCOUNT_JSON").unwrap_or_default(),
-            fcm_base_url: env::var("FCM_BASE_URL").unwrap_or_default(),
         }
     }
 }

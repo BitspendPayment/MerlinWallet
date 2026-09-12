@@ -79,7 +79,10 @@ service MPCWallet {
   rpc GetServerInfo (GetServerInfoRequest) returns (GetServerInfoResponse);
 
   // Register an FCM token so the cosigner can wake the device when a VTXO arrives.
-  rpc RegisterDeviceToken (RegisterDeviceTokenRequest) returns (RegisterDeviceTokenResponse);
+  // RegisterDeviceToken removed. The token exists to wake a device with a push, and pushing is an
+  // outbound call the cosigner cannot make: it is called rather than running, and the notification
+  // used to go out on a detached task that a per-request runtime would drop. The host owns the push
+  // channel, so it owns the registry that feeds it.
 }
 
 // DKG Messages

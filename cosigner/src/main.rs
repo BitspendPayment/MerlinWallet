@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use cosigner::{config, fcm_client, kv_store, upstreams};
+use cosigner::{config, kv_store, upstreams};
 
 #[derive(Parser)]
 #[command(
@@ -53,42 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Connected to ASP");
 
     // FCM push client (optional; auto-settle still works without it).
-    let fcm = if cfg.fcm_service_account_json.trim().is_empty() {
-        tracing::warn!(
-            "FCM_SERVICE_ACCOUNT_JSON not set; push notifications disabled — \
-             auto-settle will only fire for users who open the app"
-        );
-        None
-    } else {
-        let base_url_override = if cfg.fcm_base_url.is_empty() {
-            None
-        } else {
-            Some(cfg.fcm_base_url.clone())
-        };
-        match fcm_client::FcmClient::from_service_account_json(
-            &cfg.fcm_service_account_json,
-            base_url_override,
-        ) {
-            Ok(client) => {
-                if !cfg.fcm_base_url.is_empty() {
-                    tracing::warn!(
-                        "FCM_BASE_URL override active: {} — push traffic NOT going to real Firebase",
-                        cfg.fcm_base_url
-                    );
-                }
-                tracing::info!("FCM client initialized");
-                Some(Arc::new(client))
-            }
-            Err(e) => {
-                tracing::error!("FCM init failed: {e}; push notifications disabled");
-                None
-            }
-        }
-    };
-
     let upstreams = Arc::new(upstreams::Upstreams::new(
         persistence,
-        fcm,
         cfg.auto_settle_safety_margin_secs,
     ));
 

@@ -87,19 +87,7 @@ pub fn save_user_vtxos(
     }
 }
 
-/// Persist a user's registered device tokens.
-pub fn save_user_device_tokens(
-    persistence: &dyn KvStore,
-    user_id_hex: &str,
-    tokens: &[crate::types::DeviceToken],
-) {
-    let user_id_hex = &group_key_of(persistence, user_id_hex);
-    if let Ok(json) = serde_json::to_string(tokens) {
-        if let Err(e) = persistence.put("device_tokens", user_id_hex, &json) {
-            tracing::warn!("persist device_tokens/{user_id_hex} failed: {e}");
-        }
-    }
-}
+
 
 
 
@@ -123,25 +111,7 @@ pub fn load_user_vtxos(
     }
 }
 
-/// Read back a user's registered FCM device tokens from persistence. Closes
-/// the gap from TODO #4 — without this, pushes silently no-op after a
-/// cosigner restart for any user who hasn't reopened the app since.
-pub fn load_user_device_tokens(
-    persistence: &dyn KvStore,
-    user_id_hex: &str,
-) -> Vec<crate::types::DeviceToken> {
-    let user_id_hex = &group_key_of(persistence, user_id_hex);
-    match persistence.get("device_tokens", user_id_hex) {
-        Ok(Some(json)) => match serde_json::from_str(&json) {
-            Ok(tokens) => tokens,
-            Err(e) => {
-                tracing::warn!("parse device_tokens/{user_id_hex} failed: {e}");
-                Vec::new()
-            }
-        },
-        _ => Vec::new(),
-    }
-}
+
 
 /// Record a user's boarding address so the boarding watcher can poll it. Keyed
 /// by the canonical group key (one entry per group).

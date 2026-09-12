@@ -7,7 +7,6 @@
 //! blocking task, which is the safe pattern for tokio's blocking pool.
 
 pub mod ark_send;
-pub mod device_token;
 pub mod helpers;
 pub mod onboarding;
 pub mod settle;

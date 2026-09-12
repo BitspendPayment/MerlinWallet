@@ -650,15 +650,6 @@ impl MpcWallet for WalletService {
         Ok(Response::new(out))
     }
 
-    async fn register_device_token(
-        &self,
-        request: Request<wp::RegisterDeviceTokenRequest>,
-    ) -> Result<Response<wp::RegisterDeviceTokenResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_REGISTER_DEVICE_TOKEN)?;
-        let out = self.cosigner.lock().await.register_device_token(req).await?;
-        Ok(Response::new(out))
-    }
 
 
 

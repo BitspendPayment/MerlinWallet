@@ -29,7 +29,6 @@ pub async fn try_shared() -> Option<Arc<Upstreams>> {
     let store = Arc::new(SqliteStore::open(":memory:").expect("open in-memory store"));
     Some(Arc::new(Upstreams::new(
         store,
-        None, // fcm
         1800, // auto_settle_safety_margin_secs
     )))
 }

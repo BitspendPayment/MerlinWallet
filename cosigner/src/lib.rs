@@ -8,7 +8,6 @@
 pub mod cosigner;
 pub mod auth;
 pub mod config;
-pub mod fcm_client;
 pub mod handlers;
 pub mod kv_store;
 pub mod session;

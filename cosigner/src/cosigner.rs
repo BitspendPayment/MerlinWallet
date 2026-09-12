@@ -19,7 +19,7 @@ use crate::handlers;
 
 use crate::types::{
     ApplyDelegateSigs, BoardingSettleSubmitted, Commitment,
-    Contact, DeviceToken, IntentStatus, PaymentIntent,
+    Contact, IntentStatus, PaymentIntent,
     SendVtxoStep1, SendVtxoSubmitted, SignStep1, SignStep1Out, SignStep2,
     SignStep2Out, SnapshotState, VtxoEntry, VtxoInput,
 };
@@ -114,8 +114,6 @@ pub struct Cosigner {
     pub(crate) group_key: String,
     /// The owned VTXO set, with the expiry a delegate's renewal deadline is computed from.
     pub(crate) owned_vtxos: Vec<VtxoEntry>,
-    /// Devices to push to. Pushes go to all of them.
-    pub(crate) device_tokens: Vec<DeviceToken>,
 }
 
 /// In-flight boarding settle, held across the commitment-FROST pause (the client FROST-signs the
@@ -147,23 +145,17 @@ impl Cosigner {
         Ok(cosigner)
     }
 
-    /// Read back what is stored outside the seal: the VTXO set with its expiry, and the devices to
-    /// push to.
+    /// Read back what is stored outside the seal: the VTXO set, with the expiry a delegate's
+    /// renewal deadline is computed from.
     fn load_owned(&mut self, group_key: &str) {
         use crate::handlers::helpers as h;
         let persistence = self.upstreams.persistence.as_ref();
         let vtxos = h::load_user_vtxos(persistence, group_key);
-        let device_tokens = h::load_user_device_tokens(persistence, group_key);
-        if vtxos.is_empty() && device_tokens.is_empty() {
+        if vtxos.is_empty() {
             return;
         }
-        tracing::info!(
-            vtxos = vtxos.len(),
-            device_tokens = device_tokens.len(),
-            "restored owned state"
-        );
+        tracing::info!(vtxos = vtxos.len(), "restored owned VTXOs");
         self.owned_vtxos = vtxos;
-        self.device_tokens = device_tokens;
     }
 
     pub fn group_key(&self) -> &str {
@@ -187,7 +179,6 @@ impl Cosigner {
             upstreams,
             group_key,
             owned_vtxos: Vec::new(),
-            device_tokens: Vec::new(),
         }
     }
 

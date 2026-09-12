@@ -11,7 +11,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::upstreams::Upstreams;
 
 use super::cosigner::Cosigner;
-use crate::types::DeviceToken;
 
 pub(crate) fn now_secs() -> i64 {
     SystemTime::now()
@@ -116,35 +115,6 @@ pub(crate) async fn restore_snapshot(
 
 
 
-/// Notify the payer that an allowlisted contact has asked them to pay. Best-effort — the intent is
-/// already sealed, and the app also polls on resume.
-pub async fn push_payment_request(
-    fcm: &std::sync::Arc<crate::fcm_client::FcmClient>,
-    payer_vk_hex: &str,
-    tokens: &[DeviceToken],
-    intent_id: &str,
-    amount_sats: u64,
-) {
-    if tokens.is_empty() {
-        return;
-    }
-    let mut data = std::collections::HashMap::new();
-    data.insert("type".to_string(), "payment_request".to_string());
-    data.insert("user_id".to_string(), payer_vk_hex.to_string());
-    data.insert("id".to_string(), intent_id.to_string());
-    data.insert("amount_sats".to_string(), amount_sats.to_string());
-    let body = format!("{amount_sats} sats — tap to review");
-    for token in tokens {
-        if let Err(e) = fcm
-            .send_notification(&token.fcm_token, "Payment requested", &body, &data)
-            .await
-        {
-            tracing::warn!(
-                "[{payer_vk_hex}] payment-request push to {} failed: {e}",
-                token.platform
-            );
-        }
-    }
-}
+
 
 
