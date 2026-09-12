@@ -36,7 +36,7 @@ use threshold::point;
 use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};
 use threshold::signing::{self, SignatureShare};
 
-use crate::upstreams::Upstreams;
+use crate::store::Store;
 
 const THRESHOLD_COUNT: usize = 2;
 
@@ -106,8 +106,8 @@ pub struct Cosigner {
     /// Request-to-pay records held for the payer (bounded; see `prune_intents`).
     payment_intents: Vec<PaymentIntent>,
     /// Global services (contract gate + ASP url). Held so `command()` is a drop-in for the old
-    /// `GuestInstance::command` — no per-call-site `upstreams` threading.
-    pub(crate) upstreams: Arc<Upstreams>,
+    /// `GuestInstance::command` — no per-call-site `store` threading.
+    pub(crate) store: Arc<Store>,
     /// This user's public projection (VTXOs / history / device tokens / policy metadata). The
     /// non-signing query + stream + inbox handlers are `impl Cosigner` methods over it.
     /// The group key this cosigner serves. Configuration, not something a caller names.
@@ -138,9 +138,9 @@ impl Cosigner {
     ///
     /// No seal yet is not an error. Before onboarding there is nothing to read, and DKG is what
     /// writes the first one.
-    pub async fn open(upstreams: Arc<Upstreams>, group_key: String) -> Result<Self, Status> {
-        let mut cosigner = Self::new(upstreams.clone(), group_key.clone());
-        crate::store::restore_snapshot(&mut cosigner, &upstreams, &group_key).await;
+    pub async fn open(store: Arc<Store>, group_key: String) -> Result<Self, Status> {
+        let mut cosigner = Self::new(store.clone(), group_key.clone());
+        crate::store::restore_snapshot(&mut cosigner, &store, &group_key).await;
         cosigner.load_owned(&group_key);
         Ok(cosigner)
     }
@@ -149,8 +149,7 @@ impl Cosigner {
     /// renewal deadline is computed from.
     fn load_owned(&mut self, group_key: &str) {
         use crate::handlers::helpers as h;
-        let persistence = self.upstreams.persistence.as_ref();
-        let vtxos = h::load_user_vtxos(persistence, group_key);
+        let vtxos = h::load_user_vtxos(self.store.as_ref(), group_key);
         if vtxos.is_empty() {
             return;
         }
@@ -162,11 +161,11 @@ impl Cosigner {
         &self.group_key
     }
 
-    pub fn upstreams(&self) -> &Arc<Upstreams> {
-        &self.upstreams
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
     }
 
-    fn new(upstreams: Arc<Upstreams>, group_key: String) -> Self {
+    fn new(store: Arc<Store>, group_key: String) -> Self {
         Self {
             policy: None,
             delegate_session: None,
@@ -176,7 +175,7 @@ impl Cosigner {
             vtxos: Vec::new(),
             contacts: Vec::new(),
             payment_intents: Vec::new(),
-            upstreams,
+            store,
             group_key,
             owned_vtxos: Vec::new(),
         }
@@ -264,15 +263,15 @@ impl Cosigner {
     pub fn prepare_delegate(
         &self,
     ) -> Result<(Vec<VtxoInput>, Option<u64>), Status> {
-        handlers::ark_send::build_delegate_step1(&self.owned_vtxos, &self.upstreams)
+        handlers::ark_send::build_delegate_step1(&self.owned_vtxos, &self.store)
     }
 
     /// Seal this actor's state. Storage is the whole of the persistence now, so a method that
     /// mutates durable state seals here rather than trusting its caller to remember.
     pub async fn seal(&mut self) {
-        let upstreams = self.upstreams.clone();
+        let store = self.store.clone();
         let group_key = self.group_key.clone();
-        crate::store::seal_snapshot(self, &upstreams, &group_key).await;
+        crate::store::seal_snapshot(self, &store, &group_key).await;
     }
 
     /// Record a settled boarding output: replace it in the host projection with the VTXO it
@@ -294,7 +293,7 @@ impl Cosigner {
             expires_at: 0,
         });
         handlers::helpers::save_user_vtxos(
-            self.upstreams.persistence.as_ref(),
+            self.store.as_ref(),
             user_id_hex,
             &self.owned_vtxos,
         );
@@ -313,7 +312,7 @@ impl Cosigner {
         let SendVtxoSubmitted { ark_txid, change } = submitted;
         let resp = crate::handlers::ark_send::apply_send_result(
             &mut self.owned_vtxos,
-            &self.upstreams,
+            &self.store.as_ref(),
             req,
             ark_txid.clone(),
             change,

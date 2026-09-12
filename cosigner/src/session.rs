@@ -159,7 +159,7 @@ impl SigningSession for SessionService {
         &self,
         request: Request<Streaming<proto::DkgClientMsg>>,
     ) -> Result<Response<DkgStream>, Status> {
-        let upstreams = { self.cosigner.lock().await.upstreams().clone() };
+        let store = { self.cosigner.lock().await.store().clone() };
         let cosigner = self.cosigner.clone();
         let mut inbound = request.into_inner();
 
@@ -208,7 +208,7 @@ impl SigningSession for SessionService {
             };
             let r3 = ob::dkg_finish(
                 &mut sess,
-                &upstreams,
+                &store,
                 wp::DkgStep3Request {
                     user_id: open.user_id.clone(),
                     identifier: round2.identifier,

@@ -1,17 +1,16 @@
 //! One cosigner, serving one wallet.
 //!
-//! [`Cosigner`] holds the keys, the FROST ceremonies and the Ark sessions; [`instance::Cosigner`]
-//! is the wallet this process serves, loaded from its seal. Tenancy is deliberately absent: the
-//! runtime this is built for hands an instance a filesystem already scoped to one client, so there
-//! is nothing here to route between.
+//! [`Cosigner`] is that wallet: its keys, its FROST ceremonies, its Ark sessions, loaded from its
+//! seal when the process opens. Tenancy is deliberately absent — the runtime this is built for
+//! hands an instance a filesystem already scoped to one client, so there is nothing here to route
+//! between — and so are outbound sockets: the ASP is driven by whoever calls, and waking a device
+//! is the host's. What is left talks to its [`store`] and to its caller.
 
-pub mod cosigner;
 pub mod auth;
 pub mod config;
+pub mod cosigner;
 pub mod handlers;
-pub mod kv_store;
 pub mod session;
-pub mod upstreams;
 pub mod store;
 pub mod types;
 

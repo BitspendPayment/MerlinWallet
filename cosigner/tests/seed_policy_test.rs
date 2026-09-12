@@ -10,7 +10,7 @@ mod common;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn install_policy_seals_without_plaintext() {
-    let Some(upstreams) = common::try_shared().await else {
+    let Some(store) = common::try_store().await else {
         return;
     };
 
@@ -20,20 +20,20 @@ async fn install_policy_seals_without_plaintext() {
     let group_key = hex::encode(pkp.verifying_key.serialize());
 
     // Install straight into the actor — note we never write the `policies` tree.
-    let cosigner = common::open_cosigner(&upstreams, &group_key).await;
+    let cosigner = common::open_cosigner(&store, &group_key).await;
     common::seed_policy(&cosigner, &group_key, kp_cosigner, kp_user, &pkp, None).await;
 
     // The actor sealed its state ⇒ a sealed_state blob exists for the group key.
-    let blob = upstreams.persistence.get("sealed_state", &group_key).unwrap();
+    let blob = store.get("sealed_state", &group_key).unwrap();
     assert!(blob.is_some(), "expected a sealed_state blob after install");
 
     // …and no plaintext policy was written/needed — the actor owns the keys.
-    let plaintext = upstreams.persistence.get("policies", &group_key).unwrap();
+    let plaintext = store.get("policies", &group_key).unwrap();
     assert!(
         plaintext.is_none(),
         "installing a policy must not require a plaintext copy in the `policies` tree"
     );
 
     // Drop the key this test wrote (the in-memory store dies with the test anyway).
-    let _ = upstreams.persistence.delete("sealed_state", &group_key);
+    let _ = store.delete("sealed_state", &group_key);
 }

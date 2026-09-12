@@ -56,7 +56,7 @@ fn client_round1(kp_user: &KeyPackage, message: &[u8; 32]) -> (nonce::SigningNon
 /// Seed, drop, reopen, and run a full ceremony against the reopened cosigner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sign_session_restores_seal_and_verifies() {
-    let Some(upstreams) = common::try_shared().await else {
+    let Some(store) = common::try_store().await else {
         return;
     };
 
@@ -66,12 +66,12 @@ async fn sign_session_restores_seal_and_verifies() {
     let (kp_user, kp_cosigner) = (&kps[0], &kps[1]);
     let message = [0x42u8; 32];
 
-    let seeder = common::open_cosigner(&upstreams, &group_key).await;
+    let seeder = common::open_cosigner(&store, &group_key).await;
     common::seed_policy(&seeder, &group_key, kp_cosigner, kp_user, &pkp, None).await;
     drop(seeder);
 
     // A fresh instance holds nothing in memory: the seal is where its keys come from.
-    let cosigner = common::open_cosigner(&upstreams, &group_key).await;
+    let cosigner = common::open_cosigner(&store, &group_key).await;
     let (user_nonce, req1) = client_round1(kp_user, &message);
     let user_id = req1.user_id.clone();
 
@@ -124,7 +124,7 @@ async fn sign_session_restores_seal_and_verifies() {
         .verify(&pkp.verifying_key, &message)
         .expect("aggregated 2-of-2 signature must verify under the group key");
 
-    let _ = upstreams.persistence.delete("sealed_state", &group_key);
+    let _ = store.delete("sealed_state", &group_key);
 }
 
 /// The property the redesign rests on: an abandoned ceremony leaves nothing reusable behind.
@@ -135,7 +135,7 @@ async fn sign_session_restores_seal_and_verifies() {
 /// it and the nonce is gone, and a second ceremony on the same cosigner gets fresh commitments.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abandoned_ceremony_leaves_no_reusable_nonce() {
-    let Some(upstreams) = common::try_shared().await else {
+    let Some(store) = common::try_store().await else {
         return;
     };
 
@@ -144,7 +144,7 @@ async fn abandoned_ceremony_leaves_no_reusable_nonce() {
     let (kp_user, kp_cosigner) = (&kps[0], &kps[1]);
     let message = [0x42u8; 32];
 
-    let cosigner = common::open_cosigner(&upstreams, &group_key).await;
+    let cosigner = common::open_cosigner(&store, &group_key).await;
     common::seed_policy(&cosigner, &group_key, kp_cosigner, kp_user, &pkp, None).await;
 
     // Open a ceremony and abandon it, as an interrupted stream does.
@@ -171,5 +171,5 @@ async fn abandoned_ceremony_leaves_no_reusable_nonce() {
     assert_ne!(a.hiding, b.hiding, "hiding commitment must not repeat across ceremonies");
     assert_ne!(a.binding, b.binding, "binding commitment must not repeat across ceremonies");
 
-    let _ = upstreams.persistence.delete("sealed_state", &group_key);
+    let _ = store.delete("sealed_state", &group_key);
 }

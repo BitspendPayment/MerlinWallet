@@ -35,7 +35,7 @@ fn parse_wire(wire: &std::collections::HashMap<String, String>) -> BTreeMap<Iden
 /// Run the full three rounds and check both sides land on the same group key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ceremony_derives_one_group_key() {
-    let Some(upstreams) = common::try_shared().await else {
+    let Some(store) = common::try_store().await else {
         return;
     };
 
@@ -73,7 +73,7 @@ async fn ceremony_derives_one_group_key() {
     // --- Its round 2 in, ours out with the key ----------------------------------------------
     let r3 = ob::dkg_finish(
         &mut sess,
-        &upstreams,
+        &store,
         DkgStep3Request {
             user_id: user_id.clone(),
             identifier: wallet_id.serialize().to_vec(),
@@ -111,8 +111,8 @@ async fn ceremony_derives_one_group_key() {
         "the wallet and the cosigner must derive the same group key"
     );
 
-    let _ = upstreams.persistence.delete("sealed_state", &mat.group_key);
-    let _ = upstreams.persistence.delete("policy_owner_idx", &hex::encode(&user_id));
+    let _ = store.delete("sealed_state", &mat.group_key);
+    let _ = store.delete("policy_owner_idx", &hex::encode(&user_id));
 }
 
 /// An abandoned ceremony leaves no key material anywhere.
@@ -122,7 +122,7 @@ async fn ceremony_derives_one_group_key() {
 /// gone, and a second ceremony starts from nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abandoned_ceremony_leaves_nothing() {
-    let Some(_upstreams) = common::try_shared().await else {
+    let Some(_store) = common::try_store().await else {
         return;
     };
 

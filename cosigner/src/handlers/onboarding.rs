@@ -32,7 +32,7 @@ use threshold::random;
 use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};
 
 use crate::handlers::parsers;
-use crate::upstreams::Upstreams;
+use crate::store::Store;
 use crate::wallet_proto::{DkgStep1Request, DkgStep1Response, DkgStep3Request, DkgStep3Response};
 
 /// Freshly-minted DKG key material, captured when round 3 finalizes so the caller can install it
@@ -306,7 +306,7 @@ fn compute_local_round2(sess: &mut OnboardingSession, user_id_hex: &str) -> Resu
 #[tracing::instrument(skip_all, name = "dkg::finish", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
 pub fn dkg_finish(
     sess: &mut OnboardingSession,
-    upstreams: &Upstreams,
+    store: &Store,
     req: DkgStep3Request,
 ) -> Result<DkgStep3Response, Status> {
     let user_id_hex = parsers::user_id_hex(&req.user_id);
@@ -407,8 +407,8 @@ pub fn dkg_finish(
             server_dkg_secret_hex,
         });
 
-        upstreams
-            .persistence
+        store
+            
             .put("policy_owner_idx", &policy_user_id, &group_key)
             .map_err(|e| {
                 tracing::error!("persist policy_owner_idx/{policy_user_id} failed: {e}");

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use cosigner::{config, kv_store, upstreams};
+use cosigner::{config, store};
 
 #[derive(Parser)]
 #[command(
@@ -39,24 +39,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Persistence: the single embedded SQLite KV backend, a file on the local data volume.
-    tracing::info!("Persistence: SQLite KV backend at {}", cfg.sqlite_path);
-    let persistence: Arc<dyn kv_store::KvStore> =
-        Arc::new(kv_store::SqliteStore::open(&cfg.sqlite_path)?);
-
-    // ASP connection — REQUIRED. The cosigner is an Ark wallet co-signer; it cannot serve without
-    // an ASP, so a missing URL or a failed connect is a hard startup error, not a soft fallback.
-    if cfg.asp_url.is_empty() {
-        return Err("ASP_URL is required".into());
-    }
-    tracing::info!("Connecting to ASP at {}", cfg.asp_url);
-    tracing::info!("Connected to ASP");
-
-    // FCM push client (optional; auto-settle still works without it).
-    let upstreams = Arc::new(upstreams::Upstreams::new(
-        persistence,
+    // The only thing this process opens: its own database, a file on the local data volume. No ASP
+    // connection, no push channel — the caller drives the Ark protocol and the host wakes devices.
+    tracing::info!("Store: SQLite at {}", cfg.sqlite_path);
+    let store = Arc::new(store::Store::open(
+        &cfg.sqlite_path,
         cfg.auto_settle_safety_margin_secs,
-    ));
+    )?);
 
     // One cosigner per process, named by COSIGNER_GROUP_KEY. Not optional: a cosigner serves one
     // wallet, and which wallet is configuration rather than something a caller names per request.
@@ -70,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(7075);
 
     let cosigner = std::sync::Arc::new(tokio::sync::Mutex::new(
-        cosigner::Cosigner::open(upstreams.clone(), group_key.clone()).await?,
+        cosigner::Cosigner::open(store.clone(), group_key.clone()).await?,
     ));
     let server_info = cosigner::wallet_proto::GetServerInfoResponse {
         bitcoin_network: cfg.bitcoin_network.clone(),

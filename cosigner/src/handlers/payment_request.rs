@@ -101,7 +101,7 @@ impl Cosigner {
     ) -> Result<crate::wallet_proto::ContactAddResponse, Status> {
         self.require_owner(&req.user_id)?;
         let vk_hex = super::helpers::group_key_of(
-            self.upstreams.persistence.as_ref(),
+            self.store.as_ref(),
             &hex::encode(&req.contact_verifying_key),
         );
         self.add_contact(vk_hex, req.label, crate::store::now_secs())
@@ -117,7 +117,7 @@ impl Cosigner {
     ) -> Result<crate::wallet_proto::ContactRemoveResponse, Status> {
         self.require_owner(&req.user_id)?;
         let vk_hex = super::helpers::group_key_of(
-            self.upstreams.persistence.as_ref(),
+            self.store.as_ref(),
             &hex::encode(&req.contact_verifying_key),
         );
         self.remove_contact(&vk_hex).map_err(Status::not_found)?;
@@ -137,7 +137,7 @@ impl Cosigner {
         // identity, and the key the payee address MUST derive from — a share key yields an address
         // the requester cannot spend, while the payment still appears to succeed.
         let from_vk_hex = super::helpers::group_key_of(
-            self.upstreams.persistence.as_ref(),
+            self.store.as_ref(),
             &hex::encode(&req.user_id),
         );
         if !self.is_contact(&from_vk_hex) {

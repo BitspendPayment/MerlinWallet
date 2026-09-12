@@ -1,7 +1,7 @@
 // Shared test helpers: each integration binary compiles this module and uses only part of it.
 #![allow(dead_code)]
 
-//! Shared setup for the integration tests. Builds `Upstreams` against the local dev stack.
+//! Shared setup for the integration tests. Builds `Store` against the local dev stack.
 //!
 //! Persistence is an in-process SQLite store, so there is no external dependency to reach and each
 //! `try_shared` call gets its own isolated database. The ASP channel is created lazily, so a
@@ -15,22 +15,19 @@ use std::sync::Arc;
 
 use rand::rngs::OsRng;
 
-use cosigner::kv_store::SqliteStore;
-use cosigner::upstreams::Upstreams;
+use cosigner::store::Store;
 
 use threshold::dkg::{self, Round1Package, Round2Package};
 use threshold::identifier::Identifier;
 use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::random;
 
-pub async fn try_shared() -> Option<Arc<Upstreams>> {
+pub async fn try_store() -> Option<Arc<Store>> {
     // `:memory:` — a fresh, private store per caller. Tests no longer share one namespace, so a
     // leftover key from a failed run can't leak into the next one.
-    let store = Arc::new(SqliteStore::open(":memory:").expect("open in-memory store"));
-    Some(Arc::new(Upstreams::new(
-        store,
-        1800, // auto_settle_safety_margin_secs
-    )))
+    Some(Arc::new(
+        Store::open(":memory:", 1800).expect("open in-memory store"),
+    ))
 }
 
 /// Host-side 2-of-2 DKG; even-Y-normalized outputs. Index 0 = user/client, 1 = cosigner/server.
@@ -92,9 +89,9 @@ pub fn dkg_2of2() -> (Vec<KeyPackage>, PublicKeyPackage) {
 }
 
 /// Open the cosigner this process serves, loading whatever its seal already holds.
-pub async fn open_cosigner(upstreams: &Arc<Upstreams>, group_key: &str) -> tokio::sync::Mutex<Cosigner> {
+pub async fn open_cosigner(store: &Arc<Store>, group_key: &str) -> tokio::sync::Mutex<Cosigner> {
     tokio::sync::Mutex::new(
-        Cosigner::open(upstreams.clone(), group_key.to_string())
+        Cosigner::open(store.clone(), group_key.to_string())
             .await
             .expect("open cosigner"),
     )

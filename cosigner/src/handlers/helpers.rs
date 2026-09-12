@@ -1,12 +1,12 @@
 //! Shared helpers for actor command handlers. Each function takes plain references to
-//! `CosignerState` and upstreams services so handlers can compose without locking.
+//! `CosignerState` and store services so handlers can compose without locking.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tonic::Status;
 
 use crate::auth::message::{build_auth_message, MAX_TIMESTAMP_DRIFT_MS};
-use crate::kv_store::KvStore;
+use crate::store::Store;
 
 
 
@@ -65,7 +65,7 @@ pub fn is_authorized_share(authorized_shares: &[String], claimed_share_hex: &str
 /// Resolve an addressing id (a member's verifying share) to its GROUP KEY
 /// (`cosigner_id`) via `policy_owner_idx`, so all of a group's per-user data is keyed
 /// by the one group key. Identity for a group key, or any id with no index entry.
-pub fn group_key_of(persistence: &dyn KvStore, id: &str) -> String {
+pub fn group_key_of(persistence: &Store, id: &str) -> String {
     persistence
         .get("policy_owner_idx", id)
         .ok()
@@ -75,7 +75,7 @@ pub fn group_key_of(persistence: &dyn KvStore, id: &str) -> String {
 
 /// Persist a user's VTXO list (best-effort; logs and ignores errors).
 pub fn save_user_vtxos(
-    persistence: &dyn KvStore,
+    persistence: &Store,
     user_id_hex: &str,
     vtxos: &[crate::types::VtxoEntry],
 ) {
@@ -95,7 +95,7 @@ pub fn save_user_vtxos(
 /// miss or parse failure. The vtxo_stream subscription will reconcile via its
 /// own dedup as ASP events arrive, so a stale read here is self-healing.
 pub fn load_user_vtxos(
-    persistence: &dyn KvStore,
+    persistence: &Store,
     user_id_hex: &str,
 ) -> Vec<crate::types::VtxoEntry> {
     let user_id_hex = &group_key_of(persistence, user_id_hex);
@@ -116,7 +116,7 @@ pub fn load_user_vtxos(
 /// Record a user's boarding address so the boarding watcher can poll it. Keyed
 /// by the canonical group key (one entry per group).
 pub fn save_user_boarding_address(
-    persistence: &dyn KvStore,
+    persistence: &Store,
     user_id_hex: &str,
     boarding_address: &str,
 ) {
@@ -128,7 +128,7 @@ pub fn save_user_boarding_address(
 
 /// The set of boarding outpoints (`txid:vout`) already pushed for, so the
 /// watcher notifies once per deposit and survives a restart.
-pub fn save_user_boarding_seen(persistence: &dyn KvStore, user_id_hex: &str, seen: &[String]) {
+pub fn save_user_boarding_seen(persistence: &Store, user_id_hex: &str, seen: &[String]) {
     let user_id_hex = &group_key_of(persistence, user_id_hex);
     if let Ok(json) = serde_json::to_string(seen) {
         if let Err(e) = persistence.put("boarding_seen_outpoints", user_id_hex, &json) {
@@ -137,7 +137,7 @@ pub fn save_user_boarding_seen(persistence: &dyn KvStore, user_id_hex: &str, see
     }
 }
 
-pub fn load_user_boarding_seen(persistence: &dyn KvStore, user_id_hex: &str) -> Vec<String> {
+pub fn load_user_boarding_seen(persistence: &Store, user_id_hex: &str) -> Vec<String> {
     let user_id_hex = &group_key_of(persistence, user_id_hex);
     match persistence.get("boarding_seen_outpoints", user_id_hex) {
         Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
@@ -153,7 +153,7 @@ pub fn load_user_boarding_seen(persistence: &dyn KvStore, user_id_hex: &str) -> 
 /// the in-memory `DelegateRecord` is cleared, the sled row must go too,
 /// otherwise the next actor spawn would rehydrate a stale intent that no
 /// longer matches `state.vtxos`.
-pub fn delete_user_delegate(persistence: &dyn KvStore, user_id_hex: &str) {
+pub fn delete_user_delegate(persistence: &Store, user_id_hex: &str) {
     let user_id_hex = &group_key_of(persistence, user_id_hex);
     if let Err(e) = persistence.delete("delegate_sessions", user_id_hex) {
         tracing::warn!("delete delegate_sessions/{user_id_hex} failed: {e}");
@@ -164,7 +164,7 @@ pub fn delete_user_delegate(persistence: &dyn KvStore, user_id_hex: &str) {
 /// marker so a stored delegate survives a runtime restart. The delegate itself lives in the guest's
 /// sealed snapshot; this is only the host's "fire at / has a pending delegate" record (replacing the
 /// legacy `delegate_sessions` row, which carried no secret either but needed the dkg-secret to rehydrate).
-pub fn save_guest_delegate_threshold(persistence: &dyn KvStore, user_id_hex: &str, threshold: i64) {
+pub fn save_guest_delegate_threshold(persistence: &Store, user_id_hex: &str, threshold: i64) {
     let user_id_hex = &group_key_of(persistence, user_id_hex);
     if let Err(e) = persistence.put(
         "guest_delegate_thresholds",
@@ -176,7 +176,7 @@ pub fn save_guest_delegate_threshold(persistence: &dyn KvStore, user_id_hex: &st
 }
 
 /// Read back the guest-delegate threshold marker. `None` on miss / parse error.
-pub fn load_guest_delegate_threshold(persistence: &dyn KvStore, user_id_hex: &str) -> Option<i64> {
+pub fn load_guest_delegate_threshold(persistence: &Store, user_id_hex: &str) -> Option<i64> {
     let user_id_hex = &group_key_of(persistence, user_id_hex);
     match persistence.get("guest_delegate_thresholds", user_id_hex) {
         Ok(Some(s)) => s.parse().ok(),
@@ -185,7 +185,7 @@ pub fn load_guest_delegate_threshold(persistence: &dyn KvStore, user_id_hex: &st
 }
 
 /// Drop the guest-delegate threshold marker (after the delegate auto-settles or is invalidated).
-pub fn delete_guest_delegate_threshold(persistence: &dyn KvStore, user_id_hex: &str) {
+pub fn delete_guest_delegate_threshold(persistence: &Store, user_id_hex: &str) {
     let user_id_hex = &group_key_of(persistence, user_id_hex);
     if let Err(e) = persistence.delete("guest_delegate_thresholds", user_id_hex) {
         tracing::warn!("delete guest_delegate_thresholds/{user_id_hex} failed: {e}");

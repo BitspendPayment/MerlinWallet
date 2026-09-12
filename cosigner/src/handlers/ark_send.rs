@@ -1,6 +1,6 @@
 //! Heavy Ark RPCs (send/redeem/settle/settle_delegate/submit_ark_send).
 //! Each handler runs synchronously in `spawn_blocking`; ASP gRPC calls are
-//! awaited via `Handle::current().block_on(...)` against the upstreams client.
+//! awaited via `Handle::current().block_on(...)` against the store client.
 
 use tonic::Status;
 
@@ -8,7 +8,7 @@ use crate::cosigner::Cosigner;
 use crate::handlers::parsers;
 use crate::types::VtxoEntry;
 use crate::types::VtxoInput;
-use crate::upstreams::Upstreams;
+use crate::store::Store;
 use crate::wallet_proto::*;
 
 use super::helpers::{
@@ -26,7 +26,7 @@ use super::helpers::{
 /// − the safety margin). The self-refresh output is computed from the cosigner's own key.
 pub fn build_delegate_step1(
     owned: &[VtxoEntry],
-    upstreams: &Upstreams,
+    store: &Store,
 ) -> Result<(Vec<VtxoInput>, Option<u64>), Status> {
     if owned.is_empty() {
         return Err(Status::failed_precondition("no VTXOs to settle"));
@@ -45,7 +45,7 @@ pub fn build_delegate_step1(
         .filter_map(|e| (e.expires_at > 0).then_some(e.expires_at))
         .min()
         .unwrap_or(0);
-    let margin = upstreams.auto_settle_safety_margin_secs;
+    let margin = store.auto_settle_safety_margin_secs;
     let intent_valid_at = if earliest > margin {
         Some((earliest - margin) as u64)
     } else {
@@ -58,7 +58,7 @@ pub fn build_delegate_step1(
 /// back whatever change it produced.
 pub fn apply_send_result(
     owned: &mut Vec<VtxoEntry>,
-    upstreams: &Upstreams,
+    store: &Store,
     req: &SendVtxoRequest,
     ark_txid: String,
     change: Option<(String, u32, u64, u32)>,
@@ -66,8 +66,8 @@ pub fn apply_send_result(
     let user_id_hex = parsers::user_id_hex(&req.user_id);
     owned.clear();
     // The send consumed the VTXOs a stored delegate may cover, so it can no longer be settled.
-    delete_user_delegate(upstreams.persistence.as_ref(), &user_id_hex);
-    super::helpers::delete_guest_delegate_threshold(upstreams.persistence.as_ref(), &user_id_hex);
+    delete_user_delegate(store, &user_id_hex);
+    super::helpers::delete_guest_delegate_threshold(store, &user_id_hex);
     if let Some((txid, vout, amount, exit_delay)) = change {
         tracing::info!(
             "[{user_id_hex}] SendVtxo: change VTXO txid={txid}, vout={vout}, amount={amount}, exit_delay={exit_delay}"
@@ -81,7 +81,7 @@ pub fn apply_send_result(
             expires_at: 0,
         });
     }
-    save_user_vtxos(upstreams.persistence.as_ref(), &user_id_hex, owned);
+    save_user_vtxos(store, &user_id_hex, owned);
     SendVtxoResponse {
         status: send_vtxo_response::Status::Settled as i32,
         messages_to_sign: vec![],
