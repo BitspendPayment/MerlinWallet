@@ -22,27 +22,37 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::cosigner::Cosigner;
+use crate::wallet_proto as wp;
 use crate::types::{SignStep1, SignStep2};
 
 pub mod proto {
     #![allow(clippy::all)]
-    tonic::include_proto!("mpc_wallet.session.v1");
+    tonic::include_proto!("cosigner.v1");
 }
 
-use proto::signing_session_server::SigningSession;
+use proto::cosigner_server::Cosigner as CosignerRpc;
 use proto::{
     sign_client_msg, sign_server_msg, Commitment, SignClientMsg, SignComplete, SignCommitments,
     SignServerMsg,
 };
 
-pub struct SessionService {
+pub struct CosignerService {
     cosigner: Arc<Mutex<Cosigner>>,
+    server_info: wp::GetServerInfoResponse,
 }
 
-impl SessionService {
-    pub fn new(cosigner: Arc<Mutex<Cosigner>>) -> Self {
-        Self { cosigner }
+impl CosignerService {
+    pub fn new(cosigner: Arc<Mutex<Cosigner>>, server_info: wp::GetServerInfoResponse) -> Self {
+        Self {
+            cosigner,
+            server_info,
+        }
     }
+}
+
+/// Check the caller's auth signature.
+fn check(user_id: &[u8], signature: &[u8], timestamp_ms: i64, op: &str) -> Result<(), Status> {
+    crate::handlers::helpers::verify_auth(user_id, signature, timestamp_ms, op)
 }
 
 type SignStream = Pin<Box<dyn Stream<Item = Result<SignServerMsg, Status>> + Send + 'static>>;
@@ -52,7 +62,7 @@ type SettleStream =
     Pin<Box<dyn Stream<Item = Result<proto::SettleServerMsg, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
-impl SigningSession for SessionService {
+impl CosignerRpc for CosignerService {
     type SignStream = SignStream;
     type DkgStream = DkgStream;
     type SendStream = SendStream;
@@ -510,6 +520,84 @@ impl SigningSession for SessionService {
 
         Ok(Response::new(Box::pin(out) as SettleStream))
     }
+
+    // -------------------------------------------------------------------------------------------
+    // The single-round calls. Nothing is held between messages, so a stream would buy nothing.
+    // -------------------------------------------------------------------------------------------
+
+    async fn contact_list(
+        &self,
+        request: Request<wp::ContactListRequest>,
+    ) -> Result<Response<wp::ContactListResponse>, Status> {
+        let req = request.into_inner();
+        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_CONTACT_LIST)?;
+        let out = self.cosigner.lock().await.contact_list(req).await?;
+        Ok(Response::new(out))
+    }
+
+    async fn payment_request_list(
+        &self,
+        request: Request<wp::PaymentRequestListRequest>,
+    ) -> Result<Response<wp::PaymentRequestListResponse>, Status> {
+        let req = request.into_inner();
+        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_PAYREQ_LIST)?;
+        let out = self.cosigner.lock().await.payment_request_list(req).await?;
+        Ok(Response::new(out))
+    }
+
+    async fn get_server_info(
+        &self,
+        _request: Request<wp::GetServerInfoRequest>,
+    ) -> Result<Response<wp::GetServerInfoResponse>, Status> {
+        Ok(Response::new(self.server_info.clone()))
+    }
+
+    async fn contact_add(
+        &self,
+        request: Request<wp::ContactAddRequest>,
+    ) -> Result<Response<wp::ContactAddResponse>, Status> {
+        let req = request.into_inner();
+        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_CONTACT_ADD)?;
+        let out = self.cosigner.lock().await.contact_add(req).await?;
+        Ok(Response::new(out))
+    }
+
+    async fn contact_remove(
+        &self,
+        request: Request<wp::ContactRemoveRequest>,
+    ) -> Result<Response<wp::ContactRemoveResponse>, Status> {
+        let req = request.into_inner();
+        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_CONTACT_REMOVE)?;
+        let out = self.cosigner.lock().await.contact_remove(req).await?;
+        Ok(Response::new(out))
+    }
+
+    async fn payment_request_decline(
+        &self,
+        request: Request<wp::PaymentRequestDeclineRequest>,
+    ) -> Result<Response<wp::PaymentRequestDeclineResponse>, Status> {
+        let req = request.into_inner();
+        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_PAYREQ_DECLINE)?;
+        let mut actor = self.cosigner.lock().await;
+        actor.require_owner(&req.user_id)?;
+        actor.decline_intent(&req.id).map_err(Status::invalid_argument)?;
+        actor.seal().await;
+        Ok(Response::new(wp::PaymentRequestDeclineResponse { ok: true }))
+    }
+
+    /// The deliberate exception: signed by the REQUESTER, not this wallet's owner. The payer's
+    /// contact allowlist is what authorizes it, which is why there is no `require_owner` here — and
+    /// why one cosigner per process suits it: the requester addresses the payer's endpoint.
+    async fn payment_request_create(
+        &self,
+        request: Request<wp::PaymentRequestCreateRequest>,
+    ) -> Result<Response<wp::PaymentRequestCreateResponse>, Status> {
+        let req = request.into_inner();
+        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_PAYREQ_CREATE)?;
+        let out = self.cosigner.lock().await.payment_request_create(req).await?;
+        Ok(Response::new(out))
+    }
+
 }
 
 async fn next_send(
@@ -578,161 +666,4 @@ fn asp_submit(call: crate::handlers::settle::AspCall) -> proto::AspSubmit {
         }
     };
     proto::AspSubmit { call: Some(call) }
-}
-
-// ===========================================================================
-// The wallet API, over gRPC.
-//
-// `mpc_wallet.proto` has declared these RPCs all along; the server only ever served them as REST,
-// so the proto was a message-definition file with an unimplemented service attached. This is that
-// service, which is what lets `rest_api.rs` go: one transport, and the ceremonies that need a
-// channel open in both directions get one.
-//
-// Auth is still `verify_auth` per call, as the REST layer did. That is transitional — the runtime
-// this is heading for verifies a passkey assertion per interaction and hands the guest an already
-// authenticated cosigner, at which point this disappears rather than being ported.
-// ===========================================================================
-
-use crate::wallet_proto::mpc_wallet_server::MpcWallet;
-use crate::wallet_proto as wp;
-
-pub struct WalletService {
-    cosigner: Arc<Mutex<Cosigner>>,
-    server_info: wp::GetServerInfoResponse,
-}
-
-impl WalletService {
-    pub fn new(
-        cosigner: Arc<Mutex<Cosigner>>,
-        server_info: wp::GetServerInfoResponse,
-    ) -> Self {
-        Self { cosigner, server_info }
-    }
-}
-
-/// Ceremonies that are sessions, not calls. Kept as explicit refusals rather than partial unary
-/// implementations: a half-ported ceremony that appears to work is worse than one that says it is
-/// not here. `Sign` already lives on `SigningSession`; the rest follow.
-fn use_a_session(name: &str) -> Status {
-    Status::unimplemented(format!(
-        "{name} is a multi-round ceremony and is moving to a bidirectional session (see \
-         cosign_session.proto); the unary form is being removed, not reimplemented"
-    ))
-}
-
-/// Check the caller's auth signature, exactly as `dispatch_json!` did before it.
-fn check(user_id: &[u8], signature: &[u8], timestamp_ms: i64, op: &str) -> Result<(), Status> {
-    crate::handlers::helpers::verify_auth(user_id, signature, timestamp_ms, op)
-}
-
-#[tonic::async_trait]
-impl MpcWallet for WalletService {
-
-
-
-    async fn contact_list(
-        &self,
-        request: Request<wp::ContactListRequest>,
-    ) -> Result<Response<wp::ContactListResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_CONTACT_LIST)?;
-        let out = self.cosigner.lock().await.contact_list(req).await?;
-        Ok(Response::new(out))
-    }
-
-    async fn payment_request_list(
-        &self,
-        request: Request<wp::PaymentRequestListRequest>,
-    ) -> Result<Response<wp::PaymentRequestListResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_PAYREQ_LIST)?;
-        let out = self.cosigner.lock().await.payment_request_list(req).await?;
-        Ok(Response::new(out))
-    }
-
-
-
-
-    async fn get_server_info(
-        &self,
-        _request: Request<wp::GetServerInfoRequest>,
-    ) -> Result<Response<wp::GetServerInfoResponse>, Status> {
-        Ok(Response::new(self.server_info.clone()))
-    }
-
-    async fn send_vtxo(&self, _r: Request<wp::SendVtxoRequest>) -> Result<Response<wp::SendVtxoResponse>, Status> {
-        Err(use_a_session("SendVtxo"))
-    }
-    async fn settle(&self, _r: Request<wp::SettleRequest>) -> Result<Response<wp::SettleResponse>, Status> {
-        Err(use_a_session("Settle"))
-    }
-    async fn settle_delegate(&self, _r: Request<wp::SettleDelegateRequest>) -> Result<Response<wp::SettleDelegateResponse>, Status> {
-        Err(use_a_session("SettleDelegate"))
-    }
-
-
-    // --- Gone with the contract layer ----------------------------------------------------------
-    async fn contract_create(&self, _r: Request<wp::ContractCreateRequest>) -> Result<Response<wp::ContractCreateResponse>, Status> {
-        Err(Status::unimplemented("the eVTXO/contract layer is not part of this API"))
-    }
-    async fn evtxo_pending_shares(&self, _r: Request<wp::EvtxoPendingSharesRequest>) -> Result<Response<wp::EvtxoPendingSharesResponse>, Status> {
-        Err(Status::unimplemented("the eVTXO/contract layer is not part of this API"))
-    }
-    async fn evtxo_ack_share(&self, _r: Request<wp::EvtxoAckShareRequest>) -> Result<Response<wp::EvtxoAckShareResponse>, Status> {
-        Err(Status::unimplemented("the eVTXO/contract layer is not part of this API"))
-    }
-    async fn redeem_vtxo(&self, _r: Request<wp::RedeemVtxoRequest>) -> Result<Response<wp::RedeemVtxoResponse>, Status> {
-        Err(Status::unimplemented("RedeemVtxo is not implemented"))
-    }
-
-    // --- Owner-only mutations -------------------------------------------------------------------
-    //
-    // `require_owner`, not the wider signing test: adding yourself to a wallet's contact allowlist
-    // is enough to bill it, since the allowlist is the only gate on `payment_request_create`.
-
-    async fn contact_add(
-        &self,
-        request: Request<wp::ContactAddRequest>,
-    ) -> Result<Response<wp::ContactAddResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_CONTACT_ADD)?;
-        let out = self.cosigner.lock().await.contact_add(req).await?;
-        Ok(Response::new(out))
-    }
-
-    async fn contact_remove(
-        &self,
-        request: Request<wp::ContactRemoveRequest>,
-    ) -> Result<Response<wp::ContactRemoveResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_CONTACT_REMOVE)?;
-        let out = self.cosigner.lock().await.contact_remove(req).await?;
-        Ok(Response::new(out))
-    }
-
-    async fn payment_request_decline(
-        &self,
-        request: Request<wp::PaymentRequestDeclineRequest>,
-    ) -> Result<Response<wp::PaymentRequestDeclineResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_PAYREQ_DECLINE)?;
-        let mut actor = self.cosigner.lock().await;
-        actor.require_owner(&req.user_id)?;
-        actor.decline_intent(&req.id).map_err(Status::invalid_argument)?;
-        actor.seal().await;
-        Ok(Response::new(wp::PaymentRequestDeclineResponse { ok: true }))
-    }
-
-    /// The deliberate exception: signed by the REQUESTER, not this wallet's owner. The payer's
-    /// contact allowlist is what authorizes it, which is why there is no `require_owner` here — and
-    /// why one cosigner per process suits it: the requester addresses the payer's endpoint.
-    async fn payment_request_create(
-        &self,
-        request: Request<wp::PaymentRequestCreateRequest>,
-    ) -> Result<Response<wp::PaymentRequestCreateResponse>, Status> {
-        let req = request.into_inner();
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_PAYREQ_CREATE)?;
-        let out = self.cosigner.lock().await.payment_request_create(req).await?;
-        Ok(Response::new(out))
-    }
 }

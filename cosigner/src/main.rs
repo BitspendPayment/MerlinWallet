@@ -68,16 +68,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grpc_addr: std::net::SocketAddr = format!("0.0.0.0:{grpc_port}").parse()?;
     tracing::info!(%group_key, "cosigner listening on {grpc_addr} (gRPC over HTTP/2)");
 
-    let sessions =
-        cosigner::session::proto::signing_session_server::SigningSessionServer::new(
-            cosigner::session::SessionService::new(cosigner.clone()),
-        );
-    let wallet = cosigner::wallet_proto::mpc_wallet_server::MpcWalletServer::new(
-        cosigner::session::WalletService::new(cosigner, server_info),
+    let service = cosigner::session::proto::cosigner_server::CosignerServer::new(
+        cosigner::session::CosignerService::new(cosigner, server_info),
     );
     let serve_result = tonic::transport::Server::builder()
-        .add_service(sessions)
-        .add_service(wallet)
+        .add_service(service)
         .serve_with_shutdown(grpc_addr, shutdown_signal())
         .await;
 

@@ -1,3 +1,5 @@
+// The cosigner's whole API.
+//
 // A signing ceremony as ONE bidirectional session.
 //
 // The unary `SignStep1`/`SignStep2` pair in mpc_wallet.proto makes the server hold a FROST nonce in
@@ -10,9 +12,11 @@
 // sequence number, and a typed body per round.
 syntax = "proto3";
 
-package mpc_wallet.session.v1;
+import "mpc_wallet.proto";
 
-service SigningSession {
+package cosigner.v1;
+
+service Cosigner {
   // Both directions open at once: the server answers each round as it arrives.
   rpc Sign(stream SignClientMsg) returns (stream SignServerMsg);
 
@@ -38,6 +42,26 @@ service SigningSession {
   // submit next, and never opens a socket. One RPC covers both shapes — a boarding output settles
   // when `boarding_utxo` is set, a self-refresh when it is not.
   rpc Settle(stream SettleClientMsg) returns (stream SettleServerMsg);
+
+  // The rest. Not ceremonies — one round each, with nothing to hold between messages, so a stream
+  // would buy nothing.
+  //
+  // Request-to-pay: a wallet allowlists a contact, and that contact may then bill it. The payer's
+  // cosigner authenticates the requester, checks the allowlist, DERIVES the requester's Ark address
+  // from the allowlisted key — never a supplied one — and records the intent.
+  rpc ContactAdd(mpc_wallet.ContactAddRequest) returns (mpc_wallet.ContactAddResponse);
+  rpc ContactRemove(mpc_wallet.ContactRemoveRequest) returns (mpc_wallet.ContactRemoveResponse);
+  rpc ContactList(mpc_wallet.ContactListRequest) returns (mpc_wallet.ContactListResponse);
+  rpc PaymentRequestCreate(mpc_wallet.PaymentRequestCreateRequest)
+      returns (mpc_wallet.PaymentRequestCreateResponse);
+  rpc PaymentRequestList(mpc_wallet.PaymentRequestListRequest)
+      returns (mpc_wallet.PaymentRequestListResponse);
+  rpc PaymentRequestDecline(mpc_wallet.PaymentRequestDeclineRequest)
+      returns (mpc_wallet.PaymentRequestDeclineResponse);
+
+  // Deployment metadata: the Bitcoin network, so a caller renders addresses with the right HRP
+  // without having to be told separately. Unauthenticated.
+  rpc GetServerInfo(mpc_wallet.GetServerInfoRequest) returns (mpc_wallet.GetServerInfoResponse);
 }
 
 message SettleClientMsg {
