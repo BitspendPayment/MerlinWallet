@@ -4,8 +4,6 @@
 //! `CosignerRegistry` is spawned lazily on the first post-onboarding request.
 
 mod ceremony;
-mod handlers;
-pub mod manager;
+pub mod handlers;
 pub mod session;
 
-pub use manager::OnboardingManager;

@@ -1,8 +1,6 @@
 use bitcoin::consensus::deserialize;
-use bitcoin::hashes::Hash as _;
 use bitcoin::Transaction;
 
-use crate::contract::{EvalContext, Outpoint, PrevoutInfo, Transaction as ContractTx, Txin, Txout};
 use crate::cosigner::state::Utxo;
 
 /// Parse a transaction from raw hex bytes and calculate the spent amount.
@@ -29,83 +27,6 @@ pub fn calculate_spent_amount(
     Ok(total_spent)
 }
 
-/// Map a parsed Bitcoin transaction plus the outputs it spends into the contract
-/// ABI's `EvalContext` for the input at `input_index`. `prevouts` is 1:1 with
-/// `tx.input` (use a zero-value placeholder for any unknown prevout). txids are
-/// in internal (consensus) byte order. `contract_args` is the opaque caller data
-/// the gate reads from the spending input's PSBT proprietary map (empty if none).
-pub fn build_eval_context(
-    tx: &Transaction,
-    prevouts: &[bitcoin::TxOut],
-    input_index: u32,
-    contract_args: Vec<u8>,
-) -> EvalContext {
-    let inputs = tx
-        .input
-        .iter()
-        .map(|i| Txin {
-            prevout: Outpoint {
-                txid: i.previous_output.txid.to_byte_array().to_vec(),
-                vout: i.previous_output.vout,
-            },
-            sequence: i.sequence.to_consensus_u32(),
-            script_sig: i.script_sig.as_bytes().to_vec(),
-            witness: i.witness.to_vec(),
-        })
-        .collect();
-    let outputs = tx
-        .output
-        .iter()
-        .map(|o| Txout {
-            value: o.value.to_sat(),
-            script_pubkey: o.script_pubkey.as_bytes().to_vec(),
-        })
-        .collect();
-    let prevouts = prevouts
-        .iter()
-        .map(|p| PrevoutInfo {
-            value: p.value.to_sat(),
-            script_pubkey: p.script_pubkey.as_bytes().to_vec(),
-        })
-        .collect();
-    EvalContext {
-        tx: ContractTx {
-            version: tx.version.0,
-            lock_time: tx.lock_time.to_consensus_u32(),
-            inputs,
-            outputs,
-        },
-        prevouts,
-        input_index,
-        contract_args,
-    }
-}
-
-/// The PSBT proprietary key that carries off-chain contract arguments for an
-/// eVTXO input: `ProprietaryKey { prefix: b"EVTXO", subtype: 0x01, key: [] }`.
-/// The value is opaque caller data handed to the contract as `ctx.contract_args`.
-/// It rides the PSBT the cosigner already deserializes, binds to the specific
-/// input, and is stripped at finalization — it is never written on-chain.
-pub const CONTRACT_ARGS_PREFIX: &[u8] = b"EVTXO";
-pub const CONTRACT_ARGS_SUBTYPE: u8 = 0x01;
-
-/// Read the contract arguments carried in a PSBT input's proprietary map, if any.
-/// Returns an empty vector when the input carries no `EVTXO/0x01` proprietary key.
-pub fn read_contract_args(input: &bitcoin::psbt::Input) -> Vec<u8> {
-    input
-        .proprietary
-        .iter()
-        .find(|(k, _)| {
-            k.prefix.as_slice() == CONTRACT_ARGS_PREFIX
-                && k.subtype == CONTRACT_ARGS_SUBTYPE
-                && k.key.is_empty()
-        })
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default()
-}
-
-/// Derive the P2TR script hex from a compressed public key hex.
-/// The public key should be the tweaked verifying key from the public key package.
 pub fn derive_p2tr_script_hex(compressed_pubkey_hex: &str) -> Result<String, String> {
     let pubkey_bytes =
         hex::decode(compressed_pubkey_hex).map_err(|e| format!("Invalid hex: {e}"))?;

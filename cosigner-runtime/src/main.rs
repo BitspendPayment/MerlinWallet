@@ -2,10 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use cosigner_runtime::{
-    config, contract, cosigner, esplora, fcm_client, onboarding, kv_store, rest_api, shared,
-    telemetry, vtxo_stream, webauthn_server,
-};
+use cosigner_runtime::{config, fcm_client, kv_store, shared, telemetry};
 
 #[derive(Parser)]
 #[command(
@@ -116,209 +113,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_authority,
     );
 
-    // Contracts are stored in the cosigner's own KV at eVTXO creation; the gate
-    // resolves them from there. Gating is a no-op if the engine fails to init.
-    let contract_registry: Box<dyn contract::ContractRegistry> =
-        Box::new(contract::KvRegistry::new(shared.persistence.clone()));
-    match contract::ContractHost::new(contract_registry) {
-        Ok(host) => {
-            tracing::info!("Contract engine ready");
-            shared.contract_host = Some(Arc::new(host));
-        }
-        Err(e) => tracing::warn!("Contract engine disabled: {e}"),
-    }
-
-    // WebAuthn ceremony server: the cosigner is its own Relying Party (register/assert + session
-    // token mint). Disabled (None) if the RP config is invalid, rather than aborting startup.
-    match webauthn_server::WebauthnServer::new(
-        webauthn_server::RpConfig {
-            rp_id: &cfg.webauth_rp_id,
-            rp_origin: &cfg.webauth_rp_origin,
-            android_origin: &cfg.webauth_android_origin,
-            rp_name: &cfg.webauth_rp_name,
-        },
-        shared.persistence.clone(),
-        shared.session_authority.clone(),
-    ) {
-        Ok(server) => {
-            tracing::info!(
-                "WebAuthn server ready (rp_id={}, origin={})",
-                cfg.webauth_rp_id,
-                cfg.webauth_rp_origin
-            );
-            shared.webauthn = Some(Arc::new(server));
-        }
-        Err(e) => tracing::warn!("WebAuthn server disabled: {e}"),
-    }
-
     let shared = Arc::new(shared);
 
-    // The cosigner runs natively in-process (no WASM guest); only the contract is sandboxed WASM.
-    let registry = cosigner::CosignerRegistry::new(shared.clone())?;
+    // One cosigner per process, named by COSIGNER_GROUP_KEY. Not optional: a cosigner serves one
+    // wallet, and which wallet is configuration rather than something a caller names per request.
+    // That is what removes a whole class of confusion the old `/u/{group_key}/...` routing had —
+    // a caller naming one wallet while addressing another. There is no other wallet to address.
+    let group_key = std::env::var("COSIGNER_GROUP_KEY")
+        .map_err(|_| "COSIGNER_GROUP_KEY is required: a cosigner serves exactly one wallet")?;
+    let grpc_port: u16 = args
+        .port
+        .or_else(|| std::env::var("GRPC_PORT").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(7075);
 
-    // Populate cross-user secondary indices from persistence so restore /
-    // VTXO-stream lookups don't need to wake any actor.
-    if let Err(e) = registry.load_indices_from_persistence() {
-        tracing::warn!("Failed to load registry indices from persistence: {e}");
-    }
-
-    // Spawn the global VTXO stream task.
-    {
-        let registry_clone = registry.clone();
-        let shared_clone = shared.clone();
-        tokio::spawn(async move {
-            vtxo_stream::run_vtxo_stream(registry_clone, shared_clone).await;
-        });
-    }
-
-    // Auto-settle tick: every 60s, find users with a stored delegate
-    // intent in sled and send TickAutoSettle to their actor (cold-spawning
-    // if needed).
-    //
-    {
-        let registry_clone = registry.clone();
-        let persistence_clone = shared.persistence.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Skip the immediate fire so existing actors have time to finish boot.
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                // spawn + tick every actor with a pending guest-delegate threshold
-                // marker, so a stored delegate auto-settles even after a runtime
-                // restart.
-                let candidates = match persistence_clone.get_all("guest_delegate_thresholds") {
-                    Ok(rows) => rows,
-                    Err(e) => {
-                        tracing::warn!(
-                            "auto-settle tick: get_all guest_delegate_thresholds failed: {e}"
-                        );
-                        continue;
-                    }
-                };
-                if candidates.is_empty() {
-                    continue;
-                }
-                tracing::debug!(
-                    "auto-settle tick: {} user(s) with stored guest-delegate marker",
-                    candidates.len()
-                );
-                for (user_id, _value) in candidates {
-                    let handle = match registry_clone.get_or_spawn(&user_id) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            tracing::debug!("auto-settle tick: spawn {user_id} failed: {e}");
-                            continue;
-                        }
-                    };
-                    if let Err(e) = handle.try_send(cosigner::CosignerCommand::TickAutoSettle) {
-                        tracing::debug!("auto-settle tick: skip {user_id}: {e}");
-                    }
-                }
-            }
-        });
-    }
-
-    // Boarding watcher: every 60s, poll each user's recorded boarding address
-    // via esplora and push a "tap to board" notification for new confirmed
-    // deposits. The cosigner's ONLY chain dependency — read-only, opt-in via
-    // ESPLORA_URL, and inert without FCM. The wallet still scans + signs.
-    if !cfg.esplora_url.is_empty() {
-        if let Some(fcm) = shared.fcm.clone() {
-            let persistence_clone = shared.persistence.clone();
-            let esplora_client = esplora::EsploraClient::new(&cfg.esplora_url);
-            let interval_secs = cfg.boarding_watch_interval_secs.max(1);
-            tracing::info!(
-                "Boarding watcher enabled (esplora {}, every {interval_secs}s)",
-                cfg.esplora_url
-            );
-            tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                interval.tick().await;
-                loop {
-                    interval.tick().await;
-                    cosigner::registry::boarding_watch_sweep(
-                        &esplora_client,
-                        &persistence_clone,
-                        &fcm,
-                    )
-                    .await;
-                }
-            });
-        } else {
-            tracing::warn!("ESPLORA_URL set but FCM unconfigured; boarding watcher disabled");
-        }
-    }
-
-    // every 24 hr, drop actors that haven't recv'd anything for `ACTOR_IDLE_THRESHOLD_SECS`. Runs
-    // independently of ASP — purely a memory-pressure relief mechanism.
-    //
-    // The auto-settle tick above now only sends to users with a stored
-    // delegate row in store, so it no longer keeps every spawned actor's
-    // `last_active` fresh. Idle actors (no client RPCs, no stream events,
-    // no stored delegate) will now eventually evict in production —
-    // exactly the behaviour the sweep was designed for.
-    {
-        let registry_clone = registry.clone();
-        let threshold = shared.actor_idle_threshold_secs;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60 * 24));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await; // skip immediate fire
-            loop {
-                interval.tick().await;
-                let snapshot = registry_clone.snapshot_handles();
-                for (user_id, _handle) in snapshot {
-                    registry_clone.try_evict(&user_id, threshold);
-                }
-            }
-        });
-    }
-
-    // Onboarding coordinator: short-lived per-user ceremony sessions, evicted on
-    // TTL. Spawned independently of the per-user registry — the post-DKG
-    // actor is lazy-spawned by the first sign/ark/refresh/policy call.
-    let dkg_ttl = std::time::Duration::from_secs(cfg.dkg_session_ttl_secs);
-    let onboarding_mgr =
-        onboarding::OnboardingManager::with_registry(shared.clone(), registry.clone(), dkg_ttl);
-    {
-        let coord = onboarding_mgr.clone();
-        tokio::spawn(async move {
-            coord.run_eviction_loop().await;
-        });
-    }
-
-    // Contract-creation coordinator: refreshes V onto the service pairing INSIDE the wallet's
-    // guest (Plan A — the host never reads V), so it needs the actor registry to dispatch.
-    let contract_mgr = contract::ContractManager::new(shared.clone(), registry.clone());
-
-    // REST server.
-    let rest_port = args.port.unwrap_or_else(|| {
-        std::env::var("PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(7074)
-    });
-    let app_state = rest_api::AppState {
-        registry: registry.clone(),
-        onboarding_manager: onboarding_mgr.clone(),
-        contract_manager: contract_mgr.clone(),
-        server_info: std::sync::Arc::new(cosigner_runtime::wallet_proto::GetServerInfoResponse {
-            bitcoin_network: cfg.bitcoin_network.clone(),
-        }),
+    let wallet_state = std::sync::Arc::new(parking_lot::Mutex::new(
+        cosigner_runtime::cosigner::state::CosignerState::new(group_key.clone()),
+    ));
+    let cosigner = std::sync::Arc::new(
+        cosigner_runtime::cosigner::instance::Cosigner::open(shared.clone(), wallet_state).await?,
+    );
+    let server_info = cosigner_runtime::wallet_proto::GetServerInfoResponse {
+        bitcoin_network: cfg.bitcoin_network.clone(),
     };
-    let rest_app = axum::Router::new()
-        .nest("/api", rest_api::routes(app_state))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(tower_http::cors::CorsLayer::permissive());
-    let rest_addr = format!("0.0.0.0:{rest_port}");
-    tracing::info!("MPC Wallet Server listening on {rest_addr} (REST/HTTP1.1)");
-    let listener = tokio::net::TcpListener::bind(&rest_addr).await?;
-    let serve_result = axum::serve(listener, rest_app)
-        .with_graceful_shutdown(shutdown_signal())
+
+    let grpc_addr: std::net::SocketAddr = format!("0.0.0.0:{grpc_port}").parse()?;
+    tracing::info!(%group_key, "cosigner listening on {grpc_addr} (gRPC over HTTP/2)");
+
+    let sessions =
+        cosigner_runtime::session::proto::signing_session_server::SigningSessionServer::new(
+            cosigner_runtime::session::SessionService::new(cosigner.clone()),
+        );
+    let wallet = cosigner_runtime::wallet_proto::mpc_wallet_server::MpcWalletServer::new(
+        cosigner_runtime::session::WalletService::new(cosigner, server_info),
+    );
+    let serve_result = tonic::transport::Server::builder()
+        .add_service(sessions)
+        .add_service(wallet)
+        .serve_with_shutdown(grpc_addr, shutdown_signal())
         .await;
 
     telemetry_guard.shutdown();
@@ -326,23 +157,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Stop serving on SIGTERM or Ctrl-C, so in-flight sessions finish rather than being cut.
 async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+    let ctrl_c = async { tokio::signal::ctrl_c().await.ok(); };
     #[cfg(unix)]
-    let terminate = async {
+    let term = async {
         if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
             s.recv().await;
         }
     };
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
+    let term = std::future::pending::<()>();
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = ctrl_c => {}
+        _ = term => {}
     }
-    tracing::info!("Shutdown signal received, flushing telemetry...");
 }

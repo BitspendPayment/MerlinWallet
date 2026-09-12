@@ -17,8 +17,6 @@
 
 mod common;
 
-use cosigner_runtime::cosigner::command::CosignerCommand;
-use cosigner_runtime::cosigner::registry::CosignerRegistry;
 use cosigner_runtime::wallet_proto::{
     ContactAddRequest, ContactListRequest, ContactRemoveRequest, PaymentRequestCreateRequest,
 };
@@ -47,9 +45,9 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
     let (_receiver_kps, receiver_pkp) = common::dkg_2of2();
     let receiver_vk = receiver_pkp.verifying_key.serialize().to_vec();
 
-    let registry = CosignerRegistry::new(shared.clone()).unwrap();
+    let cosigner = common::open_cosigner(&shared, &payer_group).await;
     common::seed_policy(
-        &registry,
+        &cosigner,
         &payer_group,
         &payer_kps[1],
         &payer_kps[0],
@@ -60,13 +58,10 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
 
     // A stranger is refused — and refused BEFORE any state is touched or the ASP is consulted,
     // which is why this assertion is meaningful with or without a live stack.
-    let err = registry
-        .dispatch(&payer_group, |reply| {
-            CosignerCommand::PaymentRequestCreate {
-                req: create_req(&receiver_vk),
-                reply,
-            }
-        })
+    let err = cosigner
+        .actor()
+        .await
+        .payment_request_create(create_req(&receiver_vk))
         .await
         .expect_err("a non-contact must not be able to create a request");
     assert_eq!(
@@ -76,32 +71,30 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
     );
 
     // Authorize them.
-    registry
-        .dispatch(&payer_group, |reply| CosignerCommand::ContactAdd {
-            req: ContactAddRequest {
+    cosigner
+        .actor()
+        .await
+        .contact_add(ContactAddRequest {
                 user_id: payer_id.clone(),
                 contact_verifying_key: receiver_vk.clone(),
                 label: "Bob".to_string(),
                 signature: vec![],
                 timestamp_ms: 0,
-            },
-            reply,
         })
         .await
         .expect("add contact");
 
-    // The allowlist is sealed: drop the registry so no live actor survives, then read it back from
-    // a cold spawn (restored from the snapshot, not from memory).
-    drop(registry);
-    let registry = CosignerRegistry::new(shared.clone()).unwrap();
-    let list = registry
-        .dispatch(&payer_group, |reply| CosignerCommand::ContactList {
-            req: ContactListRequest {
+    // The allowlist is sealed: drop the cosigner so nothing survives in memory, then read it back
+    // from a fresh one (restored from the snapshot).
+    drop(cosigner);
+    let cosigner = common::open_cosigner(&shared, &payer_group).await;
+    let list = cosigner
+        .actor()
+        .await
+        .contact_list(ContactListRequest {
                 user_id: payer_id.clone(),
                 signature: vec![],
                 timestamp_ms: 0,
-            },
-            reply,
         })
         .await
         .expect("list contacts");
@@ -110,26 +103,22 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
     assert_eq!(list.contacts[0].label, "Bob");
 
     // Revoking re-closes the gate.
-    registry
-        .dispatch(&payer_group, |reply| CosignerCommand::ContactRemove {
-            req: ContactRemoveRequest {
+    cosigner
+        .actor()
+        .await
+        .contact_remove(ContactRemoveRequest {
                 user_id: payer_id.clone(),
                 contact_verifying_key: receiver_vk.clone(),
                 signature: vec![],
                 timestamp_ms: 0,
-            },
-            reply,
         })
         .await
         .expect("remove contact");
 
-    let err = registry
-        .dispatch(&payer_group, |reply| {
-            CosignerCommand::PaymentRequestCreate {
-                req: create_req(&receiver_vk),
-                reply,
-            }
-        })
+    let err = cosigner
+        .actor()
+        .await
+        .payment_request_create(create_req(&receiver_vk))
         .await
         .expect_err("a revoked contact must not be able to create a request");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -155,9 +144,9 @@ async fn owner_only_routes_reject_another_wallets_key() {
     let (_att_kps, attacker_pkp) = common::dkg_2of2();
     let attacker_id = attacker_pkp.verifying_key.serialize().to_vec();
 
-    let registry = CosignerRegistry::new(shared.clone()).unwrap();
+    let cosigner = common::open_cosigner(&shared, &payer_group).await;
     common::seed_policy(
-        &registry,
+        &cosigner,
         &payer_group,
         &payer_kps[1],
         &payer_kps[0],
@@ -166,30 +155,28 @@ async fn owner_only_routes_reject_another_wallets_key() {
     )
     .await;
 
-    let err = registry
-        .dispatch(&payer_group, |reply| CosignerCommand::ContactAdd {
-            req: ContactAddRequest {
+    let err = cosigner
+        .actor()
+        .await
+        .contact_add(ContactAddRequest {
                 user_id: attacker_id.clone(),
                 contact_verifying_key: attacker_id.clone(),
                 label: "self-authorized".to_string(),
                 signature: vec![],
                 timestamp_ms: 0,
-            },
-            reply,
         })
         .await
         .expect_err("another wallet's key must not write this wallet's allowlist");
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
 
     // ...and must not be able to read the inbox or the allowlist either.
-    let err = registry
-        .dispatch(&payer_group, |reply| CosignerCommand::ContactList {
-            req: ContactListRequest {
+    let err = cosigner
+        .actor()
+        .await
+        .contact_list(ContactListRequest {
                 user_id: attacker_id.clone(),
                 signature: vec![],
                 timestamp_ms: 0,
-            },
-            reply,
         })
         .await
         .expect_err("another wallet's key must not read this wallet's contacts");

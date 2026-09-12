@@ -1,0 +1,249 @@
+// A signing ceremony as ONE bidirectional session.
+//
+// The unary `SignStep1`/`SignStep2` pair in mpc_wallet.proto makes the server hold a FROST nonce in
+// memory between two requests. Under a per-request runtime there is no "between", so the nonce would
+// have to persist — and a reused nonce leaks a secret share. One stream removes the problem instead
+// of managing it: the ceremony is one instance, the nonce never leaves it, and a stream that dies
+// takes the nonce with it. A reconnect is a new session with a new nonce.
+//
+// Shape follows enclave-runtime's `enclave.cosign.v1` prototype: a client-owned session id, a
+// sequence number, and a typed body per round.
+syntax = "proto3";
+
+package mpc_wallet.session.v1;
+
+service SigningSession {
+  // Both directions open at once: the server answers each round as it arrives.
+  rpc Sign(stream SignClientMsg) returns (stream SignServerMsg);
+
+  // DKG is the same problem with more rounds, and the higher stakes: three unary calls today
+  // (DKGStep1/2/3), with the server holding round-1 and round-2 secrets between them. Those
+  // secrets are how the key is born, so parking them on a server between requests is the last
+  // thing that should survive the move to a per-request runtime.
+  rpc Dkg(stream DkgClientMsg) returns (stream DkgServerMsg);
+
+  // A send is two phases wearing one RPC: `SendVtxoRequest` means "build it" when its
+  // `signed_messages` is empty and "submit it" when it is not, and the half-built transactions
+  // wait on the server in between. Same shape as the sign nonce, same answer.
+  rpc Send(stream SendClientMsg) returns (stream SendServerMsg);
+
+  // Settling a boarding output takes a variable number of FROST rounds — the intent proof, then
+  // the commitment sighashes — which the unary `SettleRequest` expressed by returning
+  // `SIGNING_REQUIRED` and having the client call again. A loop states that directly: the server
+  // yields sighashes until it has none left, then yields the result.
+  rpc Settle(stream SettleClientMsg) returns (stream SettleServerMsg);
+}
+
+message SettleClientMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    SettleOpen open = 3;
+    SettleSigned signed = 4;
+  }
+}
+
+// One boarding output per settle. A longer list used to be silently truncated to its first
+// element, boarding one deposit and stranding the rest while the caller was told the batch
+// settled; the client settles them one at a time instead.
+message SettleOpen {
+  bytes user_id = 1;
+  bytes signature = 2;
+  int64 timestamp_ms = 3;
+  BoardingUtxo boarding_utxo = 4;
+}
+
+message BoardingUtxo {
+  string txid = 1;
+  uint32 vout = 2;
+  uint64 amount_sats = 3;
+}
+
+message SettleSigned {
+  repeated bytes signed_messages = 1;
+}
+
+message SettleServerMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    SettleSighashes sighashes = 3;
+    SettleComplete complete = 4;
+  }
+}
+
+message SettleSighashes {
+  repeated bytes messages_to_sign = 1;
+  bool script_path_spend = 2;
+}
+
+message SettleComplete {
+  string commitment_txid = 1;
+}
+
+message SendClientMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    SendOpen open = 3;
+    SendSigned signed = 4;
+  }
+}
+
+// Opens the send. The VTXOs to spend are not listed: the cosigner selects them from the set it
+// already holds, so a caller cannot nominate inputs it does not own.
+message SendOpen {
+  bytes user_id = 1;
+  bytes signature = 2;
+  int64 timestamp_ms = 3;
+  string recipient_ark_address = 4;
+  uint64 amount = 5;
+}
+
+message SendSigned {
+  repeated bytes signed_messages = 1;
+}
+
+message SendServerMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    SendSighashes sighashes = 3;
+    SendComplete complete = 4;
+  }
+}
+
+message SendSighashes {
+  repeated bytes messages_to_sign = 1;
+  bool script_path_spend = 2;
+}
+
+message SendComplete {
+  string ark_txid = 1;
+  // The change VTXO the send produced, absent when it spent the inputs exactly.
+  ChangeVtxo change = 2;
+}
+
+message ChangeVtxo {
+  string txid = 1;
+  uint32 vout = 2;
+  uint64 amount_sats = 3;
+  uint32 exit_delay = 4;
+}
+
+message SignClientMsg {
+  // The client's, never the server's. Correlation only — nothing is keyed on it, because a stream
+  // that dies takes its session with it regardless of what it was called.
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    SignOpen open = 3;
+    SignShare share = 4;
+  }
+}
+
+// Opens the session and carries the whole of what the old SignStep1Request carried.
+//
+// Authentication happens HERE, once, for the session — not per message. That mirrors the runtime
+// this is heading for, where one passkey assertion authorizes one interaction and the messages
+// inside it are not individually approved.
+//
+// Deliberately NO per-message approval field. Verifying an assertion needs the stored credential,
+// the issued challenge and the relying-party configuration; a field that looks like a credential
+// and is never checked reads as a guarantee it does not provide. Per-message approval needs a host
+// function that does not exist yet — see enclave-runtime docs/STREAMING.md.
+message SignOpen {
+  bytes user_id = 1;
+  bytes signature = 2;
+  int64 timestamp_ms = 3;
+  bytes hiding_commitment = 4;
+  bytes binding_commitment = 5;
+  bytes message_to_sign = 6;
+  // The transaction the policy inspects. Bound to `message_to_sign` by the cosigner before any
+  // policy runs, so a compliant transaction cannot front a signature over something else.
+  bytes full_transaction = 7;
+  bool script_path_spend = 8;
+}
+
+message SignShare {
+  bytes signature_share = 1;
+}
+
+message SignServerMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    SignCommitments commitments = 3;
+    SignComplete complete = 4;
+  }
+}
+
+message Commitment {
+  bytes hiding = 1;
+  bytes binding = 2;
+}
+
+message SignCommitments {
+  map<string, Commitment> commitments = 1;
+  // Echoed back because the cosigner is authoritative about what it will sign: if this differs from
+  // what was asked for, the caller is told rather than silently signing something else.
+  bytes message_to_sign = 2;
+}
+
+message SignComplete {
+  bytes r_point = 1;
+  bytes z_scalar = 2;
+}
+
+// ---------------------------------------------------------------------------
+// DKG: one session, three rounds.
+// ---------------------------------------------------------------------------
+
+message DkgClientMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    DkgOpen open = 3;       // was DKGStep1Request
+    DkgRound1 round1 = 4;   // was DKGStep2Request
+    DkgRound2 round2 = 5;   // was DKGStep3Request
+  }
+}
+
+// Opens the session and authenticates it once, for the whole ceremony.
+message DkgOpen {
+  bytes user_id = 1;
+  bytes signature = 2;
+  int64 timestamp_ms = 3;
+  bytes identifier = 4;
+  string round1_package = 5; // JSON
+}
+
+message DkgRound1 {
+  bytes identifier = 1;
+  string round1_package = 2; // JSON
+}
+
+message DkgRound2 {
+  bytes identifier = 1;
+  map<string, string> round2_packages_for_others = 2; // JSON per recipient
+}
+
+message DkgServerMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    DkgRound1Out round1 = 3;
+    DkgRound2Out round2 = 4;
+    DkgComplete complete = 5;
+  }
+}
+
+// Field names mirror the unary DKGStep*Response messages exactly, so the round semantics are the
+// ones the ceremony already had; only the transport changed.
+message DkgRound1Out { map<string, string> round1_packages = 1; }
+message DkgRound2Out { map<string, string> all_round1_packages = 1; }
+message DkgComplete {
+  map<string, string> round2_packages_for_me = 1;
+  // Known only once the ceremony finalizes, from the seed material the server keeps in the session.
+  string group_key = 2;
+}

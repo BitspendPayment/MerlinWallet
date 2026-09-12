@@ -5,11 +5,9 @@
 use std::sync::Arc;
 
 use crate::auth::session::SessionAuthority;
-use crate::contract::ContractHost;
 use crate::events::EventBus;
 use crate::fcm_client::FcmClient;
 use crate::kv_store::KvStore;
-use crate::webauthn_server::WebauthnServer;
 
 pub struct SharedServices {
     pub persistence: Arc<dyn KvStore>,
@@ -20,12 +18,6 @@ pub struct SharedServices {
     /// Per-user event bus (Phase 3): publish-side for `contract_share` etc., subscribed by the SSE
     /// event stream (`/u/{vk}/events`) so a backend user can react in real time.
     pub events: EventBus,
-    /// Off-chain contract engine for eVTXO programmability. `None` disables
-    /// contract gating (no contracts directory / engine init failed).
-    pub contract_host: Option<Arc<ContractHost>>,
-    /// WebAuthn ceremony server (the cosigner is its own Relying Party). Runs register/assert and
-    /// mints a session token on success. `None` when the RP config is invalid (feature disabled).
-    pub webauthn: Option<Arc<WebauthnServer>>,
     /// ASP gRPC client. REQUIRED — the cosigner cannot serve Ark without it (enforced at startup).
     pub asp_client: Arc<tokio::sync::Mutex<ark::client::AspClient>>,
     /// Push notifications. None when `FCM_SERVICE_ACCOUNT_CIPHERTEXT` is unset
@@ -52,8 +44,6 @@ impl SharedServices {
         Self {
             persistence,
             session_authority,
-            contract_host: None,
-            webauthn: None,
             events: EventBus::new(),
             asp_client: Arc::new(tokio::sync::Mutex::new(asp_client)),
             fcm,

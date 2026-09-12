@@ -7,7 +7,7 @@ use tonic::Status;
 
 use crate::cosigner::actor::CosignerActor;
 use crate::cosigner::handlers::parsers;
-use crate::cosigner::registry::run_blocking;
+use crate::cosigner::store::run_blocking;
 use crate::cosigner::state::{CosignerState, VtxoEntry};
 use crate::cosigner::types::{ArkTxEntry, VtxoInput};
 use crate::shared::SharedServices;

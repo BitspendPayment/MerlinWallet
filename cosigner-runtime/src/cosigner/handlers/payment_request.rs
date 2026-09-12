@@ -80,7 +80,7 @@ impl CosignerActor {
         // reads their inbox keeps seeing long-lapsed ones. Re-seal only if something changed.
         if self.prune_intents(now) {
             let group_key = self.state.lock().cosigner_id.clone();
-            crate::cosigner::registry::persist_actor_snapshot_for(self, &group_key).await;
+            crate::cosigner::store::persist_actor_snapshot_for(self, &group_key).await;
         }
         let mut intents: Vec<_> = self
             .payment_intents()
@@ -89,5 +89,123 @@ impl CosignerActor {
             .collect();
         intents.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(PaymentRequestListResponse { intents })
+    }
+}
+
+impl CosignerActor {
+    /// Authorize a party to bill this wallet. Contacts are compared by GROUP key, so whichever of
+    /// a wallet's ids the caller names, the allowlist stores the canonical one.
+    pub async fn contact_add(
+        &mut self,
+        req: crate::wallet_proto::ContactAddRequest,
+    ) -> Result<crate::wallet_proto::ContactAddResponse, Status> {
+        self.require_owner(&req.user_id)?;
+        let vk_hex = super::helpers::group_key_of(
+            self.shared.persistence.as_ref(),
+            &hex::encode(&req.contact_verifying_key),
+        );
+        self.add_contact(vk_hex, req.label, crate::cosigner::store::now_secs())
+            .map_err(Status::invalid_argument)?;
+        self.seal().await;
+        Ok(crate::wallet_proto::ContactAddResponse { ok: true })
+    }
+
+    /// Revoke a contact's authorization, re-closing the only gate on `PaymentRequestCreate`.
+    pub async fn contact_remove(
+        &mut self,
+        req: crate::wallet_proto::ContactRemoveRequest,
+    ) -> Result<crate::wallet_proto::ContactRemoveResponse, Status> {
+        self.require_owner(&req.user_id)?;
+        let vk_hex = super::helpers::group_key_of(
+            self.shared.persistence.as_ref(),
+            &hex::encode(&req.contact_verifying_key),
+        );
+        self.remove_contact(&vk_hex).map_err(Status::not_found)?;
+        self.seal().await;
+        Ok(crate::wallet_proto::ContactRemoveResponse { ok: true })
+    }
+
+    /// A request to be paid, from someone this wallet has allowlisted.
+    ///
+    /// Signed by the REQUESTER, not the payer — the payer's contact list is the whole of the
+    /// authorization, which is why the gate runs before anything else here.
+    pub async fn payment_request_create(
+        &mut self,
+        req: crate::wallet_proto::PaymentRequestCreateRequest,
+    ) -> Result<crate::wallet_proto::PaymentRequestCreateResponse, Status> {
+        // Resolve whichever id the requester used to its GROUP key: the canonical allowlist
+        // identity, and the key the payee address MUST derive from — a share key yields an address
+        // the requester cannot spend, while the payment still appears to succeed.
+        let from_vk_hex = super::helpers::group_key_of(
+            self.shared.persistence.as_ref(),
+            &hex::encode(&req.user_id),
+        );
+        if !self.is_contact(&from_vk_hex) {
+            return Err(Status::permission_denied(
+                "not an authorized contact of this wallet",
+            ));
+        }
+
+        // Derive the payee address from the allowlisted key; never trust a supplied one, or a
+        // contact could redirect the payment. x-only = compressed key minus its parity byte.
+        if from_vk_hex.len() != 66 {
+            return Err(Status::invalid_argument(
+                "requester key must be a 33-byte compressed pubkey",
+            ));
+        }
+        let owner_xonly = from_vk_hex[2..].to_string();
+        let info = {
+            let asp_arc = self.shared.asp_client.clone();
+            let mut asp = asp_arc.lock().await;
+            asp.get_info()
+                .await
+                .map_err(|e| Status::unavailable(format!("ASP GetInfo: {e}")))?
+        };
+        let network = ark::client::parse_network(&info.network).map_err(Status::internal)?;
+        let to_ark_address = ark::client::ark_address(
+            &owner_xonly,
+            &info.signer_pubkey,
+            info.unilateral_exit_delay as u32,
+            network,
+        )
+        .map_err(|e| Status::internal(format!("derive ark address: {e}")))?;
+
+        let now = crate::cosigner::store::now_secs();
+        let intent = self
+            .create_payment_intent(
+                from_vk_hex,
+                to_ark_address,
+                req.amount_sats,
+                req.memo,
+                req.expires_in_secs,
+                now,
+            )
+            .map_err(Status::invalid_argument)?;
+        self.seal().await;
+
+        // Best-effort nudge on two channels; the sealed intent is the durable record, so a failed
+        // notification must never fail the request.
+        let group_key = self.state.lock().cosigner_id.clone();
+        self.shared.events.publish(
+            &group_key,
+            crate::events::CosignerEvent::PaymentRequest {
+                id: intent.id.clone(),
+                from_vk_hex: intent.from_vk_hex.clone(),
+                amount_sats: intent.amount_sats,
+            },
+        );
+        if let Some(fcm) = self.shared.fcm.clone() {
+            let persistence = self.shared.persistence.clone();
+            let (payer, amount, id) = (group_key, intent.amount_sats, intent.id.clone());
+            tokio::spawn(async move {
+                let tokens = super::helpers::load_user_device_tokens(persistence.as_ref(), &payer);
+                crate::cosigner::store::push_payment_request(&fcm, &payer, &tokens, &id, amount)
+                    .await;
+            });
+        }
+
+        Ok(crate::wallet_proto::PaymentRequestCreateResponse {
+            intent: Some(intent_to_proto(&intent, now)),
+        })
     }
 }

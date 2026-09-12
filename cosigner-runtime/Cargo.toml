@@ -62,6 +62,9 @@ jsonwebtoken = "9"
 
 # Streaming
 tokio-stream = { version = "0.1", features = ["sync"] }
+# Streaming ceremony sessions: lets the handler own a ceremony across rounds as ordinary
+# local state, which is the whole point of moving off the unary API.
+async-stream = "0.3"
 
 # Electrum (raw TCP)
 tokio-util = { version = "0.7", features = ["codec"] }

@@ -1,16 +1,13 @@
 //! Simple Ark RPCs (info, address derivation, balance/list).
 //! Heavier ones (settle/send/redeem) live in their own module.
 
-use std::sync::Arc;
 
 use tokio::runtime::Handle;
 use tonic::Status;
 
 use crate::cosigner::actor::CosignerActor;
-use crate::cosigner::command::CosignerCommand;
-use crate::cosigner::handle::CosignerHandle;
 use crate::cosigner::handlers::parsers;
-use crate::cosigner::registry::{run_blocking, CosignerRegistry};
+use crate::cosigner::store::run_blocking;
 use crate::cosigner::state::CosignerState;
 use crate::shared::SharedServices;
 use crate::wallet_proto::*;
@@ -65,144 +62,6 @@ impl CosignerActor {
         })
         .await
     }
-}
-
-fn register_user_scripts(
-    shared: &SharedServices,
-    registry: &Arc<CosignerRegistry>,
-    state: &mut CosignerState,
-    user_id_hex: &str,
-    owner_pk_hex: &str,
-    info: &ark::client::types::ArkInfo,
-) {
-    if !state.owned_scripts.is_empty() {
-        return;
-    }
-
-    let network = match ark::client::parse_network(&info.network) {
-        Ok(n) => n,
-        Err(_) => return,
-    };
-
-    let mut scripts = Vec::new();
-    for exit_delay in [
-        info.unilateral_exit_delay as u32,
-        info.boarding_exit_delay as u32,
-    ] {
-        if let Ok(script_hex) = ark::client::vtxo_script_pubkey_hex(
-            owner_pk_hex,
-            &info.signer_pubkey,
-            exit_delay,
-            network,
-        ) {
-            registry.set_script_owner(&script_hex, user_id_hex);
-            if let Err(e) = shared
-                .persistence
-                .put("ark_script_to_user", &script_hex, user_id_hex)
-            {
-                tracing::warn!("persist ark_script_to_user/{script_hex} failed: {e}");
-            }
-            scripts.push(script_hex);
-        }
-    }
-    if scripts.is_empty() {
-        return;
-    }
-    state.owned_scripts.extend(scripts.iter().cloned());
-
-    let asp_arc = shared.asp_client.clone();
-    let rt = Handle::current();
-    let subscription_id = match rt.block_on({
-        let asp_arc = asp_arc.clone();
-        let scripts = scripts.clone();
-        async move {
-            let mut guard = asp_arc.lock().await;
-            guard.subscribe_for_scripts(scripts, None).await
-        }
-    }) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!("[{user_id_hex}] Indexer subscribe failed: {e}");
-            return;
-        }
-    };
-    tracing::info!("[{user_id_hex}] Indexer subscription: {subscription_id}");
-
-    let user_handle = match registry.get_or_spawn(user_id_hex) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!("[{user_id_hex}] indexer get_or_spawn failed: {e}");
-            return;
-        }
-    };
-
-    // Dedicated connection so the long-lived subscription stream doesn't share
-    // a lock with regular RPC traffic.
-    let asp_url = std::env::var("ASP_URL").unwrap_or_default();
-    if asp_url.is_empty() {
-        tracing::warn!("[{user_id_hex}] ASP_URL not set; cannot spawn indexer listener");
-        return;
-    }
-    let info_clone = info.clone();
-    let user_id_owned = user_id_hex.to_string();
-    rt.spawn(async move {
-        run_indexer_subscription(
-            user_id_owned,
-            subscription_id,
-            asp_url,
-            info_clone,
-            user_handle,
-        )
-        .await;
-    });
-}
-
-async fn run_indexer_subscription(
-    user_id_hex: String,
-    subscription_id: String,
-    asp_url: String,
-    info: ark::client::types::ArkInfo,
-    user_handle: CosignerHandle,
-) {
-    let mut stream_client = match ark::client::AspClient::connect(&asp_url).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("[{user_id_hex}] Indexer subscription connect failed: {e}");
-            return;
-        }
-    };
-    let mut stream = match stream_client.get_subscription(subscription_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("[{user_id_hex}] Indexer get_subscription failed: {e}");
-            return;
-        }
-    };
-    tracing::info!("[{user_id_hex}] Indexer subscription stream started");
-
-    use ark::client::proto::get_subscription_response::Data;
-    while let Ok(Some(event)) = stream.message().await {
-        if let Some(data) = event.data {
-            match data {
-                Data::Event(e) => {
-                    let cmd = CosignerCommand::IndexerUpdate {
-                        user_id_hex: user_id_hex.clone(),
-                        new_vtxos: e.new_vtxos.into_iter().map(indexer_to_vtxo).collect(),
-                        spent_vtxos: e.spent_vtxos.into_iter().map(indexer_to_vtxo).collect(),
-                        info: info.clone(),
-                    };
-                    if let Err(send_err) = user_handle.send(cmd).await {
-                        tracing::warn!(
-                            "[{user_id_hex}] indexer dispatch failed: {send_err}; ending subscription"
-                        );
-                        break;
-                    }
-                }
-                Data::Heartbeat(_) => {}
-            }
-        }
-    }
-    tracing::info!("[{user_id_hex}] Indexer subscription stream ended");
 }
 
 /// Drop cached VTXOs the ASP says are already spent.
@@ -264,41 +123,16 @@ fn drop_spent_vtxos(state: &mut CosignerState, shared: &SharedServices, user_id_
     }
 }
 
-fn indexer_to_vtxo(v: ark::client::proto::IndexerVtxo) -> ark::client::proto::Vtxo {
-    ark::client::proto::Vtxo {
-        outpoint: v.outpoint.map(|o| ark::client::proto::Outpoint {
-            txid: o.txid,
-            vout: o.vout,
-        }),
-        amount: v.amount,
-        script: v.script,
-        created_at: v.created_at,
-        expires_at: v.expires_at,
-        is_preconfirmed: v.is_preconfirmed,
-        is_swept: v.is_swept,
-        is_unrolled: v.is_unrolled,
-        is_spent: v.is_spent,
-        spent_by: v.spent_by,
-        commitment_txids: v.commitment_txids,
-        settled_by: v.settled_by,
-        ark_txid: v.ark_txid,
-        assets: Vec::new(),
-    }
-}
-
 impl CosignerActor {
     pub async fn get_ark_address(
         &mut self,
-        registry: &Arc<CosignerRegistry>,
         req: GetArkAddressRequest,
     ) -> Result<GetArkAddressResponse, Status> {
         let shared = self.shared.clone();
-        let registry = registry.clone();
         let span = tracing::info_span!("actor::get_ark_address", user_id = %parsers::user_id_hex(&req.user_id));
         run_blocking(self.state.clone(), move |state| {
             let _enter = span.enter();
             let shared = shared.as_ref();
-            let registry = &registry;
             let user_id_hex = parsers::user_id_hex(&req.user_id);
             tracing::info!("[{user_id_hex}] GetArkAddress");
             // Auth (OP_GET_ARK_ADDRESS) ran at the REST boundary.
@@ -314,7 +148,6 @@ impl CosignerActor {
                 ark::client::ark_address(&owner_pk_hex, &info.signer_pubkey, exit_delay, network)
                     .map_err(|e| Status::internal(format!("ark_address: {e}")))?;
 
-            register_user_scripts(shared, registry, state, &user_id_hex, &owner_pk_hex, &info);
 
             Ok(GetArkAddressResponse {
                 ark_address: ark_addr,
@@ -327,16 +160,13 @@ impl CosignerActor {
 impl CosignerActor {
     pub async fn get_boarding_address(
         &mut self,
-        registry: &Arc<CosignerRegistry>,
         req: GetBoardingAddressRequest,
     ) -> Result<GetBoardingAddressResponse, Status> {
         let shared = self.shared.clone();
-        let registry = registry.clone();
         let span = tracing::info_span!("actor::get_boarding_address", user_id = %parsers::user_id_hex(&req.user_id));
         run_blocking(self.state.clone(), move |state| {
             let _enter = span.enter();
             let shared = shared.as_ref();
-            let registry = &registry;
             let user_id_hex = parsers::user_id_hex(&req.user_id);
             tracing::info!("[{user_id_hex}] GetBoardingAddress");
             // Auth (OP_GET_BOARDING_ADDRESS) ran at the REST boundary.
@@ -353,9 +183,6 @@ impl CosignerActor {
                 network,
             )
             .map_err(|e| Status::internal(format!("boarding_address: {e}")))?;
-            register_user_scripts(shared, registry, state, &user_id_hex, &owner_pk_hex, &info);
-            // Record the boarding address so the watcher can poll it for deposits and
-            // nudge the device to board.
             super::helpers::save_user_boarding_address(
                 shared.persistence.as_ref(),
                 &user_id_hex,

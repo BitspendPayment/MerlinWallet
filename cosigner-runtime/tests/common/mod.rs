@@ -9,14 +9,14 @@
 //! DKG onboarding bookkeeping) — which is every test using this helper. `try_shared` returns
 //! `None` only if the ASP URL itself is malformed.
 
+use cosigner_runtime::cosigner::instance::Cosigner;
+use cosigner_runtime::cosigner::state::CosignerState;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rand::rngs::OsRng;
 
 use cosigner_runtime::auth::session::SessionAuthority;
-use cosigner_runtime::cosigner::command::CosignerCommand;
-use cosigner_runtime::cosigner::registry::CosignerRegistry;
 use cosigner_runtime::kv_store::SqliteStore;
 use cosigner_runtime::shared::SharedServices;
 
@@ -106,25 +106,37 @@ pub fn dkg_2of2() -> (Vec<KeyPackage>, PublicKeyPackage) {
     (key_packages, pkp_out.unwrap())
 }
 
-/// Seed a wallet's policy into its actor: installs the cosigner key package + group PKP, supplies
-/// the Ark cosigner secret, and seals it.
+/// Open the cosigner this process serves, loading whatever its seal already holds.
+pub async fn open_cosigner(shared: &Arc<SharedServices>, group_key: &str) -> Cosigner {
+    let state = Arc::new(parking_lot::Mutex::new(CosignerState::new(
+        group_key.to_string(),
+    )));
+    Cosigner::open(shared.clone(), state)
+        .await
+        .expect("open cosigner")
+}
+
+/// Install a wallet's key material and seal it, as DKG's final round does: the cosigner key
+/// package, the group PKP, the user's signing identifier and the Ark cosigner secret.
 pub async fn seed_policy(
-    registry: &Arc<CosignerRegistry>,
+    cosigner: &Cosigner,
     group_key: &str,
     kp_cosigner: &KeyPackage,
     kp_user: &KeyPackage,
     pkp: &PublicKeyPackage,
     ark_cosigner_secret_hex: Option<String>,
 ) {
-    registry
-        .dispatch(group_key, |reply| CosignerCommand::SeedPolicy {
-            key_package_json: kp_cosigner.to_json(),
-            public_key_package_json: pkp.to_json(),
-            user_signing_identifier_hex: Some(hex::encode(kp_user.identifier.serialize())),
-            server_dkg_secret_hex: ark_cosigner_secret_hex,
-            contract_pairing: None,
-            reply,
-        })
-        .await
-        .expect("seed policy");
+    let mut actor = cosigner.actor().await;
+    actor
+        .install_policy(
+            group_key.to_string(),
+            &kp_cosigner.to_json(),
+            &pkp.to_json(),
+            Some(&hex::encode(kp_user.identifier.serialize())),
+            ark_cosigner_secret_hex,
+            None,
+            String::new(),
+        )
+        .expect("install policy");
+    cosigner.persist(&mut actor).await;
 }

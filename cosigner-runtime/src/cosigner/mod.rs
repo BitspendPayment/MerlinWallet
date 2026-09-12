@@ -1,17 +1,13 @@
-//! Per-cosigner actor model. Each user has one native `CosignerActor` (keys + FROST ceremony +
-//! Ark sessions); a tokio task owns it + its mutable host state, processing commands serially.
+//! The cosigner. One `CosignerActor` holds the keys, the FROST ceremonies and the Ark sessions;
+//! `instance::Cosigner` is the single wallet this process serves, loaded from its seal.
 
 pub mod actor;
-pub mod command;
-pub mod handle;
 pub mod handlers;
-pub mod registry;
+pub mod store;
+pub mod instance;
 pub mod state;
 pub mod types;
 
 pub use actor::CosignerActor;
-pub use command::CosignerCommand;
-pub use handle::CosignerHandle;
-pub use registry::CosignerRegistry;
 pub use state::CosignerState;
 pub use types::ArkTxEntry;

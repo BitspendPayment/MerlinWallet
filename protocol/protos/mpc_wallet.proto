@@ -35,8 +35,10 @@ service MPCWallet {
   rpc PaymentRequestDecline (PaymentRequestDeclineRequest) returns (PaymentRequestDeclineResponse);
 
   // Signing
-  rpc SignStep1 (SignStep1Request) returns (SignStep1Response);
-  rpc SignStep2 (SignStep2Request) returns (SignStep2Response);
+  // SignStep1/SignStep2 were removed: signing is a bidirectional session now, in
+  // cosign_session.proto. Two unary steps made the server park a single-use FROST nonce between
+  // requests; a stream owns it for one ceremony and drops it, so there is nothing to persist and
+  // nothing to replay.
 
   // Ark Protocol
   rpc GetArkInfo (GetArkInfoRequest) returns (GetArkInfoResponse);

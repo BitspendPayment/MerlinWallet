@@ -9,7 +9,7 @@ use tokio::runtime::Handle;
 use tonic::Status;
 
 use crate::cosigner::actor::CosignerActor;
-use crate::cosigner::registry::run_blocking;
+use crate::cosigner::store::run_blocking;
 use crate::cosigner::state::VtxoEntry;
 use crate::cosigner::types::ArkTxEntry;
 

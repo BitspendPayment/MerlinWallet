@@ -12,9 +12,8 @@ use zeroize::Zeroizing;
 
 use tonic::Status;
 
-use crate::cosigner::command::CosignerCommand;
 use crate::cosigner::handlers;
-use crate::cosigner::registry::{push_vtxo_received, CosignerRegistry};
+use crate::cosigner::store::push_vtxo_received;
 use crate::cosigner::state::CosignerState;
 
 use crate::cosigner::types::{
@@ -79,7 +78,7 @@ struct Policy {
 
 /// In-flight FROST ceremony state (cleared between rounds).
 #[derive(Default)]
-struct Ceremony {
+pub struct Ceremony {
     message: Vec<u8>,
     commitments: BTreeMap<Identifier, SigningCommitments>,
     shares: BTreeMap<Identifier, SignatureShare>,
@@ -92,9 +91,7 @@ struct Ceremony {
 
 pub struct CosignerActor {
     policy: Option<Policy>,
-    ceremony: Ceremony,
     /// In-flight off-chain send: `(session, change_exit_delay)`.
-    send_session: Option<(SendSession, u32)>,
     /// A `ReadyToSettle` delegate session the core can drive autonomously (auto-settle).
     delegate_session: Option<DelegateSettleSession>,
     /// In-flight GUEST-style boarding settle, held across the commitment-FROST pause (the client
@@ -136,8 +133,6 @@ impl CosignerActor {
     pub fn new(shared: Arc<SharedServices>, state: Arc<Mutex<CosignerState>>) -> Self {
         Self {
             policy: None,
-            ceremony: Ceremony::default(),
-            send_session: None,
             delegate_session: None,
             boarding_settle: None,
             ark_cosigner_secret_hex: None,
@@ -232,6 +227,82 @@ impl CosignerActor {
 
     pub fn set_vtxos(&mut self, vtxos: Vec<VtxoInput>) {
         self.vtxos = vtxos;
+    }
+
+    /// Seal this actor's state. Storage is the whole of the persistence now, so a method that
+    /// mutates durable state seals here rather than trusting its caller to remember.
+    pub async fn seal(&mut self) {
+        let shared = self.shared.clone();
+        let group_key = self.state.lock().cosigner_id.clone();
+        crate::cosigner::store::persist_actor_snapshot(self, &shared, &group_key).await;
+    }
+
+    /// Record a settled boarding output: replace it in the host projection with the VTXO it
+    /// became, log it, and hand back the commitment txid.
+    pub fn apply_boarding_settle(
+        &mut self,
+        user_id_hex: &str,
+        sub: BoardingSettleSubmitted,
+    ) -> String {
+        let now = crate::cosigner::store::now_secs();
+        let mut st = self.state.lock();
+        st.vtxos
+            .retain(|e| !(e.txid == sub.vtxo_txid && e.vout == sub.vtxo_vout));
+        st.vtxos.push(crate::cosigner::state::VtxoEntry {
+            txid: sub.vtxo_txid.clone(),
+            vout: sub.vtxo_vout,
+            amount: sub.amount_sats,
+            exit_delay: sub.exit_delay,
+            created_at: now,
+            expires_at: 0,
+        });
+        handlers::helpers::save_user_vtxos(self.shared.persistence.as_ref(), user_id_hex, &st.vtxos);
+        st.ark_tx_history.push(ArkTxEntry {
+            tx_type: "board".into(),
+            amount_sats: sub.amount_sats as i64,
+            txid: sub.vtxo_txid,
+            timestamp: now,
+        });
+        handlers::helpers::save_user_ark_history(
+            self.shared.persistence.as_ref(),
+            user_id_hex,
+            &st.ark_tx_history,
+        );
+        sub.commitment_txid
+    }
+
+    /// Record a completed send: mirror it into the owned history, update the host projection for
+    /// live queries, and mark any outstanding request the tx satisfies as paid. Matched on the
+    /// STORED intent's destination + amount, so the seal stays the authority and the client never
+    /// says which request it is paying.
+    pub fn apply_send(
+        &mut self,
+        req: &crate::wallet_proto::SendVtxoRequest,
+        submitted: SendVtxoSubmitted,
+    ) -> crate::wallet_proto::SendVtxoResponse {
+        let SendVtxoSubmitted { ark_txid, change } = submitted;
+        self.append_history(ArkTxEntry {
+            tx_type: "send".to_string(),
+            amount_sats: -(req.amount as i64),
+            txid: ark_txid.clone(),
+            timestamp: crate::cosigner::store::now_secs(),
+        });
+        let resp = {
+            let mut st = self.state.lock();
+            crate::cosigner::handlers::ark_send::apply_send_result(
+                &mut st,
+                &self.shared,
+                req,
+                ark_txid.clone(),
+                change,
+            )
+        };
+        if let Some(id) =
+            self.fulfil_matching_intent(&req.recipient_ark_address, req.amount, &ark_txid)
+        {
+            tracing::info!("payment request {id} fulfilled by {ark_txid}");
+        }
+        resp
     }
 
     /// Append one entry to the owned Ark transaction history (after a send/settle).
@@ -531,7 +602,7 @@ impl CosignerActor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn install_policy(
+    pub fn install_policy(
         &mut self,
         group_key: String,
         key_package_json: &str,
@@ -608,7 +679,8 @@ impl CosignerActor {
         ))
     }
 
-    pub fn sign_step1(&mut self, req: SignStep1) -> Result<SignStep1Out, String> {
+    /// Open a ceremony and hand it back. Nothing about it is stored here.
+    pub fn sign_open(&mut self, req: SignStep1) -> Result<(Ceremony, SignStep1Out), String> {
         // Authentication (OP_SIGN_STEP1) ran at the REST boundary; AUTHORIZATION is ours. Reject
         // before touching `self.ceremony`, or a stranger's rejected call still wipes a live one.
         if !self.is_authorized_signer(&req.user_id) {
@@ -680,25 +752,32 @@ impl CosignerActor {
             })
             .collect();
         let message_to_sign = new_signing_ceremony.message.clone();
-        self.ceremony = new_signing_ceremony;
-
-        Ok(SignStep1Out {
-            commitments,
-            message_to_sign,
-        })
+        Ok((
+            new_signing_ceremony,
+            SignStep1Out {
+                commitments,
+                message_to_sign,
+            },
+        ))
     }
 
-    pub fn sign_step2(&mut self, req: SignStep2) -> Result<SignStep2Out, String> {
+    /// Finish a ceremony the caller owns. Takes it by value: the nonce is single-use, so consuming
+    /// the ceremony is what makes reuse unrepresentable rather than merely discouraged.
+    pub fn sign_finish(
+        &mut self,
+        ceremony: Ceremony,
+        req: SignStep2,
+    ) -> Result<SignStep2Out, String> {
         // Same gate as step 1: step 2 consumes the single-use nonce, so an unauthorized caller
         // could otherwise burn it and strand the real signer.
         if !self.is_authorized_signer(&req.user_id) {
             return Err("signer is not authorized for this wallet".into());
         }
-        // Plan A: enforce the bound contract (native `ContractHost`) over the full tx BEFORE
-        // producing the cosigner's share — on Deny we refuse. No-op for non-contract spends.
-        let full_tx = self.ceremony.full_transaction.clone();
-        crate::cosigner::handlers::contract_gate::enforce_contracts(&self.shared, &full_tx)
-            .map_err(|e| format!("contract gate denied: {}", e.message()))?;
+        let mut ceremony = ceremony;
+        // NOTHING IS CHECKED HERE. The contract gate that stood in this spot was the only thing
+        // between an authorized caller and a signature over arbitrary bytes, and the WASM contract
+        // layer it enforced is no longer planned. The policy IR is what has to take its place
+        // before this is exposed for real signing.
 
         let policy = self.policy.as_ref().ok_or("no policy installed")?;
         let user_identifier = policy
@@ -718,41 +797,42 @@ impl CosignerActor {
             .map_err(|_| "signature_share must be 32 bytes")?;
         let user_s =
             scalar_from_bytes(&user_s_bytes).map_err(|e| format!("bad share scalar: {e}"))?;
-        self.ceremony
+        ceremony
             .shares
             .insert(user_identifier, SignatureShare { s: user_s });
 
         // Compute the cosigner's share once (consumes the single-use nonce).
-        if !self.ceremony.shares.contains_key(&server_identifier) {
-            let nonce = self
-                .ceremony
+        if !ceremony.shares.contains_key(&server_identifier) {
+            let nonce = ceremony
                 .nonce
                 .take()
                 .ok_or("no signing nonce; call FrostSignStep1 first")?;
             let package = SigningPackage::new(
-                self.ceremony.commitments.clone(),
-                self.ceremony.message.clone(),
+                ceremony.commitments.clone(),
+                ceremony.message.clone(),
             );
             let share = signing::sign(&package, &nonce, &key_package)
                 .map_err(|e| format!("frost sign: {e}"))?;
-            self.ceremony.shares.insert(server_identifier, share);
+            ceremony.shares.insert(server_identifier, share);
         }
 
-        if self.ceremony.shares.len() < THRESHOLD_COUNT {
+        if ceremony.shares.len() < THRESHOLD_COUNT {
             return Err("share count below threshold".into());
         }
 
         // Aggregate.
         let package = SigningPackage::new(
-            self.ceremony.commitments.clone(),
-            self.ceremony.message.clone(),
+            ceremony.commitments.clone(),
+            ceremony.message.clone(),
         );
-        let signature = signing::aggregate(&package, &self.ceremony.shares, &public_key_package)
+        let signature = signing::aggregate(&package, &ceremony.shares, &public_key_package)
             .map_err(|e| format!("frost aggregate: {e}"))?;
         let r_point = point::serialize_compressed(&signature.r).to_vec();
         let z_scalar = scalar_to_bytes(&signature.z).to_vec();
 
-        self.ceremony = Ceremony::default();
+        // No clearing step. This was `self.ceremony = Ceremony::default()` when the actor parked
+        // the ceremony — erasing a spent nonce that would otherwise sit there. Taken by value, it
+        // drops here whatever happens, including on every error path above.
         Ok(SignStep2Out { r_point, z_scalar })
     }
 
@@ -1312,12 +1392,12 @@ impl CosignerActor {
         })
     }
 
-    /// SendVtxo phase 1: build the off-chain send tx (after `GetInfo`) and return the sighashes the
-    /// client must FROST-sign.
-    pub(crate) async fn send_vtxo_step1(
+    /// Open a send: build the off-chain send tx (after `GetInfo`) and hand back the session
+    /// alongside the sighashes the client must FROST-sign. Nothing about it is stored here.
+    pub async fn send_open(
         &mut self,
         req: SendVtxoStep1,
-    ) -> Result<Vec<Vec<u8>>, String> {
+    ) -> Result<(SendSession, u32, Vec<Vec<u8>>), String> {
         // Auth (OP_SEND_VTXO) ran at the REST boundary.
         let asp_arc = self.shared.asp_client.clone();
         let mut asp = asp_arc.lock().await;
@@ -1336,20 +1416,17 @@ impl CosignerActor {
             Ok(i) => i,
             Err(e) => return Err(format!("GetInfo: {e}")),
         };
-        match build_send(&owner_pk_hex, &req.vtxos, &req, &info) {
-            Ok((session, change_exit_delay, sighashes)) => {
-                self.send_session = Some((session, change_exit_delay));
-                Ok(sighashes)
-            }
-            Err(e) => Err(format!("build send: {e}")),
-        }
+        build_send(&owner_pk_hex, &req.vtxos, &req, &info).map_err(|e| format!("build send: {e}"))
     }
 
-    /// SendVtxo phase 2: insert the client's signatures, then submit + finalize via the ASP.
-    pub(crate) async fn send_vtxo_step2(
+    /// Finish a send the caller opened. Takes the session by value: it holds the half-signed
+    /// transactions, so consuming it is what stops a second submit from reaching the same session.
+    pub async fn send_finish(
         &mut self,
+        session: (SendSession, u32),
         req: SendVtxoStep2,
     ) -> Result<SendVtxoSubmitted, String> {
+        let (mut session, change_exit_delay) = session;
         // Auth (OP_SEND_VTXO) ran at the REST boundary.
         let asp_arc = self.shared.asp_client.clone();
         let mut asp = asp_arc.lock().await;
@@ -1358,14 +1435,10 @@ impl CosignerActor {
             Err(e) => return Err(e),
         };
 
-        let (ark_b64, checkpoints) = match self
-            .send_session
-            .as_mut()
-            .ok_or_else(|| "no send session".to_string())
-            .and_then(|(session, _)| {
-                session.sign_with_frost(signatures)?;
-                session.prepare_submit()
-            }) {
+        let (ark_b64, checkpoints) = match session
+            .sign_with_frost(signatures)
+            .and_then(|_| session.prepare_submit())
+        {
             Ok(x) => x,
             Err(e) => return Err(format!("prepare submit: {e}")),
         };
@@ -1375,12 +1448,7 @@ impl CosignerActor {
             Err(e) => return Err(format!("SubmitTx: {e}")),
         };
 
-        let final_checkpoints = match self
-            .send_session
-            .as_ref()
-            .ok_or_else(|| "no send session".to_string())
-            .and_then(|(session, _)| session.finalize_checkpoints(&submit.signed_checkpoint_txs))
-        {
+        let final_checkpoints = match session.finalize_checkpoints(&submit.signed_checkpoint_txs) {
             Ok(c) => c,
             Err(e) => return Err(format!("finalize checkpoints: {e}")),
         };
@@ -1393,18 +1461,10 @@ impl CosignerActor {
         }
 
         let change = {
-            let change = self
-                .send_session
-                .as_ref()
-                .and_then(|(session, change_exit_delay)| {
-                    session
-                        .change_vtxo()
-                        .map(|(txid, vout, amount)| (txid, vout, amount, *change_exit_delay))
-                });
-            if let Some((session, _)) = self.send_session.as_mut() {
-                session.mark_done();
-            }
-            self.send_session = None;
+            let change = session
+                .change_vtxo()
+                .map(|(txid, vout, amount)| (txid, vout, amount, change_exit_delay));
+            session.mark_done();
             // The send spent all current VTXOs; re-add the change VTXO to the owned set, if any.
             self.vtxos.clear();
             if let Some((txid, vout, amount_sats, exit_delay)) = change.clone() {
@@ -1643,149 +1703,5 @@ pub fn build_arktx_sighash(checkpoint_tx: &[u8], ark_tx: &[u8]) -> Result<[u8; 3
 }
 
 impl CosignerActor {
-    /// Per-command dispatch. Each command routes to the matching `&mut self` handler method.
-    /// `Shutdown` is handled directly in `run_cosigner` (it breaks the loop) and never reaches here.
-    pub async fn dispatch(&mut self, cmd: CosignerCommand, registry: Arc<CosignerRegistry>) {
-        match cmd {
-            // -------- Ark (lookups) --------
-            CosignerCommand::GetArkInfo { req, reply } => {
-                let _ = reply.send(self.get_ark_info(req).await);
-            }
-            CosignerCommand::GetArkAddress { req, reply } => {
-                let _ = reply.send(self.get_ark_address(&registry, req).await);
-            }
-            CosignerCommand::GetBoardingAddress { req, reply } => {
-                let _ = reply.send(self.get_boarding_address(&registry, req).await);
-            }
-            CosignerCommand::ListVtxos { req, reply } => {
-                let _ = reply.send(self.list_vtxos(req).await);
-            }
-            CosignerCommand::ListArkTransactions { req, reply } => {
-                let _ = reply.send(self.list_ark_transactions(req).await);
-            }
-            CosignerCommand::RedeemVtxo { req: _, reply } => {
-                let _ = reply.send(Err(Status::unimplemented("RedeemVtxo not implemented")));
-            }
-            CosignerCommand::SubmitArkSend { req, reply } => {
-                // The client-built send path. If the tx pays an outstanding request, mark it
-                // fulfilled — recognised from the tx's own outputs, so the sealed intent stays
-                // the authority (the client never says which request it is paying).
-                match self.submit_ark_send(req).await {
-                    Ok((resp, paid_outputs)) => {
-                        if let Some(id) =
-                            self.fulfil_intent_from_outputs(&paid_outputs, &resp.ark_txid)
-                        {
-                            tracing::info!("payment request {id} fulfilled by {}", resp.ark_txid);
-                            let group_key = self.state.lock().cosigner_id.clone();
-                            crate::cosigner::registry::persist_actor_snapshot_for(
-                                self,
-                                &group_key,
-                            )
-                            .await;
-                        }
-                        let _ = reply.send(Ok(resp));
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                    }
-                }
-            }
-            // -------- Push registration --------
-            CosignerCommand::RegisterDeviceToken { req, reply } => {
-                let _ = reply.send(self.register_device_token(req).await);
-            }
-            // -------- Request-to-pay (reads; the mutating paths are registry route_* fns) --------
-            CosignerCommand::ContactList { req, reply } => {
-                let _ = reply.send(self.contact_list(req).await);
-            }
-            CosignerCommand::PaymentRequestList { req, reply } => {
-                let _ = reply.send(self.payment_request_list(req).await);
-            }
-            // -------- Peer-contract share inbox --------
-            CosignerCommand::EvtxoPendingShares { req, reply } => {
-                let _ = reply.send(self.evtxo_pending_shares(req).await);
-            }
-            CosignerCommand::EvtxoAckShare { req, reply } => {
-                let _ = reply.send(self.evtxo_ack_share(req).await);
-            }
-            // -------- Auto-settle tick --------
-            CosignerCommand::TickAutoSettle => {
-                if let Err(e) = self.tick_auto_settle().await {
-                    tracing::warn!("tick_auto_settle: {e}");
-                }
-            }
-            // -------- Stream fan-in (no reply) --------
-            CosignerCommand::VtxoStreamUpdate {
-                user_id_hex,
-                spent,
-                spendable,
-                info,
-            } => {
-                self.apply_stream_update(user_id_hex, spent, spendable, info)
-                    .await
-            }
-            CosignerCommand::IndexerUpdate {
-                user_id_hex,
-                new_vtxos,
-                spent_vtxos,
-                info,
-            } => {
-                self.apply_stream_update(user_id_hex, spent_vtxos, new_vtxos, info)
-                    .await
-            }
-            // The rest are intercepted/`continue`d in run_cosigner; log (don't panic) if one slips through.
-            _ => tracing::error!("dispatch reached by a run_cosigner-intercepted command (bug)"),
-        }
-    }
 
-    /// Apply a VTXO stream / indexer update for `user_id_hex`: reconcile the spent + spendable
-    /// sets into the public projection (inside `spawn_blocking`), then push a `vtxo_received`
-    /// notification for any newly-added VTXOs. Both stream variants funnel through here.
-    async fn apply_stream_update(
-        &mut self,
-        user_id_hex: String,
-        spent: Vec<ark::client::proto::Vtxo>,
-        spendable: Vec<ark::client::proto::Vtxo>,
-        info: ArkInfo,
-    ) {
-        let s = self.shared.clone();
-        let span = tracing::info_span!("actor::vtxo_stream_update", user_id = %user_id_hex);
-        let user_id_for_push = user_id_hex.clone();
-        let state_lock = self.state.clone();
-        let blocking_outcome = tokio::task::spawn_blocking(move || {
-            let _enter = span.enter();
-            let mut state = state_lock.lock();
-            let added = match handlers::vtxo_stream::apply_stream_update(
-                &mut state,
-                &s,
-                &user_id_hex,
-                spent,
-                spendable,
-                info,
-            ) {
-                Ok(added) => added,
-                Err(e) => {
-                    tracing::warn!("[{user_id_hex}] VTXO stream apply failed: {e}");
-                    Vec::new()
-                }
-            };
-            let tokens = state.device_tokens.clone();
-            (added, tokens)
-        })
-        .await;
-        let (newly_added, device_tokens) = match blocking_outcome {
-            Ok(x) => x,
-            Err(join_err) if join_err.is_panic() => {
-                tracing::error!("[{user_id_for_push}] stream update panicked: {join_err:?}");
-                (Vec::new(), Vec::new())
-            }
-            Err(join_err) => {
-                tracing::error!("[{user_id_for_push}] stream update task error: {join_err:?}");
-                (Vec::new(), Vec::new())
-            }
-        };
-        if !newly_added.is_empty() {
-            push_vtxo_received(self.shared.as_ref(), &user_id_for_push, &device_tokens).await;
-        }
-    }
 }
