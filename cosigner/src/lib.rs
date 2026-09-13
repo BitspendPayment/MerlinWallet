@@ -10,6 +10,7 @@ pub mod auth;
 pub mod config;
 pub mod cosigner;
 pub mod handlers;
+pub mod host;
 pub mod session;
 pub mod store;
 pub mod types;

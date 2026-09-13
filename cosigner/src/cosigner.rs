@@ -106,6 +106,9 @@ pub struct Cosigner {
     /// Global services (contract gate + ASP url). Held so `command()` is a drop-in for the old
     /// `GuestInstance::command` — no per-call-site `store` threading.
     pub(crate) store: Arc<Store>,
+    /// The runtime this cosigner runs inside: its task queue and its push channel. `Detached` when
+    /// it runs as a plain process, where every call fails rather than quietly doing nothing.
+    pub(crate) host: Arc<dyn crate::host::Host>,
     /// This user's public projection (VTXOs / history / device tokens / policy metadata). The
     /// non-signing query + stream + inbox handlers are `impl Cosigner` methods over it.
     /// The group key this cosigner serves. Configuration, not something a caller names.
@@ -143,7 +146,16 @@ impl Cosigner {
     /// No seal yet is not an error. Before onboarding there is nothing to read, and DKG is what
     /// writes the first one.
     pub async fn open(store: Arc<Store>, group_key: String) -> Result<Self, Status> {
-        let mut cosigner = Self::new(store.clone(), group_key.clone());
+        Self::open_with_host(store, group_key, Arc::new(crate::host::Detached)).await
+    }
+
+    /// Open against a given runtime. The guest port and the tests are the two callers.
+    pub async fn open_with_host(
+        store: Arc<Store>,
+        group_key: String,
+        host: Arc<dyn crate::host::Host>,
+    ) -> Result<Self, Status> {
+        let mut cosigner = Self::new(store.clone(), group_key.clone(), host);
         crate::store::restore_snapshot(&mut cosigner, &store, &group_key).await;
         Ok(cosigner)
     }
@@ -156,7 +168,7 @@ impl Cosigner {
         &self.store
     }
 
-    fn new(store: Arc<Store>, group_key: String) -> Self {
+    fn new(store: Arc<Store>, group_key: String, host: Arc<dyn crate::host::Host>) -> Self {
         Self {
             policy: None,
             delegate_session: None,
@@ -166,6 +178,7 @@ impl Cosigner {
             contacts: Vec::new(),
             payment_intents: Vec::new(),
             store,
+            host,
             group_key,
             owned_vtxos: Vec::new(),
         }
@@ -579,7 +592,26 @@ impl Cosigner {
             .as_mut()
             .ok_or("no delegate session")?;
         session.sign_with_frost(signatures)?;
+
+        // The delegate is signed and ReadyToSettle from here, so this is the moment to arm the
+        // watch: `enqueue` is interactive-only, and this is the last interactive call the settle
+        // has. Best-effort — a wallet running detached from a runtime has no queue, and refusing
+        // the settle over a missing background nicety would be the wrong trade.
+        match self.settle_deadline() {
+            Some(deadline) => {
+                if let Err(e) = self.arm_settle_watch(deadline) {
+                    tracing::warn!("settle watch not armed: {e}");
+                }
+            }
+            None => tracing::debug!("settle watch not armed: VTXO expiries unknown"),
+        }
         Ok(())
+    }
+
+    /// When the delegate's intent becomes valid: earliest covered expiry minus the safety margin.
+    /// `None` when no covered VTXO has a known expiry — the ASP had not indexed them yet.
+    fn settle_deadline(&self) -> Option<u64> {
+        self.prepare_delegate().ok().and_then(|(_, valid_at)| valid_at)
     }
 
 
@@ -864,7 +896,7 @@ impl Cosigner {
 
     /// Delegate phase 1: build the pre-authorized intent + forfeit PSBTs (after `GetInfo`) and return
     /// the sighashes the client must FROST-sign. The Ark cosigner secret never leaves the core.
-    pub(crate) async fn generate_delegate_for(
+    pub async fn generate_delegate_for(
         &mut self,
         info: &ArkInfo,
     ) -> Result<Vec<Vec<u8>>, String> {

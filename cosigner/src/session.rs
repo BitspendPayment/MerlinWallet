@@ -638,6 +638,59 @@ impl CosignerRpc for CosignerService {
         Ok(Response::new(out))
     }
 
+
+    // --- Devices ---------------------------------------------------------------------------------
+    //
+    // Forwarded to the runtime and not stored here. The cosigner has no push channel of its own and
+    // never sees a token twice; `device_count` returns a number because it is not meant to be able
+    // to enumerate a tenant's devices.
+
+    async fn register_device(
+        &self,
+        request: Request<proto::RegisterDeviceRequest>,
+    ) -> Result<Response<proto::RegisterDeviceResponse>, Status> {
+        let req = request.into_inner();
+        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_REGISTER_DEVICE_TOKEN)?;
+        self.cosigner
+            .lock()
+            .await
+            .host
+            .register_device(&req.token)
+            .map_err(Status::unavailable)?;
+        Ok(Response::new(proto::RegisterDeviceResponse {}))
+    }
+
+    async fn forget_device(
+        &self,
+        request: Request<proto::ForgetDeviceRequest>,
+    ) -> Result<Response<proto::ForgetDeviceResponse>, Status> {
+        let req = request.into_inner();
+        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_REGISTER_DEVICE_TOKEN)?;
+        self.cosigner
+            .lock()
+            .await
+            .host
+            .forget_device(&req.token)
+            .map_err(Status::unavailable)?;
+        Ok(Response::new(proto::ForgetDeviceResponse {}))
+    }
+
+    async fn device_count(
+        &self,
+        request: Request<proto::DeviceCountRequest>,
+    ) -> Result<Response<proto::DeviceCountResponse>, Status> {
+        let req = request.into_inner();
+        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_REGISTER_DEVICE_TOKEN)?;
+        let devices = self
+            .cosigner
+            .lock()
+            .await
+            .host
+            .devices()
+            .map_err(Status::unavailable)?;
+        Ok(Response::new(proto::DeviceCountResponse { devices }))
+    }
+
 }
 
 async fn next_send(

@@ -10,5 +10,6 @@ pub mod ark_send;
 pub mod helpers;
 pub mod onboarding;
 pub mod settle;
+pub mod watch;
 pub mod parsers;
 pub mod payment_request;

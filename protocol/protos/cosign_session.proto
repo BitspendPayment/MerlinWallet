@@ -62,6 +62,47 @@ service Cosigner {
   // Deployment metadata: the Bitcoin network, so a caller renders addresses with the right HRP
   // without having to be told separately. Unauthenticated.
   rpc GetServerInfo(mpc_wallet.GetServerInfoRequest) returns (mpc_wallet.GetServerInfoResponse);
+
+  // Enrolling a device for wake signals, forwarded to the runtime.
+  //
+  // The cosigner does not keep the token and cannot send a message: it has no outbound socket. The
+  // runtime owns the registry and the FCM channel — `enclave:notify/notify` — and the cosigner only
+  // spends an enrolment, by calling `wake` from a background task when a settle comes due. That is
+  // also why these are interactive-only there, and why `DeviceCount` returns a number rather than
+  // the tokens: the cosigner is not meant to be able to enumerate a tenant's devices.
+  //
+  // Nothing woken this way carries readable text. The payload crosses the parent instance and
+  // Google; the app wakes on an opaque category and fetches the detail over this channel.
+  rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
+  rpc ForgetDevice(ForgetDeviceRequest) returns (ForgetDeviceResponse);
+  rpc DeviceCount(DeviceCountRequest) returns (DeviceCountResponse);
+}
+
+// 32-512 characters of [A-Za-z0-9_:.-], as `notify.wit` specifies.
+message RegisterDeviceRequest {
+  bytes user_id = 1;
+  bytes signature = 2;
+  int64 timestamp_ms = 3;
+  string token = 4;
+}
+message RegisterDeviceResponse {}
+
+message ForgetDeviceRequest {
+  bytes user_id = 1;
+  bytes signature = 2;
+  int64 timestamp_ms = 3;
+  string token = 4;
+}
+message ForgetDeviceResponse {}
+
+message DeviceCountRequest {
+  bytes user_id = 1;
+  bytes signature = 2;
+  int64 timestamp_ms = 3;
+}
+// How many devices are enrolled. Never which.
+message DeviceCountResponse {
+  uint32 devices = 1;
 }
 
 message SettleClientMsg {
