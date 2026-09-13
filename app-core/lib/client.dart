@@ -1,25 +1,24 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:app_core/policy.dart';
 import 'package:app_core/auth_helper.dart';
-import 'package:app_core/ark/ark_send.dart';
-import 'package:grpc/src/client/channel.dart' as grpc_base;
-import 'package:app_core/wallet_api.dart';
-import 'package:app_core/grpc_wallet_api.dart';
-import 'package:app_core/rest_wallet_api.dart';
+import 'package:app_core/ark/ark.dart' as ark_addr;
+import 'package:app_core/asp/asp_client.dart';
+import 'package:app_core/cosigner/connection.dart';
+import 'package:app_core/sessions/dkg_session.dart';
+import 'package:app_core/sessions/send_session.dart';
+import 'package:app_core/sessions/settle_session.dart';
+import 'package:app_core/sessions/sign_session.dart';
 import 'package:app_core/passkey/session_token_source.dart';
 import 'package:app_core/passkey/seed_source.dart';
 import 'package:app_core/pin_blinding.dart';
-import 'package:app_core/attested_wallet_api.dart';
-import 'package:app_core/enclave/native_enclave.dart' show AttestationStatus;
-import 'package:http/http.dart' as http;
+import 'package:protocol/cosigner_v1.dart' as cs;
 import 'package:app_core/threshold/core/dkg.dart';
 import 'package:app_core/threshold/threshold.dart' as threshold;
-import 'package:app_core/threshold/frost/signing.dart' as frost;
-import 'package:app_core/threshold/frost/commitment.dart' as frost_comm;
-import 'package:protocol/protocol.dart';
+// `ArkInfo` is hidden: the proto one is the wire shape, and `asp/ark_info.dart` has the value type
+// the wallet actually passes around. `SendSession.arkInfoToProto` converts at the boundary.
+import 'package:protocol/protocol.dart' hide ArkInfo;
 import 'package:fixnum/fixnum.dart';
 import 'package:hive/hive.dart';
 import 'dart:io';
@@ -29,7 +28,12 @@ import 'package:convert/convert.dart';
 import 'package:app_core/persistence/wallet_store.dart';
 
 class MpcClient {
-  final WalletApi _stub;
+  /// The cosigner: four ceremony streams and seven single-round calls.
+  final CosignerConnection _conn;
+
+  /// The ASP. The wallet's own now — the cosigner renounced its socket, so whoever calls it drives
+  /// the Ark protocol and relays what it learns.
+  final AspClient _asp;
   // Store
   late final WalletStore _store;
 
@@ -113,14 +117,25 @@ class MpcClient {
   /// [encryptionCipher] - Optional cipher for encrypted storage.
   ///                      Use HiveAesCipher for AES-256 encryption.
   ///                      When null, data is stored unencrypted.
-  /// Create an MpcClient using gRPC transport (HTTP/2).
-  MpcClient(
-    grpc_base.ClientChannel channel, {
+  /// Connect to a cosigner and an ASP.
+  ///
+  /// One transport now. REST is gone — the cosigner serves a single gRPC service — and with it the
+  /// attested-REST variant, whose per-response signature header had nothing to attach to on a
+  /// bidirectional stream. Attestation belongs per request, in gRPC metadata, once the runtime
+  /// serves a document to verify against; the FFI verifier in `enclave/` is untouched and is the
+  /// half worth keeping.
+  MpcClient.grpc({
+    required String cosignerHost,
+    required int cosignerPort,
+    required String aspHost,
+    required int aspPort,
+    bool secure = false,
     int maxSigners = 2,
     int minSigners = 2,
     String? storageId,
     HiveCipher? encryptionCipher,
-  })  : _stub = GrpcWalletApi(channel),
+  })  : _conn = CosignerConnection.connect(cosignerHost, cosignerPort, secure: secure),
+        _asp = AspClient.connect(aspHost, aspPort, secure: secure),
         _maxSigners = maxSigners,
         _minSigners = minSigners {
     _store = WalletStore(
@@ -129,82 +144,12 @@ class MpcClient {
     );
   }
 
-  /// Create an MpcClient using REST transport (HTTP/1.1).
-  MpcClient.rest(
-    String baseUrl, {
-    int maxSigners = 2,
-    int minSigners = 2,
-    String? storageId,
-    HiveCipher? encryptionCipher,
-    http.Client? httpClient,
-  })  : _stub = RestWalletApi(baseUrl, httpClient: httpClient),
-        _maxSigners = maxSigners,
-        _minSigners = minSigners {
-    _store = WalletStore(
-      boxName: storageId ?? 'mpc_wallet_state_default',
-      cipher: encryptionCipher,
-    );
-  }
+  /// The ASP, for a caller that needs to ask it something directly — chiefly polling for receives.
+  AspClient get asp => _asp;
 
-  /// Wire the upstream Bearer session-token source onto the transport
-  /// (auth-off-the-share migration). No-op for transports that can't carry HTTP
-  /// headers (attested FFI), which stay on Schnorr until that path is extended.
-  void setSessionTokenSource(SessionTokenSource source) {
-    final stub = _stub;
-    if (stub is RestWalletApi) {
-      stub.sessionTokens = source;
-    }
-  }
-
-  /// Create an MpcClient using attested REST transport (enclave FFI).
-  /// Verifies enclave attestation (PCR0) and response signatures (BIP-340).
-  /// FFI runs in a background isolate -- non-blocking.
-  static Future<MpcClient> attested(
-    String baseUrl, {
-    required String expectedPcr0,
-    int maxSigners = 2,
-    int minSigners = 2,
-    String? storageId,
-    HiveCipher? encryptionCipher,
-    int cacheTtlSecs = 60,
-  }) async {
-    final api = await AttestedWalletApi.create(baseUrl,
-        expectedPcr0: expectedPcr0, cacheTtlSecs: cacheTtlSecs);
-    final client = MpcClient._internal(
-      stub: api,
-      maxSigners: maxSigners,
-      minSigners: minSigners,
-      storageId: storageId,
-      encryptionCipher: encryptionCipher,
-    );
-    return client;
-  }
-
-  /// Internal constructor used by the async `attested()` factory.
-  MpcClient._internal({
-    required WalletApi stub,
-    required int maxSigners,
-    required int minSigners,
-    String? storageId,
-    HiveCipher? encryptionCipher,
-  })  : _stub = stub,
-        _maxSigners = maxSigners,
-        _minSigners = minSigners {
-    _store = WalletStore(
-      boxName: storageId ?? 'mpc_wallet_state_default',
-      cipher: encryptionCipher,
-    );
-  }
-
-  /// Get the attestation status (only available with `MpcClient.attested()`).
-  /// Returns a Future since the FFI runs in a background isolate.
-  Future<AttestationStatus?> getAttestationStatus() async {
-    final stub = _stub;
-    if (stub is AttestedWalletApi) {
-      return stub.getAttestationStatus();
-    }
-    return null;
-  }
+  /// No-op. The Bearer session token rode HTTP headers on the REST transport; there are none. When
+  /// tokens return they ride gRPC metadata, which is an interceptor on [CosignerConnection].
+  void setSessionTokenSource(SessionTokenSource source) {}
 
   /// Initializes persistence for the client.
   ///
@@ -313,77 +258,25 @@ class MpcClient {
 
   /// Fetch the server's deployment metadata (Bitcoin network).
   /// Unauthenticated; safe to call before DKG completes.
-  Future<GetServerInfoResponse> getServerInfo() async {
-    return _stub.getServerInfo(GetServerInfoRequest());
-  }
+  Future<GetServerInfoResponse> getServerInfo() => _conn.getServerInfo();
 
   // --- DKG ---
 
-  /// DKG: only the hardware signer and server contribute secrets (dealers).
-  /// The wallet is a passive receiver — it gets a valid signing share
-  /// without contributing key material. Group key = s_hw + s_server.
+  /// Run the DKG ceremony and keep the resulting share.
+  ///
+  /// 2-of-2 {wallet, cosigner}: both deal, both hold a share, both are needed to sign.
   Future<void> doDkg() async {
     await _store.init();
-
-    // Real 2-of-2 {wallet, cosigner}: the wallet is a dealer (its own secret) and
-    // the cosigner is the other dealer. Both hold a share; both are mandatory to
-    // sign. No hardware signer, no recovery share.
-    final secret = threshold.newSecretKey();
-    // This dealer secret is also the wallet's single-key on-chain ("utxo") key.
-    _onchainSecret = secret;
-    final coefficients =
-        List<BigInt>.generate(_minSigners - 1, (_) => threshold.modNRandom());
-    final (r1Secret, r1Pkg) =
-        threshold.dkgPart1(_maxSigners, _minSigners, secret, coefficients);
-
-    final walletVkBytes =
-        threshold.elemSerializeCompressed(r1Pkg.commitment.toVerifyingKey().E);
-    final walletIdentifier = threshold.Identifier.derive(walletVkBytes);
-    // Temporary session label during DKG (endpoints are unauthenticated until the
-    // group key exists). The canonical user_id is the verifying share, set below.
-    final tempUserId = Uint8List.fromList(walletVkBytes);
-
-    // Step 1 — wallet sends its round1 (dealer). The server self-inits as the
-    // second dealer and completes the round once both are registered.
-    final step1Resp = await _stub.dKGStep1(DKGStep1Request()
-      ..userId = tempUserId
-      ..identifier = walletIdentifier.serialize()
-      ..round1Package = jsonEncode(r1Pkg.toJson()));
-
-    // Step 2 — server computes its round2 share for the wallet.
-    await _stub.dKGStep2(DKGStep2Request()..userId = tempUserId);
-
-    // The server's round1 package (the other dealer).
-    final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
-    step1Resp.round1Packages.forEach((k, v) {
-      if (v.isEmpty) return;
-      final id = threshold.Identifier(BigInt.parse(k, radix: 16));
-      if (id == walletIdentifier) return; // skip our own
-      round1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
-    });
-
-    // Wallet computes its round2 share for the server.
-    final (r2Secret, sharesFromWallet) =
-        threshold.dkgPart2(r1Secret, round1Pkgs);
-
-    // Step 3 — wallet sends its round2 share; server finalizes.
-    final step3Resp = await _stub.dKGStep3(DKGStep3Request()
-      ..userId = tempUserId
-      ..identifier = threshold.bigIntToBytes(walletIdentifier.toScalar())
-      ..round2PackagesForOthers.addAll(_buildSharesMap(sharesFromWallet)));
-
-    // Wallet finalizes (full participant) → its key package + the group PKP.
-    final sharesForWallet = _parseShares(step3Resp.round2PackagesForMe);
-    final (walletKeyPkg, pubKeyPkg) =
-        threshold.dkgPart3(r1Secret, r2Secret, round1Pkgs, sharesForWallet);
-
-    // The wallet's DKG share becomes `_normalPolicy` (blinded under the seed when gating is on).
-    await _finalizeWalletShare(walletKeyPkg, pubKeyPkg);
-
+    final result = await DkgSession(_conn).run(
+      maxSigners: _maxSigners,
+      minSigners: _minSigners,
+    );
+    // The wallet's dealer secret doubles as its single-key on-chain key.
+    _onchainSecret = result.onchainSecret;
+    await _finalizeWalletShare(result.dkg.keyPackage, result.dkg.publicKeyPackage);
     await _saveState();
   }
 
-  // Note: PublicKey is the unifying key for all identities
   PublicKeyPackage? getTweakedPublicKeyPackage(List<int>? merkle_root) {
     final publicKeyPackage = _normalPolicy?.publicKeyPackage;
     return publicKeyPackage?.tweak(merkle_root);
@@ -520,492 +413,177 @@ class MpcClient {
     );
   }
 
+  /// Sign [message], with the ceremony carried on one stream.
+  ///
+  /// The two unary steps this replaces made the cosigner hold a single-use FROST nonce between
+  /// them; here it lives on the handler's stack and dies with the stream, so an interrupted
+  /// ceremony leaves nothing to reuse.
   Future<threshold.Signature> signWithContext(
     Uint8List message,
     threshold.KeyPackage keyPkg,
     threshold.PublicKeyPackage groupPubKey,
     List<int>? fullTransaction, {
     bool applyTweak = true,
-    String? routeGroupKeyHex,
-    List<int>? arkTx,
   }) async {
-    final nonce = frost_comm.newNonce(keyPkg.secretShare);
-
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot proceed with signing.");
+    final userId = _userId;
+    if (userId == null) {
+      throw StateError('User ID is null, cannot proceed with signing.');
     }
-
-    // `user_id` is our own verifying share (auth identity); routing is by the actor URL.
-    // Contract spends reuse our normal V actor, so there's no separate routing key.
-    // 2. Step 1: Commitments
-    final auth1 = _authSig((h) => h.signForSignStep1());
-    final req = SignStep1Request()
-      ..userId = _userId!
-      ..hidingCommitment =
-          threshold.elemSerializeCompressed(nonce.commitments.hiding)
-      ..bindingCommitment =
-          threshold.elemSerializeCompressed(nonce.commitments.binding)
-      ..messageToSign = message
-      ..signature = auth1.signature
-      ..timestampMs = auth1.timestampMs;
-
-    if (fullTransaction != null) {
-      req.fullTransaction = fullTransaction;
-    }
-    // For a contract RECEIVER spending via the {receiver, cosigner} pairing actor, the
-    // cosigner is authoritative about the message: with `ark_tx` present it takes the two-leg
-    // path and signs the requested leg (else it overrides to leg 1, breaking the aggregate).
-    if (arkTx != null) {
-      req.arkTx = arkTx;
-    }
-    if (!applyTweak) {
-      req.scriptPathSpend = true;
-    }
-    final signStep1Resp =
-        await _stub.signStep1(req, routeGroupKeyHex: routeGroupKeyHex);
-
-    // Parse Commitments
-    final commitmentsMap =
-        <threshold.Identifier, frost_comm.SigningCommitments>{};
-    signStep1Resp.commitments.forEach((k, v) {
-      final id = threshold.Identifier(BigInt.parse(k, radix: 16));
-      final hiding =
-          threshold.elemDeserializeCompressed(Uint8List.fromList(v.hiding));
-      final binding =
-          threshold.elemDeserializeCompressed(Uint8List.fromList(v.binding));
-      commitmentsMap[id] = frost_comm.SigningCommitments(binding, hiding);
-    });
-
-    // 3. Step 2: Sign
-    final signingPkg = frost_comm.SigningPackage(commitmentsMap, message);
-
-    // Apply Taproot tweak for key-path spending; skip for script-path spending.
-    threshold.PublicKeyPackage pubPackage;
-    if (applyTweak) {
-      keyPkg = keyPkg.tweak(null);
-      pubPackage = groupPubKey.tweak(null);
-    } else {
-      pubPackage = groupPubKey;
-    }
-
-    final sigShare = frost.sign(signingPkg, nonce, keyPkg);
-
-    // 4. Send Share & Get Result
-    final auth2 = _authSig((h) => h.signForSignStep2());
-    final signStep2Resp = await _stub.signStep2(
-        SignStep2Request()
-          ..userId = _userId!
-          ..signatureShare = threshold.bigIntToBytes(sigShare.s)
-          ..signature = auth2.signature
-          ..timestampMs = auth2.timestampMs,
-        routeGroupKeyHex: routeGroupKeyHex);
-
-    // 5. Verify
-    final R = threshold
-        .elemDeserializeCompressed(Uint8List.fromList(signStep2Resp.rPoint));
-    final z =
-        threshold.bytesToBigInt(Uint8List.fromList(signStep2Resp.zScalar));
-
-    final signature = threshold.Signature(R, z);
-
-    return signature.verify(pubPackage.verifyingKey, message);
-  }
-
-
-  // Helpers
-  Map<String, String> _buildSharesMap(
-      Map<threshold.Identifier, threshold.Round2Package> shares) {
-    final m = <String, String>{};
-    shares.forEach((id, pkg) {
-      m[threshold
-          .bigIntToBytes(id.toScalar())
-          .map((b) => b.toRadixString(16).padLeft(2, '0'))
-          .join()] = jsonEncode(pkg.toJson());
-    });
-    return m;
-  }
-
-  Map<threshold.Identifier, threshold.Round2Package> _parseShares(
-      Map<String, String> raw) {
-    final m = <threshold.Identifier, threshold.Round2Package>{};
-    raw.forEach((k, v) {
-      m[threshold.Identifier(BigInt.parse(k, radix: 16))] =
-          threshold.Round2Package.fromJson(jsonDecode(v));
-    });
-    return m;
-  }
-
-  // --- ARK ---
-
-  Future<GetArkInfoResponse> getArkInfo() async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot get Ark info.");
-    }
-    final auth = _authSig((h) => h.signForGetArkInfo());
-    return await _stub.getArkInfo(GetArkInfoRequest()
-      ..userId = _userId!
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
-  }
-
-  Future<String> getArkAddress() async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot get Ark address.");
-    }
-    final auth = _authSig((h) => h.signForGetArkAddress());
-    final response = await _stub.getArkAddress(GetArkAddressRequest()
-      ..userId = _userId!
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
-    return response.arkAddress;
-  }
-
-  Future<String> getBoardingAddress() async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot get boarding address.");
-    }
-    final auth = _authSig((h) => h.signForGetBoardingAddress());
-    final response = await _stub.getBoardingAddress(GetBoardingAddressRequest()
-      ..userId = _userId!
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
-    return response.boardingAddress;
-  }
-
-  Future<ListVtxosResponse> listVtxos() async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot list VTXOs.");
-    }
-    final auth = _authSig((h) => h.signForListVtxos());
-    return await _stub.listVtxos(ListVtxosRequest()
-      ..userId = _userId!
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
-  }
-
-
-  /// Send VTXOs off-chain to a recipient Ark address.
-  ///
-  /// 2-round flow:
-  /// Phase 1: get sighashes (ark tx + checkpoint tx inputs)
-  /// Phase 2: send FROST signatures, server submits to ASP + finalizes
-  Future<String> sendVtxo(String recipientArkAddress, int amountSats) async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot send VTXO.");
-    }
-
-    // 1. Get ArkInfo (includes checkpoint_tapscript, forfeit_address)
-    final arkInfo = await getArkInfo();
-
-    // 2. Get VTXOs from server
-    final vtxosResp = await listVtxos();
-    if (vtxosResp.vtxos.isEmpty) {
-      throw Exception('No VTXOs available for sending');
-    }
-
-    // 3. Get change address (our own Ark address)
-    final changeAddr = await getArkAddress();
-
-    // 4. Owner x-only pubkey. VTXOs are locked to the GROUP key (a FROST aggregate verifies under
-    //    it), NOT `_userId` — the share key builds a taptree the ASP rejects as INVALID_PSBT_INPUT.
-    final ownerPk = groupXOnlyPubKey;
-    if (ownerPk == null) {
-      throw StateError('Group key unavailable — cannot build an Ark send.');
-    }
-
-    // Use exit_delay from first VTXO (all should be same type)
-    // VTXOs from server don't carry exit_delay, so use unilateral_exit_delay
-    final exitDelay = arkInfo.unilateralExitDelay.toInt();
-
-    // 5. Build Ark send transaction via FFI (client-side)
-    final vtxoInputs = vtxosResp.vtxos.map((v) => {
-      'txid': v.txid,
-      'vout': v.vout,
-      'amount': v.amount.toInt(),
-    }).toList();
-
-    final arkInfoMap = {
-      'signer_pubkey': arkInfo.signerPubkey,
-      'forfeit_pubkey': arkInfo.forfeitPubkey,
-      'forfeit_address': arkInfo.forfeitAddress,
-      'checkpoint_tapscript': arkInfo.checkpointTapscript,
-      'network': arkInfo.network,
-      'session_duration': arkInfo.sessionDuration.toInt(),
-      'unilateral_exit_delay': arkInfo.unilateralExitDelay.toInt(),
-      'boarding_exit_delay': arkInfo.boardingExitDelay.toInt(),
-      'vtxo_min_amount': arkInfo.vtxoMinAmount.toInt(),
-      'dust': arkInfo.dust.toInt(),
-    };
-
-    final session = ArkSendSession.build(
-      ownerPk: ownerPk,
-      vtxoInputs: vtxoInputs,
-      recipientArkAddress: recipientArkAddress,
-      amountSats: amountSats,
-      changeArkAddress: changeAddr,
-      exitDelay: exitDelay,
-      arkInfo: arkInfoMap,
+    final auth = _authSig((h) => h.signForSignStep1());
+    return SignSession(_conn).sign(
+      message: message,
+      keyPkg: keyPkg,
+      groupPubKey: groupPubKey,
+      userId: userId,
+      signature: auth.signature,
+      timestampMs: auth.timestampMs.toInt(),
+      fullTransaction: fullTransaction,
+      applyTweak: applyTweak,
     );
-
-    try {
-      // 6. FROST sign each sighash. Pass real PSBT bytes as fullTransaction so
-      //    the server independently evaluates the same net spend.
-      final sigHexes = <String>[];
-      for (final sighash in session.sighashes) {
-        final sig = await sign(
-          sighash,
-          fullTransaction: session.arkTxBytes,
-          applyTweak: false, // script-path spend
-        );
-
-        final rBytes = threshold.elemSerializeCompressed(sig.R);
-        final xOnly = rBytes.sublist(1);
-        final zBytes = threshold.bigIntToBytes(sig.Z);
-
-        final schnorrSig = Uint8List(64);
-        schnorrSig.setRange(0, 32, xOnly);
-        schnorrSig.setRange(32, 64, zBytes);
-
-        sigHexes.add(hex.encode(schnorrSig));
-      }
-
-      // 7. Insert signatures into PSBTs via FFI
-      final signed = ArkSendSession.insertSignatures(session.handle, sigHexes);
-
-      // 8. Submit via server proxy (server forwards to ASP + counter-signs)
-      final spentOutpoints = vtxosResp.vtxos.map((v) => '${v.txid}:${v.vout}').toList();
-
-      final auth = _authSig((h) => h.signForSendVtxo());
-      final resp = await _stub.submitArkSend(SubmitArkSendRequest()
-        ..userId = _userId!
-        ..signature = auth.signature
-        ..timestampMs = auth.timestampMs
-        ..signedArkTxB64 = signed.signedArkTxB64
-        ..signedCheckpointTxsB64.addAll(signed.signedCheckpointTxsB64)
-        ..spentOutpoints.addAll(spentOutpoints));
-
-      return resp.arkTxid;
-    } finally {
-      ArkSendSession.free(session.handle);
-    }
   }
-
-  /// Submits signed Ark PSBTs to the ASP via the server proxy.
-  Future<String> submitArkSend({
-    required String signedArkTxB64,
-    required List<String> signedCheckpointTxsB64,
-    required List<String> spentOutpoints,
-  }) async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot submit Ark send.");
-    }
-    final auth = _authSig((h) => h.signForSendVtxo());
-    final resp = await _stub.submitArkSend(SubmitArkSendRequest()
-      ..userId = _userId!
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs
-      ..signedArkTxB64 = signedArkTxB64
-      ..signedCheckpointTxsB64.addAll(signedCheckpointTxsB64)
-      ..spentOutpoints.addAll(spentOutpoints));
-    return resp.arkTxid;
-  }
-
-  Future<RedeemVtxoResponse> redeemVtxo(String onChainAddress, int amountSats) async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot redeem VTXO.");
-    }
-    final auth = _authSig((h) => h.signForRedeemVtxo());
-    return await _stub.redeemVtxo(RedeemVtxoRequest()
-      ..userId = _userId!
-      ..onChainAddress = onChainAddress
-      ..amount = Int64(amountSats)
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
-  }
-
-  /// Settle on-chain boarding UTXOs into Ark VTXOs.
-  /// Returns the commitment txid when settled.
-  ///
-  /// Spending policies do NOT gate settling — they gate fund egress (sends
-  /// and redeems), not "promote my boarding UTXO into a VTXO." Server-side
-  /// `SignStep1` forces the normal key package whenever an active settle
-  /// or delegate session is in flight, so no PIN is required.
-  /// [boardingUtxos] are the wallet-scanned on-chain boarding outputs to settle
-  /// — the cosigner no longer scans the chain. They are sent on the phase-1
-  /// (no-signatures) request.
-  Future<String> settle({List<BoardingUtxo> boardingUtxos = const []}) async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot settle.");
-    }
-
-    List<List<int>> signedMessages = [];
-
-    while (true) {
-      final auth = _authSig((h) => h.signForSettle());
-      final request = SettleRequest()
-        ..userId = _userId!
-        ..signature = auth.signature
-        ..timestampMs = auth.timestampMs;
-      if (signedMessages.isNotEmpty) {
-        request.signedMessages.addAll(signedMessages);
-      } else {
-        // Phase 1: supply the boarding UTXOs the wallet found on-chain.
-        request.boardingUtxos.addAll(boardingUtxos);
-      }
-
-      final response = await _stub.settle(request);
-      final status = response.status;
-
-      if (status == SettleResponse_Status.SETTLED) {
-        return response.commitmentTxid;
-      }
-
-      if (status == SettleResponse_Status.ERROR) {
-        throw Exception('Settle error: ${response.errorMessage}');
-      }
-
-      if (status == SettleResponse_Status.SIGNING_REQUIRED) {
-        signedMessages = [];
-        final scriptPath = response.scriptPathSpend;
-
-        for (final sighash in response.messagesToSign) {
-          final sighashBytes = Uint8List.fromList(sighash);
-
-          // Settling always signs with the normal policy KP.
-          final sig = await sign(
-            sighashBytes,
-            applyTweak: !scriptPath,
-          );
-
-          // Convert threshold.Signature to 64-byte BIP-340 Schnorr sig
-          // R: compressed point (33 bytes) -> x-only (32 bytes, drop prefix)
-          final rBytes = threshold.elemSerializeCompressed(sig.R);
-          final xOnly = rBytes.sublist(1);
-          // Z: scalar -> 32 bytes big-endian
-          final zBytes = threshold.bigIntToBytes(sig.Z);
-
-          final schnorrSig = Uint8List(64);
-          schnorrSig.setRange(0, 32, xOnly);
-          schnorrSig.setRange(32, 64, zBytes);
-
-          signedMessages.add(schnorrSig.toList());
-        }
-        // Loop back to call Settle again with signatures
-        continue;
-      }
-
-      if (status == SettleResponse_Status.WAITING_FOR_BATCH) {
-        // Server is still processing, wait and retry
-        await Future.delayed(Duration(seconds: 2));
-        signedMessages = []; // No signatures to send when polling
-        continue;
-      }
-    }
-  }
-
-  /// Settle existing VTXOs using the delegate pattern.
-  ///
-  /// Two rounds. Phase 1 fetches sighashes; phase 2 sends FROST signatures.
-  /// When [storeOnly] is true, the cosigner stores the signed intent and
-  /// drives the batch later when the auto-settle threshold is met (returns
-  /// DELEGATED, commitment txid is empty). When false, the cosigner joins
-  /// the next batch immediately (returns SETTLED with the commitment txid).
-  ///
-  /// Like [settle], no PIN/policy is required. Settling is a re-packaging of
-  /// the user's own funds, not egress; server-side `SignStep1` forces the
-  /// normal key package while a delegate session is active.
-  Future<String> settleDelegate({bool storeOnly = false}) async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot settleDelegate.");
-    }
-
-    // Phase 1: request sighashes
-    final auth1 = _authSig((h) => h.signForSettleDelegate());
-    final req1 = SettleDelegateRequest()
-      ..userId = _userId!
-      ..signature = auth1.signature
-      ..timestampMs = auth1.timestampMs;
-
-    final resp1 = await _stub.settleDelegate(req1);
-
-    if (resp1.status == SettleDelegateResponse_Status.ERROR) {
-      throw Exception('SettleDelegate error: ${resp1.errorMessage}');
-    }
-    if (resp1.status != SettleDelegateResponse_Status.SIGNING_REQUIRED) {
-      throw Exception('Expected SIGNING_REQUIRED, got ${resp1.status}');
-    }
-
-    // FROST sign all sighashes
-    List<List<int>> signedMessages = [];
-    final scriptPath = resp1.scriptPathSpend;
-
-    for (final sighash in resp1.messagesToSign) {
-      final sighashBytes = Uint8List.fromList(sighash);
-      // Always sign with normal policy KP — see class docstring above.
-      final sig = await sign(
-        sighashBytes,
-        applyTweak: !scriptPath,
-      );
-
-      final rBytes = threshold.elemSerializeCompressed(sig.R);
-      final xOnly = rBytes.sublist(1);
-      final zBytes = threshold.bigIntToBytes(sig.Z);
-
-      final schnorrSig = Uint8List(64);
-      schnorrSig.setRange(0, 32, xOnly);
-      schnorrSig.setRange(32, 64, zBytes);
-
-      signedMessages.add(schnorrSig.toList());
-    }
-
-    // Phase 2: send signatures. When storeOnly, the server holds the intent
-    // and the auto-settle tick task drives it later.
-    final auth2 = _authSig((h) => h.signForSettleDelegate());
-    final req2 = SettleDelegateRequest()
-      ..userId = _userId!
-      ..signature = auth2.signature
-      ..timestampMs = auth2.timestampMs
-      ..storeOnly = storeOnly;
-    req2.signedMessages.addAll(signedMessages);
-
-    final resp2 = await _stub.settleDelegate(req2);
-
-    if (resp2.status == SettleDelegateResponse_Status.ERROR) {
-      throw Exception('SettleDelegate error: ${resp2.errorMessage}');
-    }
-    final isDelegatedOk = storeOnly
-        ? resp2.status == SettleDelegateResponse_Status.DELEGATED
-        : resp2.status == SettleDelegateResponse_Status.SETTLED;
-    if (!isDelegatedOk) {
-      throw Exception(
-          'Expected ${storeOnly ? "DELEGATED" : "SETTLED"}, got ${resp2.status}');
-    }
-
-    return resp2.commitmentTxid; // empty when DELEGATED
-  }
-
-
-
-  // ---------------------------------------------------------------------------
-  // Request-to-pay
-  // ---------------------------------------------------------------------------
+  // --- ARK ---
   //
-  // These use [userId] like every other call, so the URL id, body `user_id` and the session
-  // token's `sub` agree (the runtime checks the token first). The cosigner resolves that id to the
-  // wallet's GROUP key itself — the key a payee address must derive from.
+  // The cosigner answered all of this once, by relaying its own ASP connection and deriving from a
+  // key the caller already held. It has no socket now, so the wallet asks the ASP itself and
+  // derives its own addresses through the FFI — which is parity-tested against the same ark-core
+  // code the cosigner signs with.
 
+  /// This wallet's group key, x-only, as address derivation wants it.
+  String get _ownerXOnly {
+    final pkp = _normalPolicy?.publicKeyPackage;
+    if (pkp == null) throw StateError('No key yet — run DKG first.');
+    final hex = _hexOf(threshold.elemSerializeCompressed(pkp.verifyingKey.E));
+    // Compressed is 33 bytes; x-only drops the parity prefix.
+    return hex.length == 66 ? hex.substring(2) : hex;
+  }
+
+  /// The ASP's published parameters.
+  Future<ArkInfo> getArkInfo() => _asp.getInfo();
+
+  /// Where this wallet receives off-chain.
+  Future<String> getArkAddress() async {
+    final info = await _asp.getInfo();
+    return ark_addr.arkAddress(
+      ownerXOnlyHex: _ownerXOnly,
+      aspPubkeyHex: info.signerPubkey,
+      exitDelay: info.unilateralExitDelay,
+      network: info.network,
+    );
+  }
+
+  /// Where this wallet receives on-chain, to be boarded.
+  Future<String> getBoardingAddress() async {
+    final info = await _asp.getInfo();
+    return ark_addr.boardingAddress(
+      ownerXOnlyHex: _ownerXOnly,
+      aspPubkeyHex: info.signerPubkey,
+      exitDelay: info.boardingExitDelay,
+      network: info.network,
+    );
+  }
+
+  /// What this wallet holds, from the ASP's indexer.
+  ///
+  /// Both scripts — a boarded VTXO keeps the boarding delay while received and refreshed ones use
+  /// the unilateral delay, so they sit under different ones, and asking for a single script makes
+  /// the other bucket invisible.
+  Future<List<IndexerVtxo>> listVtxos() async {
+    final info = await _asp.getInfo();
+    return _asp.getOwnedVtxos(
+      unilateralScript: ark_addr.vtxoScriptPubkeyHex(
+        ownerXOnlyHex: _ownerXOnly,
+        aspPubkeyHex: info.signerPubkey,
+        exitDelay: info.unilateralExitDelay,
+        network: info.network,
+      ),
+      boardingScript: ark_addr.vtxoScriptPubkeyHex(
+        ownerXOnlyHex: _ownerXOnly,
+        aspPubkeyHex: info.signerPubkey,
+        exitDelay: info.boardingExitDelay,
+        network: info.network,
+      ),
+      info: info,
+    );
+  }
+
+  /// Our own verifying share, or a clear failure. Every authenticated call needs it, and "null
+  /// user id" surfaces far from the call that forgot to run DKG.
   List<int> _idOrThrow() {
     final id = _userId;
-    if (id == null) {
-      throw StateError('User id unavailable — complete DKG before using payment requests.');
-    }
+    if (id == null) throw StateError('No user id yet — run DKG first.');
     return id;
   }
 
-  /// Authorize [contactGroupKeyHex] to send this wallet payment requests.
+  static String _hexOf(List<int> bytes) =>
+      bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+  /// Send [amountSats] off-chain to [recipientArkAddress]. Returns the ark txid.
+  ///
+  /// The wallet no longer builds the transaction — the cosigner does, and hands back sighashes to
+  /// FROST-sign. What the wallet does instead is talk to the ASP: `SubmitTx`, then `FinalizeTx`,
+  /// then tell the cosigner it was accepted so the send is recorded only once it is real.
+  Future<String> sendVtxo(String recipientArkAddress, int amountSats) async {
+    final userId = _userId;
+    if (userId == null) throw StateError('User ID is null, cannot send.');
+    final auth = _authSig((h) => h.signForSendVtxo());
+    final info = await _asp.getInfo();
+    return SendSession(_conn, _asp).send(
+      recipientArkAddress: recipientArkAddress,
+      amountSats: amountSats,
+      vtxos: await listVtxos(),
+      info: info,
+      keyPkg: await _walletKeyPackage(),
+      groupPubKey: _normalPolicy!.publicKeyPackage,
+      userId: userId,
+      signature: auth.signature,
+      timestampMs: auth.timestampMs.toInt(),
+    );
+  }
+
+  /// Board an on-chain output into Ark, or refresh what is already held.
+  ///
+  /// One boarding output at a time: a longer list used to be silently truncated to its first
+  /// element, boarding one deposit and stranding the rest while the caller was told the whole batch
+  /// settled.
+  Future<String> settle({
+    List<cs.BoardingUtxo> boardingUtxos = const [],
+    void Function(SettlePhase)? onProgress,
+  }) async {
+    if (boardingUtxos.length > 1) {
+      throw ArgumentError(
+        'settle takes one boarding UTXO at a time, got ${boardingUtxos.length} — '
+        'settle them individually',
+      );
+    }
+    final userId = _userId;
+    if (userId == null) throw StateError('User ID is null, cannot settle.');
+    final auth = _authSig((h) => h.signForSettle());
+    final info = await _asp.getInfo();
+    final result = await SettleSession(_conn, _asp).settle(
+      info: info,
+      keyPkg: await _walletKeyPackage(),
+      groupPubKey: _normalPolicy!.publicKeyPackage,
+      userId: userId,
+      signature: auth.signature,
+      timestampMs: auth.timestampMs.toInt(),
+      boardingUtxo: boardingUtxos.isEmpty ? null : boardingUtxos.first,
+      vtxos: boardingUtxos.isEmpty ? await listVtxos() : const [],
+      onProgress: onProgress,
+    );
+    return result.commitmentTxid;
+  }
+
+  /// Refresh the held VTXOs before they expire.
+  ///
+  /// The same `Settle` stream with no boarding output. There is no `storeOnly` any more: the
+  /// cosigner cannot drive a round unattended — a guest has no egress — so what it does instead is
+  /// arm a durable watch and wake the device when the deadline arrives, and this is what runs then.
+  Future<String> settleDelegate({void Function(SettlePhase)? onProgress}) =>
+      settle(onProgress: onProgress);
+
   Future<void> contactAdd(String contactGroupKeyHex, String label) async {
     final auth = _authSig((h) => h.signForContactAdd());
-    await _stub.contactAdd(ContactAddRequest()
+    await _conn.contactAdd(ContactAddRequest()
       ..userId = _idOrThrow()
       ..contactVerifyingKey = hex.decode(contactGroupKeyHex)
       ..label = label
@@ -1016,7 +594,7 @@ class MpcClient {
   /// Revoke a contact. Their pending requests are dropped too.
   Future<void> contactRemove(String contactGroupKeyHex) async {
     final auth = _authSig((h) => h.signForContactRemove());
-    await _stub.contactRemove(ContactRemoveRequest()
+    await _conn.contactRemove(ContactRemoveRequest()
       ..userId = _idOrThrow()
       ..contactVerifyingKey = hex.decode(contactGroupKeyHex)
       ..signature = auth.signature
@@ -1025,32 +603,39 @@ class MpcClient {
 
   Future<List<Contact>> contactList() async {
     final auth = _authSig((h) => h.signForContactList());
-    final resp = await _stub.contactList(ContactListRequest()
+    final resp = await _conn.contactList(ContactListRequest()
       ..userId = _idOrThrow()
       ..signature = auth.signature
       ..timestampMs = auth.timestampMs);
     return resp.contacts;
   }
 
-  /// Ask [payerGroupKeyHex] to pay us. Addressed to THEIR actor while identifying US; their
-  /// allowlist is the authorization. The payee address is derived by their cosigner from our
-  /// group key — we never supply it.
+  /// Ask to be paid.
+  ///
+  /// Signed by US and addressed to the PAYER's cosigner — their allowlist is the authorization,
+  /// which is why there is no ownership check on the other side. The payee address is derived there
+  /// from our allowlisted key; we never supply one, or a contact could redirect the payment.
+  ///
+  /// [conn] must point at the payer's cosigner. There is no routing argument any more: one process
+  /// serves one wallet, so which cosigner you are talking to *is* which payer you are billing.
   Future<PaymentIntent> requestPayment(
-    String payerGroupKeyHex,
+    CosignerConnection conn,
     int amountSats, {
     String memo = '',
     int expiresInSecs = 0,
   }) async {
     final auth = _authSig((h) => h.signForPayreqCreate());
-    final resp = await _stub.createPaymentRequest(
+    // The payer's cosigner derives our address from these; it has no ASP of its own to ask.
+    final info = await _asp.getInfo();
+    final resp = await conn.paymentRequestCreate(
       PaymentRequestCreateRequest()
         ..userId = _idOrThrow()
         ..amountSats = Int64(amountSats)
         ..memo = memo
         ..expiresInSecs = Int64(expiresInSecs)
         ..signature = auth.signature
-        ..timestampMs = auth.timestampMs,
-      payerGroupKeyHex,
+        ..timestampMs = auth.timestampMs
+        ..arkInfo = arkInfoToProto(info),
     );
     return resp.intent;
   }
@@ -1058,7 +643,7 @@ class MpcClient {
   /// Payment requests addressed to this wallet, newest first.
   Future<List<PaymentIntent>> paymentRequests() async {
     final auth = _authSig((h) => h.signForPayreqList());
-    final resp = await _stub.paymentRequestList(PaymentRequestListRequest()
+    final resp = await _conn.paymentRequestList(PaymentRequestListRequest()
       ..userId = _idOrThrow()
       ..signature = auth.signature
       ..timestampMs = auth.timestampMs);
@@ -1067,11 +652,50 @@ class MpcClient {
 
   Future<void> declinePaymentRequest(String id) async {
     final auth = _authSig((h) => h.signForPayreqDecline());
-    await _stub.paymentRequestDecline(PaymentRequestDeclineRequest()
+    await _conn.paymentRequestDecline(PaymentRequestDeclineRequest()
       ..userId = _idOrThrow()
       ..id = id
       ..signature = auth.signature
       ..timestampMs = auth.timestampMs);
   }
 
+  // --- Devices ----------------------------------------------------------------------------------
+  //
+  // The cosigner never sees a push token twice and has no channel to send on: it forwards these to
+  // the runtime, which owns the FCM credentials and the registry. Enrolling is what makes the
+  // cosigner's settle watch able to reach anybody — without it `wake` has no devices and the whole
+  // watch runs and notifies nothing.
+  //
+  // Enrolling is deliberately an interactive call. It grants a standing ability to reach a device,
+  // and background work must not be able to grant itself that.
+
+  /// Enrol [token] so this wallet's cosigner can wake this device.
+  Future<void> registerDevice(String token) async {
+    final auth = _authSig((h) => h.signForRegisterDeviceToken());
+    await _conn.registerDevice(cs.RegisterDeviceRequest()
+      ..userId = _idOrThrow()
+      ..token = token
+      ..signature = auth.signature
+      ..timestampMs = auth.timestampMs);
+  }
+
+  /// Stop waking the device behind [token] — a sign-out, or a token FCM rotated away.
+  Future<void> forgetDevice(String token) async {
+    final auth = _authSig((h) => h.signForRegisterDeviceToken());
+    await _conn.forgetDevice(cs.ForgetDeviceRequest()
+      ..userId = _idOrThrow()
+      ..token = token
+      ..signature = auth.signature
+      ..timestampMs = auth.timestampMs);
+  }
+
+  /// How many devices are enrolled. A count, never the tokens: the cosigner is not meant to be
+  /// able to enumerate them.
+  Future<int> deviceCount() async {
+    final auth = _authSig((h) => h.signForRegisterDeviceToken());
+    return _conn.deviceCount(cs.DeviceCountRequest()
+      ..userId = _idOrThrow()
+      ..signature = auth.signature
+      ..timestampMs = auth.timestampMs);
+  }
 }

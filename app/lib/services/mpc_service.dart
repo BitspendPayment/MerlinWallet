@@ -5,13 +5,13 @@ import 'package:convert/convert.dart';
 import 'package:flutter/foundation.dart';
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:protocol/protocol.dart';
+// `ArkInfo` also exists as a proto message; the ASP's value type is the one meant here.
+import 'package:protocol/protocol.dart' hide ArkInfo;
 
-import 'package:app_core/ark_wallet.dart';
+import 'package:app_core/asp/asp_client.dart';
 import 'package:app_core/bitcoin.dart';
 import 'package:app_core/client.dart';
-import 'package:app_core/rest_wallet_api.dart' show WalletAuthException;
-import 'package:app_core/enclave/native_enclave.dart' show AttestationStatus;
+import 'package:app_core/cosigner/connection.dart' show CosignerException;
 import 'package:app_core/enclave/manifest.dart' as manifest;
 
 import '../passkey/passkey_authenticator.dart';
@@ -50,22 +50,25 @@ class MpcService extends ChangeNotifier {
   MpcBitcoinWallet? _wallet;
   MpcBitcoinWallet? get wallet => _wallet;
 
-  MpcArkWallet? _arkWallet;
-  MpcArkWallet? get arkWallet => _arkWallet;
 
   BigInt _balance = BigInt.zero;
   BigInt get balance => _balance;
   List<WalletTransaction> get transactions => _wallet?.transactions ?? [];
 
   // --- Ark state ---
-  GetArkInfoResponse? _arkInfo;
-  GetArkInfoResponse? get arkInfo => _arkInfo;
+  //
+  // `ArkInfo` and `IndexerVtxo` come from the ASP directly now. They were
+  // `GetArkInfoResponse` and `VtxoInfo`, proto messages the cosigner relayed
+  // from its own ASP connection — it has no socket, so the app asks and passes
+  // what it learns back in on each `SendOpen`/`SettleOpen`.
+  ArkInfo? _arkInfo;
+  ArkInfo? get arkInfo => _arkInfo;
   String? _arkAddress;
   String? get arkAddress => _arkAddress;
   String? _boardingAddress;
   String? get boardingAddress => _boardingAddress;
-  List<VtxoInfo> _vtxos = [];
-  List<VtxoInfo> get vtxos => _vtxos;
+  List<IndexerVtxo> _vtxos = [];
+  List<IndexerVtxo> get vtxos => _vtxos;
   BigInt _arkBalance = BigInt.zero;
   BigInt get arkBalance => _arkBalance;
 
@@ -104,7 +107,6 @@ class MpcService extends ChangeNotifier {
     }
     if (forced) {
       _vtxoPollTimer?.cancel();
-      _arkWallet = null;
       _arkAvailable = false;
       notifyListeners();
     } else {
@@ -148,20 +150,9 @@ class MpcService extends ChangeNotifier {
   /// Cached PCR0 from the deployment manifest.
   String? _expectedPcr0;
 
-  /// Base URL for the server.
-  /// Uses HTTPS (port 443) for remote hosts.
-  /// Uses HTTP (port 7074) for local addresses (dev).
-  String get _baseUrl => server_host.baseUrlFor(_host);
-
-  /// Cached attestation status for immediate UI access.
-  AttestationStatus? _lastAttestationStatus;
-
-  /// Attestation status from the enclave client (null for local dev).
-  Future<AttestationStatus?> getAttestationStatus() async {
-    final status = await _client?.getAttestationStatus();
-    if (status != null) _lastAttestationStatus = status;
-    return _lastAttestationStatus;
-  }
+  /// The runtime's HTTP surface — passkeys and the manifest, not the cosigner.
+  /// The cosigner is gRPC and is dialled by host and port, not by URL.
+  String get _baseUrl => server_host.hostBaseUrl(_host);
 
   /// The expected PCR0 (from manifest). Null if not yet fetched.
   String? get expectedPcr0 => _expectedPcr0;
@@ -231,6 +222,15 @@ class MpcService extends ChangeNotifier {
       // the wallet stays on-chain only even if the ASP is reachable.
       _offlineModeForced =
           _identityBox!.get('offlineMode', defaultValue: false) as bool;
+
+      // What the cosigner's sealed delegate already covers. Restoring this is
+      // the whole point of persisting it: without it a cold start reads as "no
+      // delegate" and settles again — a real ASP batch round, minutes long and
+      // a biometric prompt, for a delegate that is already signed and sealed.
+      final delegated = _identityBox!.get('delegatedOutpoints');
+      if (delegated is List) {
+        _delegatedOutpoints = delegated.cast<String>().toSet();
+      }
 
       _isInitialized = true;
     } catch (e) {
@@ -312,26 +312,36 @@ class MpcService extends ChangeNotifier {
   /// non-enclave deployments (mutinynet today; never mainnet).
   bool get _requiresAttestation => server_host.requiresAttestation(_host);
 
-  /// Create an MpcClient with the appropriate transport.
-  /// Local hosts use plain REST. Remote hosts MUST use attested transport —
-  /// if attestation fails, the error propagates (no silent fallback).
+  /// Connect to this host's cosigner and its ASP.
+  ///
+  /// One transport now, where there were two. REST is gone, and with it the
+  /// attested-REST variant: attestation verified a BIP-340 signature on every
+  /// REST response body, and there are no response bodies to sign — a
+  /// bidirectional stream has no per-response header to put one in.
+  ///
+  /// **The PCR0 check below no longer verifies anything**, and is kept anyway.
+  /// What it asserts today is narrower than it reads — that a manifest naming a
+  /// measurement exists — but dropping it would turn "this host must prove it
+  /// is an enclave" into "this host is trusted", with nothing in the diff
+  /// saying so. It stays until per-request attestation replaces it, which is
+  /// where verification belongs: a badge polled once a second could only ever
+  /// describe some earlier request, never the one carrying your money.
   Future<MpcClient> _createMpcClient({
     String? storageId,
   }) async {
-    if (_requiresAttestation) {
-      if (_expectedPcr0 == null || _expectedPcr0!.isEmpty) {
-        throw StateError(
-            'Attestation required for remote host $_host but no PCR0 available. '
-            'Check network connection and retry.');
-      }
-      return MpcClient.attested(
-        _baseUrl,
-        expectedPcr0: _expectedPcr0!,
-        storageId: storageId,
-      );
+    if (_requiresAttestation && (_expectedPcr0 == null || _expectedPcr0!.isEmpty)) {
+      throw StateError(
+          'Attestation required for remote host $_host but no PCR0 available. '
+          'Check network connection and retry.');
     }
-    return MpcClient.rest(
-      _baseUrl,
+    final cosigner = server_host.cosignerEndpoint(_host);
+    final asp = server_host.aspEndpoint(_host);
+    return MpcClient.grpc(
+      cosignerHost: cosigner.host,
+      cosignerPort: cosigner.port,
+      aspHost: asp.host,
+      aspPort: asp.port,
+      secure: cosigner.secure,
       storageId: storageId,
     );
   }
@@ -545,7 +555,6 @@ class MpcService extends ChangeNotifier {
     // User forced on-chain-only: don't touch the ASP at all. The un-toggle path
     // (setOfflineMode(false) -> initArk) restarts polling.
     if (_offlineModeForced) {
-      _arkWallet = null;
       _arkAvailable = false;
       _vtxoPollTimer?.cancel();
       notifyListeners();
@@ -555,13 +564,11 @@ class MpcService extends ChangeNotifier {
       _arkInfo = await _client!.getArkInfo();
       _arkAddress = await _client!.getArkAddress();
       _boardingAddress = await _client!.getBoardingAddress();
-      _arkWallet = MpcArkWallet(_client!);
       _arkAvailable = true;
       await refreshVtxos();
       _startVtxoPolling();
     } catch (e) {
       debugPrint("Ark init failed (ASP unreachable — offline mode): $e");
-      _arkWallet = null;
       _arkAvailable = false;
       // Keep polling so the ASP is re-probed and Ark auto-recovers when it returns.
       _startVtxoPolling();
@@ -573,7 +580,16 @@ class MpcService extends ChangeNotifier {
   /// "new VTXO arrived" so the auto-settle re-delegation can fire even when
   /// the push notification path didn't deliver (denied perms, force-quit, etc).
   final Set<String> _previousVtxoOutpoints = <String>{};
-  bool _serverHasActiveDelegate = false;
+
+  /// The outpoints the last settle covered, persisted.
+  ///
+  /// This replaces `ListVtxosResponse.has_active_delegate`, which the cosigner
+  /// answered from its own view of the ASP. It has no such view — it is called
+  /// rather than running — so the fact has to live where the knowledge is. It is
+  /// persisted rather than held in memory because a cold start would otherwise
+  /// read as "no delegate" and settle again: a real ASP batch round, minutes
+  /// long and a biometric prompt, for a delegate that is already sealed.
+  Set<String> _delegatedOutpoints = <String>{};
   bool _delegateInFlight = false;
 
   /// Don't retry a failed auto-delegate before this. With a passkey-gated
@@ -596,11 +612,24 @@ class MpcService extends ChangeNotifier {
   bool _vtxoPollInFlight = false;
   static const Duration _vtxoPollInterval = Duration(seconds: 10);
 
-  /// Whether the cosigner currently holds a signed delegate intent for this
-  /// user. Refreshed on every `refreshVtxos()` from `ListVtxosResponse.
-  /// has_active_delegate`. Used by integration tests to verify the auto-
-  /// delegate flow fired.
-  bool get hasActiveDelegate => _serverHasActiveDelegate;
+  /// Whether the cosigner's sealed delegate still covers everything we hold.
+  ///
+  /// A delegate is signed over a specific set of VTXOs, so a new one appearing
+  /// makes it stale — that is the whole trigger for re-delegating. Used by
+  /// integration tests to verify the auto-delegate flow fired.
+  bool get hasActiveDelegate =>
+      _vtxos.isNotEmpty && _delegateCoversCurrentVtxos;
+
+  bool get _delegateCoversCurrentVtxos {
+    final current = _vtxos.map((v) => v.outpoint).toSet();
+    return current.isNotEmpty && current.difference(_delegatedOutpoints).isEmpty;
+  }
+
+  /// Record that a settle just covered what we hold, and remember it across restarts.
+  void _markDelegated() {
+    _delegatedOutpoints = _vtxos.map((v) => v.outpoint).toSet();
+    _identityBox?.put('delegatedOutpoints', _delegatedOutpoints.toList());
+  }
 
   /// Whether the last [refreshVtxos] failure was our credentials being refused
   /// rather than the ASP being unreachable. The poll loop must not treat the
@@ -614,12 +643,15 @@ class MpcService extends ChangeNotifier {
     bool ok = false;
     _lastVtxoFailureWasAuth = false;
     try {
-      final resp = await _client!.listVtxos();
-      _vtxos = resp.vtxos;
-      _arkBalance = BigInt.from(resp.totalBalance.toInt());
-      _serverHasActiveDelegate = resp.hasActiveDelegate;
+      // A bare list from the indexer. It was `ListVtxosResponse`, which also
+      // carried the balance and whether the cosigner held a delegate; both came
+      // from a cosigner that was watching the ASP for us. It no longer can, so
+      // the balance is a sum and the delegate is tracked here — see
+      // [_delegateCoversCurrentVtxos].
+      _vtxos = await _client!.listVtxos();
+      _arkBalance = _vtxos.fold(BigInt.zero, (sum, v) => sum + BigInt.from(v.amountSats));
       ok = true;
-    } on WalletAuthException catch (e) {
+    } on CosignerException catch (e) {
       // Our credentials, not the ASP. Recorded so the poll loop does not read a
       // routine re-auth as an outage and evict the user from Ark.
       _lastVtxoFailureWasAuth = true;
@@ -647,6 +679,21 @@ class MpcService extends ChangeNotifier {
   /// cached from a just-finished user op). Otherwise raise [needsDelegateAction]
   /// so the Ark tab shows a delegate button — the cosigner's "Funds received"
   /// notification brings the user there.
+  ///
+  /// **This got much more expensive.** It used to be `settleDelegate(storeOnly:
+  /// true)` — one call that had the cosigner seal an intent for its own later
+  /// use. The cosigner cannot settle for itself any more (a guest has no
+  /// egress), so the only way to renew is to drive a real ASP batch round from
+  /// here: register an intent, wait for the ASP's next round, sign the tree,
+  /// submit forfeits. That waits on the ASP's schedule, which is minutes, and
+  /// it dies if the app is backgrounded part-way through.
+  ///
+  /// Firing that automatically on every receive is kept for now because it is
+  /// what keeps a delegate armed and the watch running, and because the
+  /// `promptless` guard below already stops it interrupting the user. Whether
+  /// an unattended multi-minute round should start without being asked for is a
+  /// product call, and [needsDelegateAction] is the mechanism if the answer is
+  /// no — flip the condition to always raise it.
   Future<void> _delegateIfNeeded() async {
     if (_client == null || _delegateInFlight || _vtxos.isEmpty) return;
 
@@ -660,7 +707,7 @@ class MpcService extends ChangeNotifier {
     // cosigner's Ark history — a log it can no longer keep, since it is called rather than running
     // and never saw the receives. The cost is a delegate refreshed after our own change lands as
     // well as after a real receive, which is conservative rather than wrong.
-    final needsDelegate = newOutpoints.isNotEmpty || !_serverHasActiveDelegate;
+    final needsDelegate = newOutpoints.isNotEmpty || !_delegateCoversCurrentVtxos;
     if (!needsDelegate) {
       if (_delegateActionNeeded) {
         _delegateActionNeeded = false;
@@ -684,10 +731,11 @@ class MpcService extends ChangeNotifier {
 
     _delegateInFlight = true;
     try {
-      await _client!.settleDelegate(storeOnly: true);
-      _serverHasActiveDelegate = true;
+      await _client!.settleDelegate();
+      _markDelegated();
       _delegateActionNeeded = false;
       _delegateRetryAfter = null;
+      await refreshVtxos();
       notifyListeners();
     } catch (e) {
       _delegateRetryAfter = DateTime.now().add(_delegateFailureCooldown);
@@ -710,10 +758,11 @@ class MpcService extends ChangeNotifier {
     if (_delegateInFlight) throw StateError('a delegate is already in progress');
     _delegateInFlight = true;
     try {
-      await client.settleDelegate(storeOnly: true);
-      _serverHasActiveDelegate = true;
+      await client.settleDelegate();
+      _markDelegated();
       _delegateActionNeeded = false;
       _delegateRetryAfter = null;
+      await refreshVtxos();
       notifyListeners();
     } finally {
       _delegateInFlight = false;
@@ -743,7 +792,6 @@ class MpcService extends ChangeNotifier {
           if (!ok && !_lastVtxoFailureWasAuth && !await _probeArk()) {
             // ASP went down — enter offline mode.
             _arkAvailable = false;
-            _arkWallet = null;
             debugPrint('Ark ASP unreachable — entering offline mode');
             notifyListeners();
           }
@@ -817,18 +865,15 @@ class MpcService extends ChangeNotifier {
   }
 
   Future<String> sendArk(String recipientArkAddress, int amountSats) async {
-    // The same path the Send screen uses. `client.sendVtxo` is a second implementation that
-    // derived the VTXO owner key from the share id, which the ASP rejects — one proven path only.
-    final wallet = _arkWallet;
-    if (wallet == null || !arkAvailable) {
+    final client = _client;
+    if (client == null || !arkAvailable) {
       throw StateError('Ark is unavailable — cannot send.');
     }
-    final unsigned = await wallet.createTransaction(
-      destination: recipientArkAddress,
-      amountSats: amountSats,
-    );
-    final signed = await wallet.signTransaction(unsigned);
-    final arkTxid = await wallet.submit(signed);
+    // One call, where there were three. `MpcArkWallet` built the transaction here, had it
+    // co-signed, then submitted it — a second implementation of the Ark send that derived the
+    // VTXO owner key from the share id, which the ASP rejected. The cosigner builds it now and
+    // hands back sighashes, so there is one path and it is the cosigner's.
+    final arkTxid = await client.sendVtxo(recipientArkAddress, amountSats);
     await refreshVtxos();
     return arkTxid;
   }
@@ -878,14 +923,35 @@ class MpcService extends ChangeNotifier {
     await refreshPaymentRequests();
   }
 
-  /// Ask [payerGroupKeyHex] to pay us.
+  /// Ask [payerGroupKeyHex] to pay us. **Not reachable from the app today.**
+  ///
+  /// The request is signed by us and addressed to the PAYER's cosigner — their
+  /// contact allowlist is what authorizes it, which is why the payee address is
+  /// derived there from our allowlisted key rather than supplied by us. That
+  /// needs a connection to their cosigner, and there is no way to open one:
+  /// enclave-runtime resolves the tenant from the caller's own interaction
+  /// token and strips any tenant header a client sends, so every connection we
+  /// can open lands in our own instance. Calling it against our own cosigner
+  /// would create a request for *us* to pay, which is backwards.
+  ///
+  /// The inbox half is unaffected — [paymentRequests], [approvePaymentRequest]
+  /// and [declinePaymentRequest] all read our own cosigner and work.
+  ///
+  /// What would close this: carry the signed request out of band (a QR code or
+  /// a link) and have the payer's app submit it to the payer's own cosigner.
+  /// The RPC already takes the requester's `user_id`, `signature` and
+  /// `timestamp_ms`, so nothing on the cosigner needs to change — only how the
+  /// request travels, which is a product decision rather than a port.
   Future<PaymentIntent> requestPayment(
     String payerGroupKeyHex,
     int amountSats, {
     String memo = '',
   }) async {
-    if (_client == null) throw StateError('Client not initialized');
-    return _client!.requestPayment(payerGroupKeyHex.trim(), amountSats, memo: memo);
+    throw UnsupportedError(
+      'Requesting a payment needs a connection to the payer\'s cosigner, and '
+      'the runtime routes every connection to our own. Share the request out '
+      'of band instead — see MpcService.requestPayment.',
+    );
   }
 
   /// Pay a request. Amount and payee come from the STORED intent, never the UI — that is what

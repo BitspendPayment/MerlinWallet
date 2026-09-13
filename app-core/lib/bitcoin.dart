@@ -5,6 +5,8 @@ import 'package:blockchain_utils/blockchain_utils.dart'
     hide hex; // For Regtest address encoding
 import 'package:bitcoin_base/bitcoin_base.dart';
 import 'package:app_core/client.dart';
+// `BoardingUtxo` moved to the session proto with the Settle stream that consumes it.
+import 'package:protocol/cosigner_v1.dart' show BoardingUtxo;
 import 'package:convert/convert.dart';
 import 'package:app_core/persistence/wallet_store.dart';
 import 'package:app_core/coin_selection.dart';
@@ -12,7 +14,6 @@ import 'package:app_core/electrum.dart';
 import 'package:app_core/fees.dart';
 import 'package:app_core/ark/ark.dart';
 import 'package:fixnum/fixnum.dart';
-import 'package:protocol/protocol.dart';
 
 /// A wallet on-chain transaction summary for the history UI (was the
 /// `TransactionSummary` proto message; on-chain history is now wallet-derived).

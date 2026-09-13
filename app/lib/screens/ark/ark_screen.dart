@@ -3,9 +3,9 @@ import 'package:go_router/go_router.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
+import 'package:app_core/asp/asp_client.dart' show IndexerVtxo;
 import 'package:app/services/mpc_service.dart';
 import 'package:app/widgets/app_bottom_nav.dart';
-import 'package:protocol/protocol.dart';
 
 class ArkScreen extends StatelessWidget {
   const ArkScreen({super.key});
@@ -14,11 +14,6 @@ class ArkScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final mpcService = context.watch<MpcService>();
     final arkBalance = mpcService.arkBalance;
-    // No history to show. The cosigner kept an Ark transaction log and served it over
-    // `ListArkTransactions`; it is called rather than running now, so it never sees a receive and
-    // could only ever log what it performed itself — a wallet that appears never to have been
-    // paid. Rebuilding this from the ASP indexer's own history is its own piece of work.
-    const arkTxs = <ArkTransactionSummary>[];
     final arkAvailable = mpcService.arkAvailable;
 
     final balanceBtc = arkBalance.toDouble() / 100000000;
@@ -96,37 +91,32 @@ class ArkScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 8),
+                  // No history to show. The cosigner kept an Ark transaction log and served it
+                  // over `ListArkTransactions`; it is called rather than running now, so it never
+                  // sees a receive and could only ever log what it performed itself — a wallet
+                  // that appears never to have been paid. Rebuilding this from the ASP indexer's
+                  // `GetVirtualTxs` is its own piece of work.
                   Expanded(
-                    child: arkTxs.isEmpty
-                        ? Center(
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(Icons.receipt_long_outlined,
-                                    size: 48, color: Colors.white24),
-                                const SizedBox(height: 12),
-                                Text(
-                                  'History unavailable',
-                                  style:
-                                      GoogleFonts.inter(color: Colors.white38),
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  'Your balance above is current',
-                                  style: GoogleFonts.inter(
-                                      color: Colors.white24, fontSize: 12),
-                                ),
-                              ],
-                            ),
-                          )
-                        : ListView.builder(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            itemCount: arkTxs.length,
-                            itemBuilder: (context, index) {
-                              final tx = arkTxs[arkTxs.length - 1 - index];
-                              return _buildTransactionItem(context, tx);
-                            },
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.receipt_long_outlined,
+                              size: 48, color: Colors.white24),
+                          const SizedBox(height: 12),
+                          Text(
+                            'History unavailable',
+                            style: GoogleFonts.inter(color: Colors.white38),
                           ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Your balance above is current',
+                            style: GoogleFonts.inter(
+                                color: Colors.white24, fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ],
               ),
@@ -175,9 +165,9 @@ class ArkScreen extends StatelessWidget {
     final hasFunds = balance > BigInt.zero;
     final delegated = mpcService.hasActiveDelegate;
     int? soonestExp;
-    VtxoInfo? soonest;
+    IndexerVtxo? soonest;
     for (final v in mpcService.vtxos) {
-      final e = v.expiresAt.toInt();
+      final e = v.expiresAt;
       if (e <= 0) continue;
       if (soonestExp == null || e < soonestExp) {
         soonestExp = e;
@@ -308,20 +298,23 @@ class ArkScreen extends StatelessWidget {
   /// is known it shows a countdown and taps through to the refresh/expiry sheet;
   /// while the fresh expiry is still being backfilled it just reads "active".
   Widget _buildRenewalLine(
-      BuildContext context, MpcService mpcService, VtxoInfo? soonest) {
+      BuildContext context, MpcService mpcService, IndexerVtxo? soonest) {
     String label;
     VoidCallback? onTap;
     if (soonest == null) {
       label = 'Auto-renew active';
     } else {
+      // Counted to expiry, not to a refresh time. The refresh threshold was
+      // `expires_at - GetArkInfo.auto_settle_safety_margin_secs`, a cosigner
+      // setting it published so the app could show when it would settle on our
+      // behalf. It does not settle on our behalf any more, and there is no RPC
+      // for that margin — so the honest number is the one the ASP told us.
       final s = soonest;
-      final serverMargin =
-          mpcService.arkInfo?.autoSettleSafetyMarginSecs.toInt() ?? 0;
       final nowSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      final secsUntil = (s.expiresAt.toInt() - serverMargin) - nowSecs;
+      final secsUntil = s.expiresAt - nowSecs;
       label = secsUntil <= 0
-          ? 'Auto-renews soon'
-          : 'Auto-renews in ${_formatTimeUntil(secsUntil)}';
+          ? 'Renew now'
+          : 'Renew within ${_formatTimeUntil(secsUntil)}';
       onTap = () => _showDelegateInfo(context, s, mpcService);
     }
     return InkWell(
@@ -444,119 +437,19 @@ class ArkScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildTransactionItem(BuildContext context, ArkTransactionSummary tx) {
-    final amount = tx.amountSats.toInt();
-    final isIncoming = amount >= 0;
-    final absAmount = amount.abs();
-    final formatter = NumberFormat("#,##0", "en_US");
-
-    String title;
-    switch (tx.txType) {
-      case 'board':
-        title = 'Boarded (UTXO → VTXO)';
-        break;
-      case 'send':
-        title = 'Sent';
-        break;
-      case 'receive':
-        title = 'Received';
-        break;
-      case 'settle':
-        title = 'Refreshed (VTXO)';
-        break;
-      default:
-        title = tx.txType;
-    }
-
-    final date = tx.timestamp > 0
-        ? DateFormat.yMMMd().add_jm().format(
-            DateTime.fromMillisecondsSinceEpoch(tx.timestamp.toInt() * 1000))
-        : '';
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1E1E1E),
-        borderRadius: BorderRadius.circular(16),
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 40,
-            height: 40,
-            decoration: BoxDecoration(
-              color:
-                  isIncoming ? Colors.green.withOpacity(0.1) : Colors.white10,
-              shape: BoxShape.circle,
-            ),
-            child: Icon(
-              isIncoming ? Icons.arrow_downward : Icons.arrow_upward,
-              color: isIncoming ? Colors.greenAccent : Colors.white,
-              size: 20,
-            ),
-          ),
-          const SizedBox(width: 16),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  overflow: TextOverflow.ellipsis,
-                  style: GoogleFonts.inter(
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white,
-                    fontSize: 14,
-                  ),
-                ),
-                Text(
-                  date,
-                  style: GoogleFonts.inter(
-                    color: Colors.white38,
-                    fontSize: 12,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          Text(
-            '${isIncoming ? '+' : '-'}${formatter.format(absAmount)} Sats',
-            style: GoogleFonts.inter(
-              fontWeight: FontWeight.bold,
-              color: isIncoming ? Colors.greenAccent : Colors.white,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// Bottom sheet shown when tapping a delegated received VTXO: explains the
-  /// auto-refresh and shows the estimated refresh + expiry times.
+  /// Bottom sheet shown when tapping a VTXO: explains what keeps it alive and
+  /// when it stops being spendable off-chain.
   void _showDelegateInfo(
-      BuildContext context, VtxoInfo vtxo, MpcService mpcService) {
-    // The server auto-settles when now >= expires_at - safety_margin (see
-    // auto_settle.rs), so that threshold is the real refresh time. The margin
-    // comes from GetArkInfo. When the threshold is already in the past the
-    // next 60s auto-settle tick refreshes it, so show it as imminent rather
-    // than a stale timestamp.
-    final serverMargin =
-        mpcService.arkInfo?.autoSettleSafetyMarginSecs.toInt() ?? 0;
-    final expiresAt = vtxo.expiresAt.toInt();
+      BuildContext context, IndexerVtxo vtxo, MpcService mpcService) {
+    final expiresAt = vtxo.expiresAt;
     final hasExpiry = expiresAt > 0;
     final fmt = DateFormat.yMMMd().add_jm();
     final expiryStr = hasExpiry
         ? fmt.format(DateTime.fromMillisecondsSinceEpoch(expiresAt * 1000))
         : null;
-    final refreshAt = expiresAt - serverMargin;
     final nowSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-    final hasRefreshEstimate = hasExpiry && serverMargin > 0;
-    // Threshold already passed: the next auto-settle tick refreshes it.
-    final refreshImminent = hasRefreshEstimate && refreshAt <= nowSecs;
-    final refreshTimeStr = (hasRefreshEstimate && !refreshImminent)
-        ? fmt.format(DateTime.fromMillisecondsSinceEpoch(refreshAt * 1000))
-        : null;
+    final overdue = hasExpiry && expiresAt <= nowSecs;
+    final delegated = mpcService.hasActiveDelegate;
 
     showModalBottomSheet(
       context: context,
@@ -576,7 +469,7 @@ class ArkScreen extends StatelessWidget {
                     size: 20, color: Colors.tealAccent.withOpacity(0.9)),
                 const SizedBox(width: 8),
                 Text(
-                  'Auto-refresh enabled',
+                  delegated ? 'Renewal armed' : 'Renewal needed',
                   style: GoogleFonts.inter(
                     fontWeight: FontWeight.w600,
                     color: Colors.white,
@@ -586,10 +479,21 @@ class ArkScreen extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 8),
+            // This used to read "delegated to the server, which automatically
+            // refreshes your funds — no action needed". That is no longer true,
+            // and it is the kind of untrue that costs someone their VTXOs: the
+            // cosigner runs as a sandboxed guest with no network access at all,
+            // so it can reach neither the ASP nor anything else and cannot
+            // settle on our behalf. What it does is hold the signed renewal and
+            // watch the clock, waking this device when the deadline nears.
             Text(
-              'Your Ark balance is delegated to the server, which automatically '
-              'refreshes all your funds together into a single VTXO before they '
-              'expire — no action needed.',
+              delegated
+                  ? 'Your renewal is signed and held by the cosigner. It cannot '
+                      'submit it for you — it has no network access — so it will '
+                      'notify you here in time to refresh these funds.'
+                  : 'These funds have no signed renewal yet. Refresh them from '
+                      'the Ark tab so a renewal is prepared and you get reminded '
+                      'before they expire.',
               style: GoogleFonts.inter(
                 color: Colors.white60,
                 fontSize: 13,
@@ -597,13 +501,10 @@ class ArkScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 20),
-            if (refreshImminent)
-              _infoRow('Refreshes', 'any moment now')
-            else if (refreshTimeStr != null)
-              _infoRow('Refreshes around', refreshTimeStr)
-            else
-              _infoRow('Refreshes', 'shortly before expiry'),
-            if (expiryStr != null) _infoRow('Expires', expiryStr),
+            if (overdue)
+              _infoRow('Refresh', 'now — this VTXO has expired')
+            else if (expiryStr != null)
+              _infoRow('Refresh before', expiryStr),
           ],
         ),
       ),

@@ -4,7 +4,6 @@
 // ignore_for_file: avoid_print
 
 import 'package:app/services/mpc_service.dart';
-import 'package:app/services/push_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
@@ -159,21 +158,25 @@ void main() {
           timeout: const Duration(seconds: 60),
         );
 
-        // ── Background push handler ─────────────────────────────────
-        // 1500 sats fits Bob's residual budget after the 3000-sat send
-        // above; deliberately no refreshVtxos before the handler call
-        // (it would fire foreground _delegateIfNeeded and steal the work).
+        // ── A receive re-arms the renewal ───────────────────────────
+        //
+        // This used to drive PushService.handleBackgroundMessageForTest and
+        // assert the background isolate had stored a delegate. Both ends of
+        // that are gone: the isolate cannot drive an ASP batch round, and the
+        // cosigner could not have used a stored delegate by itself anyway —
+        // a Wasm guest has no egress, so waking its owner is what it does
+        // instead. The renewal happens in the foreground now, which is what
+        // this exercises.
+        //
+        // 1500 sats fits Bob's residual budget after the 3000-sat send above.
         final preBgArkBalance = svcBoard.arkBalance;
         await bob.sendTo(myArkAddress, 1500);
         await Future<void>.delayed(const Duration(seconds: 15));
 
-        await PushService.handleBackgroundMessageForTest(const {
-          'type': 'vtxo_received',
-          'user_id': '',
-        });
-
+        // A fresh outpoint makes the sealed renewal stale, so refreshVtxos ->
+        // _delegateIfNeeded settles again and re-arms it.
         await svcBoard.refreshVtxos();
-        final bgDeadline = DateTime.now().add(const Duration(seconds: 30));
+        final bgDeadline = DateTime.now().add(const Duration(minutes: 3));
         while (!svcBoard.hasActiveDelegate &&
             DateTime.now().isBefore(bgDeadline)) {
           await tester.pump(const Duration(seconds: 1));
@@ -184,12 +187,10 @@ void main() {
             reason: 'Alice should hold Bob\'s 1500-sat VTXO (after fees)');
         expect(svcBoard.hasActiveDelegate, isTrue,
             reason:
-                'after PushService.handleBackgroundMessageForTest ran, '
-                'the cosigner should hold a stored delegate covering '
-                'Bob\'s fresh outpoint. If false, _runBackgroundDelegate '
-                'failed somewhere — Hive open in the background isolate, '
-                'MpcClient.restoreState(), or the FROST sign round of '
-                'settleDelegate(storeOnly:true).');
+                'a fresh outpoint should have triggered a settle, leaving a '
+                'renewal that covers it. If false, _delegateIfNeeded did not '
+                'run or the settle round failed — the round waits on the ASP\'s '
+                'own schedule, so give it longer before suspecting the wiring.');
       }
     },
     timeout: const Timeout(Duration(minutes: 12)),

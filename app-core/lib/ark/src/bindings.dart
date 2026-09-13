@@ -19,6 +19,24 @@ final arkDefaultVtxoScriptPubkeyFfi = nativeLib
     .lookupFunction<_ArkVtxoSpkNative, _ArkVtxoSpkDart>(
         'ark_default_vtxo_script_pubkey');
 
+// Address derivation. Three symbols with the same shape: (owner_pk, asp_pk, exit_delay, network).
+//
+// These came back from the cosigner over `GetArkAddress`/`GetBoardingAddress` until it stopped
+// doing anything the caller could do itself. The Rust side has a parity test against
+// `ark::client::address`, which is what makes deriving here safe rather than a second guess at a
+// consensus-critical taptree.
+typedef _ArkAddrNative = Pointer<FfiResult> Function(
+    Pointer<Utf8>, Pointer<Utf8>, Uint32, Pointer<Utf8>);
+typedef _ArkAddrDart = Pointer<FfiResult> Function(
+    Pointer<Utf8>, Pointer<Utf8>, int, Pointer<Utf8>);
+
+final arkAddressFfi =
+    nativeLib.lookupFunction<_ArkAddrNative, _ArkAddrDart>('ark_address');
+final arkBoardingAddressFfi =
+    nativeLib.lookupFunction<_ArkAddrNative, _ArkAddrDart>('ark_boarding_address');
+final arkVtxoScriptPubkeyHexFfi = nativeLib
+    .lookupFunction<_ArkAddrNative, _ArkAddrDart>('ark_vtxo_script_pubkey_hex');
+
 typedef _ArkForfeitNative = Pointer<FfiResult> Function(
     Pointer<Utf8>, Pointer<Utf8>, Uint32);
 typedef _ArkForfeitDart = Pointer<FfiResult> Function(

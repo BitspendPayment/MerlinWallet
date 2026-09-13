@@ -38,9 +38,8 @@ class _SigningScreenState extends State<SigningScreen> {
 
   Future<void> _startArkSend() async {
     final mpcService = context.read<MpcService>();
-    final arkWallet = mpcService.arkWallet;
 
-    if (arkWallet == null || !mpcService.arkAvailable) {
+    if (!mpcService.arkAvailable) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Ark wallet not initialized!')),
@@ -81,28 +80,22 @@ class _SigningScreenState extends State<SigningScreen> {
         _statusText = 'Building transaction...';
       });
 
-      final unsigned = await arkWallet.createTransaction(
-        destination: destination,
-        amountSats: amount,
-      );
-
+      // One call where there were three. `MpcArkWallet` built the transaction,
+      // had it co-signed and submitted it as separate steps this screen could
+      // narrate; the cosigner builds it now and the wallet answers with FROST
+      // signatures and talks to the ASP, all inside one session. The steps
+      // still happen — they are just no longer three awaits to sit between.
       setState(() {
         _currentStep = 1;
         _statusText = 'Signing with your Key Share...';
       });
-      await Future.delayed(const Duration(milliseconds: 300));
 
-      final signed = await arkWallet.signTransaction(unsigned);
+      final arkTxid = await mpcService.sendArk(destination, amount);
 
-      // Step 2: Submit
       setState(() {
         _currentStep = 2;
-        _statusText = 'Submitting to Ark...';
+        _statusText = 'Submitted to Ark...';
       });
-      await Future.delayed(const Duration(milliseconds: 300));
-
-      final arkTxid = await arkWallet.submit(signed);
-      await mpcService.refreshVtxos();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(

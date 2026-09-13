@@ -1,28 +1,38 @@
 /// FCM push handling.
 ///
-/// Initializes Firebase, registers the device token with the cosigner, and
-/// keeps the token registration in sync with FCM rotations. Wakes
-/// [MpcService] from a background message so the app re-delegates after a
-/// receive even when the user hasn't opened it.
+/// Initializes Firebase, enrols the device token with the cosigner, and keeps
+/// that enrolment in sync with FCM rotations.
+///
+/// # A wake carries nothing
+///
+/// The runtime sends **data-only** messages — no title, no body, no
+/// `notification` object, not behind a flag. Its payload is
+/// `{"v": "1", "category": "...", "ref": "..."}` and that is all. The reason is
+/// that an FCM payload travels through the parent instance and then through
+/// Google, which are the two parties an enclave exists to exclude, so nothing
+/// readable goes in it: the app wakes and fetches the detail over its own
+/// connection.
+///
+/// Two consequences, both load-bearing here:
+///
+///  * **The OS displays nothing.** A `notification` block is rendered without
+///    the app running, so a wake carrying one would show text and fail to wake
+///    anything. [_handleBackgroundMessage] is the only thing that runs.
+///  * **The key is `category`, not `type`.** Every handler in this file used to
+///    read `msg.data['type']`, which the runtime never sets — so every one of
+///    them early-returned and the whole push path was dead.
 ///
 /// Safe to call on platforms or builds without Firebase config: any
 /// initialization error is logged and the rest of the app continues without
-/// push (auto-settle still fires for users who open the app).
+/// push (the foreground refresh still catches up for users who open the app).
 library;
 
-
-import 'package:app_core/client.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
-import 'package:hive/hive.dart';
-import 'package:app_core/passkey/session_token_source.dart'
-    show StaticSessionToken;
-import 'package:path_provider/path_provider.dart';
 
 import '../firebase_options.dart';
 import 'mpc_service.dart';
-import 'server_host.dart' as server_host;
 
 class PushService {
   static bool _initialized = false;
@@ -31,18 +41,14 @@ class PushService {
   /// foreground push handler can drive a re-delegate while the app is open.
   static MpcService? _svc;
 
-  /// Set when a "boarding_deposit" notification opened the app from a
-  /// terminated state before the service was ready; acted on in
+  /// The one category anything sends today: the cosigner's settle watch found
+  /// its sealed delegate due and woke its owner to come and finish the round.
+  /// Mirrors `CATEGORY_SETTLE_DUE` in `cosigner/src/handlers/watch.rs`.
+  static const String categorySettleDue = 'settle-due';
+
+  /// Set when a wake reached us before the service was ready; acted on in
   /// [registerCurrentToken] once it is.
-  static bool _pendingBoarding = false;
-
-  /// Set when a "contract_share" notification opened the app from a terminated
-  /// state before the service was ready; acted on in [registerCurrentToken].
-
-  /// Set when a "vtxo_received" notification opened the app from a terminated
-  /// state before the service was ready; acted on in [registerCurrentToken]
-  /// (a refresh, which raises the Ark-tab delegate banner if needed).
-  static bool _pendingVtxoReceived = false;
+  static bool _pendingWake = false;
 
   /// Foreground init. Called from `main()` before runApp.
   static Future<void> initialize() async {
@@ -76,204 +82,124 @@ class PushService {
     }
   }
 
-  /// Register the current FCM token with the cosigner. Call after login,
-  /// once `MpcService` has a client. Idempotent.
+  /// Enrol the current FCM token with the cosigner. Call after login, once
+  /// `MpcService` has a client. Idempotent — enrolling a token the tenant
+  /// already has is success and changes nothing.
+  ///
+  /// This is what makes the cosigner's settle watch able to reach anybody. The
+  /// cosigner never sees the token twice and has no channel to send on; it
+  /// forwards the enrolment to the runtime, which owns the FCM credentials.
+  /// Without it `wake` has no devices and the watch runs and notifies nothing.
   static Future<void> registerCurrentToken(MpcService svc) async {
     _svc = svc;
-    // A boarding notification opened the app before the service was ready.
-    if (_pendingBoarding) {
-      _pendingBoarding = false;
-      try {
-        await svc.boardFunds();
-      } catch (e) {
-        debugPrint('[push] pending boardFunds failed: $e');
-      }
-    }
-    // A funds-received notification opened the app before the service was
-    // ready; refresh so the Ark tab raises its delegate banner if needed.
-    if (_pendingVtxoReceived) {
-      _pendingVtxoReceived = false;
+
+    // A wake reached us before the service was ready. Refreshing is the whole
+    // response: it recomputes whether the sealed delegate still covers what we
+    // hold, and raises the Ark-tab banner if it does not.
+    if (_pendingWake) {
+      _pendingWake = false;
       try {
         await svc.refreshVtxos();
       } catch (e) {
-        debugPrint('[push] pending refreshVtxos failed: $e');
+        debugPrint('[push] pending wake refresh failed: $e');
       }
     }
-    // No token registration. The cosigner had a `RegisterDeviceToken` RPC and pushed from its
-    // own FCM client; it is called rather than running and has no outbound sockets, so the host
-    // owns the push channel and the registry that feeds it. Display still works — what is gone is
-    // this side telling the cosigner where to reach us.
+
+    final client = svc.client;
+    if (client == null) {
+      debugPrint('[push] no client yet — cannot enrol for wakes');
+      return;
+    }
+    try {
+      final token = await FirebaseMessaging.instance.getToken();
+      if (token == null || token.isEmpty) {
+        debugPrint('[push] FCM returned no token — not enrolled');
+        return;
+      }
+      await client.registerDevice(token);
+      debugPrint('[push] enrolled for wakes');
+    } catch (e) {
+      // Not fatal: the wallet works, it just will not be woken before a
+      // renewal falls due. Worth being loud about rather than silent.
+      debugPrint('[push] device enrolment failed — no wakes will arrive: $e');
+    }
   }
 
+  /// A wake arriving while the app is open.
+  ///
+  /// The branches for `boarding_deposit`, `payment_request` and `vtxo_received`
+  /// are gone with the sender: those came from the old always-on server's own
+  /// FCM client, and the cosigner that replaced it calls `wake` with exactly
+  /// one category. Bringing any of them back is a `wake` call in the cosigner
+  /// plus a branch here — not a branch here on its own, which is what they had
+  /// become.
   static Future<void> _handleForegroundMessage(RemoteMessage msg) async {
     debugPrint('[push] foreground: ${msg.data}');
-    final type = msg.data['type'];
     final svc = _svc;
     if (svc == null) {
-      debugPrint('[push] foreground $type but no live service yet');
+      debugPrint('[push] foreground wake but no live service yet');
       return;
     }
-    if (type == 'vtxo_received') {
-      // App is open: refresh so _delegateIfNeeded() runs — it re-delegates
-      // silently when no biometric prompt would appear, otherwise it raises
-      // the Ark-tab delegate banner for the user to act on.
-      try {
-        await svc.refreshVtxos();
-        debugPrint('[push] foreground re-delegate via refreshVtxos ok');
-      } catch (e) {
-        debugPrint('[push] foreground refreshVtxos failed: $e');
-      }
-    } else if (type == 'boarding_deposit') {
-      // App is open: reflect the pending deposit so the user can board from UI.
-      try {
-        await svc.refreshBoardingBalance();
-        debugPrint('[push] foreground boarding balance refreshed');
-      } catch (e) {
-        debugPrint('[push] foreground refreshBoardingBalance failed: $e');
-      }
-    } else if (type == 'payment_request') {
-      // App is open: an allowlisted contact asked us to pay. The intent is already sealed
-      // cosigner-side, so this is only a nudge to refresh the inbox.
-      try {
-        await svc.refreshPaymentRequests();
-        debugPrint('[push] foreground payment requests refreshed');
-      } catch (e) {
-        debugPrint('[push] foreground refreshPaymentRequests failed: $e');
-      }
+    if (msg.data['category'] != categorySettleDue) return;
+    // Refreshing is the response: it recomputes whether the sealed delegate
+    // still covers what we hold and raises the Ark-tab banner if it does not.
+    try {
+      await svc.refreshVtxos();
+      debugPrint('[push] foreground settle-due: refreshed');
+    } catch (e) {
+      debugPrint('[push] foreground settle-due refresh failed: $e');
     }
   }
 
-  /// User tapped a notification (app backgrounded or cold-started). Handles the
-  /// visible/tappable notifications: "vtxo_received" (funds arrived — refresh
-  /// so the Ark tab raises its delegate banner; the user taps Delegate there,
-  /// which is where the passkey prompt belongs), "boarding_deposit" and
-  /// "contract_share".
+  /// The app was opened from a message.
+  ///
+  /// Reachable today only via `getInitialMessage()` on a cold start, not via a
+  /// tap: nothing the runtime sends is displayable, so there is no notification
+  /// for a user to tap. Kept because the cold-start path is real and because
+  /// this is where a tap would land once wakes are surfaced locally.
   static Future<void> _handleOpenedApp(RemoteMessage msg) async {
-    final type = msg.data['type'];
+    if (msg.data['category'] != categorySettleDue) return;
     final svc = _svc;
-    if (type == 'vtxo_received') {
-      if (svc == null) {
-        _pendingVtxoReceived = true;
-        return;
-      }
-      try {
-        await svc.refreshVtxos();
-        debugPrint('[push] tap vtxo_received: refreshed (banner if needed)');
-      } catch (e) {
-        debugPrint('[push] tap vtxo_received refreshVtxos failed: $e');
-      }
-    } else if (type == 'boarding_deposit') {
-      if (svc == null) {
-        // App cold-started from the tap; act once the service is ready.
-        _pendingBoarding = true;
-        return;
-      }
-      try {
-        await svc.boardFunds();
-        debugPrint('[push] tap-to-board: boardFunds ok');
-      } catch (e) {
-        debugPrint('[push] tap-to-board boardFunds failed: $e');
-      }
-    }
-  }
-
-  /// Run the same code path `_handleBackgroundMessage` runs for a
-  /// `vtxo_received` payload, but synchronously from the calling isolate.
-  /// Integration tests use this because Flutter test bindings can't deliver
-  /// real OS push events — but the test still wants to prove the handler's
-  /// work (load Hive, restore client, store delegate) actually runs.
-  @visibleForTesting
-  static Future<void> handleBackgroundMessageForTest(
-      Map<String, String> data) async {
-    if (data['type'] != 'vtxo_received') return;
-    await _runBackgroundDelegate();
-  }
-}
-
-/// Construct a fresh REST client, restore identity from Hive, run
-/// `settleDelegate(storeOnly: true)`. Used by both the real background
-/// handler and the test-only entry point.
-///
-/// No hardware signer needed — FROST signing here uses the wallet's own
-/// share (`_normalPolicy.keyPackage`), which `restoreState()` rehydrates
-/// from Hive.
-Future<void> _runBackgroundDelegate({Duration? timeout}) async {
-  final dir = await getApplicationDocumentsDirectory();
-  // Must match the main app's Hive root. MpcService.init() initialises
-  // persistence at '<docs>/mpc_client' (via MpcClient.initPersistence), so the
-  // identity box and wallet state live there. A bare Hive.init(dir.path) opens
-  // an empty box in the wrong directory — identity + wallet state come back
-  // missing and the delegate silently no-ops.
-  await MpcClient.initPersistence(path: '${dir.path}/mpc_client');
-  final identityBox = await Hive.openBox('mpc_service_identity');
-  final host = identityBox.get('serverHost') as String?;
-  final storageId = identityBox.get('storageId') as String?;
-  if (host == null || storageId == null) {
-    debugPrint('[push:bg] missing serverHost or storageId in Hive');
-    return;
-  }
-  final client = MpcClient.rest(
-    server_host.baseUrlFor(host),
-    storageId: storageId,
-  );
-  try {
-    final restored = await client.restoreState();
-    if (!restored) {
-      debugPrint('[push:bg] restoreState returned false (no wallet)');
+    if (svc == null) {
+      // Opened before the service was ready; acted on in registerCurrentToken.
+      _pendingWake = true;
       return;
     }
-
-    // Carry the persisted session token. Without it every request here went out
-    // with an empty Schnorr signature and no Bearer header, so a passkey-gated
-    // wallet got a flat 401 — and the failure was swallowed as "foreground will
-    // catch up", which made this whole path look like it worked.
-    final token = identityBox.get('passkeySessionToken') as String?;
-    if (token != null) {
-      client.setSessionTokenSource(StaticSessionToken(token));
+    try {
+      await svc.refreshVtxos();
+      debugPrint('[push] opened on settle-due: refreshed');
+    } catch (e) {
+      debugPrint('[push] opened settle-due refresh failed: $e');
     }
-
-    // A gated share cannot be reconstructed without the passkey PRF, and a PRF
-    // evaluation needs a user gesture — impossible in a background isolate. So
-    // this path is genuinely foreground-only for passkey wallets; say so plainly
-    // instead of failing deep inside FROST signing with a confusing StateError.
-    if (client.isShareGated) {
-      debugPrint('[push:bg] share is passkey-gated — re-delegate needs the '
-          'foreground (PRF requires a user gesture); skipping');
-      return;
-    }
-    if (token == null) {
-      debugPrint('[push:bg] no persisted session token; '
-          'falling back to Schnorr auth');
-    }
-
-    final future = client.settleDelegate(storeOnly: true);
-    await (timeout != null ? future.timeout(timeout) : future);
-    debugPrint('[push:bg] settleDelegate(storeOnly:true) ok');
-  } finally {
-    // No explicit dispose on MpcClient; falls out of scope.
   }
+
 }
 
 /// Top-level background handler. Flutter requires this to be a top-level
 /// (non-class) function and annotated with `@pragma('vm:entry-point')` so the
 /// background isolate can resolve it after Tree Shaking.
 ///
-/// FROST signing happens with the wallet's own share — no hardware signer
-/// reachability required.
+/// # It cannot do the work, and it cannot yet say so
+///
+/// This used to restore the wallet from Hive and call
+/// `settleDelegate(storeOnly: true)` — have the cosigner seal a renewal for its
+/// own later use. That is gone on both ends: there is no `storeOnly`, because
+/// renewing now means driving a real ASP batch round that waits on the ASP's
+/// schedule rather than an 8-second timeout in an isolate the OS may kill; and
+/// the cosigner could not use a sealed renewal by itself anyway, since a Wasm
+/// guest has no egress at all. Waking its owner is what it does *instead*, so a
+/// background isolate finishing the job on the owner's behalf is precisely the
+/// thing that cannot happen.
+///
+/// What it should do is tell the user to open the app. **It cannot**: the wake
+/// is data-only by design and the app has no local-notification plugin, so
+/// there is nothing to display with. Until one is added, a wake that arrives
+/// while the app is backgrounded is logged and the user finds out on next open
+/// — `registerCurrentToken` and the foreground handler both refresh, and the
+/// Ark tab raises its banner if the renewal no longer covers what is held.
 @pragma('vm:entry-point')
 Future<void> _handleBackgroundMessage(RemoteMessage msg) async {
-  if (msg.data['type'] != 'vtxo_received') return;
-  try {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-  } catch (e) {
-    debugPrint('[push:bg] Firebase.initializeApp failed: $e');
-    return;
-  }
-  try {
-    await _runBackgroundDelegate(timeout: const Duration(seconds: 8));
-  } catch (e) {
-    debugPrint('[push:bg] settleDelegate failed: $e — foreground will catch up');
-  }
+  if (msg.data['category'] != PushService.categorySettleDue) return;
+  debugPrint('[push:bg] settle-due wake — nothing to display and nothing a '
+      'background isolate can settle; the next foreground refreshes');
 }

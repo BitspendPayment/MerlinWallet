@@ -1,0 +1,144 @@
+/// The DKG ceremony, as one bidirectional session.
+///
+/// Two exchanges, not three. `DKGStep1/2/3` were three unary calls because each had to be a
+/// request, and the middle one did nothing a caller needed — it recomputed the cosigner's round 2
+/// and returned the round-1 packages step 1 had already returned. On a stream the cosigner does
+/// that itself, leaving what the ceremony actually is: our round 1 in and everybody's out, then our
+/// round 2 in and the cosigner's out with the key.
+///
+/// Three unary calls also meant the cosigner held round-1 and round-2 secrets between them, and
+/// those secrets are how the key is born. Here they live on one handler's stack and die with it.
+library;
+
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:fixnum/fixnum.dart';
+import 'package:protocol/cosigner_v1.dart' as cs;
+
+import '../cosigner/connection.dart';
+import '../threshold_types.dart' as threshold;
+
+/// What a completed ceremony hands back.
+class DkgResult {
+  DkgResult(this.keyPackage, this.publicKeyPackage, this.groupKeyHex);
+  final threshold.KeyPackage keyPackage;
+  final threshold.PublicKeyPackage publicKeyPackage;
+
+  /// The group key the cosigner says the ceremony produced. Checked against the one the wallet
+  /// derives independently — see [DkgSession.run].
+  final String groupKeyHex;
+}
+
+class DkgSession {
+  DkgSession(this._conn);
+  final CosignerConnection _conn;
+
+  /// Run the ceremony. 2-of-2 {wallet, cosigner}: both deal, both hold a share, both are needed to
+  /// sign. No hardware signer and no recovery share.
+  ///
+  /// The wallet's own dealer secret is returned alongside, because it doubles as the single-key
+  /// on-chain key.
+  Future<({DkgResult dkg, threshold.SecretKey onchainSecret})> run({
+    required int maxSigners,
+    required int minSigners,
+  }) async {
+    final secret = threshold.newSecretKey();
+    final coefficients =
+        List<BigInt>.generate(minSigners - 1, (_) => threshold.modNRandom());
+    final (r1Secret, r1Pkg) =
+        threshold.dkgPart1(maxSigners, minSigners, secret, coefficients);
+
+    final walletVkBytes =
+        threshold.elemSerializeCompressed(r1Pkg.commitment.toVerifyingKey().E);
+    final walletIdentifier = threshold.Identifier.derive(walletVkBytes);
+
+    // The wallet's identity during the ceremony. There is no owner key to authenticate with yet —
+    // the ceremony is what mints it — which is why `Dkg` is the one stream the cosigner does not
+    // check. Its integrity comes from FROST and from living on one stream.
+    final tempUserId = Uint8List.fromList(walletVkBytes);
+
+    final duplex = _conn.openDkg();
+    try {
+      duplex.send(cs.DkgClientMsg(
+        sessionId: '',
+        seq: Int64(0),
+        open: cs.DkgOpen(
+          userId: tempUserId,
+          signature: const [],
+          timestampMs: Int64(DateTime.now().millisecondsSinceEpoch),
+          identifier: walletIdentifier.serialize(),
+          round1Package: jsonEncode(r1Pkg.toJson()),
+        ),
+      ));
+
+      final round1 = await duplex.next('the round-1 packages');
+      if (!round1.hasRound1()) {
+        throw CosignerException('expected the round-1 packages, got ${round1.whichBody()}');
+      }
+
+      // Everybody's round 1 except our own.
+      final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
+      round1.round1.round1Packages.forEach((k, v) {
+        if (v.isEmpty) return;
+        final id = threshold.Identifier(BigInt.parse(k, radix: 16));
+        if (id == walletIdentifier) return;
+        round1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
+      });
+      if (round1Pkgs.isEmpty) {
+        throw CosignerException('the cosigner dealt no round-1 package of its own');
+      }
+
+      final (r2Secret, sharesFromWallet) = threshold.dkgPart2(r1Secret, round1Pkgs);
+
+      duplex.send(cs.DkgClientMsg(
+        sessionId: '',
+        seq: Int64(1),
+        round2: cs.DkgRound2(
+          identifier: threshold.bigIntToBytes(walletIdentifier.toScalar()),
+          round2PackagesForOthers: {
+            for (final e in sharesFromWallet.entries)
+              _idHex(e.key): jsonEncode(e.value.toJson()),
+          },
+        ),
+      ));
+
+      final complete = await duplex.next('the key');
+      if (!complete.hasComplete()) {
+        throw CosignerException('expected the key, got ${complete.whichBody()}');
+      }
+
+      final sharesForWallet = <threshold.Identifier, threshold.Round2Package>{};
+      complete.complete.round2PackagesForMe.forEach((k, v) {
+        sharesForWallet[threshold.Identifier(BigInt.parse(k, radix: 16))] =
+            threshold.Round2Package.fromJson(jsonDecode(v));
+      });
+
+      final (keyPkg, pubKeyPkg) =
+          threshold.dkgPart3(r1Secret, r2Secret, round1Pkgs, sharesForWallet);
+
+      // Both sides derived a key; they must be the same key. The cosigner is about to seal its
+      // share against its answer, so a mismatch here is a wallet that can never sign — caught now,
+      // while it is still a failed onboarding rather than an unspendable balance.
+      final derived = _hex(threshold.elemSerializeCompressed(pubKeyPkg.verifyingKey.E));
+      if (derived != complete.complete.groupKey) {
+        throw CosignerException(
+          'the ceremony produced two different group keys: the cosigner says '
+          '${complete.complete.groupKey}, this wallet derives $derived',
+        );
+      }
+
+      return (
+        dkg: DkgResult(keyPkg, pubKeyPkg, derived),
+        onchainSecret: secret,
+      );
+    } finally {
+      await duplex.close();
+    }
+  }
+
+  static String _idHex(threshold.Identifier id) => _hex(id.serialize());
+
+  static String _hex(List<int> bytes) =>
+      bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+}

@@ -3,7 +3,6 @@ import 'package:go_router/go_router.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:app/services/mpc_service.dart';
-import 'package:app/widgets/attestation_status.dart';
 import 'package:app/widgets/app_bottom_nav.dart';
 import 'package:app/widgets/offline_banner.dart';
 import 'package:intl/intl.dart';
@@ -46,10 +45,6 @@ class HomeScreen extends StatelessWidget {
           children: [
             // On-chain-only banner (shown only in offline mode).
             const OfflineBanner(),
-            // Attestation status (only shown when using attested transport)
-            AttestationStatusWidget(
-              statusProvider: () => mpcService.getAttestationStatus(),
-            ),
             const SizedBox(height: 24),
             // Balance Card
             _buildBalanceCard(context, balance, balanceUsd),
