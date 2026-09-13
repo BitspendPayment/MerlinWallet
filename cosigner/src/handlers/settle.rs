@@ -88,9 +88,15 @@ impl Cosigner {
     pub async fn settle_open(
         &mut self,
         boarding_utxo: Option<(String, u32, u64)>,
+        vtxos: Vec<crate::types::VtxoInput>,
         info: ArkInfo,
     ) -> Result<Vec<Vec<u8>>, String> {
         let boarding = boarding_utxo.is_some();
+        // A boarding settle spends the named on-chain output; a self-refresh spends the set the
+        // caller supplies, validated against what this wallet could own.
+        if !boarding {
+            self.accept_vtxos(vtxos, &info)?;
+        }
         let sighashes = if boarding {
             self.boarding_settle_start(boarding_utxo, &info).await?
         } else {

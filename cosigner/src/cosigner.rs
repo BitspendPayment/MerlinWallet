@@ -240,6 +240,56 @@ impl Cosigner {
         self.ark_secret()
     }
 
+    /// Take the caller's account of what this wallet holds.
+    ///
+    /// The cosigner learned its VTXO set from an ASP subscription it no longer runs, so a VTXO
+    /// received from another wallet had no way in and could never be spent. The caller supplies
+    /// them now, which means saying exactly what is and is not trusted here.
+    ///
+    /// NOT trusted: ownership. Every VTXO this wallet can spend sits under a scriptPubKey derived
+    /// from the cosigner's OWN owner key and one of the two exit delays the ASP published — so an
+    /// `exit_delay` outside that pair names a script this wallet does not control, and is refused
+    /// outright. A caller cannot widen what it owns by asserting it.
+    ///
+    /// Trusted: existence. Whether `(txid, vout)` is really unspent is the ASP's to know, and a
+    /// caller inventing one gets a transaction the ASP rejects — it wastes a round and nothing
+    /// else. Existence is not a secret, so taking it on trust costs nothing.
+    pub fn accept_vtxos(&mut self, supplied: Vec<VtxoInput>, info: &ArkInfo) -> Result<(), String> {
+        let (unilateral, boarding) = (
+            info.unilateral_exit_delay as u32,
+            info.boarding_exit_delay as u32,
+        );
+        let now = crate::store::now_secs();
+        let mut accepted: Vec<VtxoEntry> = Vec::with_capacity(supplied.len());
+        for v in supplied {
+            if v.exit_delay != unilateral && v.exit_delay != boarding {
+                return Err(format!(
+                    "vtxo {}:{} has exit delay {} — this wallet's are {unilateral} (received) or \
+                     {boarding} (boarded); it is not ours to spend",
+                    v.txid, v.vout, v.exit_delay
+                ));
+            }
+            if v.amount_sats == 0 {
+                return Err(format!("vtxo {}:{} has no amount", v.txid, v.vout));
+            }
+            if accepted.iter().any(|e| e.txid == v.txid && e.vout == v.vout) {
+                return Err(format!("vtxo {}:{} named twice", v.txid, v.vout));
+            }
+            // Expiry is the ASP's and is not on the wire; 0 reads as "unknown" downstream, which
+            // `build_delegate_step1` skips conservatively rather than settling against a guess.
+            accepted.push(VtxoEntry {
+                txid: v.txid,
+                vout: v.vout,
+                amount: v.amount_sats,
+                exit_delay: v.exit_delay,
+                created_at: now,
+                expires_at: 0,
+            });
+        }
+        self.owned_vtxos = accepted;
+        Ok(())
+    }
+
     /// The owned set in the shape ark's session builders take. Expiry is dropped here because
     /// nothing downstream of a send or a settle build uses it.
     pub fn vtxos(&self) -> Vec<VtxoInput> {
@@ -902,6 +952,9 @@ impl Cosigner {
         req: SendVtxoStep1,
         info: &ArkInfo,
     ) -> Result<(SendSession, u32, Vec<Vec<u8>>), String> {
+        // `req.vtxos` is the caller's account of the set; `accept_vtxos` decides what of it this
+        // wallet could actually own before any of it is selected from.
+        self.accept_vtxos(req.vtxos.clone(), info)?;
         let total: u64 = req.vtxos.iter().map(|v| v.amount_sats).sum();
         if total < req.amount {
             return Err(format!(

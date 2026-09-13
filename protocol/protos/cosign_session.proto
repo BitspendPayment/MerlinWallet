@@ -87,26 +87,30 @@ message SettleOpen {
   bytes signature = 2;
   int64 timestamp_ms = 3;
   BoardingUtxo boarding_utxo = 4;
-  ArkInfo ark_info = 5;
+  mpc_wallet.ArkInfo ark_info = 5;
+  // The set to refresh, when `boarding_utxo` is absent. Ignored for a boarding settle.
+  repeated VtxoInput vtxos = 6;
 }
 
-message ArkInfo {
-  string signer_pubkey = 1;
-  string forfeit_pubkey = 2;
-  string forfeit_address = 3;
-  string checkpoint_tapscript = 4;
-  string network = 5;
-  int64 session_duration = 6;
-  int64 unilateral_exit_delay = 7;
-  int64 boarding_exit_delay = 8;
-  int64 vtxo_min_amount = 9;
-  int64 dust = 10;
-}
 
 message BoardingUtxo {
   string txid = 1;
   uint32 vout = 2;
   uint64 amount_sats = 3;
+}
+
+// One VTXO the caller says it holds.
+//
+// The cosigner used to learn its VTXO set from an ASP subscription it no longer runs, so a VTXO
+// received from another wallet had no way in and could never be spent. The caller supplies them
+// now, and the cosigner VALIDATES each against the scriptPubKey it derives from its own owner key
+// — so a lying caller can only name an input that does not exist, which the ASP rejects. Ownership
+// stays cosigner-derived; only existence is taken on trust, and existence is not a secret.
+message VtxoInput {
+  string txid = 1;
+  uint32 vout = 2;
+  uint64 amount_sats = 3;
+  uint32 exit_delay = 4;
 }
 
 message SettleSigned {
@@ -172,7 +176,12 @@ message TreeSignatures {
   string pubkey = 2;
   map<string, string> signatures = 3;
 }
-message ForfeitTxs { repeated string signed_txs = 1; }
+// The ASP's `SubmitSignedForfeitTxs` takes these separately. They were packed into one list, which
+// made a single-element list ambiguous between a lone forfeit and a lone commitment.
+message ForfeitTxs {
+  repeated string signed_forfeit_txs = 1;
+  string signed_commitment_tx = 2;
+}
 
 message SettleComplete {
   string commitment_txid = 1;
@@ -210,7 +219,10 @@ message SendOpen {
   int64 timestamp_ms = 3;
   string recipient_ark_address = 4;
   uint64 amount = 5;
-  ArkInfo ark_info = 6;
+  mpc_wallet.ArkInfo ark_info = 6;
+  // The set to spend from. The cosigner still selects WHICH of these to use and checks the
+  // balance itself; it validates every one against its own derived scriptPubKey first.
+  repeated VtxoInput vtxos = 7;
 }
 
 message SendSigned {

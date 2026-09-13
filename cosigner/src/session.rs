@@ -327,7 +327,7 @@ impl CosignerRpc for CosignerService {
                     timestamp_ms: open.timestamp_ms,
                     recipient_ark_address: open.recipient_ark_address.clone(),
                     amount: open.amount,
-                    vtxos: c.vtxos().to_vec(),
+                    vtxos: vtxos_from_proto(open.vtxos.clone()),
                 };
                 c.send_open(step1, &info).map_err(Status::internal)?
             };
@@ -467,10 +467,13 @@ impl CosignerRpc for CosignerService {
                 .map(ark_info_from_proto)
                 .ok_or_else(|| Status::invalid_argument("SettleOpen carried no ark_info"))?;
             let boarding_utxo = open.boarding_utxo.map(|u| (u.txid, u.vout, u.amount_sats));
+            let vtxos = vtxos_from_proto(open.vtxos);
 
             let sighashes = {
                 let mut c = cosigner.lock().await;
-                c.settle_open(boarding_utxo, info).await.map_err(Status::internal)?
+                c.settle_open(boarding_utxo, vtxos, info)
+                    .await
+                    .map_err(Status::internal)?
             };
 
             let mut seq = 1u64;
@@ -659,7 +662,18 @@ fn decode_event(
     Ok(resp.event)
 }
 
-fn ark_info_from_proto(i: proto::ArkInfo) -> ark::client::types::ArkInfo {
+fn vtxos_from_proto(v: Vec<proto::VtxoInput>) -> Vec<crate::types::VtxoInput> {
+    v.into_iter()
+        .map(|i| crate::types::VtxoInput {
+            txid: i.txid,
+            vout: i.vout,
+            amount_sats: i.amount_sats,
+            exit_delay: i.exit_delay,
+        })
+        .collect()
+}
+
+fn ark_info_from_proto(i: wp::ArkInfo) -> ark::client::types::ArkInfo {
     ark::client::types::ArkInfo {
         signer_pubkey: i.signer_pubkey,
         forfeit_pubkey: i.forfeit_pubkey,
@@ -693,13 +707,11 @@ fn asp_submit(call: crate::handlers::settle::AspCall) -> proto::AspSubmit {
                 signatures: signatures.into_iter().collect(),
             })
         }
-        // The signed commitment rides the same call as the forfeits; the ASP takes both.
         AspCall::ForfeitTxs { signed_txs, signed_commitment_b64 } => {
-            let mut signed = signed_txs;
-            if !signed_commitment_b64.is_empty() {
-                signed.push(signed_commitment_b64);
-            }
-            Call::ForfeitTxs(proto::ForfeitTxs { signed_txs: signed })
+            Call::ForfeitTxs(proto::ForfeitTxs {
+                signed_forfeit_txs: signed_txs,
+                signed_commitment_tx: signed_commitment_b64,
+            })
         }
     };
     proto::AspSubmit { call: Some(call) }
