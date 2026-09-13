@@ -86,6 +86,17 @@ impl CosignerRpc for CosignerService {
                 Some(sign_client_msg::Body::Open(o)) => o,
                 _ => Err(Status::invalid_argument("a session must open with SignOpen"))?,
             };
+            // The session is authenticated ONCE, here. Every message after this one rides that
+            // assertion — see cosign_session.proto for why there is no per-message approval. This
+            // was missing: the check ran at the REST boundary, and deleting that boundary left the
+            // four streams open to anyone who could reach the port.
+            check(
+                &open.user_id,
+                &open.signature,
+                open.timestamp_ms,
+                crate::auth::message::OP_SIGN_STEP1,
+            )?;
+
 
             let step1 = SignStep1 {
                 user_id: open.user_id.clone(),
@@ -187,6 +198,11 @@ impl CosignerRpc for CosignerService {
                 _ => Err(Status::invalid_argument("a session must open with DkgOpen"))?,
             };
 
+            // No `check()` here, and it is the one stream that cannot have one: the owner key it
+            // would verify against is what this ceremony mints. `DkgOpen` carries `signature` and
+            // `timestamp_ms` for shape only. Integrity comes from FROST itself and from the
+            // ceremony living on one stream — see `handlers::onboarding`.
+
             // The ceremony, owned here. Round-1 and round-2 secrets live on this stack and die
             // with the stream.
             let mut sess = OnboardingSession::new(hex::encode(&open.user_id));
@@ -285,6 +301,17 @@ impl CosignerRpc for CosignerService {
                 Some(proto::send_client_msg::Body::Open(o)) => o,
                 _ => Err(Status::invalid_argument("a session must open with SendOpen"))?,
             };
+            // The session is authenticated ONCE, here. Every message after this one rides that
+            // assertion — see cosign_session.proto for why there is no per-message approval. This
+            // was missing: the check ran at the REST boundary, and deleting that boundary left the
+            // four streams open to anyone who could reach the port.
+            check(
+                &open.user_id,
+                &open.signature,
+                open.timestamp_ms,
+                crate::auth::message::OP_SEND_VTXO,
+            )?;
+
             let info = open
                 .ark_info
                 .map(ark_info_from_proto)
@@ -424,12 +451,22 @@ impl CosignerRpc for CosignerService {
                 Some(proto::settle_client_msg::Body::Open(o)) => o,
                 _ => Err(Status::invalid_argument("a session must open with SettleOpen"))?,
             };
+            // The session is authenticated ONCE, here. Every message after this one rides that
+            // assertion — see cosign_session.proto for why there is no per-message approval. This
+            // was missing: the check ran at the REST boundary, and deleting that boundary left the
+            // four streams open to anyone who could reach the port.
+            check(
+                &open.user_id,
+                &open.signature,
+                open.timestamp_ms,
+                crate::auth::message::OP_SETTLE,
+            )?;
+
             let info = open
                 .ark_info
                 .map(ark_info_from_proto)
                 .ok_or_else(|| Status::invalid_argument("SettleOpen carried no ark_info"))?;
             let boarding_utxo = open.boarding_utxo.map(|u| (u.txid, u.vout, u.amount_sats));
-            let user_id_hex = crate::handlers::parsers::user_id_hex(&open.user_id);
 
             let sighashes = {
                 let mut c = cosigner.lock().await;
@@ -471,7 +508,7 @@ impl CosignerRpc for CosignerService {
                         };
                         {
                             let mut c = cosigner.lock().await;
-                            c.apply_boarding_settle(&user_id_hex, sub);
+                            c.apply_boarding_settle(sub);
                             c.seal().await;
                         }
                         yield proto::SettleServerMsg {

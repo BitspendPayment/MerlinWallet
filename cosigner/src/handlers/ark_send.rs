@@ -12,7 +12,7 @@ use crate::store::Store;
 use crate::wallet_proto::*;
 
 use super::helpers::{
-    delete_user_delegate, now_secs, save_user_vtxos,
+    delete_user_delegate, now_secs,
 };
 
 
@@ -81,7 +81,6 @@ pub fn apply_send_result(
             expires_at: 0,
         });
     }
-    save_user_vtxos(store, &user_id_hex, owned);
     SendVtxoResponse {
         status: send_vtxo_response::Status::Settled as i32,
         messages_to_sign: vec![],

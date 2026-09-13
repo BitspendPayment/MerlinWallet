@@ -73,43 +73,13 @@ pub fn group_key_of(persistence: &Store, id: &str) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
-/// Persist a user's VTXO list (best-effort; logs and ignores errors).
-pub fn save_user_vtxos(
-    persistence: &Store,
-    user_id_hex: &str,
-    vtxos: &[crate::types::VtxoEntry],
-) {
-    let user_id_hex = &group_key_of(persistence, user_id_hex);
-    if let Ok(json) = serde_json::to_string(vtxos) {
-        if let Err(e) = persistence.put("vtxo_store", user_id_hex, &json) {
-            tracing::warn!("persist vtxo_store/{user_id_hex} failed: {e}");
-        }
-    }
-}
 
 
 
 
 
-/// Read back a user's stored VTXOs from persistence. Returns an empty vec on
-/// miss or parse failure. The vtxo_stream subscription will reconcile via its
-/// own dedup as ASP events arrive, so a stale read here is self-healing.
-pub fn load_user_vtxos(
-    persistence: &Store,
-    user_id_hex: &str,
-) -> Vec<crate::types::VtxoEntry> {
-    let user_id_hex = &group_key_of(persistence, user_id_hex);
-    match persistence.get("vtxo_store", user_id_hex) {
-        Ok(Some(json)) => match serde_json::from_str(&json) {
-            Ok(vtxos) => vtxos,
-            Err(e) => {
-                tracing::warn!("parse vtxo_store/{user_id_hex} failed: {e}");
-                Vec::new()
-            }
-        },
-        _ => Vec::new(),
-    }
-}
+
+
 
 
 

@@ -99,8 +99,6 @@ pub struct Cosigner {
     pub(crate) settle_inflight: Option<crate::handlers::settle::InFlight>,
     /// The Ark cosigner (MuSig2) secret, hex — zeroized on drop. Used for tree signing.
     ark_cosigner_secret_hex: Option<Zeroizing<String>>,
-    /// The owned spendable VTXO set.
-    vtxos: Vec<VtxoInput>,
     /// Parties authorized to bill this wallet — the only authorization for an incoming request.
     contacts: Vec<Contact>,
     /// Request-to-pay records held for the payer (bounded; see `prune_intents`).
@@ -112,7 +110,13 @@ pub struct Cosigner {
     /// non-signing query + stream + inbox handlers are `impl Cosigner` methods over it.
     /// The group key this cosigner serves. Configuration, not something a caller names.
     pub(crate) group_key: String,
-    /// The owned VTXO set, with the expiry a delegate's renewal deadline is computed from.
+    /// The owned VTXO set — the ONE set.
+    ///
+    /// There were two until recently: a `Vec<VtxoInput>` in the seal that `send_open` selected
+    /// from, and this one, loaded from storage and written by boarding and sending. They never
+    /// synced, so a freshly boarded VTXO was invisible to a send. `VtxoEntry` is the superset —
+    /// it carries the expiry a delegate's renewal deadline is computed from — so it is the one
+    /// that survives, and callers wanting the ark-facing shape go through [`Self::vtxos`].
     pub(crate) owned_vtxos: Vec<VtxoEntry>,
 }
 
@@ -141,20 +145,7 @@ impl Cosigner {
     pub async fn open(store: Arc<Store>, group_key: String) -> Result<Self, Status> {
         let mut cosigner = Self::new(store.clone(), group_key.clone());
         crate::store::restore_snapshot(&mut cosigner, &store, &group_key).await;
-        cosigner.load_owned(&group_key);
         Ok(cosigner)
-    }
-
-    /// Read back what is stored outside the seal: the VTXO set, with the expiry a delegate's
-    /// renewal deadline is computed from.
-    fn load_owned(&mut self, group_key: &str) {
-        use crate::handlers::helpers as h;
-        let vtxos = h::load_user_vtxos(self.store.as_ref(), group_key);
-        if vtxos.is_empty() {
-            return;
-        }
-        tracing::info!(vtxos = vtxos.len(), "restored owned VTXOs");
-        self.owned_vtxos = vtxos;
     }
 
     pub fn group_key(&self) -> &str {
@@ -172,7 +163,6 @@ impl Cosigner {
             boarding_settle: None,
             settle_inflight: None,
             ark_cosigner_secret_hex: None,
-            vtxos: Vec::new(),
             contacts: Vec::new(),
             payment_intents: Vec::new(),
             store,
@@ -194,7 +184,7 @@ impl Cosigner {
                 .as_ref()
                 .map(|id| hex::encode(id.serialize())),
             ark_cosigner_secret_hex: self.ark_secret().map(|s| s.to_string()),
-            vtxos: self.vtxos.clone(),
+            vtxos: self.owned_vtxos.clone(),
             // Persist a ReadyToSettle delegate (to_persisted errors for other phases → None).
             delegate_json: self
                 .delegate_session
@@ -226,7 +216,7 @@ impl Cosigner {
             user_signing_identifier,
         });
         self.ark_cosigner_secret_hex = snap.ark_cosigner_secret_hex.map(Zeroizing::new);
-        self.vtxos = snap.vtxos;
+        self.owned_vtxos = snap.vtxos;
         self.contacts = snap.contacts;
         self.payment_intents = snap.payment_intents;
         // Restore a pending ReadyToSettle delegate (needs the cosigner secret to re-derive its kp).
@@ -250,13 +240,18 @@ impl Cosigner {
         self.ark_secret()
     }
 
-    /// The owned VTXO set.
-    pub fn vtxos(&self) -> &[VtxoInput] {
-        &self.vtxos
-    }
-
-    pub fn set_vtxos(&mut self, vtxos: Vec<VtxoInput>) {
-        self.vtxos = vtxos;
+    /// The owned set in the shape ark's session builders take. Expiry is dropped here because
+    /// nothing downstream of a send or a settle build uses it.
+    pub fn vtxos(&self) -> Vec<VtxoInput> {
+        self.owned_vtxos
+            .iter()
+            .map(|e| VtxoInput {
+                txid: e.txid.clone(),
+                vout: e.vout,
+                amount_sats: e.amount,
+                exit_delay: e.exit_delay,
+            })
+            .collect()
     }
 
     /// The VTXO set to refresh and the renewal deadline the delegate becomes valid at.
@@ -274,13 +269,9 @@ impl Cosigner {
         crate::store::seal_snapshot(self, &store, &group_key).await;
     }
 
-    /// Record a settled boarding output: replace it in the host projection with the VTXO it
-    /// became, log it, and hand back the commitment txid.
-    pub fn apply_boarding_settle(
-        &mut self,
-        user_id_hex: &str,
-        sub: BoardingSettleSubmitted,
-    ) -> String {
+    /// Record a settled boarding output: replace it in the owned set with the VTXO it became, and
+    /// hand back the commitment txid.
+    pub fn apply_boarding_settle(&mut self, sub: BoardingSettleSubmitted) -> String {
         let now = crate::store::now_secs();
         self.owned_vtxos
             .retain(|e| !(e.txid == sub.vtxo_txid && e.vout == sub.vtxo_vout));
@@ -292,11 +283,6 @@ impl Cosigner {
             created_at: now,
             expires_at: 0,
         });
-        handlers::helpers::save_user_vtxos(
-            self.store.as_ref(),
-            user_id_hex,
-            &self.owned_vtxos,
-        );
         sub.commitment_txid
     }
 
@@ -972,13 +958,18 @@ impl Cosigner {
             .map(|(txid, vout, amount)| (txid, vout, amount, change_exit_delay));
         session.mark_done();
         // The send spent all current VTXOs; re-add the change VTXO to the owned set, if any.
-        self.vtxos.clear();
-        if let Some((txid, vout, amount_sats, exit_delay)) = change.clone() {
-            self.vtxos.push(VtxoInput {
+        // Expiry is unknown until the ASP indexes it, so 0 — `build_delegate_step1` reads that as
+        // "unknown" and skips it conservatively rather than settling against a made-up deadline.
+        let now = crate::store::now_secs();
+        self.owned_vtxos.clear();
+        if let Some((txid, vout, amount, exit_delay)) = change.clone() {
+            self.owned_vtxos.push(VtxoEntry {
                 txid,
                 vout,
-                amount_sats,
+                amount,
                 exit_delay,
+                created_at: now,
+                expires_at: 0,
             });
         }
         SendVtxoSubmitted { ark_txid, change }

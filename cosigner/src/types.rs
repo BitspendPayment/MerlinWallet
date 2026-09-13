@@ -108,7 +108,9 @@ pub struct SnapshotState {
     pub public_key_package_json: String,
     pub user_signing_identifier_hex: Option<String>,
     pub ark_cosigner_secret_hex: Option<String>,
-    pub vtxos: Vec<VtxoInput>,
+    /// The owned set, with expiry. `VtxoInput` before — a shape that dropped the expiry a
+    /// delegate's renewal deadline needs, which is why a second set existed alongside it.
+    pub vtxos: Vec<VtxoEntry>,
     /// A `ReadyToSettle` delegate session serialized via ark `PersistedDelegate` (JSON), if
     /// one is pending. Lets durable auto-settle survive actor eviction. Only ever
     /// `ReadyToSettle` (never a `Settling`-phase session — MuSig2 nonces must not persist).
