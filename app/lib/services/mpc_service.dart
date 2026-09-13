@@ -11,7 +11,6 @@ import 'package:app_core/ark_wallet.dart';
 import 'package:app_core/bitcoin.dart';
 import 'package:app_core/client.dart';
 import 'package:app_core/rest_wallet_api.dart' show WalletAuthException;
-import 'package:app_core/services_registry.dart';
 import 'package:app_core/enclave/native_enclave.dart' show AttestationStatus;
 import 'package:app_core/enclave/manifest.dart' as manifest;
 
@@ -69,8 +68,6 @@ class MpcService extends ChangeNotifier {
   List<VtxoInfo> get vtxos => _vtxos;
   BigInt _arkBalance = BigInt.zero;
   BigInt get arkBalance => _arkBalance;
-  List<ArkTransactionSummary> _arkTransactions = [];
-  List<ArkTransactionSummary> get arkTransactions => _arkTransactions;
 
   /// Confirmed deposits — the only ones [boardFunds] can settle.
   int _boardingBalance = 0;
@@ -630,7 +627,6 @@ class MpcService extends ChangeNotifier {
     } catch (e) {
       debugPrint("Refresh VTXOs failed: $e");
     }
-    await refreshArkTransactions();
     notifyListeners();
     unawaited(_delegateIfNeeded());
     return ok;
@@ -660,12 +656,11 @@ class MpcService extends ChangeNotifier {
       ..clear()
       ..addAll(current);
 
-    final selfTxids =
-        _arkTransactions.map((t) => t.txid).where((s) => s.isNotEmpty).toSet();
-    final external =
-        newOutpoints.where((op) => !selfTxids.contains(op.split(':').first));
-
-    final needsDelegate = external.isNotEmpty || !_serverHasActiveDelegate;
+    // Every new outpoint counts as external now. This used to subtract our own sends, using the
+    // cosigner's Ark history — a log it can no longer keep, since it is called rather than running
+    // and never saw the receives. The cost is a delegate refreshed after our own change lands as
+    // well as after a real receive, which is conservative rather than wrong.
+    final needsDelegate = newOutpoints.isNotEmpty || !_serverHasActiveDelegate;
     if (!needsDelegate) {
       if (_delegateActionNeeded) {
         _delegateActionNeeded = false;
@@ -773,16 +768,6 @@ class MpcService extends ChangeNotifier {
       return true;
     } catch (_) {
       return false;
-    }
-  }
-
-  Future<void> refreshArkTransactions() async {
-    if (_client == null) return;
-    try {
-      final resp = await _client!.listArkTransactions();
-      _arkTransactions = resp.transactions;
-    } catch (e) {
-      debugPrint("Refresh Ark transactions failed: $e");
     }
   }
 
@@ -920,124 +905,11 @@ class MpcService extends ChangeNotifier {
     await refreshPaymentRequests();
   }
 
-  // --- Contracts (the Services tab, PEER model) -----------------------------
-  // Browse the cosigner's template directory (CosignerID -> [template, VerifyingShare]),
-  // then create a contract WITH a chosen author as the receiver. No service URLs.
-
-  final ContractDirectory _directory = ContractDirectory();
-
-  List<DirectoryContract> _contracts = [];
-  List<DirectoryContract> get contracts => List.unmodifiable(_contracts);
-
-  /// Browse all published contract templates from the cosigner directory.
-  Future<void> fetchContracts() async {
-    _contracts = await _directory.listContracts(_baseUrl);
-    notifyListeners();
-  }
-
-  /// Create a contract eVTXO bound to [contract], WITH its author as the receiver: the
-  /// cosigner refreshes our V onto {author, cosigner} and relays the author's two share
-  /// halves into the author's inbox. Returns the registered eVTXO scriptPubKey hex.
-  Future<String> createContractWith(DirectoryContract contract) async {
-    if (_client == null) throw StateError("Client not initialized");
-    final wasm = await _directory.fetchWasm(_baseUrl, contract.contractIdHex);
-    final arkInfo = await _client!.getArkInfo();
-    var serverPkHex = arkInfo.signerPubkey;
-    if (serverPkHex.length == 66) serverPkHex = serverPkHex.substring(2);
-    final serverPk = Uint8List.fromList(hex.decode(serverPkHex));
-    final result = await _client!.createEvtxoKey(
-      contract.contractId,
-      wasm,
-      serverPk,
-      arkInfo.unilateralExitDelay.toInt(),
-      receiverVk: contract.authorVk,
-    );
-    notifyListeners();
-    return hex.encode(result.scriptPubkey);
-  }
-
-  /// Phase 2: create a contract FROM a template, supplying the author's TYPED config (collected
-  /// from the template's published schema). The cosigner composes the template + a provider
-  /// synthesized from [config] into one contract whose composed sha256 is bound to the eVTXO.
-  Future<String> createContractFromTemplate(
-    DirectoryContract contract,
-    List<(String, ConfigValue)> config,
-  ) async {
-    if (_client == null) throw StateError("Client not initialized");
-    final arkInfo = await _client!.getArkInfo();
-    var serverPkHex = arkInfo.signerPubkey;
-    if (serverPkHex.length == 66) serverPkHex = serverPkHex.substring(2);
-    final serverPk = Uint8List.fromList(hex.decode(serverPkHex));
-    final result = await _client!.createEvtxoFromTemplate(
-      templateId: contract.contractIdHex,
-      stubId: contract.stubId,
-      configBlob: encodeContractConfig(config),
-      serverPk: serverPk,
-      exitDelay: arkInfo.unilateralExitDelay.toInt(),
-      receiverVk: contract.authorVk,
-    );
-    notifyListeners();
-    return hex.encode(result.scriptPubkey);
-  }
-
-  /// Publish a contract template under this wallet's CosignerID so others can discover it
-  /// and create a contract WITH this wallet as the receiver. [contractId] must be
-  /// sha256([wasm]).
-  Future<void> publishTemplate({
-    required Uint8List contractId,
-    required Uint8List wasm,
-    String name = '',
-    String description = '',
-  }) async {
-    if (_client == null || _client!.userId == null) {
-      throw StateError("Client not initialized");
-    }
-    await _directory.registerTemplate(
-      cosignerBase: _baseUrl,
-      authorVkHex: _client!.userId!,
-      contractIdHex: hex.encode(contractId),
-      wasm: wasm,
-      name: name,
-      description: description,
-    );
-    await fetchContracts();
-  }
-
-  /// Receiver side: pick up any contract shares waiting in this wallet's inbox, assemble
-  /// each into a spendable pairing share, and ack them. Returns the number picked up.
-  Future<int> pickUpContractShares() async {
-    if (_client == null) throw StateError("Client not initialized");
-    final shares = await _client!.fetchContractShares();
-    for (final s in shares) {
-      await _client!.ackContractShare(s.scriptPubkey);
-    }
-    notifyListeners();
-    return shares.length;
-  }
-
   Future<String> settleDelegate() async {
     if (_client == null) throw StateError("Client not initialized");
     final txid = await _client!.settleDelegate();
     await refreshVtxos();
     return txid;
-  }
-
-  /// Register a push notification token. Best-effort — failures are logged.
-  Future<void> registerDeviceToken({
-    required String fcmToken,
-    required String platform,
-    String appVersion = '',
-  }) async {
-    if (_client == null) return;
-    try {
-      await _client!.registerDeviceToken(
-        fcmToken: fcmToken,
-        platform: platform,
-        appVersion: appVersion,
-      );
-    } catch (e) {
-      debugPrint("registerDeviceToken failed: $e");
-    }
   }
 
   String _generateSessionId() {

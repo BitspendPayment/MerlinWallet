@@ -75,17 +75,13 @@ class AttestedWalletApi implements WalletApi {
   @override Future<DKGStep1Response> dKGStep1(DKGStep1Request r) => _inner.dKGStep1(r);
   @override Future<DKGStep2Response> dKGStep2(DKGStep2Request r) => _inner.dKGStep2(r);
   @override Future<DKGStep3Response> dKGStep3(DKGStep3Request r) => _inner.dKGStep3(r);
-  @override Future<ContractCreateResponse> contractCreate(ContractCreateRequest r) => _inner.contractCreate(r);
-  @override Future<EvtxoPendingSharesResponse> evtxoPendingShares(EvtxoPendingSharesRequest r) => _inner.evtxoPendingShares(r);
-  @override Future<EvtxoAckShareResponse> evtxoAckShare(EvtxoAckShareRequest r) => _inner.evtxoAckShare(r);
-  @override Future<SignStep1Response> signStep1(SignStep1Request r, {String? routeGroupKeyHex}) => _inner.signStep1(r, routeGroupKeyHex: routeGroupKeyHex);
+   @override Future<SignStep1Response> signStep1(SignStep1Request r, {String? routeGroupKeyHex}) => _inner.signStep1(r, routeGroupKeyHex: routeGroupKeyHex);
   @override Future<SignStep2Response> signStep2(SignStep2Request r, {String? routeGroupKeyHex}) => _inner.signStep2(r, routeGroupKeyHex: routeGroupKeyHex);
   @override Future<GetArkInfoResponse> getArkInfo(GetArkInfoRequest r) => _inner.getArkInfo(r);
   @override Future<GetArkAddressResponse> getArkAddress(GetArkAddressRequest r) => _inner.getArkAddress(r);
   @override Future<GetBoardingAddressResponse> getBoardingAddress(GetBoardingAddressRequest r) => _inner.getBoardingAddress(r);
   @override Future<ListVtxosResponse> listVtxos(ListVtxosRequest r) => _inner.listVtxos(r);
-  @override Future<ListArkTransactionsResponse> listArkTransactions(ListArkTransactionsRequest r) => _inner.listArkTransactions(r);
-  @override Future<SendVtxoResponse> sendVtxo(SendVtxoRequest r) => _inner.sendVtxo(r);
+   @override Future<SendVtxoResponse> sendVtxo(SendVtxoRequest r) => _inner.sendVtxo(r);
   @override Future<RedeemVtxoResponse> redeemVtxo(RedeemVtxoRequest r) => _inner.redeemVtxo(r);
   @override Future<SettleResponse> settle(SettleRequest r) => _inner.settle(r);
   @override Future<SettleDelegateResponse> settleDelegate(SettleDelegateRequest r) => _inner.settleDelegate(r);
@@ -98,9 +94,7 @@ class AttestedWalletApi implements WalletApi {
   @override Future<PaymentRequestListResponse> paymentRequestList(PaymentRequestListRequest r) => _inner.paymentRequestList(r);
   @override Future<PaymentRequestDeclineResponse> paymentRequestDecline(PaymentRequestDeclineRequest r) => _inner.paymentRequestDecline(r);
   @override Future<GetServerInfoResponse> getServerInfo(GetServerInfoRequest r) => _inner.getServerInfo(r);
-  @override Future<RegisterDeviceTokenResponse> registerDeviceToken(RegisterDeviceTokenRequest r) => _inner.registerDeviceToken(r);
-
-  @override
+   @override
   Future<void> shutdown() async {
     _attested.dispose();
   }

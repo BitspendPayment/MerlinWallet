@@ -10,7 +10,6 @@
 /// push (auto-settle still fires for users who open the app).
 library;
 
-import 'dart:io' show Platform;
 
 import 'package:app_core/client.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -39,7 +38,6 @@ class PushService {
 
   /// Set when a "contract_share" notification opened the app from a terminated
   /// state before the service was ready; acted on in [registerCurrentToken].
-  static bool _pendingContractShare = false;
 
   /// Set when a "vtxo_received" notification opened the app from a terminated
   /// state before the service was ready; acted on in [registerCurrentToken]
@@ -91,15 +89,6 @@ class PushService {
         debugPrint('[push] pending boardFunds failed: $e');
       }
     }
-    // A contract-share notification opened the app before the service was ready.
-    if (_pendingContractShare) {
-      _pendingContractShare = false;
-      try {
-        await svc.pickUpContractShares();
-      } catch (e) {
-        debugPrint('[push] pending pickUpContractShares failed: $e');
-      }
-    }
     // A funds-received notification opened the app before the service was
     // ready; refresh so the Ark tab raises its delegate banner if needed.
     if (_pendingVtxoReceived) {
@@ -110,25 +99,10 @@ class PushService {
         debugPrint('[push] pending refreshVtxos failed: $e');
       }
     }
-    if (!_initialized) return;
-    try {
-      final token = await FirebaseMessaging.instance.getToken();
-      if (token == null) return;
-      await svc.registerDeviceToken(
-        fcmToken: token,
-        platform: Platform.isAndroid ? 'android' : 'ios',
-      );
-      // Re-register on rotation. We don't store the StreamSubscription —
-      // it lives for the process lifetime, same as the MpcService it talks to.
-      FirebaseMessaging.instance.onTokenRefresh.listen((newToken) {
-        svc.registerDeviceToken(
-          fcmToken: newToken,
-          platform: Platform.isAndroid ? 'android' : 'ios',
-        );
-      });
-    } catch (e) {
-      debugPrint('[push] registerCurrentToken failed: $e');
-    }
+    // No token registration. The cosigner had a `RegisterDeviceToken` RPC and pushed from its
+    // own FCM client; it is called rather than running and has no outbound sockets, so the host
+    // owns the push channel and the registry that feeds it. Display still works — what is gone is
+    // this side telling the cosigner where to reach us.
   }
 
   static Future<void> _handleForegroundMessage(RemoteMessage msg) async {
@@ -156,14 +130,6 @@ class PushService {
         debugPrint('[push] foreground boarding balance refreshed');
       } catch (e) {
         debugPrint('[push] foreground refreshBoardingBalance failed: $e');
-      }
-    } else if (type == 'contract_share') {
-      // App is open: a contract share landed in our inbox — pick it up + assemble.
-      try {
-        final n = await svc.pickUpContractShares();
-        debugPrint('[push] foreground picked up $n contract share(s)');
-      } catch (e) {
-        debugPrint('[push] foreground pickUpContractShares failed: $e');
       }
     } else if (type == 'payment_request') {
       // App is open: an allowlisted contact asked us to pay. The intent is already sealed
@@ -207,17 +173,6 @@ class PushService {
         debugPrint('[push] tap-to-board: boardFunds ok');
       } catch (e) {
         debugPrint('[push] tap-to-board boardFunds failed: $e');
-      }
-    } else if (type == 'contract_share') {
-      if (svc == null) {
-        _pendingContractShare = true;
-        return;
-      }
-      try {
-        final n = await svc.pickUpContractShares();
-        debugPrint('[push] tap-to-accept: picked up $n contract share(s)');
-      } catch (e) {
-        debugPrint('[push] tap-to-accept pickUpContractShares failed: $e');
       }
     }
   }

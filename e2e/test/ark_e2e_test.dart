@@ -606,22 +606,11 @@ void main() {
     expect(bobBalance1, equals(sendAmount),
         reason: 'Bob should have received exactly $sendAmount sats');
 
-    // 8c. Verify the receive shows up in Bob's transaction history.
-    // Regression guard for the `vtxo_stream::apply_stream_update` gate that
-    // previously dropped "receive" entries when any session was in flight.
-    // Without this assertion the bug was invisible — listVtxos worked fine
-    // even while listArkTransactions silently lost the row.
-    final bobHistoryAfterSend1 = await bob.listArkTransactions();
-    final receivesAfter1 = bobHistoryAfterSend1.transactions
-        .where((e) => e.txType == 'receive')
-        .toList();
-    print(
-        '   Bob history: ${bobHistoryAfterSend1.transactions.length} entries, '
-        'receives: ${receivesAfter1.length}');
-    expect(receivesAfter1, hasLength(1),
-        reason: 'Bob should have exactly 1 receive entry after first send');
-    expect(receivesAfter1.first.amountSats.toInt(), equals(sendAmount),
-        reason: 'Receive amount should match sent amount');
+    // PORT NOTE: the receive-history assertions that stood here are gone. They guarded
+    // `vtxo_stream::apply_stream_update` against dropping "receive" rows — a stream the cosigner
+    // no longer runs. It is called rather than running, so it never observes a receive and cannot
+    // record one; `ListArkTransactions` was removed with the log. Balances above still prove the
+    // receive landed. Rebuilding history from the ASP indexer is its own piece of work.
 
     // 9. Alice sends again to Bob (uses change VTXO from first send)
     print('9. Alice sends to Bob again');
@@ -655,20 +644,6 @@ void main() {
     expect(bobBalance2, equals(sendAmount + sendAmount2),
         reason: 'Bob should have ${sendAmount + sendAmount2} sats total');
 
-    // 9c. Bob's history should now have two distinct receive entries — one
-    // per send. Verifies receives don't merge or get dropped on the second
-    // event when the first VTXO is being spent.
-    final bobHistoryAfterSend2 = await bob.listArkTransactions();
-    final receivesAfter2 = bobHistoryAfterSend2.transactions
-        .where((e) => e.txType == 'receive')
-        .toList();
-    print('   Bob history: ${receivesAfter2.length} receives');
-    expect(receivesAfter2, hasLength(2),
-        reason: 'Bob should have 2 receive entries after second send');
-    final totalReceived = receivesAfter2.fold<int>(
-        0, (sum, e) => sum + e.amountSats.toInt());
-    expect(totalReceived, equals(sendAmount + sendAmount2),
-        reason: 'Sum of receive amounts should match total sent');
 
     // 10. Third send (20k sats) — exercises spending down the change VTXO
     print('10. Alice sends 20k to Bob');
@@ -1062,16 +1037,11 @@ void main() {
 
     print('3. Capture pre-restart state');
     final preVtxos = await alice.listVtxos();
-    final preTxs = await alice.listArkTransactions();
     expect(preVtxos.vtxos, isNotEmpty,
         reason: 'pre-restart should have at least one VTXO');
-    expect(preTxs.transactions, isNotEmpty,
-        reason: 'pre-restart should have at least the boarding settle entry');
     final preVtxoOutpoints =
         preVtxos.vtxos.map((v) => '${v.txid}:${v.vout}').toSet();
-    final preTxTxids = preTxs.transactions.map((t) => t.txid).toSet();
-    print(
-        '   pre-restart: ${preVtxos.vtxos.length} VTXOs, ${preTxs.transactions.length} history entries');
+    print('   pre-restart: ${preVtxos.vtxos.length} VTXOs');
 
     print('4. Kill cosigner');
     final oldProcess = serverProcess!;
@@ -1094,21 +1064,16 @@ void main() {
     // subscription will also reconnect and reconcile, but the rehydration
     // load means the first listVtxos call already returns valid state.
     final postVtxos = await alice.listVtxos();
-    final postTxs = await alice.listArkTransactions();
 
     print(
-        '   post-restart: ${postVtxos.vtxos.length} VTXOs, ${postTxs.transactions.length} history entries');
+        '   post-restart: ${postVtxos.vtxos.length} VTXOs');
 
     final postVtxoOutpoints =
         postVtxos.vtxos.map((v) => '${v.txid}:${v.vout}').toSet();
-    final postTxTxids = postTxs.transactions.map((t) => t.txid).toSet();
 
     expect(postVtxoOutpoints, equals(preVtxoOutpoints),
         reason:
             'VTXOs should be rehydrated from vtxo_store after restart (pre-restart set must match post-restart set)');
-    expect(postTxTxids, equals(preTxTxids),
-        reason:
-            'ark_tx_history should be rehydrated from sled after restart — without the new load_user_ark_history path this set would be empty');
 
     print('7. Sanity: post-restart per-user RPCs work');
     final addr = await alice.getArkAddress();
@@ -1184,193 +1149,14 @@ void main() {
   //   * payload is a visible notification ("Funds received") + `type=vtxo_received` data
   //   * Android `priority: HIGH` + APNS alert headers present
   //   * `user_id` field in data matches the recipient
-  test('FCM push fires on VTXO receive with correct payload shape', () async {
-    // Use a port for Bob's signer that isn't already taken by other tests in
-    // this suite (9090 is the universal one most tests use; we use it too
-    // here since each test does its own DKG and there's no signer-state
-    // overlap between tests).
-    print('1. Alice + Bob DKG');
-    final alice = createClient(storageId: "alice");
-    await alice.doDkg();
-
-    final bob = createClient(storageId: "bob");
-    await bob.doDkg();
-
-    // Snapshot mock sends BEFORE registering — prior tests may have left
-    // residue (they shouldn't, but be defensive).
-    mockFcm.clearSends();
-
-    print('2. Register fake FCM token for Bob');
-    const fakeBobToken = 'fake-fcm-token-for-bob-e2e';
-    await bob.registerDeviceToken(
-      fcmToken: fakeBobToken,
-      platform: 'android',
-      appVersion: '1.0.0-e2e',
-    );
-
-    print('3. Fund Alice + settle into VTXO');
-    final boardingAddress = await alice.getBoardingAddress();
-    final minerAddr = await btc.getNewAddress();
-    await btc.sendToAddress(boardingAddress, 0.003);
-    await btc.generateToAddress(1, minerAddr);
-
-    final boardingUtxos = await pollBoardingUtxos(boardingAddress, 300000);
-    expect(boardingUtxos, isNotEmpty);
-
-    bool stillMining = true;
-    final miningTimer = Timer.periodic(Duration(seconds: 3), (timer) async {
-      if (!stillMining) {
-        timer.cancel();
-        return;
-      }
-      try {
-        await btc.generateToAddress(1, await btc.getNewAddress());
-      } catch (_) {}
-    });
-
-    final commitment = await settleBoarding(alice, boardingUtxos);
-    expect(commitment, isNotEmpty);
-
-    print('4. Alice sends to Bob (triggers receive on Bob → push fires)');
-    final bobArkAddress = await bob.getArkAddress();
-    final aliceArkWallet = MpcArkWallet(alice);
-    final unsigned = await aliceArkWallet.createTransaction(
-      destination: bobArkAddress,
-      amountSats: 100000,
-    );
-    final signed = await aliceArkWallet.signTransaction(unsigned);
-    final arkTxid = await aliceArkWallet.submit(signed);
-    expect(arkTxid, isNotEmpty);
-    print('   send ark_txid=$arkTxid');
-
-    // 5. Wait for the mock to record the push. The cosigner's stream
-    // fan-out runs after the vtxo_stream event arrives at Bob's actor,
-    // which is async w.r.t. the send completing.
-    print('5. Wait for FCM mock to record the push');
-    final push = await mockFcm.waitForFirstSend(timeout: Duration(seconds: 15));
-    stillMining = false;
-    miningTimer.cancel();
-
-    expect(push, isNotNull,
-        reason:
-            'FCM mock should have received a messages:send call within 15s of Bob receiving a VTXO');
-    final p = push!;
-
-    // 6. Assert the OAuth happened — the bearer token must be the mock's
-    // canonical access token, NOT the raw JWT assertion.
-    expect(p.bearerToken, equals(MockFcmServer.mockAccessToken),
-        reason:
-            'Cosigner must complete the OAuth round-trip and use the access_token from the mock token endpoint');
-
-    // 7. The path's project_id must match what we configured the cosigner
-    // with — proves the URL template uses sa.project_id.
-    expect(p.projectId, equals(fcmTestProjectId),
-        reason:
-            'POST path must be /v1/projects/${fcmTestProjectId}/messages:send');
-
-    // 8. The push must target Bob's registered token.
-    expect(p.targetToken, equals(fakeBobToken),
-        reason:
-            'cosigner should push to the FCM token Bob registered, not Alice or some default');
-
-    // 9. Payload shape — the vtxo-received push carries a data payload
-    // (type=vtxo_received + Bob's user_id) the app reads to scope its refresh.
-    final data = p.data;
-    expect(data, isNotNull, reason: 'message.data must be present');
-    expect(data!['type'], equals('vtxo_received'),
-        reason: 'data.type identifies what the notification is about');
-    expect(data['user_id'], isNotEmpty,
-        reason: 'data.user_id lets the app scope its refresh to the right user');
-
-    // 10. Visible notification block + Android/APNS routing. The vtxo-received
-    // push is a user-visible banner ("Funds received" / "Tap to activate
-    // auto-settle protection"), so it carries a `notification` block and an
-    // APNS `alert` (not a silent content-available background wake).
-    const pushTitle = 'Funds received';
-    const pushBody = 'Tap to activate auto-settle protection';
-    final message = p.body['message'] as Map<String, dynamic>;
-    final notification = message['notification'] as Map<String, dynamic>?;
-    expect(notification, isNotNull,
-        reason: 'vtxo-received is a visible banner, so a notification block is present');
-    expect(notification!['title'], equals(pushTitle));
-    expect(notification['body'], equals(pushBody));
-    expect((message['android'] as Map?)?['priority'], equals('HIGH'),
-        reason: 'Android needs HIGH priority to deliver promptly');
-    final apns = message['apns'] as Map<String, dynamic>?;
-    expect(apns, isNotNull);
-    expect((apns!['headers'] as Map?)?['apns-priority'], equals('10'),
-        reason: 'apns-priority=10 for an immediate visible alert');
-    final alert = ((apns['payload'] as Map?)?['aps'] as Map?)?['alert']
-        as Map<String, dynamic>?;
-    expect(alert, isNotNull, reason: 'iOS shows the alert title/body');
-    expect(alert!['title'], equals(pushTitle));
-    expect(alert['body'], equals(pushBody));
-
-    print('FCM push test complete!');
-  }, timeout: Timeout(Duration(minutes: 4)));
-
-  // Boarding watcher: the cosigner has no chain view for the WALLET's money,
-  // but it runs a thin read-only esplora watcher over each user's boarding
-  // address. On a new confirmed deposit it pushes a user-visible "tap to
-  // board" notification — the device boards on tap. This test funds a boarding
-  // address WITHOUT the client polling, and asserts the cosigner autonomously
-  // pushes a `boarding_deposit` notification with the deposit's outpoint.
-  test('Ark: boarding watcher pushes tap-to-board on a confirmed deposit',
-      () async {
-    print('1. DKG + register device token');
-    final alice = createClient(storageId: 'boardwatch');
-    await alice.doDkg();
-    // getBoardingAddress records the address in the cosigner's boarding_watches.
-    final boardingAddress = await alice.getBoardingAddress();
-    const fakeToken = 'fake-fcm-token-boardwatch';
-    await alice.registerDeviceToken(
-      fcmToken: fakeToken,
-      platform: 'android',
-      appVersion: '1.0.0-e2e',
-    );
-
-    mockFcm.clearSends();
-
-    print('2. Fund + confirm the boarding deposit (client does NOT poll)');
-    await btc.sendToAddress(boardingAddress, 0.004);
-    await btc.generateToAddress(1, await btc.getNewAddress());
-
-    print('3. Wait for the watcher to detect + push (3s sweep + index lag)');
-    final push = await mockFcm.waitForFirstSend(timeout: Duration(seconds: 40));
-    expect(push, isNotNull,
-        reason: 'cosigner boarding watcher should push within the sweep window');
-    final p = push!;
-    expect(p.targetToken, equals(fakeToken));
-
-    final data = p.data;
-    expect(data, isNotNull);
-    expect(data!['type'], equals('boarding_deposit'));
-    expect(data['txid'], isNotEmpty);
-    expect(int.parse(data['amount_sats']!), equals(400000));
-
-    // Visible notification (tap-to-board), unlike the silent vtxo_received push.
-    final message = p.body['message'] as Map<String, dynamic>;
-    expect(message['notification'], isNotNull,
-        reason: 'boarding push is a user-visible notification to tap');
-
-    print('Boarding watcher push test complete!');
-  }, timeout: Timeout(Duration(minutes: 3)));
-
-  // Delegate persistence across cosigner restart (Phase 2, issue #31).
+  // REMOVED: 'FCM push fires on VTXO receive with correct payload shape' and
+  // 'Ark: boarding watcher pushes tap-to-board on a confirmed deposit'.
   //
-  // Verifies the full round-trip:
-  //   1. Alice stores a signed delegate intent via settleDelegate(storeOnly).
-  //   2. Cosigner-runtime is killed + restarted against the same data_dir.
-  //   3. listVtxos confirms `has_active_delegate=true` — rehydration ran
-  //      `DelegateSettleSession::from_persisted` with the dkg_secret pulled
-  //      from `SecretStore`, NOT from the persisted record.
-  //   4. The auto-settle tick fires on the rehydrated session and drives
-  //      it through a batch, producing a new VTXO with the same balance.
-  //
-  // The key correctness claim: the cosigner secret was never written to
-  // the sled `delegate_sessions` tree. The rehydration path reattaches
-  // it from `SecretStore` (`dkg-secret.<canonical>`), which already
-  // existed in sled from the original DKG.
+  // Both drove a push the cosigner cannot send. It is called rather than running, so it has no
+  // outbound socket and no FCM client; the notification used to go out on a detached task that a
+  // per-request runtime would drop. `RegisterDeviceToken` went with it — the host owns the push
+  // channel now, and the registry that feeds it. These come back as host tests, not cosigner ones.
+
   test('Ark: delegate intent survives cosigner restart + auto-settles',
       () async {
     print('1. Alice DKG');
@@ -1761,13 +1547,6 @@ void main() {
         expect(recvBal, equals(recvPre + sendSats),
             reason: '$receiverLabel should receive exactly $sendSats sats');
 
-        final receives = (await receiver.listArkTransactions())
-            .transactions
-            .where((e) => e.txType == 'receive')
-            .toList();
-        expect(receives, isNotEmpty,
-            reason: '$receiverLabel must record a receive history entry');
-        expect(receives.last.amountSats.toInt(), equals(sendSats));
       }
 
       // Receiver stores a delegate (FROST-signs), then waits (3-min deadline) for the

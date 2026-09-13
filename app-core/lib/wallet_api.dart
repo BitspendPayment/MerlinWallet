@@ -15,12 +15,7 @@ abstract class WalletApi {
   // Contract eVTXO creation (PEER model): a single key-preserving refresh of V onto
   // {receiver, cosigner}. The receiver later picks up its two ECIES half-shares from
   // its inbox (evtxoPendingShares) and acks them (evtxoAckShare).
-  Future<ContractCreateResponse> contractCreate(ContractCreateRequest request);
-  Future<EvtxoPendingSharesResponse> evtxoPendingShares(
-      EvtxoPendingSharesRequest request);
-  Future<EvtxoAckShareResponse> evtxoAckShare(EvtxoAckShareRequest request);
-
-  // Signing
+   // Signing
   // [routeGroupKeyHex] overrides the actor the request is routed to (the URL group_key),
   // while `request.userId` stays the signer's auth identity. Used by a contract RECEIVER to
   // route a spend to the eVTXO's `{receiver, cosigner}` pairing actor (keyed by the spk) while
@@ -36,9 +31,7 @@ abstract class WalletApi {
   Future<GetBoardingAddressResponse> getBoardingAddress(
       GetBoardingAddressRequest request);
   Future<ListVtxosResponse> listVtxos(ListVtxosRequest request);
-  Future<ListArkTransactionsResponse> listArkTransactions(
-      ListArkTransactionsRequest request);
-  Future<SendVtxoResponse> sendVtxo(SendVtxoRequest request);
+   Future<SendVtxoResponse> sendVtxo(SendVtxoRequest request);
   Future<RedeemVtxoResponse> redeemVtxo(RedeemVtxoRequest request);
   Future<SettleResponse> settle(SettleRequest request);
   Future<SettleDelegateResponse> settleDelegate(
@@ -63,9 +56,6 @@ abstract class WalletApi {
   Future<GetServerInfoResponse> getServerInfo(GetServerInfoRequest request);
 
   // Push notifications
-  Future<RegisterDeviceTokenResponse> registerDeviceToken(
-      RegisterDeviceTokenRequest request);
-
-  /// Shutdown the underlying connection.
+   /// Shutdown the underlying connection.
   Future<void> shutdown();
 }

@@ -14,7 +14,11 @@ class ArkScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final mpcService = context.watch<MpcService>();
     final arkBalance = mpcService.arkBalance;
-    final arkTxs = mpcService.arkTransactions;
+    // No history to show. The cosigner kept an Ark transaction log and served it over
+    // `ListArkTransactions`; it is called rather than running now, so it never sees a receive and
+    // could only ever log what it performed itself — a wallet that appears never to have been
+    // paid. Rebuilding this from the ASP indexer's own history is its own piece of work.
+    const arkTxs = <ArkTransactionSummary>[];
     final arkAvailable = mpcService.arkAvailable;
 
     final balanceBtc = arkBalance.toDouble() / 100000000;
@@ -102,13 +106,13 @@ class ArkScreen extends StatelessWidget {
                                     size: 48, color: Colors.white24),
                                 const SizedBox(height: 12),
                                 Text(
-                                  'No transactions yet',
+                                  'History unavailable',
                                   style:
                                       GoogleFonts.inter(color: Colors.white38),
                                 ),
                                 const SizedBox(height: 4),
                                 Text(
-                                  'Board on-chain funds to get started',
+                                  'Your balance above is current',
                                   style: GoogleFonts.inter(
                                       color: Colors.white24, fontSize: 12),
                                 ),

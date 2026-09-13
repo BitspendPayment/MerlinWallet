@@ -191,62 +191,9 @@ class RestWalletApi implements WalletApi {
   // -------------------------------------------------------------------------
 
   @override
-  Future<ContractCreateResponse> contractCreate(ContractCreateRequest r) async {
-    final resp = await _post('/api/u/${_hex(r.userId)}/contract/create', {
-      'identifier': _hex(r.identifier),
-      'contract_id': _hex(r.contractId),
-      'contract_wasm': _hex(r.contractWasm),
-      'server_pk': _hex(r.serverPk),
-      'exit_delay': r.exitDelay,
-      'owner_pk': _hex(r.ownerPk),
-      'receiver_vk': _hex(r.receiverVk),
-      'a_at_cosigner': _hex(r.aAtCosigner),
-      'a_at_receiver_point': _hex(r.aAtReceiverPoint),
-      'signature': _hex(r.signature),
-      'timestamp_ms': r.timestampMs.toInt(),
-      'ecies_a_at_receiver': _hex(r.eciesAAtReceiver),
-      'template_id': r.templateId,
-      'stub_id': r.stubId,
-      'config_blob': _hex(r.configBlob),
-    });
-    return ContractCreateResponse()
-      ..contractScriptPubkey = _unhex(resp['contract_script_pubkey'] as String?)
-      ..contractId = _unhex(resp['contract_id'] as String?);
-  }
-
-  @override
-  Future<EvtxoPendingSharesResponse> evtxoPendingShares(
-      EvtxoPendingSharesRequest r) async {
-    final resp = await _post('/api/u/${_hex(r.userId)}/evtxo/pending', {
-      'signature': _hex(r.signature),
-      'timestamp_ms': r.timestampMs.toInt(),
-    });
-    final shares = (resp['shares'] as List<dynamic>? ?? [])
-        .map((s) => PendingContractShare()
-          ..evtxoScriptPubkey = _unhex(s['evtxo_script_pubkey'] as String?)
-          ..contractId = _unhex(s['contract_id'] as String?)
-          ..eciesHalfAuthor = _unhex(s['ecies_half_author'] as String?)
-          ..eciesHalfCosigner = _unhex(s['ecies_half_cosigner'] as String?)
-          ..publicKeyPackageJson = s['public_key_package_json'] as String? ?? ''
-          ..exitDelay = (s['exit_delay'] as num?)?.toInt() ?? 0
-          ..serverPk = _unhex(s['server_pk'] as String?)
-          ..ownerPk = _unhex(s['owner_pk'] as String?))
-        .toList();
-    return EvtxoPendingSharesResponse()..shares.addAll(shares);
-  }
-
-  @override
-  Future<EvtxoAckShareResponse> evtxoAckShare(EvtxoAckShareRequest r) async {
-    final resp = await _post('/api/u/${_hex(r.userId)}/evtxo/ack', {
-      'evtxo_script_pubkey': _hex(r.evtxoScriptPubkey),
-      'signature': _hex(r.signature),
-      'timestamp_ms': r.timestampMs.toInt(),
-    });
-    return EvtxoAckShareResponse()..ok = resp['ok'] as bool? ?? false;
-  }
-
-
-  // -------------------------------------------------------------------------
+   @override
+   @override
+   // -------------------------------------------------------------------------
   // Request-to-pay
   // -------------------------------------------------------------------------
   //
@@ -460,23 +407,7 @@ class RestWalletApi implements WalletApi {
   }
 
   @override
-  Future<ListArkTransactionsResponse> listArkTransactions(
-      ListArkTransactionsRequest r) async {
-    final resp = await _post('/api/u/${_hex(r.userId)}/ark/transactions', {
-      ..._authFields(r.userId, r.signature, r.timestampMs),
-    });
-    final result = ListArkTransactionsResponse();
-    for (final t in (resp['transactions'] as List? ?? [])) {
-      result.transactions.add(ArkTransactionSummary()
-        ..txType = t['tx_type'] as String? ?? ''
-        ..amountSats = Int64(t['amount_sats'] as int? ?? 0)
-        ..txid = t['txid'] as String? ?? ''
-        ..timestamp = Int64(t['timestamp'] as int? ?? 0));
-    }
-    return result;
-  }
-
-  @override
+   @override
   Future<SendVtxoResponse> sendVtxo(SendVtxoRequest r) async {
     final resp = await _post('/api/u/${_hex(r.userId)}/ark/send', {
       'user_id': _hex(r.userId),
@@ -589,21 +520,7 @@ class RestWalletApi implements WalletApi {
   }
 
   @override
-  Future<RegisterDeviceTokenResponse> registerDeviceToken(
-      RegisterDeviceTokenRequest r) async {
-    final resp = await _post(
-      '/api/u/${_hex(r.userId)}/push/register-device-token',
-      {
-        ..._authFields(r.userId, r.signature, r.timestampMs),
-        'fcm_token': r.fcmToken,
-        'platform': r.platform,
-        'app_version': r.appVersion,
-      },
-    );
-    return RegisterDeviceTokenResponse()..ok = resp['ok'] as bool? ?? false;
-  }
-
-  @override
+   @override
   Future<void> shutdown() async {
     _http?.close();
   }

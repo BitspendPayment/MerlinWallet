@@ -21,17 +21,9 @@ class GrpcWalletApi implements WalletApi {
   Future<DKGStep3Response> dKGStep3(DKGStep3Request r) => _stub.dKGStep3(r);
 
   @override
-  Future<ContractCreateResponse> contractCreate(ContractCreateRequest r) =>
-      _stub.contractCreate(r);
-  @override
-  Future<EvtxoPendingSharesResponse> evtxoPendingShares(
-          EvtxoPendingSharesRequest r) =>
-      _stub.evtxoPendingShares(r);
-  @override
-  Future<EvtxoAckShareResponse> evtxoAckShare(EvtxoAckShareRequest r) =>
-      _stub.evtxoAckShare(r);
-
-  @override
+   @override
+   @override
+   @override
   Future<SignStep1Response> signStep1(SignStep1Request r,
           {String? routeGroupKeyHex}) =>
       _stub.signStep1(r);
@@ -54,10 +46,7 @@ class GrpcWalletApi implements WalletApi {
   Future<ListVtxosResponse> listVtxos(ListVtxosRequest r) =>
       _stub.listVtxos(r);
   @override
-  Future<ListArkTransactionsResponse> listArkTransactions(
-          ListArkTransactionsRequest r) =>
-      _stub.listArkTransactions(r);
-  @override
+   @override
   Future<SendVtxoResponse> sendVtxo(SendVtxoRequest r) => _stub.sendVtxo(r);
   @override
   Future<RedeemVtxoResponse> redeemVtxo(RedeemVtxoRequest r) =>
@@ -100,10 +89,6 @@ class GrpcWalletApi implements WalletApi {
       _stub.getServerInfo(r);
 
   @override
-  Future<RegisterDeviceTokenResponse> registerDeviceToken(
-          RegisterDeviceTokenRequest r) =>
-      _stub.registerDeviceToken(r);
-
-  @override
+   @override
   Future<void> shutdown() => _channel.shutdown();
 }

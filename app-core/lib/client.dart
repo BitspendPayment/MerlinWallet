@@ -64,10 +64,6 @@ class MpcClient {
   final int _maxSigners;
   final int _minSigners;
 
-  /// REST base URL (set only for the REST transport) — used by [subscribeEvents] to open the SSE
-  /// event stream, which is a raw streamed GET outside the request-reply `WalletApi`.
-  String? _restBaseForEvents;
-
   threshold.SecretKey? _signingSecret;
 
   /// PIN/passkey-PRF share gating. When a [SeedSource] is configured the wallet's FROST share is
@@ -144,7 +140,6 @@ class MpcClient {
   })  : _stub = RestWalletApi(baseUrl, httpClient: httpClient),
         _maxSigners = maxSigners,
         _minSigners = minSigners {
-    _restBaseForEvents = baseUrl;
     _store = WalletStore(
       boxName: storageId ?? 'mpc_wallet_state_default',
       cipher: encryptionCipher,
@@ -396,262 +391,6 @@ class MpcClient {
 
   PublicKeyPackage? getPublicKeyPackage() {
     return _normalPolicy?.publicKeyPackage;
-  }
-
-  // --- CONTRACT eVTXO CREATION ---
-
-  /// Create a contract eVTXO bound to [contractId] WITH a peer [receiverVk]. The
-  /// cooperative leaf reuses the wallet's EXISTING key `V` (no new key): a single
-  /// key-preserving REFRESH places a co-signing share of `V` onto a `{receiver, cosigner}`
-  /// pairing so the chosen receiver (another user) can co-sign independently, while the
-  /// cosigner GATES every spend by [contractWasm]. The wallet computes its refresh slices
-  /// locally from `V` and sends `a@cosigner` (scalar) + `a@receiver·G` (point) +
-  /// `ECIES(a@receiver)` (to receiver_vk) to the cosigner; the cosigner adds its own
-  /// `b@receiver`, ECIES-encrypts it too, and drops BOTH halves into the receiver's inbox.
-  /// Only the POINT `a@receiver·G` reaches the cosigner in the clear, so it never learns
-  /// the receiver's full share. The cosigner validates `sha256(contractWasm)==contractId`,
-  /// stores the wasm, and registers the eVTXO spk (coop leaf = `V`).
-  ///
-  /// [receiverVk] is the peer receiver's verifying key (33 bytes). [ownerPk] is the
-  /// unilateral-exit-leaf x-only key; defaults to the wallet's own `V` x-only.
-  ///
-  /// Returns the registered eVTXO scriptPubKey plus the wallet's `V` key package + PKP,
-  /// which the author uses to spend the contract's cooperative leaf via its normal pairing.
-  Future<
-      ({
-        Uint8List scriptPubkey,
-        threshold.KeyPackage keyPackage,
-        threshold.PublicKeyPackage publicKeyPackage,
-      })> createEvtxoKey(
-    Uint8List contractId,
-    Uint8List contractWasm,
-    Uint8List serverPk,
-    int exitDelay, {
-    required Uint8List receiverVk,
-    Uint8List? ownerPk,
-  }) async {
-    if (!isInitialized || _userId == null) {
-      throw StateError('Client not initialized (DKG not run).');
-    }
-
-    final vKp = await _walletKeyPackage();
-    final vPkp = _normalPolicy!.publicKeyPackage;
-    final walletId = vKp.identifier;
-    final cosignerId =
-        vPkp.verifyingShares.keys.firstWhere((id) => id != walletId);
-    final receiverId = threshold.Identifier.derive(receiverVk);
-    final ts = Int64(DateTime.now().millisecondsSinceEpoch);
-
-    // Exit-leaf owner defaults to the wallet's own V x-only (drop the parity byte).
-    final vCompressed = threshold.elemSerializeCompressed(vPkp.verifyingKey.E);
-    final ownerXonly = ownerPk ?? Uint8List.fromList(vCompressed.sublist(1));
-
-    // Key-preserving refresh of V onto {receiver, cosigner}: a@cosigner (scalar) +
-    // a@receiver·G (point) go to the cosigner; a@receiver is ECIES-sealed to the receiver.
-    final idSet = <threshold.Identifier>[walletId, cosignerId];
-    final slope = threshold.modNRandom();
-    final (aAtReceiver, aAtCosigner) =
-        threshold.refreshShareToId(vKp, idSet, receiverId, cosignerId, slope);
-    final aAtReceiverPoint =
-        threshold.elemSerializeCompressed(threshold.elemBaseMul(aAtReceiver));
-    final eciesAAtReceiver =
-        threshold.eciesEncrypt(threshold.bigIntToBytes(aAtReceiver), receiverVk);
-
-    final resp = await _stub.contractCreate(ContractCreateRequest()
-      ..userId = _userId!
-      ..identifier = walletId.serialize()
-      ..contractId = contractId
-      ..contractWasm = contractWasm
-      ..serverPk = serverPk
-      ..exitDelay = exitDelay
-      ..ownerPk = ownerXonly
-      ..receiverVk = receiverVk
-      ..aAtCosigner = threshold.bigIntToBytes(aAtCosigner)
-      ..aAtReceiverPoint = aAtReceiverPoint
-      ..signature = Uint8List(0) // contract-create path is unauthenticated for now
-      ..timestampMs = ts
-      ..eciesAAtReceiver = eciesAAtReceiver);
-
-    return (
-      scriptPubkey: Uint8List.fromList(resp.contractScriptPubkey),
-      keyPackage: vKp,
-      publicKeyPackage: vPkp,
-    );
-  }
-
-  /// Phase 2: create a contract eVTXO from a published TEMPLATE + the author's typed config. The
-  /// cosigner composes the template + a provider synthesized from [configBlob] (the encoded
-  /// key-value config) into one contract whose composed sha256 becomes the bound contract_id, then
-  /// runs the same peer flow as [createEvtxoKey] (refresh V onto {receiver, cosigner} + relay).
-  /// Returns the eVTXO spk, the COMPOSED contract id, and the wallet's V key package + PKP.
-  Future<
-      ({
-        Uint8List scriptPubkey,
-        Uint8List contractId,
-        threshold.KeyPackage keyPackage,
-        threshold.PublicKeyPackage publicKeyPackage,
-      })> createEvtxoFromTemplate({
-    required String templateId,
-    required String stubId,
-    required Uint8List configBlob,
-    required Uint8List serverPk,
-    int exitDelay = 0,
-    required Uint8List receiverVk,
-    Uint8List? ownerPk,
-  }) async {
-    if (!isInitialized || _userId == null) {
-      throw StateError('Client not initialized (DKG not run).');
-    }
-    final vKp = await _walletKeyPackage();
-    final vPkp = _normalPolicy!.publicKeyPackage;
-    final walletId = vKp.identifier;
-    final cosignerId =
-        vPkp.verifyingShares.keys.firstWhere((id) => id != walletId);
-    final receiverId = threshold.Identifier.derive(receiverVk);
-    final ts = Int64(DateTime.now().millisecondsSinceEpoch);
-
-    final vCompressed = threshold.elemSerializeCompressed(vPkp.verifyingKey.E);
-    final ownerXonly = ownerPk ?? Uint8List.fromList(vCompressed.sublist(1));
-
-    final idSet = <threshold.Identifier>[walletId, cosignerId];
-    final slope = threshold.modNRandom();
-    final (aAtReceiver, aAtCosigner) =
-        threshold.refreshShareToId(vKp, idSet, receiverId, cosignerId, slope);
-    final aAtReceiverPoint =
-        threshold.elemSerializeCompressed(threshold.elemBaseMul(aAtReceiver));
-    final eciesAAtReceiver =
-        threshold.eciesEncrypt(threshold.bigIntToBytes(aAtReceiver), receiverVk);
-
-    final resp = await _stub.contractCreate(ContractCreateRequest()
-      ..userId = _userId!
-      ..identifier = walletId.serialize()
-      ..templateId = templateId
-      ..stubId = stubId
-      ..configBlob = configBlob
-      ..serverPk = serverPk
-      ..exitDelay = exitDelay
-      ..ownerPk = ownerXonly
-      ..receiverVk = receiverVk
-      ..aAtCosigner = threshold.bigIntToBytes(aAtCosigner)
-      ..aAtReceiverPoint = aAtReceiverPoint
-      ..signature = Uint8List(0)
-      ..timestampMs = ts
-      ..eciesAAtReceiver = eciesAAtReceiver);
-
-    return (
-      scriptPubkey: Uint8List.fromList(resp.contractScriptPubkey),
-      contractId: Uint8List.fromList(resp.contractId),
-      keyPackage: vKp,
-      publicKeyPackage: vPkp,
-    );
-  }
-
-  /// Receiver side: fetch the contract shares held for this wallet in its inbox, decrypt
-  /// BOTH ECIES halves with the signing secret, sum them into the receiver's share
-  /// `P = a@receiver + b@receiver`, and return the spendable context per contract eVTXO
-  /// (the `{receiver, cosigner}` pairing key package + PKP + taptree parameters).
-  Future<
-      List<
-          ({
-            Uint8List scriptPubkey,
-            Uint8List contractId,
-            int exitDelay,
-            Uint8List serverPk,
-            Uint8List ownerPk,
-            threshold.KeyPackage keyPackage,
-            threshold.PublicKeyPackage publicKeyPackage,
-          })>> fetchContractShares() async {
-    // `_normalPolicy` (not `_signingSecret`) — a gated wallet has no raw `_signingSecret`; the
-    // share (blinded) lives in the policy and is reconstructed by `_walletKeyPackage()` below.
-    if (_userId == null || _normalPolicy == null) {
-      throw StateError('Client not initialized.');
-    }
-    final auth = _authSig((h) => h.signForEvtxoPending());
-    final resp = await _stub.evtxoPendingShares(EvtxoPendingSharesRequest()
-      ..userId = _userId!
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
-
-    final receiverId = threshold.Identifier.derive(Uint8List.fromList(_userId!));
-    // Reconstruct the wallet share (P_full) to ECIES-decrypt the inbox; gated ⇒ needs the seed.
-    final secret = (await _walletKeyPackage()).secretShare;
-    final out = <
-        ({
-          Uint8List scriptPubkey,
-          Uint8List contractId,
-          int exitDelay,
-          Uint8List serverPk,
-          Uint8List ownerPk,
-          threshold.KeyPackage keyPackage,
-          threshold.PublicKeyPackage publicKeyPackage,
-        })>[];
-    for (final s in resp.shares) {
-      final aAtR = threshold.bytesToBigInt(threshold.eciesDecrypt(
-          Uint8List.fromList(s.eciesHalfAuthor), secret));
-      final bAtR = threshold.bytesToBigInt(threshold.eciesDecrypt(
-          Uint8List.fromList(s.eciesHalfCosigner), secret));
-      final pI = threshold.modNAdd(aAtR, bAtR);
-      final pkp = threshold.PublicKeyPackage.fromJson(
-          jsonDecode(s.publicKeyPackageJson) as Map<String, dynamic>);
-      final kp = threshold.KeyPackage(
-          receiverId, pI, threshold.elemBaseMul(pI), pkp.verifyingKey, 2);
-      out.add((
-        scriptPubkey: Uint8List.fromList(s.evtxoScriptPubkey),
-        contractId: Uint8List.fromList(s.contractId),
-        exitDelay: s.exitDelay,
-        serverPk: Uint8List.fromList(s.serverPk),
-        ownerPk: Uint8List.fromList(s.ownerPk),
-        keyPackage: kp,
-        publicKeyPackage: pkp,
-      ));
-    }
-    return out;
-  }
-
-  /// Receiver side: clear a picked-up contract share from the inbox.
-  Future<void> ackContractShare(Uint8List evtxoScriptPubkey) async {
-    final auth = _authSig((h) => h.signForEvtxoAck());
-    await _stub.evtxoAckShare(EvtxoAckShareRequest()
-      ..userId = _userId!
-      ..evtxoScriptPubkey = evtxoScriptPubkey
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
-  }
-
-  /// Subscribe (Phase 3) to this wallet's cosigner event stream over HTTP (SSE). For a BACKEND
-  /// user that holds the connection open and reacts to events — chiefly `contract_share` (a
-  /// contract share landed in our inbox). Best-effort live nudges; the inbox (`fetchContractShares`)
-  /// is the durable record, so drain it on connect to catch up. REST transport only.
-  Stream<({String type, Map<String, dynamic> data})> subscribeEvents() async* {
-    if (_userId == null) throw StateError('Client not initialized.');
-    final base = _restBaseForEvents;
-    if (base == null) {
-      throw StateError('Event stream is only available on the REST transport.');
-    }
-    final auth = _authSig((h) => h.signForEventsSubscribe());
-    final uri = Uri.parse('${base.replaceAll(RegExp(r'/+$'), '')}/api/u/'
-        '${hex.encode(_userId!)}/events'
-        '?signature=${hex.encode(auth.signature)}&timestamp_ms=${auth.timestampMs.toInt()}');
-    final req = http.Request('GET', uri)..headers['accept'] = 'text/event-stream';
-    final resp = await http.Client().send(req);
-    if (resp.statusCode != 200) {
-      throw Exception('events subscribe: HTTP ${resp.statusCode}');
-    }
-    String? ev;
-    await for (final line
-        in resp.stream.transform(utf8.decoder).transform(const LineSplitter())) {
-      if (line.startsWith('event:')) {
-        ev = line.substring(6).trim();
-      } else if (line.startsWith('data:')) {
-        final raw = line.substring(5).trim();
-        final data = raw.isEmpty
-            ? <String, dynamic>{}
-            : jsonDecode(raw) as Map<String, dynamic>;
-        yield (type: ev ?? (data['type'] as String? ?? 'message'), data: data);
-        ev = null;
-      }
-      // blank lines separate events; keep-alive comment lines (':') are ignored.
-    }
   }
 
 
@@ -944,16 +683,6 @@ class MpcClient {
       ..timestampMs = auth.timestampMs);
   }
 
-  Future<ListArkTransactionsResponse> listArkTransactions() async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot list Ark transactions.");
-    }
-    final auth = _authSig((h) => h.signForListArkTransactions());
-    return await _stub.listArkTransactions(ListArkTransactionsRequest()
-      ..userId = _userId!
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
-  }
 
   /// Send VTXOs off-chain to a recipient Ark address.
   ///
@@ -1255,26 +984,6 @@ class MpcClient {
     return resp2.commitmentTxid; // empty when DELEGATED
   }
 
-  /// Register an FCM token so the cosigner can wake the device on receive.
-  /// Idempotent — safe to call on every login and token rotation.
-  Future<void> registerDeviceToken({
-    required String fcmToken,
-    required String platform,
-    String appVersion = '',
-  }) async {
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot registerDeviceToken.");
-    }
-    final auth = _authSig((h) => h.signForRegisterDeviceToken());
-    final req = RegisterDeviceTokenRequest()
-      ..userId = _userId!
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs
-      ..fcmToken = fcmToken
-      ..platform = platform
-      ..appVersion = appVersion;
-    await _stub.registerDeviceToken(req);
-  }
 
 
   // ---------------------------------------------------------------------------
