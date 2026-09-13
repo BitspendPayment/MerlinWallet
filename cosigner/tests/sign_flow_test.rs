@@ -54,9 +54,9 @@ fn client_round1(kp_user: &KeyPackage, message: &[u8; 32]) -> (nonce::SigningNon
 }
 
 /// Seed, drop, reopen, and run a full ceremony against the reopened cosigner.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sign_session_restores_seal_and_verifies() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn sign_session_restores_seal_and_verifies() {
+    let Some(store) = common::try_store() else {
         return;
     };
 
@@ -66,18 +66,18 @@ async fn sign_session_restores_seal_and_verifies() {
     let (kp_user, kp_cosigner) = (&kps[0], &kps[1]);
     let message = [0x42u8; 32];
 
-    let seeder = common::open_cosigner(&store, &group_key).await;
-    common::seed_policy(&seeder, &group_key, kp_cosigner, kp_user, &pkp, None).await;
+    let seeder = common::open_cosigner(&store, &group_key);
+    common::seed_policy(&seeder, &group_key, kp_cosigner, kp_user, &pkp, None);
     drop(seeder);
 
     // A fresh instance holds nothing in memory: the seal is where its keys come from.
-    let cosigner = common::open_cosigner(&store, &group_key).await;
+    let cosigner = common::open_cosigner(&store, &group_key);
     let (user_nonce, req1) = client_round1(kp_user, &message);
     let user_id = req1.user_id.clone();
 
     // Round 1. The ceremony leaves the cosigner with the reply; nothing is parked behind it.
     let (ceremony, resp1) = {
-        let mut actor = cosigner.lock().await;
+        let mut actor = cosigner.lock().unwrap();
         actor.sign_open(req1).expect("sign_open")
     };
 
@@ -100,7 +100,7 @@ async fn sign_session_restores_seal_and_verifies() {
 
     // Round 2. The ceremony goes back in by value and is consumed.
     let resp2 = {
-        let mut actor = cosigner.lock().await;
+        let mut actor = cosigner.lock().unwrap();
         actor
             .sign_finish(
                 ceremony,
@@ -133,9 +133,9 @@ async fn sign_session_restores_seal_and_verifies() {
 /// model parked the ceremony on the actor between two requests, so an abandoned round 1 left a live
 /// nonce sitting in memory addressable by whoever sent round 2. Here the ceremony is a value: drop
 /// it and the nonce is gone, and a second ceremony on the same cosigner gets fresh commitments.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn abandoned_ceremony_leaves_no_reusable_nonce() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn abandoned_ceremony_leaves_no_reusable_nonce() {
+    let Some(store) = common::try_store() else {
         return;
     };
 
@@ -144,18 +144,18 @@ async fn abandoned_ceremony_leaves_no_reusable_nonce() {
     let (kp_user, kp_cosigner) = (&kps[0], &kps[1]);
     let message = [0x42u8; 32];
 
-    let cosigner = common::open_cosigner(&store, &group_key).await;
-    common::seed_policy(&cosigner, &group_key, kp_cosigner, kp_user, &pkp, None).await;
+    let cosigner = common::open_cosigner(&store, &group_key);
+    common::seed_policy(&cosigner, &group_key, kp_cosigner, kp_user, &pkp, None);
 
     // Open a ceremony and abandon it, as an interrupted stream does.
     let (_, first) = {
-        let mut actor = cosigner.lock().await;
+        let mut actor = cosigner.lock().unwrap();
         actor.sign_open(client_round1(kp_user, &message).1).expect("first open")
     };
 
     // Same cosigner, same message: a second ceremony must not reuse the first one's nonce.
     let (_, second) = {
-        let mut actor = cosigner.lock().await;
+        let mut actor = cosigner.lock().unwrap();
         actor.sign_open(client_round1(kp_user, &message).1).expect("second open")
     };
 

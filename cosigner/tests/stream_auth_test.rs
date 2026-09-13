@@ -1,52 +1,111 @@
-//! The four ceremony streams, over a real gRPC connection.
+//! The four ceremony streams, over the real transport.
 //!
 //! `check()` ran on all seven unary RPCs and on none of the four streams: every handler carried the
 //! comment "auth ran at the REST boundary", and that boundary was deleted. Anyone who could reach
 //! the port could open a `Send` and have the cosigner co-sign a spend.
 //!
-//! These tests drive tonic against a real server rather than calling the handlers directly, because
-//! the defect was not in `verify_auth` — it was that nothing called it. Only the wire shows that.
+//! These drive [`CosignerService::route`] with a real framed request body rather than calling the
+//! ceremony functions directly, because the defect was not in `verify_auth` — it was that nothing
+//! called it, and only the wire shows that. They used to drive tonic over a TCP socket; tonic does
+//! not build for `wasm32-wasip2`, so the wire is now `src/grpc`'s own framing and trailers, and
+//! these cover that too: routing, the five-byte frames, and the `grpc-status` a client actually
+//! reads a failure from.
 
 mod common;
 
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
+use http_body_util::BodyExt;
+
+use cosigner::grpc::framing::{frame, Deframer};
+use cosigner::grpc::Code;
 use cosigner::session::proto;
-use cosigner::session::proto::cosigner_client::CosignerClient;
 use cosigner::session::CosignerService;
 use cosigner::wallet_proto::GetServerInfoResponse;
 use cosigner::Cosigner;
+use wstd::http::{Body, Request, Response};
 
 use threshold::auth::AuthSigner;
 use threshold::keys::KeyPackage;
 use threshold::scalar::scalar_to_bytes;
 
 fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
 }
 
-/// Serve one cosigner on an ephemeral port; returns its address.
-async fn serve(cosigner: Cosigner) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let svc = proto::cosigner_server::CosignerServer::new(CosignerService::new(
-        Arc::new(tokio::sync::Mutex::new(cosigner)),
-        GetServerInfoResponse {
-            bitcoin_network: "regtest".into(),
-        },
-    ));
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(svc)
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .ok();
-    });
-    format!("http://{addr}")
+/// Drive a future to completion on this thread.
+///
+/// Every body here is already in memory, so nothing genuinely parks and a busy poll is enough. The
+/// cap is what turns "this future never finishes" into a failed test rather than a hung one — which
+/// matters, because a duplex that stops making progress is exactly the bug this file would catch.
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = Box::pin(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..100_000 {
+        if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
+            return value;
+        }
+    }
+    panic!("the future never completed");
+}
+
+/// A gRPC request carrying `messages`, addressed at `method`.
+fn request<M: prost::Message>(method: &str, messages: &[M]) -> Request<Body> {
+    let mut buf = Vec::new();
+    for message in messages {
+        buf.extend_from_slice(&frame(&message.encode_to_vec()));
+    }
+    Request::builder()
+        .method("POST")
+        .uri(format!("http://cosigner/cosigner.v1.Cosigner/{method}"))
+        .header("content-type", "application/grpc+proto")
+        .body(Body::from_http_body(
+            http_body_util::Full::new(Bytes::from(buf))
+                .map_err(|e: std::convert::Infallible| -> wstd::http::Error { match e {} }),
+        ))
+        .expect("request is well formed")
+}
+
+/// What came back: the decoded messages, and the status a client reads from the trailers.
+struct Answer<M> {
+    messages: Vec<M>,
+    code: u32,
+    message: String,
+}
+
+fn collect<M: prost::Message + Default>(resp: Response<Body>) -> Answer<M> {
+    let collected = block_on(resp.into_body().into_boxed_body().collect()).expect("collect body");
+    let trailers = collected.trailers().cloned().unwrap_or_default();
+    let code = trailers
+        .get("grpc-status")
+        .expect("every gRPC response carries a grpc-status trailer")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let message = trailers
+        .get("grpc-message")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+
+    let mut deframer = Deframer::default();
+    deframer.push(&collected.to_bytes());
+    let mut messages = Vec::new();
+    while let Some(bytes) = deframer.next().expect("well-framed response") {
+        messages.push(M::decode(bytes).expect("decodable response"));
+    }
+    Answer { messages, code, message }
+}
+
+fn service(cosigner: Cosigner) -> CosignerService {
+    CosignerService::new(
+        Arc::new(Mutex::new(cosigner)),
+        GetServerInfoResponse { bitcoin_network: "regtest".into() },
+    )
 }
 
 /// A `SignOpen` signed by the wallet's own key, or deliberately not.
@@ -80,68 +139,100 @@ fn sign_open(kp_user: &KeyPackage, authentic: bool) -> proto::SignClientMsg {
     }
 }
 
-/// An unsigned `SignOpen` is refused before any ceremony state is created.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sign_rejects_an_unauthenticated_open() {
-    let Some(store) = common::try_store().await else {
-        return;
-    };
+/// A seeded cosigner and the wallet key packages that own it.
+fn seeded() -> Option<(Cosigner, Vec<KeyPackage>)> {
+    let store = common::try_store()?;
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
+    let cosigner = common::open_cosigner(&store, &group_key);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    Some((cosigner.into_inner().unwrap(), kps))
+}
 
-    let cosigner = common::open_cosigner(&store, &group_key).await;
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None).await;
-    let addr = serve(cosigner.into_inner()).await;
+/// An unsigned `SignOpen` is refused before any ceremony state is created.
+#[test]
+fn sign_rejects_an_unauthenticated_open() {
+    let Some((cosigner, kps)) = seeded() else { return };
 
-    let mut client = CosignerClient::connect(addr).await.expect("connect");
-    let (tx, rx) = tokio::sync::mpsc::channel(4);
-    tx.send(sign_open(&kps[0], false)).await.unwrap();
-    let mut inbound = client
-        .sign(tokio_stream::wrappers::ReceiverStream::new(rx))
-        .await
-        .expect("open stream")
-        .into_inner();
+    let resp = block_on(service(cosigner).route(request("Sign", &[sign_open(&kps[0], false)])));
+    let answer = collect::<proto::SignServerMsg>(resp);
 
-    let first = tokio_stream::StreamExt::next(&mut inbound).await;
-    let err = first
-        .expect("the server must answer")
-        .expect_err("a forged signature must not open a signing session");
     assert_eq!(
-        err.code(),
-        tonic::Code::Unauthenticated,
-        "expected Unauthenticated, got: {err:?}"
+        answer.code,
+        Code::Unauthenticated as u32,
+        "expected Unauthenticated, got {} ({})",
+        answer.code,
+        answer.message
+    );
+    assert!(
+        answer.messages.is_empty(),
+        "a refused open must not have answered a round first: {:?}",
+        answer.messages
     );
 }
 
 /// …and a correctly signed one is let through, so the gate is not simply refusing everything.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sign_accepts_an_authenticated_open() {
-    let Some(store) = common::try_store().await else {
-        return;
-    };
-    let (kps, pkp) = common::dkg_2of2();
-    let group_key = hex::encode(pkp.verifying_key.serialize());
+#[test]
+fn sign_accepts_an_authenticated_open() {
+    let Some((cosigner, kps)) = seeded() else { return };
 
-    let cosigner = common::open_cosigner(&store, &group_key).await;
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None).await;
-    let addr = serve(cosigner.into_inner()).await;
+    let resp = block_on(service(cosigner).route(request("Sign", &[sign_open(&kps[0], true)])));
+    let answer = collect::<proto::SignServerMsg>(resp);
 
-    let mut client = CosignerClient::connect(addr).await.expect("connect");
-    let (tx, rx) = tokio::sync::mpsc::channel(4);
-    tx.send(sign_open(&kps[0], true)).await.unwrap();
-    let mut inbound = client
-        .sign(tokio_stream::wrappers::ReceiverStream::new(rx))
-        .await
-        .expect("open stream")
-        .into_inner();
-
-    let msg = tokio_stream::StreamExt::next(&mut inbound)
-        .await
-        .expect("the server must answer")
-        .expect("an authentic open must be accepted");
+    let first = answer
+        .messages
+        .first()
+        .unwrap_or_else(|| panic!("the cosigner must answer: {} {}", answer.code, answer.message));
     assert!(
-        matches!(msg.body, Some(proto::sign_server_msg::Body::Commitments(_))),
+        matches!(first.body, Some(proto::sign_server_msg::Body::Commitments(_))),
         "expected the commitments round, got {:?}",
-        msg.body
+        first.body
     );
+}
+
+/// A ceremony that is cut off mid-round ends as a cancellation, not as a success.
+///
+/// The client half-closes after opening, so `check()` passes and the handler parks waiting for the
+/// share that never comes. Worth its own test: the trailers are the only place that difference can
+/// be said, and reporting OK here would tell a client its round completed.
+#[test]
+fn a_stream_that_ends_mid_ceremony_is_a_cancellation() {
+    let Some((cosigner, kps)) = seeded() else { return };
+
+    let resp = block_on(service(cosigner).route(request("Sign", &[sign_open(&kps[0], true)])));
+    let answer = collect::<proto::SignServerMsg>(resp);
+
+    assert_eq!(answer.code, Code::Cancelled as u32, "got {}", answer.message);
+    assert_eq!(
+        answer.messages.len(),
+        1,
+        "the commitments round went out before the client vanished"
+    );
+}
+
+/// An unknown method is a gRPC status, not an HTTP one — a client reading only the head would
+/// otherwise see a perfectly successful call.
+#[test]
+fn an_unknown_method_is_unimplemented_in_the_trailers() {
+    let Some((cosigner, _)) = seeded() else { return };
+
+    let resp = block_on(service(cosigner).route(request::<proto::SignClientMsg>("Nope", &[])));
+    assert_eq!(resp.status(), 200, "gRPC reports failure in the trailers");
+    let answer = collect::<proto::SignServerMsg>(resp);
+    assert_eq!(answer.code, Code::Unimplemented as u32);
+}
+
+/// A unary call is authenticated the same way, and answers with one message and an OK trailer.
+#[test]
+fn get_server_info_answers_a_single_framed_message() {
+    let Some((cosigner, _)) = seeded() else { return };
+
+    let resp = block_on(
+        service(cosigner).route(request("GetServerInfo", &[cosigner::wallet_proto::GetServerInfoRequest::default()])),
+    );
+    let answer = collect::<GetServerInfoResponse>(resp);
+
+    assert_eq!(answer.code, Code::Ok as u32, "got {}", answer.message);
+    assert_eq!(answer.messages.len(), 1);
+    assert_eq!(answer.messages[0].bitcoin_network, "regtest");
 }

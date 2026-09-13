@@ -2,7 +2,7 @@
 //! Each handler runs synchronously in `spawn_blocking`; ASP gRPC calls are
 //! awaited via `Handle::current().block_on(...)` against the store client.
 
-use tonic::Status;
+use crate::grpc::Status;
 
 use crate::cosigner::Cosigner;
 use crate::handlers::parsers;

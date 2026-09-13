@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rand::rngs::OsRng;
 use rand::Rng;
-use tonic::Status;
+use crate::grpc::Status;
 
 use threshold::dkg::{
     self, Round1Package, Round1SecretPackage, Round2Package, Round2SecretPackage,

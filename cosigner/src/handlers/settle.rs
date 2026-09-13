@@ -85,7 +85,7 @@ impl Cosigner {
     /// redirect funds with it: every output is still derived from the cosigner's own key, so a
     /// wrong `signer_pubkey` yields a transaction the ASP rejects rather than one that pays
     /// somebody else.
-    pub async fn settle_open(
+    pub fn settle_open(
         &mut self,
         boarding_utxo: Option<(String, u32, u64)>,
         vtxos: Vec<crate::types::VtxoInput>,
@@ -98,9 +98,9 @@ impl Cosigner {
             self.accept_vtxos(vtxos, &info)?;
         }
         let sighashes = if boarding {
-            self.boarding_settle_start(boarding_utxo, &info).await?
+            self.boarding_settle_start(boarding_utxo, &info)?
         } else {
-            self.generate_delegate_for(&info).await?
+            self.generate_delegate_for(&info)?
         };
         self.settle_inflight = Some(InFlight {
             phase: Phase::Intent,

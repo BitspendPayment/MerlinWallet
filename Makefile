@@ -18,11 +18,11 @@
 .PHONY: e2e up down \
 	bob-up bob-down bob-send \
 	ffi-build ffi-test ffi-android ffi-android-arm32 ffi-android-x86_64 ffi-android-all \
-	runtime-build \
+	runtime-build cosigner-wasm cosigner-check \
 	regtest-up regtest-down bitcoin-init mine-loop adb-reverse \
 	runtime-run runtime-stop \
 	arkd-up arkd-down arkd-init db-reset \
-	proto threshold-test \
+	proto proto-check wit-drift threshold-test \
 	flutter flutter-32 flutter-x86 ark-newaddress crypto-bench \
 	stress-test load-test \
 	signet-hardware-ark signet-down e2e-mutinynet e2e-mutinynet-ark \
@@ -33,8 +33,9 @@
 # ── Variables ─────────────────────────────────────────────────────────────────
 
 export DATA_DIR=/tmp/mpc_wallet_stress
-# The cosigner's single embedded SQLite KV backend — a file on local disk.
-export SQLITE_PATH=/tmp/mpc_cosigner/cosigner.db
+# The cosigner's KV store — a directory of files, one per key. Was an embedded SQLite database
+# until the guest port; a directory is the same data structure without the vendored C.
+export STORE_DIR=/tmp/mpc_cosigner/store
 
 NDK_VERSION ?= 27.0.12077973
 NDK_HOME     = $(HOME)/Android/Sdk/ndk/$(NDK_VERSION)
@@ -217,9 +218,26 @@ ffi-test:
 
 # Server & cosigner
 
-runtime-build:
-	@echo "Building server..."
-	cd cosigner && cargo build --release
+# The cosigner's artifact is the component, not a native binary. `wstd::http_server` exports
+# `wasi:http/incoming-handler` and leaves `fn main` as an `unreachable!()` stub, so a host build
+# produces something that panics the moment it is run — which is why this builds the wasm.
+runtime-build: cosigner-wasm
+
+# wasm32-wasip2, exporting `wasi:http/incoming-handler`. Needs wasi-sdk to compile secp256k1-sys,
+# the one vendored C library left — see the script.
+cosigner-wasm: wit-drift
+	@./scripts/build-cosigner-wasm.sh
+
+# The host build, for `cargo test` and for rust-analyzer. Not a server: see above.
+cosigner-check: wit-drift
+	cd cosigner && cargo build --release --lib && cargo test
+
+# The cosigner vendors enclave-runtime's tasks.wit and notify.wit because wit-bindgen reads a path
+# inside the crate. Two copies that must be byte-identical is the thing that drifts unnoticed: both
+# sides still compile and the mismatch surfaces as a runtime trap. Override ENCLAVE_RUNTIME if the
+# runtime lives somewhere other than ~/enclave-runtime.
+wit-drift:
+	@./scripts/wit-drift.sh
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  INFRASTRUCTURE
@@ -245,16 +263,20 @@ adb-reverse:
 	@echo "Forwarding active: phone 127.0.0.1:7074 -> PC REST server"
 	@echo "Forwarding active: phone 127.0.0.1:50001 -> PC Electrs"
 
-runtime-run: runtime-build
-	@echo "Starting MPC Wallet Server on port 7074..."
-	export ELECTRUM_URL=127.0.0.1 && \
-	export ELECTRUM_PORT=50001 && \
-	export BITCOIN_RPC_USER=admin1 && \
-	export BITCOIN_RPC_PASSWORD=123 && \
-	cd cosigner && cargo run --release --bin cosigner -- \
-		--port 7074 &
-	@sleep 2
-	@echo "MPC Wallet Server running in background."
+# There is no native server to start any more.
+#
+# The cosigner is a wasm32-wasip2 component exporting `wasi:http/incoming-handler`: enclave-runtime
+# owns the socket, the TLS and the HTTP/2 negotiation and calls the guest once per request. Running
+# the host binary hits `wstd`'s `unreachable!()` stub instead of serving anything, so this refuses
+# rather than starting something that cannot work.
+#
+# Hosting it under enclave-runtime is the remaining step. `up`, `signet-hardware` and
+# `e2e-mutinynet` still carry their own `cargo run --bin cosigner` lines and need the same fix.
+runtime-run: cosigner-wasm
+	@echo "The cosigner is a Wasm component; there is no native server to run."
+	@echo "Built: cosigner/target/wasm32-wasip2/release/cosigner.wasm"
+	@echo "Serve it with enclave-runtime, which owns the socket and calls the guest per request."
+	@exit 1
 
 runtime-stop:
 	@echo "Stopping MPC Wallet Server..."
@@ -273,12 +295,12 @@ arkd-up:
 
 # Reset the cosigner's SQLite KV file for a clean test run. The reset is per-target
 # (NOT on runtime restart), so the `sealed_state` snapshot survives the ark_e2e restart — the
-# same guarantee the old FLUSHALL-on-redis-up gave. `-wal`/`-shm` are SQLite's sidecar files;
-# leaving them behind next to a deleted DB would resurrect stale pages.
+# same guarantee the old FLUSHALL-on-redis-up gave. The whole store is one directory now, so
+# resetting it is removing that directory rather than a file and SQLite's two sidecars.
 db-reset:
-	@rm -f $(SQLITE_PATH) $(SQLITE_PATH)-wal $(SQLITE_PATH)-shm
-	@mkdir -p $(dir $(SQLITE_PATH))
-	@echo "cosigner SQLite reset ($(SQLITE_PATH))"
+	@rm -rf $(STORE_DIR)
+	@mkdir -p $(STORE_DIR)
+	@echo "cosigner store reset ($(STORE_DIR))"
 
 arkd-down:
 	@echo "Stopping arkd services..."
@@ -292,9 +314,49 @@ arkd-init:
 #  UTILITY
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# `protoc-gen-dart` comes from `dart pub global activate protoc_plugin` and lands in
+# ~/.pub-cache/bin, which is not on PATH by default. Putting it on PATH here rather than asking
+# every caller to: an undeclared global tool is how codegen silently stops being reproducible.
+PUB_BIN := $(HOME)/.pub-cache/bin
+
 proto:
-	@echo "Generating Dart gRPC stubs..."
-	protoc -I protocol/protos --dart_out=grpc:protocol/lib/src/generated protocol/protos/mpc_wallet.proto
+	@command -v protoc >/dev/null || { echo "protoc not found — install protobuf-compiler"; exit 1; }
+	@test -x "$(PUB_BIN)/protoc-gen-dart" || { \
+		echo "protoc-gen-dart not found — run: dart pub global activate protoc_plugin"; exit 1; }
+	@echo "Generating Dart stubs: the cosigner's service and the ASP's..."
+	@mkdir -p protocol/lib/src/generated
+	PATH="$$PATH:$(PUB_BIN)" protoc -I protocol/protos \
+		--dart_out=grpc:protocol/lib/src/generated \
+		protocol/protos/mpc_wallet.proto protocol/protos/cosign_session.proto
+	@# The ASP's own API, generated from the Rust crate's protos rather than a copy under
+	@# protocol/protos: crates/ark/build.rs compiles from there, and a second copy is a second
+	@# source of truth that drifts without either side noticing.
+	PATH="$$PATH:$(PUB_BIN)" protoc -I crates/ark/proto \
+		--dart_out=grpc:protocol/lib/src/generated \
+		crates/ark/proto/ark/v1/types.proto \
+		crates/ark/proto/ark/v1/service.proto \
+		crates/ark/proto/ark/v1/indexer.proto
+
+# Regenerate into a scratch directory and diff. Generated code is checked in, so drift between the
+# .proto and the .dart is invisible until something fails to compile much later.
+#
+# The file list must match `proto` exactly, including its ORDER: protoc numbers import aliases
+# ($0, $1, ...) by the order it sees the files, so a glob here and an explicit list there produce
+# byte-different output from identical input.
+proto-check:
+	@tmp=$$(mktemp -d); \
+	PATH="$$PATH:$(PUB_BIN)" protoc -I protocol/protos --dart_out=grpc:$$tmp \
+		protocol/protos/mpc_wallet.proto protocol/protos/cosign_session.proto && \
+	PATH="$$PATH:$(PUB_BIN)" protoc -I crates/ark/proto --dart_out=grpc:$$tmp \
+		crates/ark/proto/ark/v1/types.proto \
+		crates/ark/proto/ark/v1/service.proto \
+		crates/ark/proto/ark/v1/indexer.proto && \
+	if diff -r -q "$$tmp" protocol/lib/src/generated >/dev/null 2>&1; then \
+		echo "ok     generated Dart matches the .proto files"; rm -rf "$$tmp"; \
+	else \
+		echo "DRIFT  generated Dart differs from the .proto files — run 'make proto'" >&2; \
+		diff -r "$$tmp" protocol/lib/src/generated || true; rm -rf "$$tmp"; exit 1; \
+	fi
 
 threshold-test:
 	@echo "Running threshold tests..."

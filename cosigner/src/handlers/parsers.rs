@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use threshold::keys::PublicKeyPackage;
-use tonic::Status;
+use crate::grpc::Status;
 
 /// Tweak a public key package (BIP-341 key-path; pure public math, no secret) and return its
 /// JSON. Host-side replacement for the legacy in-WASM `pub_key_package_tweak` call — used only

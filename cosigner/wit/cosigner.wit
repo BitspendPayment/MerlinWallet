@@ -1,0 +1,26 @@
+// What the cosigner needs from the runtime it runs inside.
+//
+// Its own world, rather than an edited copy of `enclave:tasks`'s: the vendored `tasks.wit` and
+// `notify.wit` under `deps/` are byte-for-byte copies of the canonical ones in
+// `~/enclave-runtime/wit/`, and `scripts/wit-drift.sh` checks that they stay that way. A guest that
+// wants two capabilities composes them here instead of editing either.
+//
+// Not yet generated from. The crate now builds as a wasm32-wasip2 component — `make cosigner-wasm`
+// — serving gRPC over `wasi:http/incoming-handler`, which removed the reason this could not be
+// generated. What remains is composing this world with the one `wstd::http_server` exports, so
+// `src/host.rs` still mirrors these signatures behind a trait and `tests/wit_test.rs` checks the
+// mirror against this file. Wiring `wit_bindgen::generate!` over this world replaces the trait's
+// `Detached` impl and is the last step.
+package merlin:cosigner@0.1.0;
+
+world cosigner {
+    // `run-task`, plus the queue to arm it with. The cosigner uses this for one thing: a settle
+    // that has come due. It cannot settle from a task — a guest has no egress, so it can reach
+    // neither the ASP nor anything else — so the task reads its own sealed delegate, compares the
+    // deadline to the clock, and wakes its owner.
+    include enclave:tasks/background@0.1.0;
+
+    // Waking those devices. The cosigner never sees a token and never sends a message; it spends
+    // an enrolment an interactive call already made.
+    import enclave:notify/notify@0.1.0;
+}

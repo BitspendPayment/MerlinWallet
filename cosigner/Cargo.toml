@@ -3,6 +3,8 @@ name = "cosigner"
 version = "0.1.0"
 edition = "2021"
 
+# A component, not a server. `wstd::http_server` exports `wasi:http/incoming-handler`; the
+# runtime owns the socket and calls it once per request.
 [[bin]]
 name = "cosigner"
 path = "src/main.rs"
@@ -11,33 +13,29 @@ path = "src/main.rs"
 default = []
 
 [dependencies]
-tonic = "0.12"
+# The guest's std: `wasi:http` server plumbing and an executor over the WASI reactor. This is what
+# replaced tonic + tokio, neither of which builds for wasm32-wasip2 — tonic not at all, and tokio
+# only with `sync,macros,io-util,rt,time`, none of which a single-instance-per-request guest wants.
+wstd = "0.6"
 prost = "0.13"
-tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive"] }
+bytes = "1"
+# The streaming response body, held open while the request body is still being read — see
+# `src/grpc/duplex.rs` for why both can be held at once.
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 
-# Persistence — single embedded SQLite KV backend. `bundled` compiles SQLite from source so the
-# build needs no system libsqlite3 (matters for the Nix/enclave build and for CI images).
-rusqlite = { version = "0.32", features = ["bundled"] }
-
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde"] }
 
 # Ark protocol
 ark = { path = "../crates/ark", features = ["signing"] }
-
-# Streaming
-tokio-stream = { version = "0.1", features = ["sync"] }
-# Streaming ceremony sessions: lets the handler own a ceremony across rounds as ordinary
-# local state, which is the whole point of moving off the unary API.
-async-stream = "0.3"
 
 # Crypto
 sha2 = "0.10"
@@ -54,7 +52,16 @@ rand = "0.8"
 serde_json = "1"
 tempfile = "3"
 hex = "0.4"
-tonic = "0.12"
+# Driving the handler over a synthetic request body, which is what the transport tests do now that
+# there is no socket to bind.
+http-body-util = "0.1"
 
+# Runs on the HOST, so `protoc` here costs the wasm build nothing. Both generators are switched off
+# in `build.rs`: what lands in the crate is prost messages and no transport.
 [build-dependencies]
 tonic-build = "0.12"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

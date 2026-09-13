@@ -33,9 +33,9 @@ fn parse_wire(wire: &std::collections::HashMap<String, String>) -> BTreeMap<Iden
 }
 
 /// Run the full three rounds and check both sides land on the same group key.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ceremony_derives_one_group_key() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn ceremony_derives_one_group_key() {
+    let Some(store) = common::try_store() else {
         return;
     };
 
@@ -120,9 +120,9 @@ async fn ceremony_derives_one_group_key() {
 /// The session used to live in a map with a TTL, so round-1 and round-2 secrets — what the key is
 /// born from — sat there until a sweep noticed. Here the session is a local: drop it and they are
 /// gone, and a second ceremony starts from nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn abandoned_ceremony_leaves_nothing() {
-    let Some(_store) = common::try_store().await else {
+#[test]
+fn abandoned_ceremony_leaves_nothing() {
+    let Some(_store) = common::try_store() else {
         return;
     };
 

@@ -139,7 +139,7 @@ Future<Process> startCosignerRuntime(
     'HOME': dataDir.path,
     // Per-run SQLite KV file. Same dir across restarts, so state survives a runtime
     // bounce the way the shared Redis instance used to.
-    'SQLITE_PATH': '${dataDir.path}/cosigner.db',
+    'STORE_DIR': '${dataDir.path}/store',
     ...extraEnv,
   };
   final proc = await Process.start(
@@ -1739,7 +1739,7 @@ void main() {
     // leaves none in practice, but double them so a stray one can't break out.
     final sqlValue = poisoned.replaceAll("'", "''");
     final setResult = await Process.run('sqlite3', [
-      '${serverTempDir.path}/cosigner.db',
+      '${serverTempDir.path}/store',
       "INSERT INTO kv (tree, key, value) VALUES ('vtxo_store', '$groupKey', '$sqlValue') "
           "ON CONFLICT (tree, key) DO UPDATE SET value = excluded.value;",
     ]);

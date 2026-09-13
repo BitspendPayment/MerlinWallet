@@ -1,13 +1,16 @@
 use std::env;
 
-/// Server configuration loaded from environment variables.
-/// Mirrors the Dart `ServerConfig` from `server/lib/config.dart`.
+/// What the runtime passes the guest, as environment variables.
+///
+/// Three values, and none of them is an endpoint: the cosigner has no outbound sockets, so there is
+/// no ASP URL, no Electrum host and no push channel to configure. `COSIGNER_GROUP_KEY` — which
+/// wallet this instance serves — is read in `main` rather than here, because a missing one is a
+/// refusal to serve rather than a default.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Filesystem path to the SQLite database backing the single KV store, e.g.
-    /// `/var/lib/cosigner/state.db`. Parent directories are created at open. `:memory:` gives an
-    /// ephemeral store (tests). Env `SQLITE_PATH`.
-    pub sqlite_path: String,
+    /// Directory the KV store lives in, e.g. `/var/lib/cosigner`. Created at open, so a fresh
+    /// deployment needs no setup. `:memory:` gives an ephemeral store (tests). Env `STORE_DIR`.
+    pub store_dir: String,
     /// Bitcoin network name (e.g. "regtest", "signet", "testnet", "mainnet").
     /// Used for logging; the authoritative network comes from the ASP's GetArkInfo.
     pub bitcoin_network: String,
@@ -18,13 +21,12 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     /// Load configuration from environment variables.
-    /// Supports Docker secrets via `_FILE` suffix pattern.
     pub fn from_environment() -> Self {
         Self {
-            sqlite_path: env::var("SQLITE_PATH")
+            store_dir: env::var("STORE_DIR")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_SQLITE_PATH.to_string()),
+                .unwrap_or_else(|| DEFAULT_STORE_DIR.to_string()),
             bitcoin_network: env::var("BITCOIN_NETWORK").unwrap_or_else(|_| "regtest".to_string()),
             auto_settle_safety_margin_secs: env::var("AUTO_SETTLE_SAFETY_MARGIN_SECS")
                 .ok()
@@ -34,6 +36,6 @@ impl ServerConfig {
     }
 }
 
-/// Where the KV database lives when `SQLITE_PATH` is unset. A relative path so a bare `cargo run`
-/// works without root; deployments point this at the mounted data volume.
-const DEFAULT_SQLITE_PATH: &str = "data/cosigner.db";
+/// Where the store lives when `STORE_DIR` is unset. A relative path so a bare test run works
+/// without root; deployments point this at the filesystem the runtime scoped to this client.
+const DEFAULT_STORE_DIR: &str = "data/cosigner";

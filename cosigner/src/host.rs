@@ -42,7 +42,14 @@ pub trait Host: Send + Sync {
         interval_ms: Option<u64>,
     ) -> Result<(), String>;
 
+    /// A JSON task record: state, attempt count and result bytes. The cosigner does not read it
+    /// today; it is here because the runtime offers it and a mirror with holes is not a mirror.
+    fn status(&self, id: &str) -> Result<String, String>;
+
     fn cancel(&self, id: &str) -> Result<(), String>;
+
+    /// Drop a terminal record to release quota. Never removes running work.
+    fn forget(&self, id: &str) -> Result<(), String>;
 
     /// Enrol an FCM token. The cosigner never sees it again — the runtime owns the registry, which
     /// is why there is no `devices() -> [token]`, only a count.
@@ -72,8 +79,14 @@ impl Host for Detached {
     fn enqueue(&self, id: &str, _: &[u8], _: u64, _: Option<u64>) -> Result<(), String> {
         Err(format!("no runtime to enqueue {id}: not running as a guest"))
     }
+    fn status(&self, id: &str) -> Result<String, String> {
+        Err(format!("no runtime to ask about {id}: not running as a guest"))
+    }
     fn cancel(&self, id: &str) -> Result<(), String> {
         Err(format!("no runtime to cancel {id}: not running as a guest"))
+    }
+    fn forget(&self, id: &str) -> Result<(), String> {
+        Err(format!("no runtime to forget {id}: not running as a guest"))
     }
     fn register_device(&self, _: &str) -> Result<(), String> {
         Err("no runtime to enrol a device with: not running as a guest".into())

@@ -1,0 +1,40 @@
+package enclave:notify@0.1.0;
+
+/// Waking a tenant's devices. Calls are bound to the current tenant by the
+/// runtime; no function here accepts a tenant id.
+///
+/// **Nothing here carries text a person will read.** The runtime sends a
+/// data-only message containing an opaque category and an optional
+/// tenant-local reference, and nothing else. That payload crosses the parent
+/// instance and Google, which are the two parties this design excludes from a
+/// tenant's data — so the app wakes and fetches the detail over the attested
+/// channel. See docs/NOTIFICATIONS.md.
+interface notify {
+    /// Enrol an FCM registration token for this tenant.
+    ///
+    /// **Interactive only.** Enrolling grants a standing ability to reach a
+    /// device, and background work cannot grant itself that — the same rule
+    /// enclave:tasks/queue applies to enqueue. Enrolling a token this tenant
+    /// already has is success and changes nothing.
+    ///
+    /// 32-512 characters of [A-Za-z0-9_:.-].
+    register-device: func(token: string) -> result<_, string>;
+
+    /// Interactive only. Forgetting a token this tenant does not have is
+    /// success: a client pruned while it was offline is not wrong to ask.
+    forget-device: func(token: string) -> result<_, string>;
+
+    /// How many devices this tenant has enrolled. Never the tokens themselves.
+    devices: func() -> result<u32, string>;
+
+    /// Queue a wake signal to every device this tenant has enrolled.
+    ///
+    /// Allowed from background work, and that is the point: a finished task
+    /// telling its owner to come and look is the primary use. It authorizes
+    /// nothing — it spends an enrolment an interactive call already made.
+    ///
+    /// `category` and `reference` are opaque labels: 1-64 characters of
+    /// [A-Za-z0-9_-]. Not prose, not a message, not a title. Returns once the
+    /// signal is queued; delivery is best effort and unacknowledged.
+    wake: func(category: string, reference: option<string>) -> result<_, string>;
+}

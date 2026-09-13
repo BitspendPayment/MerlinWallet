@@ -13,7 +13,7 @@ use std::sync::Arc;
 use rand::rngs::OsRng;
 use zeroize::Zeroizing;
 
-use tonic::Status;
+use crate::grpc::Status;
 
 use crate::handlers;
 
@@ -123,17 +123,19 @@ pub struct Cosigner {
     pub(crate) owned_vtxos: Vec<VtxoEntry>,
 }
 
-/// In-flight boarding settle, held across the commitment-FROST pause (the client FROST-signs the
-/// commitment sighashes between step 2 and step 3). Unlike the guest, native tonic CAN hold the
-/// event stream across the pause, so step 3 drives to BatchFinalized — ensuring the new VTXO is
-/// settled + ASP-indexed before returning (an immediate send must find it).
+/// In-flight boarding settle, held across the commitment-FROST pause — the caller FROST-signs the
+/// commitment sighashes between one relayed ASP event and the next, and this is what waits.
+///
+/// It used to carry the ASP event stream too, from when the cosigner held that connection itself.
+/// It cannot: a guest has no egress at all, so the caller subscribes and relays each event in, and
+/// the field had one writer, no readers, and a doc comment describing a design that was already
+/// gone.
 pub struct BoardingSettleInFlight {
     pub session: ark::client::batch::SettleSession,
     pub signer: ark::client::batch::BoardingTreeSigner,
     pub amount_sats: u64,
     /// Boarding exit delay, carried through to the finalized VTXO entry the host persists.
     pub exit_delay: u32,
-    pub stream: Option<tonic::Streaming<ark::client::proto::GetEventStreamResponse>>,
 }
 
 impl Cosigner {
@@ -145,18 +147,18 @@ impl Cosigner {
     ///
     /// No seal yet is not an error. Before onboarding there is nothing to read, and DKG is what
     /// writes the first one.
-    pub async fn open(store: Arc<Store>, group_key: String) -> Result<Self, Status> {
-        Self::open_with_host(store, group_key, Arc::new(crate::host::Detached)).await
+    pub fn open(store: Arc<Store>, group_key: String) -> Result<Self, Status> {
+        Self::open_with_host(store, group_key, Arc::new(crate::host::Detached))
     }
 
     /// Open against a given runtime. The guest port and the tests are the two callers.
-    pub async fn open_with_host(
+    pub fn open_with_host(
         store: Arc<Store>,
         group_key: String,
         host: Arc<dyn crate::host::Host>,
     ) -> Result<Self, Status> {
         let mut cosigner = Self::new(store.clone(), group_key.clone(), host);
-        crate::store::restore_snapshot(&mut cosigner, &store, &group_key).await;
+        crate::store::restore_snapshot(&mut cosigner, &store, &group_key);
         Ok(cosigner)
     }
 
@@ -326,10 +328,10 @@ impl Cosigner {
 
     /// Seal this actor's state. Storage is the whole of the persistence now, so a method that
     /// mutates durable state seals here rather than trusting its caller to remember.
-    pub async fn seal(&mut self) {
+    pub fn seal(&mut self) {
         let store = self.store.clone();
         let group_key = self.group_key.clone();
-        crate::store::seal_snapshot(self, &store, &group_key).await;
+        crate::store::seal_snapshot(self, &store, &group_key);
     }
 
     /// Record a settled boarding output: replace it in the owned set with the VTXO it became, and
@@ -810,7 +812,7 @@ impl Cosigner {
     /// Boarding settle START: derive the owner key (from the installed policy), the ASP info, and
     /// the boarding address ourselves, then build the session from the wallet-scanned `boarding_utxo`
     /// `(txid, vout, amount_sats)`. Returns the intent-proof sighashes to FROST-sign.
-    pub(crate) async fn boarding_settle_start(
+    pub(crate) fn boarding_settle_start(
         &mut self,
         boarding_utxo: Option<(String, u32, u64)>,
         info: &ArkInfo,
@@ -889,14 +891,13 @@ impl Cosigner {
             signer,
             amount_sats: boarding_amount_sats,
             exit_delay: boarding_exit_delay,
-            stream: None,
         });
         Ok(sighashes.iter().map(|s| s.to_vec()).collect())
     }
 
     /// Delegate phase 1: build the pre-authorized intent + forfeit PSBTs (after `GetInfo`) and return
     /// the sighashes the client must FROST-sign. The Ark cosigner secret never leaves the core.
-    pub async fn generate_delegate_for(
+    pub fn generate_delegate_for(
         &mut self,
         info: &ArkInfo,
     ) -> Result<Vec<Vec<u8>>, String> {

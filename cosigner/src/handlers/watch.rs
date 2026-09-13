@@ -60,7 +60,7 @@ impl Cosigner {
     /// Errors are retried by the runtime and successes are persisted, so anything recoverable must
     /// return `Err` and anything concluded must return `Ok` — including "not due", which is a
     /// conclusion and not a failure.
-    pub async fn run_task(&mut self, task_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn run_task(&mut self, task_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
         if !valid_task_id(task_id) {
             return Err(format!("task id {task_id:?} is not a tenant-local key"));
         }

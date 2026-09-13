@@ -22,7 +22,9 @@ use threshold::identifier::Identifier;
 use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::random;
 
-pub async fn try_store() -> Option<Arc<Store>> {
+use std::sync::Mutex;
+
+pub fn try_store() -> Option<Arc<Store>> {
     // `:memory:` — a fresh, private store per caller. Tests no longer share one namespace, so a
     // leftover key from a failed run can't leak into the next one.
     Some(Arc::new(
@@ -89,25 +91,21 @@ pub fn dkg_2of2() -> (Vec<KeyPackage>, PublicKeyPackage) {
 }
 
 /// Open the cosigner this process serves, loading whatever its seal already holds.
-pub async fn open_cosigner(store: &Arc<Store>, group_key: &str) -> tokio::sync::Mutex<Cosigner> {
-    tokio::sync::Mutex::new(
-        Cosigner::open(store.clone(), group_key.to_string())
-            .await
-            .expect("open cosigner"),
-    )
+pub fn open_cosigner(store: &Arc<Store>, group_key: &str) -> Mutex<Cosigner> {
+    Mutex::new(Cosigner::open(store.clone(), group_key.to_string()).expect("open cosigner"))
 }
 
 /// Install a wallet's key material and seal it, as DKG's final round does: the cosigner key
 /// package, the group PKP, the user's signing identifier and the Ark cosigner secret.
-pub async fn seed_policy(
-    cosigner: &tokio::sync::Mutex<Cosigner>,
+pub fn seed_policy(
+    cosigner: &Mutex<Cosigner>,
     group_key: &str,
     kp_cosigner: &KeyPackage,
     kp_user: &KeyPackage,
     pkp: &PublicKeyPackage,
     ark_cosigner_secret_hex: Option<String>,
 ) {
-    let mut actor = cosigner.lock().await;
+    let mut actor = cosigner.lock().unwrap();
     actor
         .install_policy(
             group_key.to_string(),
@@ -117,5 +115,5 @@ pub async fn seed_policy(
             ark_cosigner_secret_hex,
             )
         .expect("install policy");
-    actor.seal().await;
+    actor.seal();
 }

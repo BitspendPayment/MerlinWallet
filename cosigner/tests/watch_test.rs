@@ -37,8 +37,14 @@ impl Host for Recorder {
             .push((id.into(), payload.to_vec(), run_at_ms, interval_ms));
         Ok(())
     }
+    fn status(&self, _: &str) -> Result<String, String> {
+        Ok("{}".into())
+    }
     fn cancel(&self, id: &str) -> Result<(), String> {
         self.cancelled.lock().unwrap().push(id.into());
+        Ok(())
+    }
+    fn forget(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
     fn register_device(&self, token: &str) -> Result<(), String> {
@@ -64,27 +70,26 @@ fn payload(deadline_secs: u64) -> Vec<u8> {
     serde_json::to_vec(&Task::SettleDue { deadline_secs }).unwrap()
 }
 
-async fn open_with(
+fn open_with(
     store: &Arc<cosigner::store::Store>,
     host: Arc<Recorder>,
     group_key: &str,
 ) -> cosigner::Cosigner {
     cosigner::Cosigner::open_with_host(store.clone(), group_key.to_string(), host)
-        .await
         .expect("open")
 }
 
 /// With no delegate there is nothing to wake anyone about, and the watch retires itself rather
 /// than asking every half hour about work that no longer exists.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_watch_with_nothing_to_settle_cancels_itself() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn a_watch_with_nothing_to_settle_cancels_itself() {
+    let Some(store) = common::try_store() else {
         return;
     };
     let host = Arc::new(Recorder::default());
-    let mut c = open_with(&store, host.clone(), "nothing").await;
+    let mut c = open_with(&store, host.clone(), "nothing");
 
-    let out = c.run_task(WATCH_TASK_ID, &payload(1)).await.expect("run");
+    let out = c.run_task(WATCH_TASK_ID, &payload(1)).expect("run");
     assert_eq!(
         serde_json::from_slice::<Outcome>(&out).unwrap(),
         Outcome::NothingToSettle
@@ -98,35 +103,33 @@ async fn a_watch_with_nothing_to_settle_cancels_itself() {
 
 /// A malformed payload is an error, not a silent success — the runtime retries errors and
 /// persists successes, so concluding "fine" on bytes we could not read would lose the work.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_undecodable_payload_is_an_error() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn an_undecodable_payload_is_an_error() {
+    let Some(store) = common::try_store() else {
         return;
     };
-    let mut c = open_with(&store, Arc::new(Recorder::default()), "bad").await;
+    let mut c = open_with(&store, Arc::new(Recorder::default()), "bad");
 
     let err = c
         .run_task(WATCH_TASK_ID, b"not json")
-        .await
         .expect_err("an undecodable payload must not report success");
     assert!(err.contains("undecodable"), "unhelpful error: {err}");
 
     let err = c
         .run_task("not a valid id!", &payload(1))
-        .await
         .expect_err("a task id outside the runtime's alphabet must be refused");
     assert!(err.contains("tenant-local"), "unhelpful error: {err}");
 }
 
 /// Arming needs a real deadline. Expiry is the ASP's to know and is 0 until it has indexed the
 /// VTXOs; arming against that would wake the owner about a deadline nobody computed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unknown_deadline_is_not_armed() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn an_unknown_deadline_is_not_armed() {
+    let Some(store) = common::try_store() else {
         return;
     };
     let host = Arc::new(Recorder::default());
-    let c = open_with(&store, host.clone(), "unknown").await;
+    let c = open_with(&store, host.clone(), "unknown");
 
     let err = c.arm_settle_watch(0).expect_err("0 is not a deadline");
     assert!(err.contains("not known yet"), "unhelpful error: {err}");
@@ -135,13 +138,13 @@ async fn an_unknown_deadline_is_not_armed() {
 
 /// Arming asks for the shape `enclave:tasks` specifies: a tenant-local idempotency key, a repeating
 /// interval at or above the runtime's floor, and a payload the task can decode back.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn arming_enqueues_a_repeating_watch() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn arming_enqueues_a_repeating_watch() {
+    let Some(store) = common::try_store() else {
         return;
     };
     let host = Arc::new(Recorder::default());
-    let c = open_with(&store, host.clone(), "arm").await;
+    let c = open_with(&store, host.clone(), "arm");
 
     c.arm_settle_watch(2_000_000_000).expect("arm");
 
@@ -189,14 +192,13 @@ fn ark_info() -> ArkInfo {
 }
 
 /// Build a cosigner holding a real, signed delegate — the state the watch exists to watch.
-async fn with_delegate(
+fn with_delegate(
     store: &Arc<cosigner::store::Store>,
     host: Arc<Recorder>,
 ) -> Option<(cosigner::Cosigner, String)> {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let mut c = cosigner::Cosigner::open_with_host(store.clone(), group_key.clone(), host)
-        .await
         .expect("open");
     c.install_policy(
         group_key.clone(),
@@ -217,7 +219,7 @@ async fn with_delegate(
     )
     .expect("accept vtxos");
     // Transport-free: the delegate is built from the cosigner's own key and the caller's ArkInfo.
-    match c.generate_delegate_for(&ark_info()).await {
+    match c.generate_delegate_for(&ark_info()) {
         Ok(_) => Some((c, group_key)),
         Err(e) => {
             eprintln!("skip: could not build a delegate offline: {e}");
@@ -228,20 +230,19 @@ async fn with_delegate(
 
 /// Before the deadline the watch concludes, and concluding is not failing: the runtime retries
 /// errors and persists successes, so "not due" has to be an Ok.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_watch_before_the_deadline_does_not_wake() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn a_watch_before_the_deadline_does_not_wake() {
+    let Some(store) = common::try_store() else {
         return;
     };
     let host = Arc::new(Recorder::default());
-    let Some((mut c, _)) = with_delegate(&store, host.clone()).await else {
+    let Some((mut c, _)) = with_delegate(&store, host.clone()) else {
         return;
     };
 
     let far_future = 4_000_000_000u64;
     let out = c
         .run_task(WATCH_TASK_ID, &payload(far_future))
-        .await
         .expect("a watch that is not due is a conclusion, not a failure");
     assert!(matches!(
         serde_json::from_slice::<Outcome>(&out).unwrap(),
@@ -253,19 +254,18 @@ async fn a_watch_before_the_deadline_does_not_wake() {
 
 /// Past the deadline it wakes — the one call a background task may make, spending an enrolment an
 /// interactive call already earned. It carries an opaque category and nothing readable.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_due_watch_wakes_the_owner() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn a_due_watch_wakes_the_owner() {
+    let Some(store) = common::try_store() else {
         return;
     };
     let host = Arc::new(Recorder::default());
-    let Some((mut c, _)) = with_delegate(&store, host.clone()).await else {
+    let Some((mut c, _)) = with_delegate(&store, host.clone()) else {
         return;
     };
 
     let out = c
         .run_task(WATCH_TASK_ID, &payload(1))
-        .await
         .expect("run");
     assert_eq!(
         serde_json::from_slice::<Outcome>(&out).unwrap(),

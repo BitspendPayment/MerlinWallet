@@ -8,9 +8,9 @@
 mod common;
 
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn install_policy_seals_without_plaintext() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn install_policy_seals_without_plaintext() {
+    let Some(store) = common::try_store() else {
         return;
     };
 
@@ -20,8 +20,8 @@ async fn install_policy_seals_without_plaintext() {
     let group_key = hex::encode(pkp.verifying_key.serialize());
 
     // Install straight into the actor — note we never write the `policies` tree.
-    let cosigner = common::open_cosigner(&store, &group_key).await;
-    common::seed_policy(&cosigner, &group_key, kp_cosigner, kp_user, &pkp, None).await;
+    let cosigner = common::open_cosigner(&store, &group_key);
+    common::seed_policy(&cosigner, &group_key, kp_cosigner, kp_user, &pkp, None);
 
     // The actor sealed its state ⇒ a sealed_state blob exists for the group key.
     let blob = store.get("sealed_state", &group_key).unwrap();

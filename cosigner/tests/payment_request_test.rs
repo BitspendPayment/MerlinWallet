@@ -33,9 +33,9 @@ fn create_req(receiver_vk: &[u8]) -> PaymentRequestCreateRequest {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn allowlist_gates_requests_and_survives_cold_spawn() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn allowlist_gates_requests_and_survives_cold_spawn() {
+    let Some(store) = common::try_store() else {
         return;
     };
 
@@ -46,7 +46,7 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
     let (_receiver_kps, receiver_pkp) = common::dkg_2of2();
     let receiver_vk = receiver_pkp.verifying_key.serialize().to_vec();
 
-    let cosigner = common::open_cosigner(&store, &payer_group).await;
+    let cosigner = common::open_cosigner(&store, &payer_group);
     common::seed_policy(
         &cosigner,
         &payer_group,
@@ -54,27 +54,25 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
         &payer_kps[0],
         &payer_pkp,
         Some(hex::encode([7u8; 32])),
-    )
-    .await;
+    );
 
     // A stranger is refused — and refused BEFORE any state is touched or the ASP is consulted,
     // which is why this assertion is meaningful with or without a live stack.
     let err = cosigner
         .lock()
-        .await
+        .unwrap()
         .payment_request_create(create_req(&receiver_vk))
-        .await
         .expect_err("a non-contact must not be able to create a request");
     assert_eq!(
         err.code(),
-        tonic::Code::PermissionDenied,
+        cosigner::grpc::Code::PermissionDenied,
         "expected PermissionDenied, got: {err:?}"
     );
 
     // Authorize them.
     cosigner
         .lock()
-        .await
+        .unwrap()
         .contact_add(ContactAddRequest {
                 user_id: payer_id.clone(),
                 contact_verifying_key: receiver_vk.clone(),
@@ -82,22 +80,20 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
                 signature: vec![],
                 timestamp_ms: 0,
         })
-        .await
         .expect("add contact");
 
     // The allowlist is sealed: drop the cosigner so nothing survives in memory, then read it back
     // from a fresh one (restored from the snapshot).
     drop(cosigner);
-    let cosigner = common::open_cosigner(&store, &payer_group).await;
+    let cosigner = common::open_cosigner(&store, &payer_group);
     let list = cosigner
         .lock()
-        .await
+        .unwrap()
         .contact_list(ContactListRequest {
                 user_id: payer_id.clone(),
                 signature: vec![],
                 timestamp_ms: 0,
         })
-        .await
         .expect("list contacts");
     assert_eq!(list.contacts.len(), 1, "contact must survive a cold spawn");
     assert_eq!(list.contacts[0].verifying_key, receiver_vk);
@@ -106,23 +102,21 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
     // Revoking re-closes the gate.
     cosigner
         .lock()
-        .await
+        .unwrap()
         .contact_remove(ContactRemoveRequest {
                 user_id: payer_id.clone(),
                 contact_verifying_key: receiver_vk.clone(),
                 signature: vec![],
                 timestamp_ms: 0,
         })
-        .await
         .expect("remove contact");
 
     let err = cosigner
         .lock()
-        .await
+        .unwrap()
         .payment_request_create(create_req(&receiver_vk))
-        .await
         .expect_err("a revoked contact must not be able to create a request");
-    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert_eq!(err.code(), cosigner::grpc::Code::PermissionDenied);
 
     let _ = store.delete("sealed_state", &payer_group);
 }
@@ -133,9 +127,9 @@ async fn allowlist_gates_requests_and_survives_cold_spawn() {
 /// picks the actor — so without `require_owner` an attacker signs as their own wallet and writes
 /// to the victim's. Adding yourself to the victim's allowlist is enough to bill them, since that
 /// allowlist is the only gate on PaymentRequestCreate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn owner_only_routes_reject_another_wallets_key() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn owner_only_routes_reject_another_wallets_key() {
+    let Some(store) = common::try_store() else {
         return;
     };
 
@@ -145,7 +139,7 @@ async fn owner_only_routes_reject_another_wallets_key() {
     let (_att_kps, attacker_pkp) = common::dkg_2of2();
     let attacker_id = attacker_pkp.verifying_key.serialize().to_vec();
 
-    let cosigner = common::open_cosigner(&store, &payer_group).await;
+    let cosigner = common::open_cosigner(&store, &payer_group);
     common::seed_policy(
         &cosigner,
         &payer_group,
@@ -153,12 +147,11 @@ async fn owner_only_routes_reject_another_wallets_key() {
         &payer_kps[0],
         &payer_pkp,
         Some(hex::encode([9u8; 32])),
-    )
-    .await;
+    );
 
     let err = cosigner
         .lock()
-        .await
+        .unwrap()
         .contact_add(ContactAddRequest {
                 user_id: attacker_id.clone(),
                 contact_verifying_key: attacker_id.clone(),
@@ -166,22 +159,20 @@ async fn owner_only_routes_reject_another_wallets_key() {
                 signature: vec![],
                 timestamp_ms: 0,
         })
-        .await
         .expect_err("another wallet's key must not write this wallet's allowlist");
-    assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+    assert_eq!(err.code(), cosigner::grpc::Code::PermissionDenied, "got: {err:?}");
 
     // ...and must not be able to read the inbox or the allowlist either.
     let err = cosigner
         .lock()
-        .await
+        .unwrap()
         .contact_list(ContactListRequest {
                 user_id: attacker_id.clone(),
                 signature: vec![],
                 timestamp_ms: 0,
         })
-        .await
         .expect_err("another wallet's key must not read this wallet's contacts");
-    assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+    assert_eq!(err.code(), cosigner::grpc::Code::PermissionDenied, "got: {err:?}");
 
     let _ = store.delete("sealed_state", &payer_group);
 }

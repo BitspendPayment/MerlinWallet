@@ -10,7 +10,7 @@
 //! Read paths live here; mutating paths are `route_*` fns in [`crate::registry`], since
 //! every change re-seals the snapshot.
 
-use tonic::Status;
+use crate::grpc::Status;
 
 use crate::cosigner::Cosigner;
 use crate::handlers::helpers::now_secs;
@@ -55,7 +55,7 @@ impl Cosigner {
     /// Auth (`OP_CONTACT_LIST`) ran at the REST boundary, which only proves the
     /// caller holds the key it named — `require_owner` is what ties that key to
     /// THIS wallet, otherwise any keypair could read anyone's allowlist.
-    pub async fn contact_list(
+    pub fn contact_list(
         &mut self,
         req: ContactListRequest,
     ) -> Result<ContactListResponse, Status> {
@@ -70,7 +70,7 @@ impl Cosigner {
     /// Auth (`OP_PAYREQ_LIST`) ran at the REST boundary; `require_owner` binds the
     /// authenticated key to this wallet so a stranger cannot read the inbox
     /// (amounts, memos, counterparties) of any wallet they can name.
-    pub async fn payment_request_list(
+    pub fn payment_request_list(
         &mut self,
         req: PaymentRequestListRequest,
     ) -> Result<PaymentRequestListResponse, Status> {
@@ -80,7 +80,7 @@ impl Cosigner {
         // reads their inbox keeps seeing long-lapsed ones. Re-seal only if something changed.
         if self.prune_intents(now) {
             let group_key = self.group_key().to_string();
-            crate::store::seal_snapshot_for(self, &group_key).await;
+            crate::store::seal_snapshot_for(self, &group_key);
         }
         let mut intents: Vec<_> = self
             .payment_intents()
@@ -95,7 +95,7 @@ impl Cosigner {
 impl Cosigner {
     /// Authorize a party to bill this wallet. Contacts are compared by GROUP key, so whichever of
     /// a wallet's ids the caller names, the allowlist stores the canonical one.
-    pub async fn contact_add(
+    pub fn contact_add(
         &mut self,
         req: crate::wallet_proto::ContactAddRequest,
     ) -> Result<crate::wallet_proto::ContactAddResponse, Status> {
@@ -106,12 +106,12 @@ impl Cosigner {
         );
         self.add_contact(vk_hex, req.label, crate::store::now_secs())
             .map_err(Status::invalid_argument)?;
-        self.seal().await;
+        self.seal();
         Ok(crate::wallet_proto::ContactAddResponse { ok: true })
     }
 
     /// Revoke a contact's authorization, re-closing the only gate on `PaymentRequestCreate`.
-    pub async fn contact_remove(
+    pub fn contact_remove(
         &mut self,
         req: crate::wallet_proto::ContactRemoveRequest,
     ) -> Result<crate::wallet_proto::ContactRemoveResponse, Status> {
@@ -121,7 +121,7 @@ impl Cosigner {
             &hex::encode(&req.contact_verifying_key),
         );
         self.remove_contact(&vk_hex).map_err(Status::not_found)?;
-        self.seal().await;
+        self.seal();
         Ok(crate::wallet_proto::ContactRemoveResponse { ok: true })
     }
 
@@ -129,7 +129,7 @@ impl Cosigner {
     ///
     /// Signed by the REQUESTER, not the payer — the payer's contact list is the whole of the
     /// authorization, which is why the gate runs before anything else here.
-    pub async fn payment_request_create(
+    pub fn payment_request_create(
         &mut self,
         req: crate::wallet_proto::PaymentRequestCreateRequest,
     ) -> Result<crate::wallet_proto::PaymentRequestCreateResponse, Status> {
@@ -178,7 +178,7 @@ impl Cosigner {
                 now,
             )
             .map_err(Status::invalid_argument)?;
-        self.seal().await;
+        self.seal();
 
         // No nudge from here. The cosigner used to push to the payer's device, which needed an
         // FCM client, an outbound socket, and a detached task that outlived the call — in a

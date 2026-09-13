@@ -46,19 +46,19 @@ fn boarded(txid: &str, amount: u64, exit_delay: u32) -> BoardingSettleSubmitted 
 }
 
 /// What boarding records is what a send selects from.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_boarded_vtxo_is_visible_to_a_send() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn a_boarded_vtxo_is_visible_to_a_send() {
+    let Some(store) = common::try_store() else {
         return;
     };
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
 
-    let cosigner = common::open_cosigner(&store, &group_key).await;
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None).await;
+    let cosigner = common::open_cosigner(&store, &group_key);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
 
     {
-        let mut c = cosigner.lock().await;
+        let mut c = cosigner.lock().unwrap();
         assert!(c.vtxos().is_empty(), "a fresh wallet owns nothing");
         c.apply_boarding_settle(boarded("aa", 50_000, 144));
 
@@ -75,24 +75,24 @@ async fn a_boarded_vtxo_is_visible_to_a_send() {
 }
 
 /// And it survives a reopen, because the seal is the only place it lives now.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_owned_set_survives_a_reopen() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn the_owned_set_survives_a_reopen() {
+    let Some(store) = common::try_store() else {
         return;
     };
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
 
     {
-        let cosigner = common::open_cosigner(&store, &group_key).await;
-        common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None).await;
-        let mut c = cosigner.lock().await;
+        let cosigner = common::open_cosigner(&store, &group_key);
+        common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+        let mut c = cosigner.lock().unwrap();
         c.apply_boarding_settle(boarded("bb", 25_000, 144));
-        c.seal().await;
+        c.seal();
     }
 
-    let reopened = common::open_cosigner(&store, &group_key).await;
-    let spendable = reopened.lock().await.vtxos();
+    let reopened = common::open_cosigner(&store, &group_key);
+    let spendable = reopened.lock().unwrap().vtxos();
     assert_eq!(spendable.len(), 1, "the seal carries the owned set");
     assert_eq!(spendable[0].txid, "bb");
     assert_eq!(spendable[0].amount_sats, 25_000);
@@ -105,17 +105,17 @@ async fn the_owned_set_survives_a_reopen() {
 /// Every spendable VTXO sits under a script derived from the cosigner's own owner key and one of
 /// the ASP's two exit delays. A delay outside that pair names a script this wallet does not
 /// control, so asserting it must not widen what the wallet will spend.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_caller_cannot_widen_what_it_owns() {
-    let Some(store) = common::try_store().await else {
+#[test]
+fn a_caller_cannot_widen_what_it_owns() {
+    let Some(store) = common::try_store() else {
         return;
     };
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
 
-    let cosigner = common::open_cosigner(&store, &group_key).await;
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None).await;
-    let mut c = cosigner.lock().await;
+    let cosigner = common::open_cosigner(&store, &group_key);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    let mut c = cosigner.lock().unwrap();
 
     // Both of the wallet's own delays are accepted — a mixed set is the normal case.
     c.accept_vtxos(
