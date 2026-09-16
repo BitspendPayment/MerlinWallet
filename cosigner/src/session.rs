@@ -63,6 +63,22 @@ impl CosignerService {
     /// fourteen names — clearer than a code generator, and the only part of tonic still in use once
     /// the framing and the status had their own modules.
     pub async fn route(&self, req: Request<Body>) -> Response<Body> {
+        // Nothing is served without the runtime's word that a passkey approved this request.
+        //
+        // That is the whole of authentication now. Every request used to carry a Schnorr signature
+        // by the wallet's share key, checked here in the guest; enclave-runtime gates every request
+        // on a WebAuthn assertion bound to its exact method and path before it reaches us, and stamps
+        // the tenant it resolved onto this header — having stripped any copy a client sent, so it
+        // cannot be supplied from outside. A passkey-gated wallet could not have produced the old
+        // signature anyway: it holds no plaintext share to sign with.
+        //
+        // It is checked first, before the path, so an unauthenticated caller learns nothing about the
+        // method surface. And it fails CLOSED: behind a runtime with no gate configured the header is
+        // never set, so this cosigner refuses everything rather than serving keys to whoever connects.
+        if let Err(status) = tenant_of(&req) {
+            return grpc::failed(status);
+        }
+
         let path = req.uri().path().to_string();
         let Some(method) = path.strip_prefix(PREFIX) else {
             return grpc::failed(Status::unimplemented(format!("no such service: {path}")));
@@ -122,7 +138,6 @@ impl CosignerService {
 
     async fn contact_list(&self, body: Body) -> Result<wp::ContactListResponse, Status> {
         let req: wp::ContactListRequest = grpc::one_message(body).await?;
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_CONTACT_LIST)?;
         lock(&self.cosigner).contact_list(req)
     }
 
@@ -131,7 +146,6 @@ impl CosignerService {
         body: Body,
     ) -> Result<wp::PaymentRequestListResponse, Status> {
         let req: wp::PaymentRequestListRequest = grpc::one_message(body).await?;
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_PAYREQ_LIST)?;
         lock(&self.cosigner).payment_request_list(req)
     }
 
@@ -142,13 +156,11 @@ impl CosignerService {
 
     async fn contact_add(&self, body: Body) -> Result<wp::ContactAddResponse, Status> {
         let req: wp::ContactAddRequest = grpc::one_message(body).await?;
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_CONTACT_ADD)?;
         lock(&self.cosigner).contact_add(req)
     }
 
     async fn contact_remove(&self, body: Body) -> Result<wp::ContactRemoveResponse, Status> {
         let req: wp::ContactRemoveRequest = grpc::one_message(body).await?;
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_CONTACT_REMOVE)?;
         lock(&self.cosigner).contact_remove(req)
     }
 
@@ -157,23 +169,23 @@ impl CosignerService {
         body: Body,
     ) -> Result<wp::PaymentRequestDeclineResponse, Status> {
         let req: wp::PaymentRequestDeclineRequest = grpc::one_message(body).await?;
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_PAYREQ_DECLINE)?;
         let mut actor = lock(&self.cosigner);
-        actor.require_owner(&req.user_id)?;
         actor.decline_intent(&req.id).map_err(Status::invalid_argument)?;
         actor.seal();
         Ok(wp::PaymentRequestDeclineResponse { ok: true })
     }
 
-    /// The deliberate exception: signed by the REQUESTER, not this wallet's owner. The payer's
-    /// contact allowlist is what authorizes it, which is why there is no `require_owner` here — and
-    /// why one cosigner per process suits it: the requester addresses the payer's endpoint.
+    /// A request to be paid, delivered by this wallet's owner but written by somebody else.
+    ///
+    /// The runtime authenticated the caller, who is the PAYER — the request travelled out of band
+    /// and the payer's app brought it here. So what is checked is not who is calling but who wrote
+    /// it: `authorship` carries a group-key signature, and the payer's allowlist decides whether that
+    /// author may bill this wallet. See `Cosigner::payment_request_create`.
     async fn payment_request_create(
         &self,
         body: Body,
     ) -> Result<wp::PaymentRequestCreateResponse, Status> {
         let req: wp::PaymentRequestCreateRequest = grpc::one_message(body).await?;
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_PAYREQ_CREATE)?;
         lock(&self.cosigner).payment_request_create(req)
     }
 
@@ -185,7 +197,6 @@ impl CosignerService {
 
     async fn register_device(&self, body: Body) -> Result<proto::RegisterDeviceResponse, Status> {
         let req: proto::RegisterDeviceRequest = grpc::one_message(body).await?;
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_REGISTER_DEVICE_TOKEN)?;
         lock(&self.cosigner)
             .host
             .register_device(&req.token)
@@ -195,7 +206,6 @@ impl CosignerService {
 
     async fn forget_device(&self, body: Body) -> Result<proto::ForgetDeviceResponse, Status> {
         let req: proto::ForgetDeviceRequest = grpc::one_message(body).await?;
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_REGISTER_DEVICE_TOKEN)?;
         lock(&self.cosigner)
             .host
             .forget_device(&req.token)
@@ -204,16 +214,31 @@ impl CosignerService {
     }
 
     async fn device_count(&self, body: Body) -> Result<proto::DeviceCountResponse, Status> {
-        let req: proto::DeviceCountRequest = grpc::one_message(body).await?;
-        check(&req.user_id, &req.signature, req.timestamp_ms, crate::auth::message::OP_REGISTER_DEVICE_TOKEN)?;
+        let _: proto::DeviceCountRequest = grpc::one_message(body).await?;
         let devices = lock(&self.cosigner).host.devices().map_err(Status::unavailable)?;
         Ok(proto::DeviceCountResponse { devices })
     }
 }
 
-/// Check the caller's auth signature.
-fn check(user_id: &[u8], signature: &[u8], timestamp_ms: i64, op: &str) -> Result<(), Status> {
-    crate::handlers::helpers::verify_auth(user_id, signature, timestamp_ms, op)
+/// The header the runtime puts the resolved tenant on.
+pub const TENANT_HEADER: &str = "x-enclave-tenant";
+
+/// The tenant the runtime authenticated this request as, or why there is none.
+///
+/// Sixteen bytes as lowercase hex, exactly as `apply_tenant` writes it. A malformed value is refused
+/// like a missing one: the runtime never produces it, so it did not come from the runtime.
+fn tenant_of(req: &Request<Body>) -> Result<String, Status> {
+    let value = req
+        .headers()
+        .get(TENANT_HEADER)
+        .ok_or_else(|| Status::unauthenticated("no tenant: this request was not approved by the runtime"))?
+        .to_str()
+        .map_err(|_| Status::unauthenticated("the tenant header is not text"))?;
+    let well_formed = value.len() == 32 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !well_formed {
+        return Err(Status::unauthenticated("the tenant header is malformed"));
+    }
+    Ok(value.to_string())
 }
 
 /// The cosigner, with a poisoned lock recovered rather than propagated.
@@ -240,25 +265,14 @@ async fn sign(
         Some(sign_client_msg::Body::Open(o)) => o,
         _ => return Err(Status::invalid_argument("a session must open with SignOpen")),
     };
-    // The session is authenticated ONCE, here. Every message after this one rides that assertion —
-    // see cosign_session.proto for why there is no per-message approval. This was missing: the
-    // check ran at the REST boundary, and deleting that boundary left the four streams open to
-    // anyone who could reach the port.
-    check(
-        &open.user_id,
-        &open.signature,
-        open.timestamp_ms,
-        crate::auth::message::OP_SIGN_STEP1,
-    )?;
+    // Authenticated before it got here: the runtime approved this stream with a passkey assertion,
+    // once, at open, and `route` refuses anything that arrives without the tenant it resolved.
 
     let step1 = SignStep1 {
-        user_id: open.user_id.clone(),
         hiding_commitment: open.hiding_commitment,
         binding_commitment: open.binding_commitment,
         message_to_sign: open.message_to_sign,
-        signature: open.signature,
         full_transaction: open.full_transaction,
-        timestamp_ms: open.timestamp_ms,
         script_path_spend: open.script_path_spend,
         ark_tx: Vec::new(),
     };
@@ -291,10 +305,7 @@ async fn sign(
     };
 
     let step2 = SignStep2 {
-        user_id: open.user_id,
         signature_share: share.signature_share,
-        signature: Vec::new(),
-        timestamp_ms: open.timestamp_ms,
     };
 
     let done = lock(&cosigner)
@@ -326,8 +337,6 @@ async fn dkg(
     use crate::handlers::onboarding as ob;
     use crate::handlers::onboarding::OnboardingSession;
 
-    let store = lock(&cosigner).store().clone();
-
     let first = duplex.expect("it opened").await?;
     let session_id = first.session_id.clone();
     let open = match first.body {
@@ -335,19 +344,21 @@ async fn dkg(
         _ => return Err(Status::invalid_argument("a session must open with DkgOpen")),
     };
 
-    // No `check()` here, and it is the one stream that cannot have one: the owner key it would
-    // verify against is what this ceremony mints. `DkgOpen` carries `signature` and `timestamp_ms`
-    // for shape only. Integrity comes from FROST itself and from the ceremony living on one stream
-    // — see `handlers::onboarding`.
+    // Authenticated for the first time. There never was a check here and there could not be one:
+    // the owner key a body signature would verify against is what this ceremony mints. The runtime's
+    // passkey is not that key, so it can approve the ceremony that creates it.
+
+    // One wallet per tenant, and never silently a second. Checked before any round-1 material
+    // exists, so a refused ceremony leaves nothing behind.
+    lock(&cosigner).refuse_if_onboarded()?;
 
     // The ceremony, owned here. Round-1 and round-2 secrets live on this stack and die with the
     // stream.
-    let mut sess = OnboardingSession::new(hex::encode(&open.user_id));
+    let mut sess = OnboardingSession::new();
 
     let r1 = ob::dkg_open(
         &mut sess,
         wp::DkgStep1Request {
-            user_id: open.user_id.clone(),
             identifier: open.identifier.clone(),
             round1_package: open.round1_package,
         },
@@ -368,9 +379,7 @@ async fn dkg(
     };
     let r3 = ob::dkg_finish(
         &mut sess,
-        &store,
         wp::DkgStep3Request {
-            user_id: open.user_id.clone(),
             identifier: round2.identifier,
             round2_packages_for_others: round2.round2_packages_for_others,
         },
@@ -424,13 +433,7 @@ async fn send(
         Some(proto::send_client_msg::Body::Open(o)) => o,
         _ => return Err(Status::invalid_argument("a session must open with SendOpen")),
     };
-    // Authenticated ONCE, here — see `sign` above.
-    check(
-        &open.user_id,
-        &open.signature,
-        open.timestamp_ms,
-        crate::auth::message::OP_SEND_VTXO,
-    )?;
+    // Authenticated by the runtime at open — see `sign` above.
 
     let info = open
         .ark_info
@@ -442,9 +445,6 @@ async fn send(
     // wallet owns.
     let (mut session, change_exit_delay, sighashes) = {
         let step1 = crate::types::SendVtxoStep1 {
-            user_id: open.user_id.clone(),
-            signature: open.signature.clone(),
-            timestamp_ms: open.timestamp_ms,
             recipient_ark_address: open.recipient_ark_address.clone(),
             amount: open.amount,
             vtxos: vtxos_from_proto(open.vtxos.clone()),
@@ -452,28 +452,35 @@ async fn send(
         lock(&cosigner).send_open(step1, &info).map_err(Status::internal)?
     };
 
+    // Round one of the FROST signature, on this stream. It used to be a nested `Sign` stream per
+    // sighash, which deadlocks inside enclave-runtime — see `Cosigner::sign_in_band_begin`.
+    let (round, commitments) = lock(&cosigner)
+        .sign_in_band_begin(&sighashes)
+        .map_err(Status::internal)?;
+
     duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
         seq: 1,
-        body: Some(proto::send_server_msg::Body::Sighashes(proto::SendSighashes {
-            messages_to_sign: sighashes,
-            script_path_spend: true,
-        })),
+        body: Some(proto::send_server_msg::Body::Sighashes(sighashes_msg(
+            sighashes,
+            commitments,
+        ))),
     });
 
-    // --- The caller's signatures, then what it must submit --------------------------------
+    // --- The wallet's half of the round, then what it must submit --------------------------
     let signed = match next_body(&duplex, "mid-send").await? {
         proto::send_client_msg::Body::Signed(s) => s,
         _ => return Err(Status::invalid_argument("expected SendSigned")),
     };
+    // A bad share is the caller's fault, and is reported as such rather than as ours.
+    let signatures = lock(&cosigner)
+        .sign_in_band_finish(round, wallet_halves(signed.rounds))
+        .map_err(Status::invalid_argument)?;
     let (ark_tx_b64, checkpoint_txs) = lock(&cosigner)
         .send_prepare(
             &mut session,
             crate::types::SendVtxoStep2 {
-                user_id: open.user_id.clone(),
-                signature: open.signature.clone(),
-                timestamp_ms: open.timestamp_ms,
-                signed_messages: signed.signed_messages,
+                signed_messages: signatures,
             },
         )
         .map_err(Status::internal)?;
@@ -511,9 +518,6 @@ async fn send(
         _ => return Err(Status::invalid_argument("expected SendFinalized")),
     }
     let req = wp::SendVtxoRequest {
-        user_id: open.user_id.clone(),
-        signature: open.signature.clone(),
-        timestamp_ms: open.timestamp_ms,
         recipient_ark_address: open.recipient_ark_address.clone(),
         amount: open.amount,
         signed_messages: Vec::new(),
@@ -554,13 +558,7 @@ async fn settle(
         Some(proto::settle_client_msg::Body::Open(o)) => o,
         _ => return Err(Status::invalid_argument("a session must open with SettleOpen")),
     };
-    // Authenticated ONCE, here — see `sign` above.
-    check(
-        &open.user_id,
-        &open.signature,
-        open.timestamp_ms,
-        crate::auth::message::OP_SETTLE,
-    )?;
+    // Authenticated by the runtime at open — see `sign` above.
 
     let info = open
         .ark_info
@@ -576,15 +574,28 @@ async fn settle(
     let mut seq = 1u64;
     let mut step = SettleStep::Sighashes(sighashes);
 
+    // The FROST round that is waiting for the wallet's half. A settle signs twice — the intent
+    // proof, and for a boarding settle the commitment transaction later — so this is set each time
+    // sighashes go out and taken when the matching `Signed` comes back. Holding it here rather than
+    // on the cosigner is what keeps the nonces on this stream's stack, where a dropped stream takes
+    // them with it.
+    let mut pending_round: Option<crate::cosigner::InBandRound> = None;
+
     loop {
         // Say what we need, then read what the caller did about it.
         let body = match step {
-            SettleStep::Sighashes(messages_to_sign) => Some(
-                proto::settle_server_msg::Body::Sighashes(proto::SettleSighashes {
+            SettleStep::Sighashes(messages_to_sign) => {
+                // Round one, on this stream — see `Cosigner::sign_in_band_begin` for why it cannot
+                // be a nested `Sign` any more.
+                let (round, commitments) = lock(&cosigner)
+                    .sign_in_band_begin(&messages_to_sign)
+                    .map_err(Status::internal)?;
+                pending_round = Some(round);
+                Some(proto::settle_server_msg::Body::Sighashes(settle_sighashes_msg(
                     messages_to_sign,
-                    script_path_spend: true,
-                }),
-            ),
+                    commitments,
+                )))
+            }
             SettleStep::Register { proof, message, topics } => Some(
                 proto::settle_server_msg::Body::Register(proto::RegisterIntent {
                     proof,
@@ -630,14 +641,20 @@ async fn settle(
             .body
             .ok_or_else(|| Status::invalid_argument("empty SettleClientMsg"))?;
 
-        // Scoped tightly: the guard must not still be held when the loop comes back around to
-        // `recv().await`, or a nested `Sign` session — which the caller opens on its own connection
-        // while this one is parked — would find the cosigner locked by a stream that is waiting on
-        // that very sign to finish.
+        // Scoped to this iteration, and released before the loop comes back around to
+        // `recv().await`. That used to matter because the caller opened a nested `Sign` on its own
+        // connection while this stream was parked; signing is in-band now, so nothing else takes
+        // this lock mid-settle — but holding a guard across an await is still the wrong habit.
         let mut c = lock(&cosigner);
         step = match body {
             proto::settle_client_msg::Body::Signed(s) => {
-                c.settle_signed(s.signed_messages).map_err(Status::internal)?
+                let round = pending_round.take().ok_or_else(|| {
+                    Status::invalid_argument("signatures arrived with no round waiting for them")
+                })?;
+                let signatures = c
+                    .sign_in_band_finish(round, wallet_halves(s.rounds))
+                    .map_err(Status::invalid_argument)?;
+                c.settle_signed(signatures).map_err(Status::internal)?
             }
             proto::settle_client_msg::Body::Registered(r) => {
                 c.settle_registered(r.intent_id).map_err(Status::internal)?;
@@ -675,6 +692,62 @@ fn decode_event(
     let resp = ark::client::proto::GetEventStreamResponse::decode(encoded)
         .map_err(|e| Status::invalid_argument(format!("undecodable ASP event: {e}")))?;
     Ok(resp.event)
+}
+
+/// The wallet's half of an in-band round, off the wire.
+fn wallet_halves(rounds: Vec<proto::WalletRound>) -> Vec<crate::cosigner::WalletHalf> {
+    rounds
+        .into_iter()
+        .map(|r| crate::cosigner::WalletHalf {
+            hiding: r.hiding,
+            binding: r.binding,
+            share: r.share,
+        })
+        .collect()
+}
+
+/// The identifier every commitment in a batch shares — they are all the cosigner's.
+fn cosigner_identifier(commitments: &[crate::types::Commitment]) -> String {
+    commitments
+        .first()
+        .map(|c| c.identifier_hex.clone())
+        .unwrap_or_default()
+}
+
+fn wire_commitments(commitments: Vec<crate::types::Commitment>) -> Vec<proto::Commitment> {
+    commitments
+        .into_iter()
+        .map(|c| proto::Commitment {
+            hiding: c.hiding,
+            binding: c.binding,
+        })
+        .collect()
+}
+
+/// A send's sighashes with the cosigner's half of round one. Always script-path: the cosigner signs
+/// untweaked, and in-band signing cannot compensate a tweak — see `Cosigner::sign_in_band_begin`.
+fn sighashes_msg(
+    messages_to_sign: Vec<Vec<u8>>,
+    commitments: Vec<crate::types::Commitment>,
+) -> proto::SendSighashes {
+    proto::SendSighashes {
+        messages_to_sign,
+        script_path_spend: true,
+        cosigner_identifier: cosigner_identifier(&commitments),
+        cosigner_commitments: wire_commitments(commitments),
+    }
+}
+
+fn settle_sighashes_msg(
+    messages_to_sign: Vec<Vec<u8>>,
+    commitments: Vec<crate::types::Commitment>,
+) -> proto::SettleSighashes {
+    proto::SettleSighashes {
+        messages_to_sign,
+        script_path_spend: true,
+        cosigner_identifier: cosigner_identifier(&commitments),
+        cosigner_commitments: wire_commitments(commitments),
+    }
 }
 
 fn vtxos_from_proto(v: Vec<proto::VtxoInput>) -> Vec<crate::types::VtxoInput> {

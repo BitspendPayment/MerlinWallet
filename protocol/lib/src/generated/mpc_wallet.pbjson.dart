@@ -17,20 +17,20 @@ import 'dart:typed_data' as $typed_data;
 const DKGStep1Request$json = {
   '1': 'DKGStep1Request',
   '2': [
-    {'1': 'user_id', '3': 1, '4': 1, '5': 12, '10': 'userId'},
     {'1': 'identifier', '3': 2, '4': 1, '5': 12, '10': 'identifier'},
     {'1': 'round1_package', '3': 3, '4': 1, '5': 9, '10': 'round1Package'},
   ],
   '9': [
+    {'1': 1, '2': 2},
     {'1': 4, '2': 5},
   ],
+  '10': ['user_id'],
 };
 
 /// Descriptor for `DKGStep1Request`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List dKGStep1RequestDescriptor = $convert.base64Decode(
-    'Cg9ES0dTdGVwMVJlcXVlc3QSFwoHdXNlcl9pZBgBIAEoDFIGdXNlcklkEh4KCmlkZW50aWZpZX'
-    'IYAiABKAxSCmlkZW50aWZpZXISJQoOcm91bmQxX3BhY2thZ2UYAyABKAlSDXJvdW5kMVBhY2th'
-    'Z2VKBAgEEAU=');
+    'Cg9ES0dTdGVwMVJlcXVlc3QSHgoKaWRlbnRpZmllchgCIAEoDFIKaWRlbnRpZmllchIlCg5yb3'
+    'VuZDFfcGFja2FnZRgDIAEoCVINcm91bmQxUGFja2FnZUoECAEQAkoECAQQBVIHdXNlcl9pZA==');
 
 @$core.Deprecated('Use dKGStep1ResponseDescriptor instead')
 const DKGStep1Response$json = {
@@ -62,11 +62,14 @@ final $typed_data.Uint8List dKGStep1ResponseDescriptor = $convert.base64Decode(
 const DKGStep3Request$json = {
   '1': 'DKGStep3Request',
   '2': [
-    {'1': 'user_id', '3': 1, '4': 1, '5': 12, '10': 'userId'},
     {'1': 'identifier', '3': 2, '4': 1, '5': 12, '10': 'identifier'},
     {'1': 'round2_packages_for_others', '3': 3, '4': 3, '5': 11, '6': '.mpc_wallet.DKGStep3Request.Round2PackagesForOthersEntry', '10': 'round2PackagesForOthers'},
   ],
   '3': [DKGStep3Request_Round2PackagesForOthersEntry$json],
+  '9': [
+    {'1': 1, '2': 2},
+  ],
+  '10': ['user_id'],
 };
 
 @$core.Deprecated('Use dKGStep3RequestDescriptor instead')
@@ -81,11 +84,11 @@ const DKGStep3Request_Round2PackagesForOthersEntry$json = {
 
 /// Descriptor for `DKGStep3Request`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List dKGStep3RequestDescriptor = $convert.base64Decode(
-    'Cg9ES0dTdGVwM1JlcXVlc3QSFwoHdXNlcl9pZBgBIAEoDFIGdXNlcklkEh4KCmlkZW50aWZpZX'
-    'IYAiABKAxSCmlkZW50aWZpZXISdQoacm91bmQyX3BhY2thZ2VzX2Zvcl9vdGhlcnMYAyADKAsy'
-    'OC5tcGNfd2FsbGV0LkRLR1N0ZXAzUmVxdWVzdC5Sb3VuZDJQYWNrYWdlc0Zvck90aGVyc0VudH'
-    'J5Uhdyb3VuZDJQYWNrYWdlc0Zvck90aGVycxpKChxSb3VuZDJQYWNrYWdlc0Zvck90aGVyc0Vu'
-    'dHJ5EhAKA2tleRgBIAEoCVIDa2V5EhQKBXZhbHVlGAIgASgJUgV2YWx1ZToCOAE=');
+    'Cg9ES0dTdGVwM1JlcXVlc3QSHgoKaWRlbnRpZmllchgCIAEoDFIKaWRlbnRpZmllchJ1Chpyb3'
+    'VuZDJfcGFja2FnZXNfZm9yX290aGVycxgDIAMoCzI4Lm1wY193YWxsZXQuREtHU3RlcDNSZXF1'
+    'ZXN0LlJvdW5kMlBhY2thZ2VzRm9yT3RoZXJzRW50cnlSF3JvdW5kMlBhY2thZ2VzRm9yT3RoZX'
+    'JzGkoKHFJvdW5kMlBhY2thZ2VzRm9yT3RoZXJzRW50cnkSEAoDa2V5GAEgASgJUgNrZXkSFAoF'
+    'dmFsdWUYAiABKAlSBXZhbHVlOgI4AUoECAEQAlIHdXNlcl9pZA==');
 
 @$core.Deprecated('Use dKGStep3ResponseDescriptor instead')
 const DKGStep3Response$json = {
@@ -117,22 +120,24 @@ final $typed_data.Uint8List dKGStep3ResponseDescriptor = $convert.base64Decode(
 const SendVtxoRequest$json = {
   '1': 'SendVtxoRequest',
   '2': [
-    {'1': 'user_id', '3': 1, '4': 1, '5': 12, '10': 'userId'},
     {'1': 'recipient_ark_address', '3': 2, '4': 1, '5': 9, '10': 'recipientArkAddress'},
     {'1': 'amount', '3': 3, '4': 1, '5': 4, '10': 'amount'},
-    {'1': 'signature', '3': 4, '4': 1, '5': 12, '10': 'signature'},
-    {'1': 'timestamp_ms', '3': 5, '4': 1, '5': 3, '10': 'timestampMs'},
     {'1': 'signed_messages', '3': 6, '4': 3, '5': 12, '10': 'signedMessages'},
   ],
+  '9': [
+    {'1': 1, '2': 2},
+    {'1': 4, '2': 5},
+    {'1': 5, '2': 6},
+  ],
+  '10': ['user_id', 'signature', 'timestamp_ms'],
 };
 
 /// Descriptor for `SendVtxoRequest`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List sendVtxoRequestDescriptor = $convert.base64Decode(
-    'Cg9TZW5kVnR4b1JlcXVlc3QSFwoHdXNlcl9pZBgBIAEoDFIGdXNlcklkEjIKFXJlY2lwaWVudF'
-    '9hcmtfYWRkcmVzcxgCIAEoCVITcmVjaXBpZW50QXJrQWRkcmVzcxIWCgZhbW91bnQYAyABKARS'
-    'BmFtb3VudBIcCglzaWduYXR1cmUYBCABKAxSCXNpZ25hdHVyZRIhCgx0aW1lc3RhbXBfbXMYBS'
-    'ABKANSC3RpbWVzdGFtcE1zEicKD3NpZ25lZF9tZXNzYWdlcxgGIAMoDFIOc2lnbmVkTWVzc2Fn'
-    'ZXM=');
+    'Cg9TZW5kVnR4b1JlcXVlc3QSMgoVcmVjaXBpZW50X2Fya19hZGRyZXNzGAIgASgJUhNyZWNpcG'
+    'llbnRBcmtBZGRyZXNzEhYKBmFtb3VudBgDIAEoBFIGYW1vdW50EicKD3NpZ25lZF9tZXNzYWdl'
+    'cxgGIAMoDFIOc2lnbmVkTWVzc2FnZXNKBAgBEAJKBAgEEAVKBAgFEAZSB3VzZXJfaWRSCXNpZ2'
+    '5hdHVyZVIMdGltZXN0YW1wX21z');
 
 @$core.Deprecated('Use sendVtxoResponseDescriptor instead')
 const SendVtxoResponse$json = {
@@ -207,20 +212,22 @@ final $typed_data.Uint8List contactDescriptor = $convert.base64Decode(
 const ContactAddRequest$json = {
   '1': 'ContactAddRequest',
   '2': [
-    {'1': 'user_id', '3': 1, '4': 1, '5': 12, '10': 'userId'},
     {'1': 'contact_verifying_key', '3': 2, '4': 1, '5': 12, '10': 'contactVerifyingKey'},
     {'1': 'label', '3': 3, '4': 1, '5': 9, '10': 'label'},
-    {'1': 'signature', '3': 4, '4': 1, '5': 12, '10': 'signature'},
-    {'1': 'timestamp_ms', '3': 5, '4': 1, '5': 3, '10': 'timestampMs'},
   ],
+  '9': [
+    {'1': 1, '2': 2},
+    {'1': 4, '2': 5},
+    {'1': 5, '2': 6},
+  ],
+  '10': ['user_id', 'signature', 'timestamp_ms'],
 };
 
 /// Descriptor for `ContactAddRequest`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List contactAddRequestDescriptor = $convert.base64Decode(
-    'ChFDb250YWN0QWRkUmVxdWVzdBIXCgd1c2VyX2lkGAEgASgMUgZ1c2VySWQSMgoVY29udGFjdF'
-    '92ZXJpZnlpbmdfa2V5GAIgASgMUhNjb250YWN0VmVyaWZ5aW5nS2V5EhQKBWxhYmVsGAMgASgJ'
-    'UgVsYWJlbBIcCglzaWduYXR1cmUYBCABKAxSCXNpZ25hdHVyZRIhCgx0aW1lc3RhbXBfbXMYBS'
-    'ABKANSC3RpbWVzdGFtcE1z');
+    'ChFDb250YWN0QWRkUmVxdWVzdBIyChVjb250YWN0X3ZlcmlmeWluZ19rZXkYAiABKAxSE2Nvbn'
+    'RhY3RWZXJpZnlpbmdLZXkSFAoFbGFiZWwYAyABKAlSBWxhYmVsSgQIARACSgQIBBAFSgQIBRAG'
+    'Ugd1c2VyX2lkUglzaWduYXR1cmVSDHRpbWVzdGFtcF9tcw==');
 
 @$core.Deprecated('Use contactAddResponseDescriptor instead')
 const ContactAddResponse$json = {
@@ -238,18 +245,21 @@ final $typed_data.Uint8List contactAddResponseDescriptor = $convert.base64Decode
 const ContactRemoveRequest$json = {
   '1': 'ContactRemoveRequest',
   '2': [
-    {'1': 'user_id', '3': 1, '4': 1, '5': 12, '10': 'userId'},
     {'1': 'contact_verifying_key', '3': 2, '4': 1, '5': 12, '10': 'contactVerifyingKey'},
-    {'1': 'signature', '3': 3, '4': 1, '5': 12, '10': 'signature'},
-    {'1': 'timestamp_ms', '3': 4, '4': 1, '5': 3, '10': 'timestampMs'},
   ],
+  '9': [
+    {'1': 1, '2': 2},
+    {'1': 3, '2': 4},
+    {'1': 4, '2': 5},
+  ],
+  '10': ['user_id', 'signature', 'timestamp_ms'],
 };
 
 /// Descriptor for `ContactRemoveRequest`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List contactRemoveRequestDescriptor = $convert.base64Decode(
-    'ChRDb250YWN0UmVtb3ZlUmVxdWVzdBIXCgd1c2VyX2lkGAEgASgMUgZ1c2VySWQSMgoVY29udG'
-    'FjdF92ZXJpZnlpbmdfa2V5GAIgASgMUhNjb250YWN0VmVyaWZ5aW5nS2V5EhwKCXNpZ25hdHVy'
-    'ZRgDIAEoDFIJc2lnbmF0dXJlEiEKDHRpbWVzdGFtcF9tcxgEIAEoA1ILdGltZXN0YW1wTXM=');
+    'ChRDb250YWN0UmVtb3ZlUmVxdWVzdBIyChVjb250YWN0X3ZlcmlmeWluZ19rZXkYAiABKAxSE2'
+    'NvbnRhY3RWZXJpZnlpbmdLZXlKBAgBEAJKBAgDEARKBAgEEAVSB3VzZXJfaWRSCXNpZ25hdHVy'
+    'ZVIMdGltZXN0YW1wX21z');
 
 @$core.Deprecated('Use contactRemoveResponseDescriptor instead')
 const ContactRemoveResponse$json = {
@@ -266,17 +276,18 @@ final $typed_data.Uint8List contactRemoveResponseDescriptor = $convert.base64Dec
 @$core.Deprecated('Use contactListRequestDescriptor instead')
 const ContactListRequest$json = {
   '1': 'ContactListRequest',
-  '2': [
-    {'1': 'user_id', '3': 1, '4': 1, '5': 12, '10': 'userId'},
-    {'1': 'signature', '3': 2, '4': 1, '5': 12, '10': 'signature'},
-    {'1': 'timestamp_ms', '3': 3, '4': 1, '5': 3, '10': 'timestampMs'},
+  '9': [
+    {'1': 1, '2': 2},
+    {'1': 2, '2': 3},
+    {'1': 3, '2': 4},
   ],
+  '10': ['user_id', 'signature', 'timestamp_ms'],
 };
 
 /// Descriptor for `ContactListRequest`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List contactListRequestDescriptor = $convert.base64Decode(
-    'ChJDb250YWN0TGlzdFJlcXVlc3QSFwoHdXNlcl9pZBgBIAEoDFIGdXNlcklkEhwKCXNpZ25hdH'
-    'VyZRgCIAEoDFIJc2lnbmF0dXJlEiEKDHRpbWVzdGFtcF9tcxgDIAEoA1ILdGltZXN0YW1wTXM=');
+    'ChJDb250YWN0TGlzdFJlcXVlc3RKBAgBEAJKBAgCEANKBAgDEARSB3VzZXJfaWRSCXNpZ25hdH'
+    'VyZVIMdGltZXN0YW1wX21z');
 
 @$core.Deprecated('Use contactListResponseDescriptor instead')
 const ContactListResponse$json = {
@@ -348,23 +359,47 @@ final $typed_data.Uint8List arkInfoDescriptor = $convert.base64Decode(
 const PaymentRequestCreateRequest$json = {
   '1': 'PaymentRequestCreateRequest',
   '2': [
-    {'1': 'user_id', '3': 1, '4': 1, '5': 12, '10': 'userId'},
     {'1': 'amount_sats', '3': 2, '4': 1, '5': 4, '10': 'amountSats'},
     {'1': 'memo', '3': 3, '4': 1, '5': 9, '10': 'memo'},
     {'1': 'expires_in_secs', '3': 4, '4': 1, '5': 3, '10': 'expiresInSecs'},
-    {'1': 'signature', '3': 5, '4': 1, '5': 12, '10': 'signature'},
-    {'1': 'timestamp_ms', '3': 6, '4': 1, '5': 3, '10': 'timestampMs'},
     {'1': 'ark_info', '3': 7, '4': 1, '5': 11, '6': '.mpc_wallet.ArkInfo', '10': 'arkInfo'},
+    {'1': 'authorship', '3': 8, '4': 1, '5': 11, '6': '.mpc_wallet.RequestAuthorship', '10': 'authorship'},
   ],
+  '9': [
+    {'1': 1, '2': 2},
+    {'1': 5, '2': 6},
+    {'1': 6, '2': 7},
+  ],
+  '10': ['user_id', 'signature', 'timestamp_ms'],
 };
 
 /// Descriptor for `PaymentRequestCreateRequest`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List paymentRequestCreateRequestDescriptor = $convert.base64Decode(
-    'ChtQYXltZW50UmVxdWVzdENyZWF0ZVJlcXVlc3QSFwoHdXNlcl9pZBgBIAEoDFIGdXNlcklkEh'
-    '8KC2Ftb3VudF9zYXRzGAIgASgEUgphbW91bnRTYXRzEhIKBG1lbW8YAyABKAlSBG1lbW8SJgoP'
-    'ZXhwaXJlc19pbl9zZWNzGAQgASgDUg1leHBpcmVzSW5TZWNzEhwKCXNpZ25hdHVyZRgFIAEoDF'
-    'IJc2lnbmF0dXJlEiEKDHRpbWVzdGFtcF9tcxgGIAEoA1ILdGltZXN0YW1wTXMSLgoIYXJrX2lu'
-    'Zm8YByABKAsyEy5tcGNfd2FsbGV0LkFya0luZm9SB2Fya0luZm8=');
+    'ChtQYXltZW50UmVxdWVzdENyZWF0ZVJlcXVlc3QSHwoLYW1vdW50X3NhdHMYAiABKARSCmFtb3'
+    'VudFNhdHMSEgoEbWVtbxgDIAEoCVIEbWVtbxImCg9leHBpcmVzX2luX3NlY3MYBCABKANSDWV4'
+    'cGlyZXNJblNlY3MSLgoIYXJrX2luZm8YByABKAsyEy5tcGNfd2FsbGV0LkFya0luZm9SB2Fya0'
+    'luZm8SPQoKYXV0aG9yc2hpcBgIIAEoCzIdLm1wY193YWxsZXQuUmVxdWVzdEF1dGhvcnNoaXBS'
+    'CmF1dGhvcnNoaXBKBAgBEAJKBAgFEAZKBAgGEAdSB3VzZXJfaWRSCXNpZ25hdHVyZVIMdGltZX'
+    'N0YW1wX21z');
+
+@$core.Deprecated('Use requestAuthorshipDescriptor instead')
+const RequestAuthorship$json = {
+  '1': 'RequestAuthorship',
+  '2': [
+    {'1': 'requester_group_key', '3': 1, '4': 1, '5': 12, '10': 'requesterGroupKey'},
+    {'1': 'payer_group_key', '3': 2, '4': 1, '5': 12, '10': 'payerGroupKey'},
+    {'1': 'not_after', '3': 3, '4': 1, '5': 3, '10': 'notAfter'},
+    {'1': 'nonce', '3': 4, '4': 1, '5': 12, '10': 'nonce'},
+    {'1': 'signature', '3': 5, '4': 1, '5': 12, '10': 'signature'},
+  ],
+};
+
+/// Descriptor for `RequestAuthorship`. Decode as a `google.protobuf.DescriptorProto`.
+final $typed_data.Uint8List requestAuthorshipDescriptor = $convert.base64Decode(
+    'ChFSZXF1ZXN0QXV0aG9yc2hpcBIuChNyZXF1ZXN0ZXJfZ3JvdXBfa2V5GAEgASgMUhFyZXF1ZX'
+    'N0ZXJHcm91cEtleRImCg9wYXllcl9ncm91cF9rZXkYAiABKAxSDXBheWVyR3JvdXBLZXkSGwoJ'
+    'bm90X2FmdGVyGAMgASgDUghub3RBZnRlchIUCgVub25jZRgEIAEoDFIFbm9uY2USHAoJc2lnbm'
+    'F0dXJlGAUgASgMUglzaWduYXR1cmU=');
 
 @$core.Deprecated('Use paymentRequestCreateResponseDescriptor instead')
 const PaymentRequestCreateResponse$json = {
@@ -382,18 +417,18 @@ final $typed_data.Uint8List paymentRequestCreateResponseDescriptor = $convert.ba
 @$core.Deprecated('Use paymentRequestListRequestDescriptor instead')
 const PaymentRequestListRequest$json = {
   '1': 'PaymentRequestListRequest',
-  '2': [
-    {'1': 'user_id', '3': 1, '4': 1, '5': 12, '10': 'userId'},
-    {'1': 'signature', '3': 2, '4': 1, '5': 12, '10': 'signature'},
-    {'1': 'timestamp_ms', '3': 3, '4': 1, '5': 3, '10': 'timestampMs'},
+  '9': [
+    {'1': 1, '2': 2},
+    {'1': 2, '2': 3},
+    {'1': 3, '2': 4},
   ],
+  '10': ['user_id', 'signature', 'timestamp_ms'],
 };
 
 /// Descriptor for `PaymentRequestListRequest`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List paymentRequestListRequestDescriptor = $convert.base64Decode(
-    'ChlQYXltZW50UmVxdWVzdExpc3RSZXF1ZXN0EhcKB3VzZXJfaWQYASABKAxSBnVzZXJJZBIcCg'
-    'lzaWduYXR1cmUYAiABKAxSCXNpZ25hdHVyZRIhCgx0aW1lc3RhbXBfbXMYAyABKANSC3RpbWVz'
-    'dGFtcE1z');
+    'ChlQYXltZW50UmVxdWVzdExpc3RSZXF1ZXN0SgQIARACSgQIAhADSgQIAxAEUgd1c2VyX2lkUg'
+    'lzaWduYXR1cmVSDHRpbWVzdGFtcF9tcw==');
 
 @$core.Deprecated('Use paymentRequestListResponseDescriptor instead')
 const PaymentRequestListResponse$json = {
@@ -412,18 +447,20 @@ final $typed_data.Uint8List paymentRequestListResponseDescriptor = $convert.base
 const PaymentRequestDeclineRequest$json = {
   '1': 'PaymentRequestDeclineRequest',
   '2': [
-    {'1': 'user_id', '3': 1, '4': 1, '5': 12, '10': 'userId'},
     {'1': 'id', '3': 2, '4': 1, '5': 9, '10': 'id'},
-    {'1': 'signature', '3': 3, '4': 1, '5': 12, '10': 'signature'},
-    {'1': 'timestamp_ms', '3': 4, '4': 1, '5': 3, '10': 'timestampMs'},
   ],
+  '9': [
+    {'1': 1, '2': 2},
+    {'1': 3, '2': 4},
+    {'1': 4, '2': 5},
+  ],
+  '10': ['user_id', 'signature', 'timestamp_ms'],
 };
 
 /// Descriptor for `PaymentRequestDeclineRequest`. Decode as a `google.protobuf.DescriptorProto`.
 final $typed_data.Uint8List paymentRequestDeclineRequestDescriptor = $convert.base64Decode(
-    'ChxQYXltZW50UmVxdWVzdERlY2xpbmVSZXF1ZXN0EhcKB3VzZXJfaWQYASABKAxSBnVzZXJJZB'
-    'IOCgJpZBgCIAEoCVICaWQSHAoJc2lnbmF0dXJlGAMgASgMUglzaWduYXR1cmUSIQoMdGltZXN0'
-    'YW1wX21zGAQgASgDUgt0aW1lc3RhbXBNcw==');
+    'ChxQYXltZW50UmVxdWVzdERlY2xpbmVSZXF1ZXN0Eg4KAmlkGAIgASgJUgJpZEoECAEQAkoECA'
+    'MQBEoECAQQBVIHdXNlcl9pZFIJc2lnbmF0dXJlUgx0aW1lc3RhbXBfbXM=');
 
 @$core.Deprecated('Use paymentRequestDeclineResponseDescriptor instead')
 const PaymentRequestDeclineResponse$json = {

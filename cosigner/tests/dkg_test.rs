@@ -45,15 +45,12 @@ fn ceremony_derives_one_group_key() {
     let coefficients = vec![random::mod_n_random(&mut rng)];
     let (w_r1_secret, w_r1_pub) = dkg::dkg_part1(2, 2, &secret, &coefficients, &mut rng).unwrap();
     let wallet_id = w_r1_secret.identifier.clone();
-    let user_id = wallet_id.serialize().to_vec();
-
-    let mut sess = OnboardingSession::new(hex::encode(&user_id));
+    let mut sess = OnboardingSession::new();
 
     // --- The wallet's round 1 in, everybody's out -------------------------------------------
     let r1 = ob::dkg_open(
         &mut sess,
         DkgStep1Request {
-            user_id: user_id.clone(),
             identifier: wallet_id.serialize().to_vec(),
             round1_package: w_r1_pub.to_json(),
         },
@@ -73,9 +70,7 @@ fn ceremony_derives_one_group_key() {
     // --- Its round 2 in, ours out with the key ----------------------------------------------
     let r3 = ob::dkg_finish(
         &mut sess,
-        &store,
         DkgStep3Request {
-            user_id: user_id.clone(),
             identifier: wallet_id.serialize().to_vec(),
             round2_packages_for_others: w_r2_out
                 .iter()
@@ -112,7 +107,6 @@ fn ceremony_derives_one_group_key() {
     );
 
     let _ = store.delete("sealed_state", &mat.group_key);
-    let _ = store.delete("policy_owner_idx", &hex::encode(&user_id));
 }
 
 /// An abandoned ceremony leaves no key material anywhere.
@@ -131,21 +125,19 @@ fn abandoned_ceremony_leaves_nothing() {
     let coefficients = vec![random::mod_n_random(&mut rng)];
     let (w_r1_secret, w_r1_pub) = dkg::dkg_part1(2, 2, &secret, &coefficients, &mut rng).unwrap();
     let wallet_id = w_r1_secret.identifier.clone();
-    let user_id = wallet_id.serialize().to_vec();
 
     let req = |pkg: String| DkgStep1Request {
-        user_id: user_id.clone(),
         identifier: wallet_id.serialize().to_vec(),
         round1_package: pkg,
     };
 
     // Open a ceremony, take the cosigner's round1 package, then abandon it.
-    let mut first = OnboardingSession::new(hex::encode(&user_id));
+    let mut first = OnboardingSession::new();
     let a = ob::dkg_open(&mut first, req(w_r1_pub.to_json())).expect("first");
     drop(first);
 
     // A fresh ceremony deals a fresh secret: the cosigner's package must differ.
-    let mut second = OnboardingSession::new(hex::encode(&user_id));
+    let mut second = OnboardingSession::new();
     let b = ob::dkg_open(&mut second, req(w_r1_pub.to_json())).expect("second");
 
     let cosigner_pkg = |wire: &std::collections::HashMap<String, String>| {
@@ -159,4 +151,35 @@ fn abandoned_ceremony_leaves_nothing() {
         cosigner_pkg(&b.round1_packages),
         "a new ceremony must not reuse the abandoned one's round1 secret"
     );
+}
+
+/// A wallet that already has a key refuses a second ceremony.
+///
+/// `install_policy` overwrites unconditionally, so a second DKG on the same tenant would replace the
+/// key and strand everything held under the old one — 2-of-2 has no other way back. The e2e suite
+/// did exactly that without noticing, re-running DKG on one wallet name across tests, and got away
+/// with it only because nothing was funded in between.
+#[test]
+fn a_wallet_with_a_key_refuses_a_second_dkg() {
+    let Some(store) = common::try_store() else {
+        return;
+    };
+    let fresh = common::open_cosigner(&store, "wallet");
+    assert!(
+        fresh.lock().unwrap().refuse_if_onboarded().is_ok(),
+        "a wallet with no key must be allowed its first ceremony"
+    );
+
+    let (kps, pkp) = common::dkg_2of2();
+    common::seed_policy(&fresh, "wallet", &kps[1], &kps[0], &pkp, None);
+    drop(fresh);
+
+    // Reopened, so the refusal comes from the seal and not from memory.
+    let reopened = common::open_cosigner(&store, "wallet");
+    let err = reopened
+        .lock()
+        .unwrap()
+        .refuse_if_onboarded()
+        .expect_err("a second DKG over an existing key must be refused");
+    assert_eq!(err.code(), cosigner::grpc::Code::FailedPrecondition);
 }

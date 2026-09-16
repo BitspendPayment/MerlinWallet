@@ -6,7 +6,6 @@
 //! between — and so are outbound sockets: the ASP is driven by whoever calls, and waking a device
 //! is the host's. What is left talks to its [`store`] and to its caller.
 
-pub mod auth;
 pub mod config;
 pub mod cosigner;
 pub mod grpc;

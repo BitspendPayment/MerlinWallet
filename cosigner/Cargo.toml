@@ -56,6 +56,14 @@ hex = "0.4"
 # there is no socket to bind.
 http-body-util = "0.1"
 
+# The component's two imports from the runtime, generated from `wit/cosigner.wit`.
+#
+# Target-scoped because the generated code is component-model bindings: a native build has nothing
+# to link them against, and `src/host.rs`'s `Detached` is what stands in there. See `mod runtime` in
+# `main.rs`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = "0.46"
+
 # Runs on the HOST, so `protoc` here costs the wasm build nothing. Both generators are switched off
 # in `build.rs`: what lands in the crate is prost messages and no transport.
 [build-dependencies]

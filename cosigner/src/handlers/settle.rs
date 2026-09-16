@@ -137,9 +137,6 @@ impl Cosigner {
             }
             (Phase::Intent, false) => {
                 self.apply_delegate_sigs(crate::types::ApplyDelegateSigs {
-                    user_id: Vec::new(),
-                    signature: Vec::new(),
-                    timestamp_ms: 0,
                     signed_messages: signed,
                 })?;
                 let (proof, message, topics) = self

@@ -117,3 +117,43 @@ pub fn seed_policy(
         .expect("install policy");
     actor.seal();
 }
+
+/// A 2-of-2 BIP-340 signature over [message] by the group key, both halves played host-side.
+///
+/// What a wallet and its cosigner produce together — used where a test needs a group-key signature
+/// without standing up a ceremony, such as authoring a payment request. `key_packages` is the pair
+/// `dkg_2of2` returns.
+pub fn group_sign(
+    key_packages: &[KeyPackage],
+    public_key_package: &PublicKeyPackage,
+    message: &[u8],
+) -> [u8; 64] {
+    use threshold::commitment::SigningPackage;
+    use threshold::nonce;
+    use threshold::signing;
+
+    let mut rng = OsRng;
+    let nonces: Vec<_> = key_packages
+        .iter()
+        .map(|kp| nonce::new_nonce(&mut rng, &kp.secret_share))
+        .collect();
+    let commitments = key_packages
+        .iter()
+        .zip(&nonces)
+        .map(|(kp, n)| (kp.identifier.clone(), n.commitments.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let package = SigningPackage::new(commitments, message.to_vec());
+    let shares = key_packages
+        .iter()
+        .zip(&nonces)
+        .map(|(kp, n)| {
+            (
+                kp.identifier.clone(),
+                signing::sign(&package, n, kp).expect("share"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    signing::aggregate(&package, &shares, public_key_package)
+        .expect("aggregate")
+        .serialize()
+}

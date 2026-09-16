@@ -5,15 +5,12 @@
 use crate::grpc::Status;
 
 use crate::cosigner::Cosigner;
-use crate::handlers::parsers;
 use crate::types::VtxoEntry;
 use crate::types::VtxoInput;
 use crate::store::Store;
 use crate::wallet_proto::*;
 
-use super::helpers::{
-    delete_user_delegate, now_secs,
-};
+use super::helpers::now_secs;
 
 
 
@@ -58,19 +55,13 @@ pub fn build_delegate_step1(
 /// back whatever change it produced.
 pub fn apply_send_result(
     owned: &mut Vec<VtxoEntry>,
-    store: &Store,
-    req: &SendVtxoRequest,
     ark_txid: String,
     change: Option<(String, u32, u64, u32)>,
 ) -> SendVtxoResponse {
-    let user_id_hex = parsers::user_id_hex(&req.user_id);
     owned.clear();
-    // The send consumed the VTXOs a stored delegate may cover, so it can no longer be settled.
-    delete_user_delegate(store, &user_id_hex);
-    super::helpers::delete_guest_delegate_threshold(store, &user_id_hex);
     if let Some((txid, vout, amount, exit_delay)) = change {
         tracing::info!(
-            "[{user_id_hex}] SendVtxo: change VTXO txid={txid}, vout={vout}, amount={amount}, exit_delay={exit_delay}"
+            "SendVtxo: change VTXO txid={txid}, vout={vout}, amount={amount}, exit_delay={exit_delay}"
         );
         owned.push(VtxoEntry {
             txid,

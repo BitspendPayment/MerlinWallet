@@ -1,22 +1,23 @@
-//! The four ceremony streams, over the real transport.
+//! Authentication, at the one place it happens: the router.
 //!
-//! `check()` ran on all seven unary RPCs and on none of the four streams: every handler carried the
-//! comment "auth ran at the REST boundary", and that boundary was deleted. Anyone who could reach
-//! the port could open a `Send` and have the cosigner co-sign a spend.
+//! Every request used to carry a Schnorr signature by the wallet's share key, checked in the guest.
+//! That is gone. enclave-runtime gates every request on a WebAuthn assertion bound to its exact
+//! method and path, and a request reaches this component only once that verified — stamped with the
+//! tenant it resolved as `x-enclave-tenant`, a header the runtime strips from anything a client sends.
+//! So `CosignerService::route` requires that header, and these tests are about that requirement:
+//! every method refuses without it, a malformed one is no better than a missing one, and it is
+//! checked before anything else so an unauthenticated caller learns nothing about what is here.
 //!
-//! These drive [`CosignerService::route`] with a real framed request body rather than calling the
-//! ceremony functions directly, because the defect was not in `verify_auth` — it was that nothing
-//! called it, and only the wire shows that. They used to drive tonic over a TCP socket; tonic does
-//! not build for `wasm32-wasip2`, so the wire is now `src/grpc`'s own framing and trailers, and
-//! these cover that too: routing, the five-byte frames, and the `grpc-status` a client actually
-//! reads a failure from.
+//! They drive `route` with real framed bodies rather than calling handlers directly, because the
+//! defect this file first guarded against was not in a check — it was that nothing called one, and
+//! only the wire shows that. So these also cover the transport: routing, the five-byte frames, and
+//! the `grpc-status` trailer a client actually reads a failure from.
 
 mod common;
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -24,18 +25,26 @@ use http_body_util::BodyExt;
 use cosigner::grpc::framing::{frame, Deframer};
 use cosigner::grpc::Code;
 use cosigner::session::proto;
-use cosigner::session::CosignerService;
-use cosigner::wallet_proto::GetServerInfoResponse;
+use cosigner::session::{CosignerService, TENANT_HEADER};
+use cosigner::wallet_proto::{GetServerInfoRequest, GetServerInfoResponse};
 use cosigner::Cosigner;
 use wstd::http::{Body, Request, Response};
 
-use threshold::auth::AuthSigner;
 use threshold::keys::KeyPackage;
-use threshold::scalar::scalar_to_bytes;
+use threshold::nonce;
+use threshold::point;
 
-fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
-}
+/// What the runtime puts on an approved request: sixteen bytes, lowercase hex.
+const TENANT: &str = "0123456789abcdef0123456789abcdef";
+
+/// Every RPC the service answers. Kept as a list so a new method is refused-by-default here the day
+/// it is added, rather than whenever somebody remembers to write a test for it.
+const METHODS: &[&str] = &[
+    "Sign", "Dkg", "Send", "Settle",
+    "ContactAdd", "ContactRemove", "ContactList",
+    "PaymentRequestCreate", "PaymentRequestList", "PaymentRequestDecline",
+    "GetServerInfo", "RegisterDevice", "ForgetDevice", "DeviceCount",
+];
 
 /// Drive a future to completion on this thread.
 ///
@@ -53,16 +62,21 @@ fn block_on<F: Future>(fut: F) -> F::Output {
     panic!("the future never completed");
 }
 
-/// A gRPC request carrying `messages`, addressed at `method`.
-fn request<M: prost::Message>(method: &str, messages: &[M]) -> Request<Body> {
+/// A gRPC request carrying `messages`, addressed at `method`, as the runtime would deliver it — or,
+/// with `tenant: None`, as it would never deliver it.
+fn request<M: prost::Message>(method: &str, messages: &[M], tenant: Option<&str>) -> Request<Body> {
     let mut buf = Vec::new();
     for message in messages {
         buf.extend_from_slice(&frame(&message.encode_to_vec()));
     }
-    Request::builder()
+    let mut builder = Request::builder()
         .method("POST")
         .uri(format!("http://cosigner/cosigner.v1.Cosigner/{method}"))
-        .header("content-type", "application/grpc+proto")
+        .header("content-type", "application/grpc+proto");
+    if let Some(tenant) = tenant {
+        builder = builder.header(TENANT_HEADER, tenant);
+    }
+    builder
         .body(Body::from_http_body(
             http_body_util::Full::new(Bytes::from(buf))
                 .map_err(|e: std::convert::Infallible| -> wstd::http::Error { match e {} }),
@@ -108,30 +122,15 @@ fn service(cosigner: Cosigner) -> CosignerService {
     )
 }
 
-/// A `SignOpen` signed by the wallet's own key, or deliberately not.
-fn sign_open(kp_user: &KeyPackage, authentic: bool) -> proto::SignClientMsg {
-    let auth = AuthSigner::from_secret_bytes(&scalar_to_bytes(&kp_user.secret_share)).unwrap();
-    let user_id = auth.public_key_compressed().to_vec();
-    let ts = now_ms();
-    let signature = if authentic {
-        auth.sign(&cosigner::auth::message::build_auth_message(
-            cosigner::auth::message::OP_SIGN_STEP1,
-            ts,
-            &hex::encode(&user_id),
-        ))
-        .to_vec()
-    } else {
-        vec![7u8; 64]
-    };
+/// A `SignOpen` with a real commitment from the wallet's share.
+fn sign_open(kp_user: &KeyPackage) -> proto::SignClientMsg {
+    let nonce = nonce::new_nonce(&mut rand::rngs::OsRng, &kp_user.secret_share);
     proto::SignClientMsg {
         session_id: "s1".into(),
         seq: 0,
         body: Some(proto::sign_client_msg::Body::Open(proto::SignOpen {
-            user_id,
-            signature,
-            timestamp_ms: ts,
-            hiding_commitment: vec![2u8; 33],
-            binding_commitment: vec![2u8; 33],
+            hiding_commitment: point::serialize_compressed(&nonce.commitments.hiding).to_vec(),
+            binding_commitment: point::serialize_compressed(&nonce.commitments.binding).to_vec(),
             message_to_sign: vec![0x42; 32],
             full_transaction: Vec::new(),
             script_path_spend: true,
@@ -149,36 +148,66 @@ fn seeded() -> Option<(Cosigner, Vec<KeyPackage>)> {
     Some((cosigner.into_inner().unwrap(), kps))
 }
 
-/// An unsigned `SignOpen` is refused before any ceremony state is created.
+/// Without the runtime's tenant, every method refuses — streams and unary calls alike, and before
+/// reading a single message.
 #[test]
-fn sign_rejects_an_unauthenticated_open() {
-    let Some((cosigner, kps)) = seeded() else { return };
-
-    let resp = block_on(service(cosigner).route(request("Sign", &[sign_open(&kps[0], false)])));
-    let answer = collect::<proto::SignServerMsg>(resp);
-
-    assert_eq!(
-        answer.code,
-        Code::Unauthenticated as u32,
-        "expected Unauthenticated, got {} ({})",
-        answer.code,
-        answer.message
-    );
-    assert!(
-        answer.messages.is_empty(),
-        "a refused open must not have answered a round first: {:?}",
-        answer.messages
-    );
+fn every_method_refuses_without_a_tenant() {
+    let Some((cosigner, _)) = seeded() else { return };
+    let svc = service(cosigner);
+    for method in METHODS {
+        // An empty body: refusal must not depend on what, if anything, was sent.
+        let answer = collect::<GetServerInfoResponse>(block_on(
+            svc.route(request::<GetServerInfoRequest>(method, &[], None)),
+        ));
+        assert_eq!(
+            answer.code,
+            Code::Unauthenticated as u32,
+            "{method} must refuse without a tenant, got {} ({})",
+            answer.code,
+            answer.message
+        );
+        assert!(answer.messages.is_empty(), "{method} answered before refusing");
+    }
 }
 
-/// …and a correctly signed one is let through, so the gate is not simply refusing everything.
+/// The runtime writes sixteen bytes as lowercase hex. Anything else did not come from it.
 #[test]
-fn sign_accepts_an_authenticated_open() {
+fn a_malformed_tenant_is_no_tenant() {
+    let Some((cosigner, _)) = seeded() else { return };
+    let svc = service(cosigner);
+    for bad in ["", "not-hex", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef"] {
+        let answer = collect::<GetServerInfoResponse>(block_on(svc.route(request(
+            "GetServerInfo",
+            &[GetServerInfoRequest::default()],
+            Some(bad),
+        ))));
+        assert_eq!(answer.code, Code::Unauthenticated as u32, "tenant {bad:?} must be refused");
+    }
+}
+
+/// Checked before the path, so an unauthenticated caller cannot map what is here: an unknown method
+/// and a real one look the same to it.
+#[test]
+fn an_unauthenticated_caller_cannot_tell_what_exists() {
+    let Some((cosigner, _)) = seeded() else { return };
+    let svc = service(cosigner);
+    let real = collect::<GetServerInfoResponse>(block_on(
+        svc.route(request::<GetServerInfoRequest>("GetServerInfo", &[], None)),
+    ));
+    let bogus = collect::<GetServerInfoResponse>(block_on(
+        svc.route(request::<GetServerInfoRequest>("NoSuchMethod", &[], None)),
+    ));
+    assert_eq!(real.code, bogus.code);
+    assert_eq!(real.code, Code::Unauthenticated as u32);
+}
+
+/// With a tenant, the same stream opens — so the gate is not simply refusing everything.
+#[test]
+fn a_tenant_opens_a_signing_session() {
     let Some((cosigner, kps)) = seeded() else { return };
-
-    let resp = block_on(service(cosigner).route(request("Sign", &[sign_open(&kps[0], true)])));
-    let answer = collect::<proto::SignServerMsg>(resp);
-
+    let answer = collect::<proto::SignServerMsg>(block_on(
+        service(cosigner).route(request("Sign", &[sign_open(&kps[0])], Some(TENANT))),
+    ));
     let first = answer
         .messages
         .first()
@@ -192,47 +221,60 @@ fn sign_accepts_an_authenticated_open() {
 
 /// A ceremony that is cut off mid-round ends as a cancellation, not as a success.
 ///
-/// The client half-closes after opening, so `check()` passes and the handler parks waiting for the
-/// share that never comes. Worth its own test: the trailers are the only place that difference can
-/// be said, and reporting OK here would tell a client its round completed.
+/// The client half-closes after opening, so the handler parks waiting for a share that never comes.
+/// The trailers are the only place that difference can be said, and reporting OK here would tell a
+/// client its round completed.
 #[test]
 fn a_stream_that_ends_mid_ceremony_is_a_cancellation() {
     let Some((cosigner, kps)) = seeded() else { return };
-
-    let resp = block_on(service(cosigner).route(request("Sign", &[sign_open(&kps[0], true)])));
-    let answer = collect::<proto::SignServerMsg>(resp);
-
+    let answer = collect::<proto::SignServerMsg>(block_on(
+        service(cosigner).route(request("Sign", &[sign_open(&kps[0])], Some(TENANT))),
+    ));
     assert_eq!(answer.code, Code::Cancelled as u32, "got {}", answer.message);
-    assert_eq!(
-        answer.messages.len(),
-        1,
-        "the commitments round went out before the client vanished"
-    );
+    assert_eq!(answer.messages.len(), 1, "the commitments round went out before the client vanished");
 }
 
-/// An unknown method is a gRPC status, not an HTTP one — a client reading only the head would
-/// otherwise see a perfectly successful call.
+/// An unknown method, once authenticated, is a gRPC status and not an HTTP one — a client reading
+/// only the head would otherwise see a perfectly successful call.
 #[test]
 fn an_unknown_method_is_unimplemented_in_the_trailers() {
     let Some((cosigner, _)) = seeded() else { return };
-
-    let resp = block_on(service(cosigner).route(request::<proto::SignClientMsg>("Nope", &[])));
+    let resp = block_on(
+        service(cosigner).route(request::<GetServerInfoRequest>("Nope", &[], Some(TENANT))),
+    );
     assert_eq!(resp.status(), 200, "gRPC reports failure in the trailers");
-    let answer = collect::<proto::SignServerMsg>(resp);
-    assert_eq!(answer.code, Code::Unimplemented as u32);
+    assert_eq!(collect::<GetServerInfoResponse>(resp).code, Code::Unimplemented as u32);
 }
 
-/// A unary call is authenticated the same way, and answers with one message and an OK trailer.
 #[test]
 fn get_server_info_answers_a_single_framed_message() {
     let Some((cosigner, _)) = seeded() else { return };
-
-    let resp = block_on(
-        service(cosigner).route(request("GetServerInfo", &[cosigner::wallet_proto::GetServerInfoRequest::default()])),
-    );
-    let answer = collect::<GetServerInfoResponse>(resp);
-
+    let answer = collect::<GetServerInfoResponse>(block_on(service(cosigner).route(request(
+        "GetServerInfo",
+        &[GetServerInfoRequest::default()],
+        Some(TENANT),
+    ))));
     assert_eq!(answer.code, Code::Ok as u32, "got {}", answer.message);
     assert_eq!(answer.messages.len(), 1);
     assert_eq!(answer.messages[0].bitcoin_network, "regtest");
+}
+
+/// A DKG over a wallet that already has a key is refused on the wire, before any round-one material
+/// is dealt.
+#[test]
+fn a_second_dkg_is_refused_on_the_wire() {
+    let Some((cosigner, _)) = seeded() else { return };
+    let open = proto::DkgClientMsg {
+        session_id: "d1".into(),
+        seq: 0,
+        body: Some(proto::dkg_client_msg::Body::Open(proto::DkgOpen {
+            identifier: vec![1; 32],
+            round1_package: "{}".into(),
+        })),
+    };
+    let answer = collect::<proto::DkgServerMsg>(block_on(
+        service(cosigner).route(request("Dkg", &[open], Some(TENANT))),
+    ));
+    assert_eq!(answer.code, Code::FailedPrecondition as u32, "got {}", answer.message);
+    assert!(answer.messages.is_empty(), "no round-one package may go out");
 }

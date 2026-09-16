@@ -11,13 +11,11 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::rngs::OsRng;
 
 use cosigner::types::{SignStep1, SignStep2};
 
-use threshold::auth::AuthSigner;
 use threshold::commitment::SigningPackage;
 use threshold::identifier::Identifier;
 use threshold::keys::KeyPackage;
@@ -27,26 +25,16 @@ use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};
 use threshold::signature::Signature;
 use threshold::signing;
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
 
 /// The client's half of round 1: a fresh nonce and the request carrying its commitments.
 fn client_round1(kp_user: &KeyPackage, message: &[u8; 32]) -> (nonce::SigningNonce, SignStep1) {
-    let auth = AuthSigner::from_secret_bytes(&scalar_to_bytes(&kp_user.secret_share)).unwrap();
     let mut rng = OsRng;
     let user_nonce = nonce::new_nonce(&mut rng, &kp_user.secret_share);
     let req = SignStep1 {
-        user_id: auth.public_key_compressed().to_vec(),
         hiding_commitment: point::serialize_compressed(&user_nonce.commitments.hiding).to_vec(),
         binding_commitment: point::serialize_compressed(&user_nonce.commitments.binding).to_vec(),
         message_to_sign: message.to_vec(),
-        signature: vec![],
         full_transaction: vec![],
-        timestamp_ms: now_ms(),
         script_path_spend: true, // raw FROST (no taproot tweak)
         ark_tx: vec![],
     };
@@ -73,7 +61,6 @@ fn sign_session_restores_seal_and_verifies() {
     // A fresh instance holds nothing in memory: the seal is where its keys come from.
     let cosigner = common::open_cosigner(&store, &group_key);
     let (user_nonce, req1) = client_round1(kp_user, &message);
-    let user_id = req1.user_id.clone();
 
     // Round 1. The ceremony leaves the cosigner with the reply; nothing is parked behind it.
     let (ceremony, resp1) = {
@@ -105,10 +92,7 @@ fn sign_session_restores_seal_and_verifies() {
             .sign_finish(
                 ceremony,
                 SignStep2 {
-                    user_id,
                     signature_share: scalar_to_bytes(&user_share.s).to_vec(),
-                    signature: vec![],
-                    timestamp_ms: now_ms(),
                 },
             )
             .expect("sign_finish")

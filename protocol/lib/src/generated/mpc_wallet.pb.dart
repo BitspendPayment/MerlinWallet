@@ -20,14 +20,10 @@ export 'mpc_wallet.pbenum.dart';
 
 class DKGStep1Request extends $pb.GeneratedMessage {
   factory DKGStep1Request({
-    $core.List<$core.int>? userId,
     $core.List<$core.int>? identifier,
     $core.String? round1Package,
   }) {
     final $result = create();
-    if (userId != null) {
-      $result.userId = userId;
-    }
     if (identifier != null) {
       $result.identifier = identifier;
     }
@@ -41,7 +37,6 @@ class DKGStep1Request extends $pb.GeneratedMessage {
   factory DKGStep1Request.fromJson($core.String i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromJson(i, r);
 
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'DKGStep1Request', package: const $pb.PackageName(_omitMessageNames ? '' : 'mpc_wallet'), createEmptyInstance: create)
-    ..a<$core.List<$core.int>>(1, _omitFieldNames ? '' : 'userId', $pb.PbFieldType.OY)
     ..a<$core.List<$core.int>>(2, _omitFieldNames ? '' : 'identifier', $pb.PbFieldType.OY)
     ..aOS(3, _omitFieldNames ? '' : 'round1Package')
     ..hasRequiredFields = false
@@ -68,30 +63,21 @@ class DKGStep1Request extends $pb.GeneratedMessage {
   static DKGStep1Request getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<DKGStep1Request>(create);
   static DKGStep1Request? _defaultInstance;
 
-  @$pb.TagNumber(1)
-  $core.List<$core.int> get userId => $_getN(0);
-  @$pb.TagNumber(1)
-  set userId($core.List<$core.int> v) { $_setBytes(0, v); }
-  @$pb.TagNumber(1)
-  $core.bool hasUserId() => $_has(0);
-  @$pb.TagNumber(1)
-  void clearUserId() => clearField(1);
-
   @$pb.TagNumber(2)
-  $core.List<$core.int> get identifier => $_getN(1);
+  $core.List<$core.int> get identifier => $_getN(0);
   @$pb.TagNumber(2)
-  set identifier($core.List<$core.int> v) { $_setBytes(1, v); }
+  set identifier($core.List<$core.int> v) { $_setBytes(0, v); }
   @$pb.TagNumber(2)
-  $core.bool hasIdentifier() => $_has(1);
+  $core.bool hasIdentifier() => $_has(0);
   @$pb.TagNumber(2)
   void clearIdentifier() => clearField(2);
 
   @$pb.TagNumber(3)
-  $core.String get round1Package => $_getSZ(2);
+  $core.String get round1Package => $_getSZ(1);
   @$pb.TagNumber(3)
-  set round1Package($core.String v) { $_setString(2, v); }
+  set round1Package($core.String v) { $_setString(1, v); }
   @$pb.TagNumber(3)
-  $core.bool hasRound1Package() => $_has(2);
+  $core.bool hasRound1Package() => $_has(1);
   @$pb.TagNumber(3)
   void clearRound1Package() => clearField(3);
 }
@@ -142,14 +128,10 @@ class DKGStep1Response extends $pb.GeneratedMessage {
 
 class DKGStep3Request extends $pb.GeneratedMessage {
   factory DKGStep3Request({
-    $core.List<$core.int>? userId,
     $core.List<$core.int>? identifier,
     $core.Map<$core.String, $core.String>? round2PackagesForOthers,
   }) {
     final $result = create();
-    if (userId != null) {
-      $result.userId = userId;
-    }
     if (identifier != null) {
       $result.identifier = identifier;
     }
@@ -163,7 +145,6 @@ class DKGStep3Request extends $pb.GeneratedMessage {
   factory DKGStep3Request.fromJson($core.String i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromJson(i, r);
 
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'DKGStep3Request', package: const $pb.PackageName(_omitMessageNames ? '' : 'mpc_wallet'), createEmptyInstance: create)
-    ..a<$core.List<$core.int>>(1, _omitFieldNames ? '' : 'userId', $pb.PbFieldType.OY)
     ..a<$core.List<$core.int>>(2, _omitFieldNames ? '' : 'identifier', $pb.PbFieldType.OY)
     ..m<$core.String, $core.String>(3, _omitFieldNames ? '' : 'round2PackagesForOthers', entryClassName: 'DKGStep3Request.Round2PackagesForOthersEntry', keyFieldType: $pb.PbFieldType.OS, valueFieldType: $pb.PbFieldType.OS, packageName: const $pb.PackageName('mpc_wallet'))
     ..hasRequiredFields = false
@@ -190,26 +171,17 @@ class DKGStep3Request extends $pb.GeneratedMessage {
   static DKGStep3Request getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<DKGStep3Request>(create);
   static DKGStep3Request? _defaultInstance;
 
-  @$pb.TagNumber(1)
-  $core.List<$core.int> get userId => $_getN(0);
-  @$pb.TagNumber(1)
-  set userId($core.List<$core.int> v) { $_setBytes(0, v); }
-  @$pb.TagNumber(1)
-  $core.bool hasUserId() => $_has(0);
-  @$pb.TagNumber(1)
-  void clearUserId() => clearField(1);
-
   @$pb.TagNumber(2)
-  $core.List<$core.int> get identifier => $_getN(1);
+  $core.List<$core.int> get identifier => $_getN(0);
   @$pb.TagNumber(2)
-  set identifier($core.List<$core.int> v) { $_setBytes(1, v); }
+  set identifier($core.List<$core.int> v) { $_setBytes(0, v); }
   @$pb.TagNumber(2)
-  $core.bool hasIdentifier() => $_has(1);
+  $core.bool hasIdentifier() => $_has(0);
   @$pb.TagNumber(2)
   void clearIdentifier() => clearField(2);
 
   @$pb.TagNumber(3)
-  $core.Map<$core.String, $core.String> get round2PackagesForOthers => $_getMap(2);
+  $core.Map<$core.String, $core.String> get round2PackagesForOthers => $_getMap(1);
 }
 
 class DKGStep3Response extends $pb.GeneratedMessage {
@@ -258,28 +230,16 @@ class DKGStep3Response extends $pb.GeneratedMessage {
 
 class SendVtxoRequest extends $pb.GeneratedMessage {
   factory SendVtxoRequest({
-    $core.List<$core.int>? userId,
     $core.String? recipientArkAddress,
     $fixnum.Int64? amount,
-    $core.List<$core.int>? signature,
-    $fixnum.Int64? timestampMs,
     $core.Iterable<$core.List<$core.int>>? signedMessages,
   }) {
     final $result = create();
-    if (userId != null) {
-      $result.userId = userId;
-    }
     if (recipientArkAddress != null) {
       $result.recipientArkAddress = recipientArkAddress;
     }
     if (amount != null) {
       $result.amount = amount;
-    }
-    if (signature != null) {
-      $result.signature = signature;
-    }
-    if (timestampMs != null) {
-      $result.timestampMs = timestampMs;
     }
     if (signedMessages != null) {
       $result.signedMessages.addAll(signedMessages);
@@ -291,11 +251,8 @@ class SendVtxoRequest extends $pb.GeneratedMessage {
   factory SendVtxoRequest.fromJson($core.String i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromJson(i, r);
 
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'SendVtxoRequest', package: const $pb.PackageName(_omitMessageNames ? '' : 'mpc_wallet'), createEmptyInstance: create)
-    ..a<$core.List<$core.int>>(1, _omitFieldNames ? '' : 'userId', $pb.PbFieldType.OY)
     ..aOS(2, _omitFieldNames ? '' : 'recipientArkAddress')
     ..a<$fixnum.Int64>(3, _omitFieldNames ? '' : 'amount', $pb.PbFieldType.OU6, defaultOrMaker: $fixnum.Int64.ZERO)
-    ..a<$core.List<$core.int>>(4, _omitFieldNames ? '' : 'signature', $pb.PbFieldType.OY)
-    ..aInt64(5, _omitFieldNames ? '' : 'timestampMs')
     ..p<$core.List<$core.int>>(6, _omitFieldNames ? '' : 'signedMessages', $pb.PbFieldType.PY)
     ..hasRequiredFields = false
   ;
@@ -321,54 +278,27 @@ class SendVtxoRequest extends $pb.GeneratedMessage {
   static SendVtxoRequest getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<SendVtxoRequest>(create);
   static SendVtxoRequest? _defaultInstance;
 
-  @$pb.TagNumber(1)
-  $core.List<$core.int> get userId => $_getN(0);
-  @$pb.TagNumber(1)
-  set userId($core.List<$core.int> v) { $_setBytes(0, v); }
-  @$pb.TagNumber(1)
-  $core.bool hasUserId() => $_has(0);
-  @$pb.TagNumber(1)
-  void clearUserId() => clearField(1);
-
   @$pb.TagNumber(2)
-  $core.String get recipientArkAddress => $_getSZ(1);
+  $core.String get recipientArkAddress => $_getSZ(0);
   @$pb.TagNumber(2)
-  set recipientArkAddress($core.String v) { $_setString(1, v); }
+  set recipientArkAddress($core.String v) { $_setString(0, v); }
   @$pb.TagNumber(2)
-  $core.bool hasRecipientArkAddress() => $_has(1);
+  $core.bool hasRecipientArkAddress() => $_has(0);
   @$pb.TagNumber(2)
   void clearRecipientArkAddress() => clearField(2);
 
   @$pb.TagNumber(3)
-  $fixnum.Int64 get amount => $_getI64(2);
+  $fixnum.Int64 get amount => $_getI64(1);
   @$pb.TagNumber(3)
-  set amount($fixnum.Int64 v) { $_setInt64(2, v); }
+  set amount($fixnum.Int64 v) { $_setInt64(1, v); }
   @$pb.TagNumber(3)
-  $core.bool hasAmount() => $_has(2);
+  $core.bool hasAmount() => $_has(1);
   @$pb.TagNumber(3)
   void clearAmount() => clearField(3);
 
-  @$pb.TagNumber(4)
-  $core.List<$core.int> get signature => $_getN(3);
-  @$pb.TagNumber(4)
-  set signature($core.List<$core.int> v) { $_setBytes(3, v); }
-  @$pb.TagNumber(4)
-  $core.bool hasSignature() => $_has(3);
-  @$pb.TagNumber(4)
-  void clearSignature() => clearField(4);
-
-  @$pb.TagNumber(5)
-  $fixnum.Int64 get timestampMs => $_getI64(4);
-  @$pb.TagNumber(5)
-  set timestampMs($fixnum.Int64 v) { $_setInt64(4, v); }
-  @$pb.TagNumber(5)
-  $core.bool hasTimestampMs() => $_has(4);
-  @$pb.TagNumber(5)
-  void clearTimestampMs() => clearField(5);
-
   /// FROST signatures for previously requested sighashes (phase 2)
   @$pb.TagNumber(6)
-  $core.List<$core.List<$core.int>> get signedMessages => $_getList(5);
+  $core.List<$core.List<$core.int>> get signedMessages => $_getList(2);
 }
 
 class SendVtxoResponse extends $pb.GeneratedMessage {
@@ -642,27 +572,15 @@ class Contact extends $pb.GeneratedMessage {
 
 class ContactAddRequest extends $pb.GeneratedMessage {
   factory ContactAddRequest({
-    $core.List<$core.int>? userId,
     $core.List<$core.int>? contactVerifyingKey,
     $core.String? label,
-    $core.List<$core.int>? signature,
-    $fixnum.Int64? timestampMs,
   }) {
     final $result = create();
-    if (userId != null) {
-      $result.userId = userId;
-    }
     if (contactVerifyingKey != null) {
       $result.contactVerifyingKey = contactVerifyingKey;
     }
     if (label != null) {
       $result.label = label;
-    }
-    if (signature != null) {
-      $result.signature = signature;
-    }
-    if (timestampMs != null) {
-      $result.timestampMs = timestampMs;
     }
     return $result;
   }
@@ -671,11 +589,8 @@ class ContactAddRequest extends $pb.GeneratedMessage {
   factory ContactAddRequest.fromJson($core.String i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromJson(i, r);
 
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'ContactAddRequest', package: const $pb.PackageName(_omitMessageNames ? '' : 'mpc_wallet'), createEmptyInstance: create)
-    ..a<$core.List<$core.int>>(1, _omitFieldNames ? '' : 'userId', $pb.PbFieldType.OY)
     ..a<$core.List<$core.int>>(2, _omitFieldNames ? '' : 'contactVerifyingKey', $pb.PbFieldType.OY)
     ..aOS(3, _omitFieldNames ? '' : 'label')
-    ..a<$core.List<$core.int>>(4, _omitFieldNames ? '' : 'signature', $pb.PbFieldType.OY)
-    ..aInt64(5, _omitFieldNames ? '' : 'timestampMs')
     ..hasRequiredFields = false
   ;
 
@@ -700,50 +615,23 @@ class ContactAddRequest extends $pb.GeneratedMessage {
   static ContactAddRequest getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<ContactAddRequest>(create);
   static ContactAddRequest? _defaultInstance;
 
-  @$pb.TagNumber(1)
-  $core.List<$core.int> get userId => $_getN(0);
-  @$pb.TagNumber(1)
-  set userId($core.List<$core.int> v) { $_setBytes(0, v); }
-  @$pb.TagNumber(1)
-  $core.bool hasUserId() => $_has(0);
-  @$pb.TagNumber(1)
-  void clearUserId() => clearField(1);
-
   @$pb.TagNumber(2)
-  $core.List<$core.int> get contactVerifyingKey => $_getN(1);
+  $core.List<$core.int> get contactVerifyingKey => $_getN(0);
   @$pb.TagNumber(2)
-  set contactVerifyingKey($core.List<$core.int> v) { $_setBytes(1, v); }
+  set contactVerifyingKey($core.List<$core.int> v) { $_setBytes(0, v); }
   @$pb.TagNumber(2)
-  $core.bool hasContactVerifyingKey() => $_has(1);
+  $core.bool hasContactVerifyingKey() => $_has(0);
   @$pb.TagNumber(2)
   void clearContactVerifyingKey() => clearField(2);
 
   @$pb.TagNumber(3)
-  $core.String get label => $_getSZ(2);
+  $core.String get label => $_getSZ(1);
   @$pb.TagNumber(3)
-  set label($core.String v) { $_setString(2, v); }
+  set label($core.String v) { $_setString(1, v); }
   @$pb.TagNumber(3)
-  $core.bool hasLabel() => $_has(2);
+  $core.bool hasLabel() => $_has(1);
   @$pb.TagNumber(3)
   void clearLabel() => clearField(3);
-
-  @$pb.TagNumber(4)
-  $core.List<$core.int> get signature => $_getN(3);
-  @$pb.TagNumber(4)
-  set signature($core.List<$core.int> v) { $_setBytes(3, v); }
-  @$pb.TagNumber(4)
-  $core.bool hasSignature() => $_has(3);
-  @$pb.TagNumber(4)
-  void clearSignature() => clearField(4);
-
-  @$pb.TagNumber(5)
-  $fixnum.Int64 get timestampMs => $_getI64(4);
-  @$pb.TagNumber(5)
-  set timestampMs($fixnum.Int64 v) { $_setInt64(4, v); }
-  @$pb.TagNumber(5)
-  $core.bool hasTimestampMs() => $_has(4);
-  @$pb.TagNumber(5)
-  void clearTimestampMs() => clearField(5);
 }
 
 class ContactAddResponse extends $pb.GeneratedMessage {
@@ -798,23 +686,11 @@ class ContactAddResponse extends $pb.GeneratedMessage {
 
 class ContactRemoveRequest extends $pb.GeneratedMessage {
   factory ContactRemoveRequest({
-    $core.List<$core.int>? userId,
     $core.List<$core.int>? contactVerifyingKey,
-    $core.List<$core.int>? signature,
-    $fixnum.Int64? timestampMs,
   }) {
     final $result = create();
-    if (userId != null) {
-      $result.userId = userId;
-    }
     if (contactVerifyingKey != null) {
       $result.contactVerifyingKey = contactVerifyingKey;
-    }
-    if (signature != null) {
-      $result.signature = signature;
-    }
-    if (timestampMs != null) {
-      $result.timestampMs = timestampMs;
     }
     return $result;
   }
@@ -823,10 +699,7 @@ class ContactRemoveRequest extends $pb.GeneratedMessage {
   factory ContactRemoveRequest.fromJson($core.String i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromJson(i, r);
 
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'ContactRemoveRequest', package: const $pb.PackageName(_omitMessageNames ? '' : 'mpc_wallet'), createEmptyInstance: create)
-    ..a<$core.List<$core.int>>(1, _omitFieldNames ? '' : 'userId', $pb.PbFieldType.OY)
     ..a<$core.List<$core.int>>(2, _omitFieldNames ? '' : 'contactVerifyingKey', $pb.PbFieldType.OY)
-    ..a<$core.List<$core.int>>(3, _omitFieldNames ? '' : 'signature', $pb.PbFieldType.OY)
-    ..aInt64(4, _omitFieldNames ? '' : 'timestampMs')
     ..hasRequiredFields = false
   ;
 
@@ -851,41 +724,14 @@ class ContactRemoveRequest extends $pb.GeneratedMessage {
   static ContactRemoveRequest getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<ContactRemoveRequest>(create);
   static ContactRemoveRequest? _defaultInstance;
 
-  @$pb.TagNumber(1)
-  $core.List<$core.int> get userId => $_getN(0);
-  @$pb.TagNumber(1)
-  set userId($core.List<$core.int> v) { $_setBytes(0, v); }
-  @$pb.TagNumber(1)
-  $core.bool hasUserId() => $_has(0);
-  @$pb.TagNumber(1)
-  void clearUserId() => clearField(1);
-
   @$pb.TagNumber(2)
-  $core.List<$core.int> get contactVerifyingKey => $_getN(1);
+  $core.List<$core.int> get contactVerifyingKey => $_getN(0);
   @$pb.TagNumber(2)
-  set contactVerifyingKey($core.List<$core.int> v) { $_setBytes(1, v); }
+  set contactVerifyingKey($core.List<$core.int> v) { $_setBytes(0, v); }
   @$pb.TagNumber(2)
-  $core.bool hasContactVerifyingKey() => $_has(1);
+  $core.bool hasContactVerifyingKey() => $_has(0);
   @$pb.TagNumber(2)
   void clearContactVerifyingKey() => clearField(2);
-
-  @$pb.TagNumber(3)
-  $core.List<$core.int> get signature => $_getN(2);
-  @$pb.TagNumber(3)
-  set signature($core.List<$core.int> v) { $_setBytes(2, v); }
-  @$pb.TagNumber(3)
-  $core.bool hasSignature() => $_has(2);
-  @$pb.TagNumber(3)
-  void clearSignature() => clearField(3);
-
-  @$pb.TagNumber(4)
-  $fixnum.Int64 get timestampMs => $_getI64(3);
-  @$pb.TagNumber(4)
-  set timestampMs($fixnum.Int64 v) { $_setInt64(3, v); }
-  @$pb.TagNumber(4)
-  $core.bool hasTimestampMs() => $_has(3);
-  @$pb.TagNumber(4)
-  void clearTimestampMs() => clearField(4);
 }
 
 class ContactRemoveResponse extends $pb.GeneratedMessage {
@@ -939,31 +785,12 @@ class ContactRemoveResponse extends $pb.GeneratedMessage {
 }
 
 class ContactListRequest extends $pb.GeneratedMessage {
-  factory ContactListRequest({
-    $core.List<$core.int>? userId,
-    $core.List<$core.int>? signature,
-    $fixnum.Int64? timestampMs,
-  }) {
-    final $result = create();
-    if (userId != null) {
-      $result.userId = userId;
-    }
-    if (signature != null) {
-      $result.signature = signature;
-    }
-    if (timestampMs != null) {
-      $result.timestampMs = timestampMs;
-    }
-    return $result;
-  }
+  factory ContactListRequest() => create();
   ContactListRequest._() : super();
   factory ContactListRequest.fromBuffer($core.List<$core.int> i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromBuffer(i, r);
   factory ContactListRequest.fromJson($core.String i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromJson(i, r);
 
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'ContactListRequest', package: const $pb.PackageName(_omitMessageNames ? '' : 'mpc_wallet'), createEmptyInstance: create)
-    ..a<$core.List<$core.int>>(1, _omitFieldNames ? '' : 'userId', $pb.PbFieldType.OY)
-    ..a<$core.List<$core.int>>(2, _omitFieldNames ? '' : 'signature', $pb.PbFieldType.OY)
-    ..aInt64(3, _omitFieldNames ? '' : 'timestampMs')
     ..hasRequiredFields = false
   ;
 
@@ -987,33 +814,6 @@ class ContactListRequest extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static ContactListRequest getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<ContactListRequest>(create);
   static ContactListRequest? _defaultInstance;
-
-  @$pb.TagNumber(1)
-  $core.List<$core.int> get userId => $_getN(0);
-  @$pb.TagNumber(1)
-  set userId($core.List<$core.int> v) { $_setBytes(0, v); }
-  @$pb.TagNumber(1)
-  $core.bool hasUserId() => $_has(0);
-  @$pb.TagNumber(1)
-  void clearUserId() => clearField(1);
-
-  @$pb.TagNumber(2)
-  $core.List<$core.int> get signature => $_getN(1);
-  @$pb.TagNumber(2)
-  set signature($core.List<$core.int> v) { $_setBytes(1, v); }
-  @$pb.TagNumber(2)
-  $core.bool hasSignature() => $_has(1);
-  @$pb.TagNumber(2)
-  void clearSignature() => clearField(2);
-
-  @$pb.TagNumber(3)
-  $fixnum.Int64 get timestampMs => $_getI64(2);
-  @$pb.TagNumber(3)
-  set timestampMs($fixnum.Int64 v) { $_setInt64(2, v); }
-  @$pb.TagNumber(3)
-  $core.bool hasTimestampMs() => $_has(2);
-  @$pb.TagNumber(3)
-  void clearTimestampMs() => clearField(3);
 }
 
 class ContactListResponse extends $pb.GeneratedMessage {
@@ -1406,18 +1206,13 @@ class ArkInfo extends $pb.GeneratedMessage {
 
 class PaymentRequestCreateRequest extends $pb.GeneratedMessage {
   factory PaymentRequestCreateRequest({
-    $core.List<$core.int>? userId,
     $fixnum.Int64? amountSats,
     $core.String? memo,
     $fixnum.Int64? expiresInSecs,
-    $core.List<$core.int>? signature,
-    $fixnum.Int64? timestampMs,
     ArkInfo? arkInfo,
+    RequestAuthorship? authorship,
   }) {
     final $result = create();
-    if (userId != null) {
-      $result.userId = userId;
-    }
     if (amountSats != null) {
       $result.amountSats = amountSats;
     }
@@ -1427,14 +1222,11 @@ class PaymentRequestCreateRequest extends $pb.GeneratedMessage {
     if (expiresInSecs != null) {
       $result.expiresInSecs = expiresInSecs;
     }
-    if (signature != null) {
-      $result.signature = signature;
-    }
-    if (timestampMs != null) {
-      $result.timestampMs = timestampMs;
-    }
     if (arkInfo != null) {
       $result.arkInfo = arkInfo;
+    }
+    if (authorship != null) {
+      $result.authorship = authorship;
     }
     return $result;
   }
@@ -1443,13 +1235,11 @@ class PaymentRequestCreateRequest extends $pb.GeneratedMessage {
   factory PaymentRequestCreateRequest.fromJson($core.String i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromJson(i, r);
 
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'PaymentRequestCreateRequest', package: const $pb.PackageName(_omitMessageNames ? '' : 'mpc_wallet'), createEmptyInstance: create)
-    ..a<$core.List<$core.int>>(1, _omitFieldNames ? '' : 'userId', $pb.PbFieldType.OY)
     ..a<$fixnum.Int64>(2, _omitFieldNames ? '' : 'amountSats', $pb.PbFieldType.OU6, defaultOrMaker: $fixnum.Int64.ZERO)
     ..aOS(3, _omitFieldNames ? '' : 'memo')
     ..aInt64(4, _omitFieldNames ? '' : 'expiresInSecs')
-    ..a<$core.List<$core.int>>(5, _omitFieldNames ? '' : 'signature', $pb.PbFieldType.OY)
-    ..aInt64(6, _omitFieldNames ? '' : 'timestampMs')
     ..aOM<ArkInfo>(7, _omitFieldNames ? '' : 'arkInfo', subBuilder: ArkInfo.create)
+    ..aOM<RequestAuthorship>(8, _omitFieldNames ? '' : 'authorship', subBuilder: RequestAuthorship.create)
     ..hasRequiredFields = false
   ;
 
@@ -1474,41 +1264,181 @@ class PaymentRequestCreateRequest extends $pb.GeneratedMessage {
   static PaymentRequestCreateRequest getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<PaymentRequestCreateRequest>(create);
   static PaymentRequestCreateRequest? _defaultInstance;
 
-  @$pb.TagNumber(1)
-  $core.List<$core.int> get userId => $_getN(0);
-  @$pb.TagNumber(1)
-  set userId($core.List<$core.int> v) { $_setBytes(0, v); }
-  @$pb.TagNumber(1)
-  $core.bool hasUserId() => $_has(0);
-  @$pb.TagNumber(1)
-  void clearUserId() => clearField(1);
-
   @$pb.TagNumber(2)
-  $fixnum.Int64 get amountSats => $_getI64(1);
+  $fixnum.Int64 get amountSats => $_getI64(0);
   @$pb.TagNumber(2)
-  set amountSats($fixnum.Int64 v) { $_setInt64(1, v); }
+  set amountSats($fixnum.Int64 v) { $_setInt64(0, v); }
   @$pb.TagNumber(2)
-  $core.bool hasAmountSats() => $_has(1);
+  $core.bool hasAmountSats() => $_has(0);
   @$pb.TagNumber(2)
   void clearAmountSats() => clearField(2);
 
   @$pb.TagNumber(3)
-  $core.String get memo => $_getSZ(2);
+  $core.String get memo => $_getSZ(1);
   @$pb.TagNumber(3)
-  set memo($core.String v) { $_setString(2, v); }
+  set memo($core.String v) { $_setString(1, v); }
   @$pb.TagNumber(3)
-  $core.bool hasMemo() => $_has(2);
+  $core.bool hasMemo() => $_has(1);
   @$pb.TagNumber(3)
   void clearMemo() => clearField(3);
 
   @$pb.TagNumber(4)
-  $fixnum.Int64 get expiresInSecs => $_getI64(3);
+  $fixnum.Int64 get expiresInSecs => $_getI64(2);
   @$pb.TagNumber(4)
-  set expiresInSecs($fixnum.Int64 v) { $_setInt64(3, v); }
+  set expiresInSecs($fixnum.Int64 v) { $_setInt64(2, v); }
   @$pb.TagNumber(4)
-  $core.bool hasExpiresInSecs() => $_has(3);
+  $core.bool hasExpiresInSecs() => $_has(2);
   @$pb.TagNumber(4)
   void clearExpiresInSecs() => clearField(4);
+
+  /// The ASP parameters the payee address is derived with. From the caller, because the caller is
+  /// the one talking to the ASP — and it cannot redirect the payment with them: the address is
+  /// derived from the ALLOWLISTED key, never a supplied one.
+  @$pb.TagNumber(7)
+  ArkInfo get arkInfo => $_getN(3);
+  @$pb.TagNumber(7)
+  set arkInfo(ArkInfo v) { setField(7, v); }
+  @$pb.TagNumber(7)
+  $core.bool hasArkInfo() => $_has(3);
+  @$pb.TagNumber(7)
+  void clearArkInfo() => clearField(7);
+  @$pb.TagNumber(7)
+  ArkInfo ensureArkInfo() => $_ensure(3);
+
+  /// Proof that the requester wrote this. Required.
+  @$pb.TagNumber(8)
+  RequestAuthorship get authorship => $_getN(4);
+  @$pb.TagNumber(8)
+  set authorship(RequestAuthorship v) { setField(8, v); }
+  @$pb.TagNumber(8)
+  $core.bool hasAuthorship() => $_has(4);
+  @$pb.TagNumber(8)
+  void clearAuthorship() => clearField(8);
+  @$pb.TagNumber(8)
+  RequestAuthorship ensureAuthorship() => $_ensure(4);
+}
+
+///  That a payment request was written by the wallet it names.
+///
+///  The caller of `PaymentRequestCreate` is the PAYER, not the requester. The runtime resolves a tenant
+///  from the caller's own token and strips any tenant header a client sends, so nobody can address
+///  another wallet's cosigner — a request has to travel out of band, and the payer's own app submits it
+///  to the payer's own cosigner. The runtime therefore authenticates the payer, which says nothing about
+///  who asked. This does.
+///
+///  It is a BIP-340 signature by the requester's GROUP key, which only the requester and the requester's
+///  cosigner together can produce. That is the point of it being the group key: the old check took a
+///  share key and resolved it to a group key through `policy_owner_idx`, an index DKG writes into each
+///  wallet's own store — which worked only while every wallet shared one store, and would otherwise have
+///  derived the payee address from a share key, an address the requester could not spend.
+///
+///  The signature covers
+///
+///  ```text
+///  sha256( "merlin/payment-request/v1" ‖ payer_group_key ‖ requester_group_key
+///          ‖ amount_sats ‖ expires_in_secs ‖ not_after ‖ nonce ‖ sha256(memo) )
+///  ```
+///
+///  Fenced as text on purpose: prost copies these comments into the generated Rust as doc comments,
+///  and an indented block there is compiled as a doctest.
+///  with integers as 8-byte big-endian. The domain tag means it can never double as a transaction
+///  sighash; the payer's key means a request to one wallet cannot be replayed to another; `not_after` and
+///  the nonce mean it cannot be replayed to the same wallet later.
+class RequestAuthorship extends $pb.GeneratedMessage {
+  factory RequestAuthorship({
+    $core.List<$core.int>? requesterGroupKey,
+    $core.List<$core.int>? payerGroupKey,
+    $fixnum.Int64? notAfter,
+    $core.List<$core.int>? nonce,
+    $core.List<$core.int>? signature,
+  }) {
+    final $result = create();
+    if (requesterGroupKey != null) {
+      $result.requesterGroupKey = requesterGroupKey;
+    }
+    if (payerGroupKey != null) {
+      $result.payerGroupKey = payerGroupKey;
+    }
+    if (notAfter != null) {
+      $result.notAfter = notAfter;
+    }
+    if (nonce != null) {
+      $result.nonce = nonce;
+    }
+    if (signature != null) {
+      $result.signature = signature;
+    }
+    return $result;
+  }
+  RequestAuthorship._() : super();
+  factory RequestAuthorship.fromBuffer($core.List<$core.int> i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromBuffer(i, r);
+  factory RequestAuthorship.fromJson($core.String i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromJson(i, r);
+
+  static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'RequestAuthorship', package: const $pb.PackageName(_omitMessageNames ? '' : 'mpc_wallet'), createEmptyInstance: create)
+    ..a<$core.List<$core.int>>(1, _omitFieldNames ? '' : 'requesterGroupKey', $pb.PbFieldType.OY)
+    ..a<$core.List<$core.int>>(2, _omitFieldNames ? '' : 'payerGroupKey', $pb.PbFieldType.OY)
+    ..aInt64(3, _omitFieldNames ? '' : 'notAfter')
+    ..a<$core.List<$core.int>>(4, _omitFieldNames ? '' : 'nonce', $pb.PbFieldType.OY)
+    ..a<$core.List<$core.int>>(5, _omitFieldNames ? '' : 'signature', $pb.PbFieldType.OY)
+    ..hasRequiredFields = false
+  ;
+
+  @$core.Deprecated(
+  'Using this can add significant overhead to your binary. '
+  'Use [GeneratedMessageGenericExtensions.deepCopy] instead. '
+  'Will be removed in next major version')
+  RequestAuthorship clone() => RequestAuthorship()..mergeFromMessage(this);
+  @$core.Deprecated(
+  'Using this can add significant overhead to your binary. '
+  'Use [GeneratedMessageGenericExtensions.rebuild] instead. '
+  'Will be removed in next major version')
+  RequestAuthorship copyWith(void Function(RequestAuthorship) updates) => super.copyWith((message) => updates(message as RequestAuthorship)) as RequestAuthorship;
+
+  $pb.BuilderInfo get info_ => _i;
+
+  @$core.pragma('dart2js:noInline')
+  static RequestAuthorship create() => RequestAuthorship._();
+  RequestAuthorship createEmptyInstance() => create();
+  static $pb.PbList<RequestAuthorship> createRepeated() => $pb.PbList<RequestAuthorship>();
+  @$core.pragma('dart2js:noInline')
+  static RequestAuthorship getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<RequestAuthorship>(create);
+  static RequestAuthorship? _defaultInstance;
+
+  @$pb.TagNumber(1)
+  $core.List<$core.int> get requesterGroupKey => $_getN(0);
+  @$pb.TagNumber(1)
+  set requesterGroupKey($core.List<$core.int> v) { $_setBytes(0, v); }
+  @$pb.TagNumber(1)
+  $core.bool hasRequesterGroupKey() => $_has(0);
+  @$pb.TagNumber(1)
+  void clearRequesterGroupKey() => clearField(1);
+
+  @$pb.TagNumber(2)
+  $core.List<$core.int> get payerGroupKey => $_getN(1);
+  @$pb.TagNumber(2)
+  set payerGroupKey($core.List<$core.int> v) { $_setBytes(1, v); }
+  @$pb.TagNumber(2)
+  $core.bool hasPayerGroupKey() => $_has(1);
+  @$pb.TagNumber(2)
+  void clearPayerGroupKey() => clearField(2);
+
+  @$pb.TagNumber(3)
+  $fixnum.Int64 get notAfter => $_getI64(2);
+  @$pb.TagNumber(3)
+  set notAfter($fixnum.Int64 v) { $_setInt64(2, v); }
+  @$pb.TagNumber(3)
+  $core.bool hasNotAfter() => $_has(2);
+  @$pb.TagNumber(3)
+  void clearNotAfter() => clearField(3);
+
+  @$pb.TagNumber(4)
+  $core.List<$core.int> get nonce => $_getN(3);
+  @$pb.TagNumber(4)
+  set nonce($core.List<$core.int> v) { $_setBytes(3, v); }
+  @$pb.TagNumber(4)
+  $core.bool hasNonce() => $_has(3);
+  @$pb.TagNumber(4)
+  void clearNonce() => clearField(4);
 
   @$pb.TagNumber(5)
   $core.List<$core.int> get signature => $_getN(4);
@@ -1518,29 +1448,6 @@ class PaymentRequestCreateRequest extends $pb.GeneratedMessage {
   $core.bool hasSignature() => $_has(4);
   @$pb.TagNumber(5)
   void clearSignature() => clearField(5);
-
-  @$pb.TagNumber(6)
-  $fixnum.Int64 get timestampMs => $_getI64(5);
-  @$pb.TagNumber(6)
-  set timestampMs($fixnum.Int64 v) { $_setInt64(5, v); }
-  @$pb.TagNumber(6)
-  $core.bool hasTimestampMs() => $_has(5);
-  @$pb.TagNumber(6)
-  void clearTimestampMs() => clearField(6);
-
-  /// The ASP parameters the payee address is derived with. From the caller, because the caller is
-  /// the one talking to the ASP — and it cannot redirect the payment with them: the address is
-  /// derived from the ALLOWLISTED key, never a supplied one.
-  @$pb.TagNumber(7)
-  ArkInfo get arkInfo => $_getN(6);
-  @$pb.TagNumber(7)
-  set arkInfo(ArkInfo v) { setField(7, v); }
-  @$pb.TagNumber(7)
-  $core.bool hasArkInfo() => $_has(6);
-  @$pb.TagNumber(7)
-  void clearArkInfo() => clearField(7);
-  @$pb.TagNumber(7)
-  ArkInfo ensureArkInfo() => $_ensure(6);
 }
 
 class PaymentRequestCreateResponse extends $pb.GeneratedMessage {
@@ -1596,31 +1503,12 @@ class PaymentRequestCreateResponse extends $pb.GeneratedMessage {
 }
 
 class PaymentRequestListRequest extends $pb.GeneratedMessage {
-  factory PaymentRequestListRequest({
-    $core.List<$core.int>? userId,
-    $core.List<$core.int>? signature,
-    $fixnum.Int64? timestampMs,
-  }) {
-    final $result = create();
-    if (userId != null) {
-      $result.userId = userId;
-    }
-    if (signature != null) {
-      $result.signature = signature;
-    }
-    if (timestampMs != null) {
-      $result.timestampMs = timestampMs;
-    }
-    return $result;
-  }
+  factory PaymentRequestListRequest() => create();
   PaymentRequestListRequest._() : super();
   factory PaymentRequestListRequest.fromBuffer($core.List<$core.int> i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromBuffer(i, r);
   factory PaymentRequestListRequest.fromJson($core.String i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromJson(i, r);
 
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'PaymentRequestListRequest', package: const $pb.PackageName(_omitMessageNames ? '' : 'mpc_wallet'), createEmptyInstance: create)
-    ..a<$core.List<$core.int>>(1, _omitFieldNames ? '' : 'userId', $pb.PbFieldType.OY)
-    ..a<$core.List<$core.int>>(2, _omitFieldNames ? '' : 'signature', $pb.PbFieldType.OY)
-    ..aInt64(3, _omitFieldNames ? '' : 'timestampMs')
     ..hasRequiredFields = false
   ;
 
@@ -1644,33 +1532,6 @@ class PaymentRequestListRequest extends $pb.GeneratedMessage {
   @$core.pragma('dart2js:noInline')
   static PaymentRequestListRequest getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<PaymentRequestListRequest>(create);
   static PaymentRequestListRequest? _defaultInstance;
-
-  @$pb.TagNumber(1)
-  $core.List<$core.int> get userId => $_getN(0);
-  @$pb.TagNumber(1)
-  set userId($core.List<$core.int> v) { $_setBytes(0, v); }
-  @$pb.TagNumber(1)
-  $core.bool hasUserId() => $_has(0);
-  @$pb.TagNumber(1)
-  void clearUserId() => clearField(1);
-
-  @$pb.TagNumber(2)
-  $core.List<$core.int> get signature => $_getN(1);
-  @$pb.TagNumber(2)
-  set signature($core.List<$core.int> v) { $_setBytes(1, v); }
-  @$pb.TagNumber(2)
-  $core.bool hasSignature() => $_has(1);
-  @$pb.TagNumber(2)
-  void clearSignature() => clearField(2);
-
-  @$pb.TagNumber(3)
-  $fixnum.Int64 get timestampMs => $_getI64(2);
-  @$pb.TagNumber(3)
-  set timestampMs($fixnum.Int64 v) { $_setInt64(2, v); }
-  @$pb.TagNumber(3)
-  $core.bool hasTimestampMs() => $_has(2);
-  @$pb.TagNumber(3)
-  void clearTimestampMs() => clearField(3);
 }
 
 class PaymentRequestListResponse extends $pb.GeneratedMessage {
@@ -1719,23 +1580,11 @@ class PaymentRequestListResponse extends $pb.GeneratedMessage {
 
 class PaymentRequestDeclineRequest extends $pb.GeneratedMessage {
   factory PaymentRequestDeclineRequest({
-    $core.List<$core.int>? userId,
     $core.String? id,
-    $core.List<$core.int>? signature,
-    $fixnum.Int64? timestampMs,
   }) {
     final $result = create();
-    if (userId != null) {
-      $result.userId = userId;
-    }
     if (id != null) {
       $result.id = id;
-    }
-    if (signature != null) {
-      $result.signature = signature;
-    }
-    if (timestampMs != null) {
-      $result.timestampMs = timestampMs;
     }
     return $result;
   }
@@ -1744,10 +1593,7 @@ class PaymentRequestDeclineRequest extends $pb.GeneratedMessage {
   factory PaymentRequestDeclineRequest.fromJson($core.String i, [$pb.ExtensionRegistry r = $pb.ExtensionRegistry.EMPTY]) => create()..mergeFromJson(i, r);
 
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'PaymentRequestDeclineRequest', package: const $pb.PackageName(_omitMessageNames ? '' : 'mpc_wallet'), createEmptyInstance: create)
-    ..a<$core.List<$core.int>>(1, _omitFieldNames ? '' : 'userId', $pb.PbFieldType.OY)
     ..aOS(2, _omitFieldNames ? '' : 'id')
-    ..a<$core.List<$core.int>>(3, _omitFieldNames ? '' : 'signature', $pb.PbFieldType.OY)
-    ..aInt64(4, _omitFieldNames ? '' : 'timestampMs')
     ..hasRequiredFields = false
   ;
 
@@ -1772,41 +1618,14 @@ class PaymentRequestDeclineRequest extends $pb.GeneratedMessage {
   static PaymentRequestDeclineRequest getDefault() => _defaultInstance ??= $pb.GeneratedMessage.$_defaultFor<PaymentRequestDeclineRequest>(create);
   static PaymentRequestDeclineRequest? _defaultInstance;
 
-  @$pb.TagNumber(1)
-  $core.List<$core.int> get userId => $_getN(0);
-  @$pb.TagNumber(1)
-  set userId($core.List<$core.int> v) { $_setBytes(0, v); }
-  @$pb.TagNumber(1)
-  $core.bool hasUserId() => $_has(0);
-  @$pb.TagNumber(1)
-  void clearUserId() => clearField(1);
-
   @$pb.TagNumber(2)
-  $core.String get id => $_getSZ(1);
+  $core.String get id => $_getSZ(0);
   @$pb.TagNumber(2)
-  set id($core.String v) { $_setString(1, v); }
+  set id($core.String v) { $_setString(0, v); }
   @$pb.TagNumber(2)
-  $core.bool hasId() => $_has(1);
+  $core.bool hasId() => $_has(0);
   @$pb.TagNumber(2)
   void clearId() => clearField(2);
-
-  @$pb.TagNumber(3)
-  $core.List<$core.int> get signature => $_getN(2);
-  @$pb.TagNumber(3)
-  set signature($core.List<$core.int> v) { $_setBytes(2, v); }
-  @$pb.TagNumber(3)
-  $core.bool hasSignature() => $_has(2);
-  @$pb.TagNumber(3)
-  void clearSignature() => clearField(3);
-
-  @$pb.TagNumber(4)
-  $fixnum.Int64 get timestampMs => $_getI64(3);
-  @$pb.TagNumber(4)
-  set timestampMs($fixnum.Int64 v) { $_setInt64(3, v); }
-  @$pb.TagNumber(4)
-  $core.bool hasTimestampMs() => $_has(3);
-  @$pb.TagNumber(4)
-  void clearTimestampMs() => clearField(4);
 }
 
 class PaymentRequestDeclineResponse extends $pb.GeneratedMessage {

@@ -123,6 +123,13 @@ pub struct SnapshotState {
     /// pruned on every mutation (the whole snapshot is re-serialized on each change).
     #[serde(default)]
     pub payment_intents: Vec<PaymentIntent>,
+    /// Payment-request nonces this wallet has accepted, hex, each with the `not_after` it arrived
+    /// under. Sealed rather than held in memory because a replay does not have to wait for the same
+    /// instance: the runtime rebuilds instances freely, and a set that died with one would let the
+    /// next accept the same request again. Pruned once `not_after` passes — after that the request
+    /// is refused for being stale anyway, so remembering it buys nothing. `default` for older seals.
+    #[serde(default)]
+    pub seen_request_nonces: std::collections::BTreeMap<String, i64>,
 }
 
 // ===========================================================================
@@ -133,9 +140,6 @@ pub struct SnapshotState {
 /// SendVtxo phase 1 — build the Ark tx and get sighashes to sign.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendVtxoStep1 {
-    pub user_id: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub timestamp_ms: i64,
     pub recipient_ark_address: String,
     pub amount: u64,
     /// The current spendable VTXO set, supplied by the host from its persisted projection. The
@@ -146,18 +150,12 @@ pub struct SendVtxoStep1 {
 /// SendVtxo phase 2 — the client's FROST signatures over the phase-1 sighashes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendVtxoStep2 {
-    pub user_id: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub timestamp_ms: i64,
     pub signed_messages: Vec<Vec<u8>>,
 }
 
 /// Delegate phase 1 — build the pre-authorized intent + forfeit PSBTs and return sighashes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateDelegate {
-    pub user_id: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub timestamp_ms: i64,
     // VTXOs come from the guest's own store (SetVtxos); the settle output is a self-refresh
     // to the owner's own ark address, which the guest computes from GetInfo. Neither is on
     // the wire. Only the host-computed renewal deadline is passed in.
@@ -168,25 +166,16 @@ pub struct GenerateDelegate {
 /// Delegate phase 2 — the client's FROST signatures over the phase-1 sighashes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyDelegateSigs {
-    pub user_id: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub timestamp_ms: i64,
     pub signed_messages: Vec<Vec<u8>>,
 }
 
 /// FROST sign round-1 request (mirrors the gRPC `SignStep1Request` fields the guest needs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignStep1 {
-    /// The client's auth/verifying identity (compressed pubkey bytes); also the key the
-    /// auth signature is checked against.
-    pub user_id: Vec<u8>,
     pub hiding_commitment: Vec<u8>,
     pub binding_commitment: Vec<u8>,
     pub message_to_sign: Vec<u8>,
-    /// BIP-340 auth signature over the canonical auth message for this operation.
-    pub signature: Vec<u8>,
     pub full_transaction: Vec<u8>,
-    pub timestamp_ms: i64,
     /// True ⇒ raw FROST (no taproot tweak).
     pub script_path_spend: bool,
     /// Service spend THROUGH arkd — the second leg's `ark_tx` PSBT. When set (and the actor is a
@@ -198,10 +187,7 @@ pub struct SignStep1 {
 /// FROST sign round-2 request (mirrors the gRPC `SignStep2Request`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignStep2 {
-    pub user_id: Vec<u8>,
     pub signature_share: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub timestamp_ms: i64,
 }
 
 /// One participant's signing commitments, keyed by FROST identifier (hex).

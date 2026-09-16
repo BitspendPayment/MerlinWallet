@@ -2,13 +2,33 @@ syntax = "proto3";
 
 package mpc_wallet;
 
+// ---------------------------------------------------------------------------------------------------
+// Where `user_id`, `signature` and `timestamp_ms` went
+//
+// Every request used to carry them: a Schnorr signature by the wallet's share key over an op tag and a
+// timestamp, which the cosigner checked before doing anything. That was authentication, and it lived
+// in the guest because nothing in front of it did any.
+//
+// Something does now. enclave-runtime gates every request on a WebAuthn assertion bound to that exact
+// method and path, and a request reaches the guest only once that has verified — with the tenant it
+// resolved stamped on as `x-enclave-tenant`, a header it strips from anything a client sends. So the
+// cosigner requires that header and nothing more. The body signature was not merely redundant: a
+// passkey-gated wallet holds no plaintext share, so it could not produce one at all.
+//
+// The fields are reserved rather than reused, so a client still sending them fails to parse instead of
+// having its bytes read as something else. What remains that is a signature — the authorship proof on a
+// payment request — is a different claim, about who wrote a request rather than who is calling.
+// ---------------------------------------------------------------------------------------------------
+
 // The service lives in cosign_session.proto now: one `Cosigner`, with the ceremonies as
 // bidirectional streams and the handful of genuinely single-round calls alongside them. What is
 // left here is the message shapes those calls carry.
 // DKG Messages
 
 message DKGStep1Request {
-  bytes user_id = 1;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1;
+  reserved "user_id";
   bytes identifier = 2;
   string round1_package = 3; // JSON
   reserved 4; // was is_restore (recovery/restore removed)
@@ -19,7 +39,9 @@ message DKGStep1Response {
 }
 
 message DKGStep3Request {
-   bytes user_id = 1;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1;
+  reserved "user_id";
     bytes identifier = 2;
    map<string, string> round2_packages_for_others = 3;
 }
@@ -33,11 +55,11 @@ message DKGStep3Response {
 // Ark Protocol Messages
 
 message SendVtxoRequest {
-    bytes user_id = 1;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 4, 5;
+  reserved "user_id", "signature", "timestamp_ms";
     string recipient_ark_address = 2;
     uint64 amount = 3;
-    bytes signature = 4;
-    int64 timestamp_ms = 5;
     // FROST signatures for previously requested sighashes (phase 2)
     repeated bytes signed_messages = 6;
 }
@@ -89,30 +111,30 @@ message Contact {
 }
 
 message ContactAddRequest {
-  bytes user_id = 1;                 // the owner (its own actor)
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 4, 5;
+  reserved "user_id", "signature", "timestamp_ms";
   bytes contact_verifying_key = 2;
   string label = 3;
-  bytes signature = 4;
-  int64 timestamp_ms = 5;
 }
 message ContactAddResponse {
   bool ok = 1;
 }
 
 message ContactRemoveRequest {
-  bytes user_id = 1;                 // the owner
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 3, 4;
+  reserved "user_id", "signature", "timestamp_ms";
   bytes contact_verifying_key = 2;
-  bytes signature = 3;
-  int64 timestamp_ms = 4;
 }
 message ContactRemoveResponse {
   bool ok = 1;
 }
 
 message ContactListRequest {
-  bytes user_id = 1;                 // the owner
-  bytes signature = 2;
-  int64 timestamp_ms = 3;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
 }
 message ContactListResponse {
   repeated Contact contacts = 1;
@@ -150,35 +172,71 @@ message ArkInfo {
 }
 
 message PaymentRequestCreateRequest {
-  bytes user_id = 1;                 // the REQUESTER (signer) — not the payer
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 5, 6;
+  reserved "user_id", "signature", "timestamp_ms";
   uint64 amount_sats = 2;
   string memo = 3;
   int64 expires_in_secs = 4;         // 0 ⇒ cosigner default
-  bytes signature = 5;
-  int64 timestamp_ms = 6;
   // The ASP parameters the payee address is derived with. From the caller, because the caller is
   // the one talking to the ASP — and it cannot redirect the payment with them: the address is
   // derived from the ALLOWLISTED key, never a supplied one.
   ArkInfo ark_info = 7;
+  // Proof that the requester wrote this. Required.
+  RequestAuthorship authorship = 8;
+}
+
+// That a payment request was written by the wallet it names.
+//
+// The caller of `PaymentRequestCreate` is the PAYER, not the requester. The runtime resolves a tenant
+// from the caller's own token and strips any tenant header a client sends, so nobody can address
+// another wallet's cosigner — a request has to travel out of band, and the payer's own app submits it
+// to the payer's own cosigner. The runtime therefore authenticates the payer, which says nothing about
+// who asked. This does.
+//
+// It is a BIP-340 signature by the requester's GROUP key, which only the requester and the requester's
+// cosigner together can produce. That is the point of it being the group key: the old check took a
+// share key and resolved it to a group key through `policy_owner_idx`, an index DKG writes into each
+// wallet's own store — which worked only while every wallet shared one store, and would otherwise have
+// derived the payee address from a share key, an address the requester could not spend.
+//
+// The signature covers
+//
+// ```text
+// sha256( "merlin/payment-request/v1" ‖ payer_group_key ‖ requester_group_key
+//         ‖ amount_sats ‖ expires_in_secs ‖ not_after ‖ nonce ‖ sha256(memo) )
+// ```
+//
+// Fenced as text on purpose: prost copies these comments into the generated Rust as doc comments,
+// and an indented block there is compiled as a doctest.
+// with integers as 8-byte big-endian. The domain tag means it can never double as a transaction
+// sighash; the payer's key means a request to one wallet cannot be replayed to another; `not_after` and
+// the nonce mean it cannot be replayed to the same wallet later.
+message RequestAuthorship {
+  bytes requester_group_key = 1;     // 33-byte compressed — must be an allowlisted contact
+  bytes payer_group_key = 2;         // 33-byte compressed — must be the receiving wallet's own
+  int64 not_after = 3;               // unix seconds; refused after this, and at most a day ahead
+  bytes nonce = 4;                   // 16 random bytes; refused if this wallet has seen it
+  bytes signature = 5;               // 64-byte BIP-340 over the digest above
 }
 message PaymentRequestCreateResponse {
   PaymentIntent intent = 1;
 }
 
 message PaymentRequestListRequest {
-  bytes user_id = 1;                 // the payer (its own actor)
-  bytes signature = 2;
-  int64 timestamp_ms = 3;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
 }
 message PaymentRequestListResponse {
   repeated PaymentIntent intents = 1;
 }
 
 message PaymentRequestDeclineRequest {
-  bytes user_id = 1;                 // the payer
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 3, 4;
+  reserved "user_id", "signature", "timestamp_ms";
   string id = 2;
-  bytes signature = 3;
-  int64 timestamp_ms = 4;
 }
 message PaymentRequestDeclineResponse {
   bool ok = 1;

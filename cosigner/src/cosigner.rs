@@ -86,6 +86,22 @@ pub struct Ceremony {
     full_transaction: Vec<u8>,
 }
 
+/// A FROST round the cosigner is halfway through, for every sighash in one batch.
+///
+/// Held by the `Send` or `Settle` handler across a single round trip, and consumed by
+/// [`Cosigner::sign_in_band_finish`]. Deliberately opaque and not `Clone`: each entry owns a
+/// single-use nonce, and a copy is a second use waiting to happen.
+pub struct InBandRound {
+    ceremonies: Vec<Ceremony>,
+}
+
+/// The wallet's half of one message's round: its commitment, and its share over both commitments.
+pub struct WalletHalf {
+    pub hiding: Vec<u8>,
+    pub binding: Vec<u8>,
+    pub share: Vec<u8>,
+}
+
 pub struct Cosigner {
     policy: Option<Policy>,
     /// A `ReadyToSettle` delegate session the core can drive autonomously (auto-settle).
@@ -103,6 +119,8 @@ pub struct Cosigner {
     contacts: Vec<Contact>,
     /// Request-to-pay records held for the payer (bounded; see `prune_intents`).
     payment_intents: Vec<PaymentIntent>,
+    /// See `SnapshotState::seen_request_nonces`.
+    pub(crate) seen_request_nonces: BTreeMap<String, i64>,
     /// Global services (contract gate + ASP url). Held so `command()` is a drop-in for the old
     /// `GuestInstance::command` — no per-call-site `store` threading.
     pub(crate) store: Arc<Store>,
@@ -179,6 +197,7 @@ impl Cosigner {
             ark_cosigner_secret_hex: None,
             contacts: Vec::new(),
             payment_intents: Vec::new(),
+            seen_request_nonces: BTreeMap::new(),
             store,
             host,
             group_key,
@@ -208,6 +227,7 @@ impl Cosigner {
                 .and_then(|p| serde_json::to_string(&p).ok()),
             contacts: self.contacts.clone(),
             payment_intents: self.payment_intents.clone(),
+            seen_request_nonces: self.seen_request_nonces.clone(),
         };
         serde_json::to_vec(&snap).map_err(|e| format!("snapshot serialize: {e}"))
     }
@@ -234,6 +254,7 @@ impl Cosigner {
         self.owned_vtxos = snap.vtxos;
         self.contacts = snap.contacts;
         self.payment_intents = snap.payment_intents;
+        self.seen_request_nonces = snap.seen_request_nonces;
         // Restore a pending ReadyToSettle delegate (needs the cosigner secret to re-derive its kp).
         self.delegate_session = match (snap.delegate_json, self.ark_secret()) {
             (Some(dj), Some(secret)) => {
@@ -363,11 +384,18 @@ impl Cosigner {
         let SendVtxoSubmitted { ark_txid, change } = submitted;
         let resp = crate::handlers::ark_send::apply_send_result(
             &mut self.owned_vtxos,
-            &self.store.as_ref(),
-            req,
             ark_txid.clone(),
             change,
         );
+        // The send spent what the sealed delegate was signed over, so it can never settle now.
+        //
+        // This used to be attempted in `apply_send_result` by deleting `delegate_sessions` and
+        // `guest_delegate_thresholds` rows keyed by the caller's id — two store trees nothing has
+        // written since the delegate moved into the seal. The deletes did nothing, and the real
+        // delegate outlived every send: still sealed, still over spent inputs, and still what the
+        // settle watch would wake the owner about. Dropping it here makes the watch find nothing on
+        // its next run and cancel itself, which is the path that already existed for exactly this.
+        self.delegate_session = None;
         if let Some(id) =
             self.fulfil_matching_intent(&req.recipient_ark_address, req.amount, &ark_txid)
         {
@@ -646,45 +674,32 @@ impl Cosigner {
 
 
 
-    /// Whether `user_id` (a compressed pubkey, hex) may drive a signing ceremony on this actor.
-    fn is_authorized_signer(&self, user_id: &[u8]) -> bool {
-        let Some(policy) = self.policy.as_ref() else {
-            return false;
-        };
-        let pkp = &policy.public_key_package;
-        pkp.verifying_shares
-            .values()
-            .any(|share| point::serialize_compressed(share) == user_id)
-            || point::serialize_compressed(&pkp.verifying_key.point) == user_id
+    /// This wallet's group key, hex, once it has one.
+    pub(crate) fn policy_group_key(&self) -> Option<String> {
+        self.policy.as_ref().map(|p| p.group_key.clone())
     }
 
-    /// Reject a caller that authenticated as some OTHER wallet.
+    /// Refuse a second DKG over a wallet that already has a key.
     ///
-    /// The REST boundary proves the caller holds the key it named in its own
-    /// body, but the URL selects which actor runs — so without this an attacker
-    /// signs as their own wallet A and operates on victim B. That is a real hole
-    /// for the owner-only routes: adding yourself to B's contact allowlist is
-    /// enough to bill B, since the allowlist is the only gate on
-    /// `payment-request/create`.
+    /// `install_policy` overwrites unconditionally, so without this a second ceremony on the same
+    /// tenant silently replaces the wallet's key — and everything held under the old one becomes
+    /// unspendable, because 2-of-2 has no other way back. The e2e suite did exactly that, repeatedly,
+    /// and only got away with it because nothing was funded in between.
     ///
-    /// `PAYREQ_CREATE` is the deliberate exception — it is signed by the
-    /// requester and routed to the payer's actor on purpose.
-    pub(crate) fn require_owner(&self, user_id: &[u8]) -> Result<(), Status> {
-        if self.is_authorized_signer(user_id) {
-            return Ok(());
+    /// It used to take a stranger to trigger it, since DKG was the one stream with no check at all.
+    /// Now the runtime authenticates it, so the risk is the owner's own app — a re-run onboarding, a
+    /// wiped local store — which is exactly the case where a refusal beats a quiet success.
+    pub fn refuse_if_onboarded(&self) -> Result<(), Status> {
+        if self.policy.is_some() {
+            return Err(Status::failed_precondition(
+                "this wallet already has a key; a second DKG would replace it and strand its funds",
+            ));
         }
-        Err(Status::permission_denied(
-            "authenticated key does not belong to this wallet",
-        ))
+        Ok(())
     }
 
     /// Open a ceremony and hand it back. Nothing about it is stored here.
     pub fn sign_open(&mut self, req: SignStep1) -> Result<(Ceremony, SignStep1Out), String> {
-        // Authentication (OP_SIGN_STEP1) ran at the REST boundary; AUTHORIZATION is ours. Reject
-        // before touching `self.ceremony`, or a stranger's rejected call still wipes a live one.
-        if !self.is_authorized_signer(&req.user_id) {
-            return Err("signer is not authorized for this wallet".into());
-        }
         let policy = self.policy.as_ref().ok_or("no policy installed")?;
         let user_identifier = policy
             .user_signing_identifier
@@ -740,11 +755,6 @@ impl Cosigner {
         ceremony: Ceremony,
         req: SignStep2,
     ) -> Result<SignStep2Out, String> {
-        // Same gate as step 1: step 2 consumes the single-use nonce, so an unauthorized caller
-        // could otherwise burn it and strand the real signer.
-        if !self.is_authorized_signer(&req.user_id) {
-            return Err("signer is not authorized for this wallet".into());
-        }
         let mut ceremony = ceremony;
         // NOTHING IS CHECKED HERE. The contract gate that stood in this spot was the only thing
         // between an authorized caller and a signature over arbitrary bytes, and the WASM contract
@@ -808,6 +818,148 @@ impl Cosigner {
         Ok(SignStep2Out { r_point, z_scalar })
     }
 
+
+    // -------------------------------------------------------------------------------------------
+    // In-band signing: FROST carried inside the Send and Settle streams
+    // -------------------------------------------------------------------------------------------
+    //
+    // A send and a settle both stop for the wallet to sign sighashes the cosigner built. They used
+    // to do it by opening a *second* stream — a nested `Sign` per sighash, while the outer stream
+    // sat parked waiting for the result. That worked against a native server running many streams
+    // at once, and cannot work inside enclave-runtime, which runs **one request per tenant for the
+    // whole life of a stream**: the outer stream holds the tenant, the nested one waits for it, and
+    // nothing moves until the interaction deadline kills both. That was measured, not inferred — a
+    // second call blocks on a separate TCP connection just the same, so a second channel does not
+    // help either.
+    //
+    // So the round rides the stream it belongs to, and it gets cheaper for it. The nested form cost
+    // two round trips per signature; this is one round trip for the whole batch, because the order
+    // FROST needs is "both commitments before either share", not "the wallet commits first":
+    //
+    //   cosigner → sighashes + its commitment for each
+    //   wallet   → its commitment + its share for each      (it has both commitments by now)
+    //   cosigner → computes its shares, aggregates, carries on
+    //
+    // What the wallet gives up is seeing the finished signature, which it used to verify. That was
+    // never the protection it looked like: a share is bound to one message and one pair of
+    // commitments, so the cosigner cannot aggregate it over anything else — it would simply not
+    // verify. And `aggregate` checks every share against its verifying share before summing, so a
+    // bad wallet share is refused here rather than by the ASP.
+    //
+    // **Script-path only, by construction.** The taproot key-path tweak is compensated entirely on
+    // the wallet's share, and the cosigner signs untweaked; a tweaked share would fail the share
+    // check in `aggregate`. The cosigner only ever offers script-path sighashes on these streams,
+    // so that is the right trade — but it is a property, not an accident.
+
+    /// Round one, the cosigner's half: a fresh nonce for each message, and the commitment to it.
+    ///
+    /// The nonces stay in the returned [`InBandRound`], which the handler holds across the one round
+    /// trip and hands back to [`Self::sign_in_band_finish`]. They are never persisted and never
+    /// leave the handler's stack, so an interrupted round leaves nothing reusable behind.
+    pub fn sign_in_band_begin(
+        &self,
+        messages: &[Vec<u8>],
+    ) -> Result<(InBandRound, Vec<Commitment>), String> {
+        let policy = self.policy.as_ref().ok_or("no policy installed")?;
+        let server_identifier = policy.key_package.identifier.clone();
+        let identifier_hex = hex::encode(server_identifier.serialize());
+
+        let mut rng = OsRng;
+        let mut ceremonies = Vec::with_capacity(messages.len());
+        let mut commitments = Vec::with_capacity(messages.len());
+        for message in messages {
+            let nonce = nonce::new_nonce(&mut rng, &policy.key_package.secret_share);
+            commitments.push(Commitment {
+                identifier_hex: identifier_hex.clone(),
+                hiding: point::serialize_compressed(&nonce.commitments.hiding).to_vec(),
+                binding: point::serialize_compressed(&nonce.commitments.binding).to_vec(),
+            });
+            let mut ceremony = Ceremony {
+                message: message.clone(),
+                ..Default::default()
+            };
+            ceremony
+                .commitments
+                .insert(server_identifier.clone(), nonce.commitments.clone());
+            ceremony.nonce = Some(nonce);
+            ceremonies.push(ceremony);
+        }
+        Ok((InBandRound { ceremonies }, commitments))
+    }
+
+    /// Round two: the wallet's commitment and share for each message in, BIP-340 signatures out.
+    ///
+    /// [`WalletHalf`]s must be in the order the messages were — index `i` is a statement about
+    /// message `i`, and nothing else ties them together. A count mismatch is refused outright,
+    /// because a batch that is one short would otherwise sign every message against its
+    /// neighbour's commitment and fail with an error that names the wrong one.
+    ///
+    /// Takes the round by value: every entry owns a single-use nonce.
+    pub fn sign_in_band_finish(
+        &self,
+        round: InBandRound,
+        wallet: Vec<WalletHalf>,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        if wallet.len() != round.ceremonies.len() {
+            return Err(format!(
+                "the wallet answered {} of {} messages",
+                wallet.len(),
+                round.ceremonies.len()
+            ));
+        }
+        let policy = self.policy.as_ref().ok_or("no policy installed")?;
+        let user_identifier = policy
+            .user_signing_identifier
+            .clone()
+            .ok_or("policy has no user_signing_identifier")?;
+        let server_identifier = policy.key_package.identifier.clone();
+
+        round
+            .ceremonies
+            .into_iter()
+            .zip(wallet)
+            .enumerate()
+            .map(|(i, (mut ceremony, half))| {
+                let at = |e: String| format!("message {i}: {e}");
+
+                ceremony.commitments.insert(
+                    user_identifier.clone(),
+                    commitments_from_bytes(&half.hiding, &half.binding).map_err(at)?,
+                );
+                let share_bytes: [u8; 32] = half
+                    .share
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| at("the wallet's share must be 32 bytes".into()))?;
+                let user_share = scalar_from_bytes(&share_bytes)
+                    .map_err(|e| at(format!("bad share scalar: {e}")))?;
+                ceremony
+                    .shares
+                    .insert(user_identifier.clone(), SignatureShare { s: user_share });
+
+                // Both commitments are in, so the binding factors are final and the cosigner's
+                // share can be computed. Doing this any earlier would sign under a package missing
+                // the wallet's commitment — valid-looking, and wrong.
+                let package =
+                    SigningPackage::new(ceremony.commitments.clone(), ceremony.message.clone());
+                let nonce = ceremony
+                    .nonce
+                    .take()
+                    .ok_or_else(|| at("the nonce was already spent".into()))?;
+                let server_share = signing::sign(&package, &nonce, &policy.key_package)
+                    .map_err(|e| at(format!("frost sign: {e}")))?;
+                ceremony.shares.insert(server_identifier.clone(), server_share);
+
+                // `aggregate` verifies each share against its verifying share before summing, so a
+                // wallet share that does not belong to this message and these commitments stops
+                // here, with the index attached, instead of at the ASP with nothing to say.
+                let signature =
+                    signing::aggregate(&package, &ceremony.shares, &policy.public_key_package)
+                        .map_err(|e| at(format!("frost aggregate: {e}")))?;
+                Ok(signature.serialize().to_vec())
+            })
+            .collect()
+    }
 
     /// Boarding settle START: derive the owner key (from the installed policy), the ASP info, and
     /// the boarding address ourselves, then build the session from the wallet-scanned `boarding_utxo`
@@ -902,9 +1054,6 @@ impl Cosigner {
         info: &ArkInfo,
     ) -> Result<Vec<Vec<u8>>, String> {
         let req = GenerateDelegate {
-            user_id: Vec::new(),
-            signature: Vec::new(),
-            timestamp_ms: 0,
             intent_valid_at: self.prepare_delegate().map(|(_, v)| v).unwrap_or(None),
         };
         let (owner_pk_hex, cosigner_secret_hex, vtxos) = {

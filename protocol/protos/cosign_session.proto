@@ -16,6 +16,24 @@ import "mpc_wallet.proto";
 
 package cosigner.v1;
 
+// ---------------------------------------------------------------------------------------------------
+// Where `user_id`, `signature` and `timestamp_ms` went
+//
+// Every request used to carry them: a Schnorr signature by the wallet's share key over an op tag and a
+// timestamp, which the cosigner checked before doing anything. That was authentication, and it lived
+// in the guest because nothing in front of it did any.
+//
+// Something does now. enclave-runtime gates every request on a WebAuthn assertion bound to that exact
+// method and path, and a request reaches the guest only once that has verified — with the tenant it
+// resolved stamped on as `x-enclave-tenant`, a header it strips from anything a client sends. So the
+// cosigner requires that header and nothing more. The body signature was not merely redundant: a
+// passkey-gated wallet holds no plaintext share, so it could not produce one at all.
+//
+// The fields are reserved rather than reused, so a client still sending them fails to parse instead of
+// having its bytes read as something else. What remains that is a signature — the authorship proof on a
+// payment request — is a different claim, about who wrote a request rather than who is calling.
+// ---------------------------------------------------------------------------------------------------
+
 service Cosigner {
   // Both directions open at once: the server answers each round as it arrives.
   rpc Sign(stream SignClientMsg) returns (stream SignServerMsg);
@@ -80,25 +98,25 @@ service Cosigner {
 
 // 32-512 characters of [A-Za-z0-9_:.-], as `notify.wit` specifies.
 message RegisterDeviceRequest {
-  bytes user_id = 1;
-  bytes signature = 2;
-  int64 timestamp_ms = 3;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
   string token = 4;
 }
 message RegisterDeviceResponse {}
 
 message ForgetDeviceRequest {
-  bytes user_id = 1;
-  bytes signature = 2;
-  int64 timestamp_ms = 3;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
   string token = 4;
 }
 message ForgetDeviceResponse {}
 
 message DeviceCountRequest {
-  bytes user_id = 1;
-  bytes signature = 2;
-  int64 timestamp_ms = 3;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
 }
 // How many devices are enrolled. Never which.
 message DeviceCountResponse {
@@ -124,9 +142,9 @@ message SettleClientMsg {
 // cosigner still derives every output from ITS OWN key, so a wrong `signer_pubkey` cannot redirect
 // funds, only waste a round.
 message SettleOpen {
-  bytes user_id = 1;
-  bytes signature = 2;
-  int64 timestamp_ms = 3;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
   BoardingUtxo boarding_utxo = 4;
   mpc_wallet.ArkInfo ark_info = 5;
   // The set to refresh, when `boarding_utxo` is absent. Ignored for a boarding settle.
@@ -155,7 +173,19 @@ message VtxoInput {
 }
 
 message SettleSigned {
-  repeated bytes signed_messages = 1;
+  // The wallet's half of each message's FROST round, in the order the sighashes arrived.
+  //
+  // This used to be `signed_messages` — finished 64-byte signatures the wallet produced by opening
+  // a nested `Sign` stream per sighash while this stream waited. That deadlocks inside
+  // enclave-runtime, which runs one request per tenant for the whole life of a stream: this stream
+  // holds the tenant, the nested one waits for it, and nothing moves until the interaction deadline
+  // kills both. So the round rides here instead, and the cosigner aggregates.
+  //
+  // Reserved rather than reused: a client still sending finished signatures in field 1 must fail
+  // to parse, not have its bytes read as something else.
+  reserved 1;
+  reserved "signed_messages";
+  repeated WalletRound rounds = 2;
 }
 
 // The id the ASP returned for `RegisterIntent`. The cosigner needs it to tell its own batch from
@@ -184,6 +214,14 @@ message SettleServerMsg {
 message SettleSighashes {
   repeated bytes messages_to_sign = 1;
   bool script_path_spend = 2;
+  // In-band FROST, round one: the cosigner's commitment for each message, in the same order.
+  //
+  // It commits first so the whole batch costs one round trip. FROST needs both commitments before
+  // either share, not the wallet's before the cosigner's — so the wallet, holding these, can commit
+  // and compute its share in the same step.
+  repeated Commitment cosigner_commitments = 3;
+  // Whose commitments those are: the FROST identifier the aggregate keys them under, hex.
+  string cosigner_identifier = 4;
 }
 
 // What the caller must send the ASP as `RegisterIntent`, followed by `GetEventStream(topics)`.
@@ -255,9 +293,9 @@ message SendFinalized {}
 // Opens the send. The VTXOs to spend are not listed: the cosigner selects them from the set it
 // already holds, so a caller cannot nominate inputs it does not own.
 message SendOpen {
-  bytes user_id = 1;
-  bytes signature = 2;
-  int64 timestamp_ms = 3;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
   string recipient_ark_address = 4;
   uint64 amount = 5;
   mpc_wallet.ArkInfo ark_info = 6;
@@ -267,7 +305,19 @@ message SendOpen {
 }
 
 message SendSigned {
-  repeated bytes signed_messages = 1;
+  // The wallet's half of each message's FROST round, in the order the sighashes arrived.
+  //
+  // This used to be `signed_messages` — finished 64-byte signatures the wallet produced by opening
+  // a nested `Sign` stream per sighash while this stream waited. That deadlocks inside
+  // enclave-runtime, which runs one request per tenant for the whole life of a stream: this stream
+  // holds the tenant, the nested one waits for it, and nothing moves until the interaction deadline
+  // kills both. So the round rides here instead, and the cosigner aggregates.
+  //
+  // Reserved rather than reused: a client still sending finished signatures in field 1 must fail
+  // to parse, not have its bytes read as something else.
+  reserved 1;
+  reserved "signed_messages";
+  repeated WalletRound rounds = 2;
 }
 
 message SendServerMsg {
@@ -296,6 +346,14 @@ message SendFinalize {
 message SendSighashes {
   repeated bytes messages_to_sign = 1;
   bool script_path_spend = 2;
+  // In-band FROST, round one: the cosigner's commitment for each message, in the same order.
+  //
+  // It commits first so the whole batch costs one round trip. FROST needs both commitments before
+  // either share, not the wallet's before the cosigner's — so the wallet, holding these, can commit
+  // and compute its share in the same step.
+  repeated Commitment cosigner_commitments = 3;
+  // Whose commitments those are: the FROST identifier the aggregate keys them under, hex.
+  string cosigner_identifier = 4;
 }
 
 message SendComplete {
@@ -333,9 +391,9 @@ message SignClientMsg {
 // and is never checked reads as a guarantee it does not provide. Per-message approval needs a host
 // function that does not exist yet — see enclave-runtime docs/STREAMING.md.
 message SignOpen {
-  bytes user_id = 1;
-  bytes signature = 2;
-  int64 timestamp_ms = 3;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
   bytes hiding_commitment = 4;
   bytes binding_commitment = 5;
   bytes message_to_sign = 6;
@@ -361,6 +419,15 @@ message SignServerMsg {
 message Commitment {
   bytes hiding = 1;
   bytes binding = 2;
+}
+
+// One message's worth of the wallet's side of an in-band FROST round: its commitment, and its
+// share computed over both its own commitment and the cosigner's.
+message WalletRound {
+  bytes hiding = 1;
+  bytes binding = 2;
+  // 32 bytes, big-endian.
+  bytes share = 3;
 }
 
 message SignCommitments {
@@ -391,9 +458,9 @@ message DkgClientMsg {
 // Opens the session and authenticates it once, for the whole ceremony, carrying the wallet's
 // round-1 package.
 message DkgOpen {
-  bytes user_id = 1;
-  bytes signature = 2;
-  int64 timestamp_ms = 3;
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
   bytes identifier = 4;
   string round1_package = 5; // JSON
 }

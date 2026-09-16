@@ -32,7 +32,6 @@ use threshold::random;
 use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};
 
 use crate::handlers::parsers;
-use crate::store::Store;
 use crate::wallet_proto::{DkgStep1Request, DkgStep1Response, DkgStep3Request, DkgStep3Response};
 
 /// Freshly-minted DKG key material, captured when round 3 finalizes so the caller can install it
@@ -47,7 +46,6 @@ pub struct SeedMaterial {
 }
 
 pub struct OnboardingSession {
-    pub user_id_hex: String,
     pub rounds: CeremonyRounds,
     /// Server's Onboarding secret (hex 32-byte scalar), persisted to the policy at finalize.
     pub server_internal_secret_hex: String,
@@ -56,9 +54,8 @@ pub struct OnboardingSession {
 }
 
 impl OnboardingSession {
-    pub fn new(user_id_hex: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            user_id_hex,
             rounds: CeremonyRounds::default(),
             server_internal_secret_hex: String::new(),
             seed_material: None,
@@ -196,14 +193,13 @@ fn req_identifier(bytes: &[u8]) -> Result<Identifier, Status> {
     parse_identifier_hex(&hex::encode(bytes))
 }
 
-#[tracing::instrument(skip_all, name = "dkg::open", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
+#[tracing::instrument(skip_all, name = "dkg::open")]
 pub fn dkg_open(
     sess: &mut OnboardingSession,
     req: DkgStep1Request,
 ) -> Result<DkgStep1Response, Status> {
-    let user_id_hex = parsers::user_id_hex(&req.user_id);
     tracing::info!(
-        "[{user_id_hex}] DKG open from {}",
+        "DKG open from {}",
         hex::encode(&req.identifier)
     );
 
@@ -215,7 +211,7 @@ pub fn dkg_open(
             }
     };
     if req.round1_package.is_empty() {
-        tracing::info!("[{user_id_hex}] DKG: registered passive receiver");
+        tracing::info!("DKG: registered passive receiver");
         sess.rounds.receiver_identifiers.insert(id);
     } else {
         match round1_pkg_from_json(&req.round1_package) {
@@ -230,7 +226,7 @@ pub fn dkg_open(
 
     // Server self-init (first caller only): deal our own round1 package.
     if sess.rounds.round1_secret.is_none() {
-        tracing::info!("[{user_id_hex}] Server: generating onboarding secrets");
+        tracing::info!("Server: generating onboarding secrets");
         let secret_hex = hex::encode(scalar_to_bytes(&random::mod_n_random(&mut OsRng)));
         let mut rng = OsRng;
         let mut seed = [0u8; 32];
@@ -275,13 +271,13 @@ pub fn dkg_open(
 /// This was `DKGStep2`, a whole round of its own — and it returned the round-1 packages the
 /// previous call had already returned. The round existed to give the unary API somewhere to
 /// trigger this computation from; in a session the cosigner simply does it when it needs it.
-fn compute_local_round2(sess: &mut OnboardingSession, user_id_hex: &str) -> Result<(), Status> {
+fn compute_local_round2(sess: &mut OnboardingSession) -> Result<(), Status> {
     if sess.rounds.round1_secret.is_none() {
         return Err(Status::internal("no onboarding session"));
     }
 
     if sess.rounds.is_round2_local_empty() {
-        tracing::info!("[{user_id_hex}] DKG: computing round 2");
+        tracing::info!("DKG: computing round 2");
         let Some(server_id) = sess.rounds.server_id.clone() else {
             return Err(Status::internal("server ID not initialized"));
             };
@@ -303,14 +299,12 @@ fn compute_local_round2(sess: &mut OnboardingSession, user_id_hex: &str) -> Resu
     Ok(())
 }
 
-#[tracing::instrument(skip_all, name = "dkg::finish", fields(user_id = %parsers::user_id_hex(&req.user_id)))]
+#[tracing::instrument(skip_all, name = "dkg::finish")]
 pub fn dkg_finish(
     sess: &mut OnboardingSession,
-    store: &Store,
     req: DkgStep3Request,
 ) -> Result<DkgStep3Response, Status> {
-    let user_id_hex = parsers::user_id_hex(&req.user_id);
-    compute_local_round2(sess, &user_id_hex)?;
+    compute_local_round2(sess)?;
     let sender_id = match req_identifier(&req.identifier) {
         Ok(id) => id,
         Err(e) => {
@@ -318,7 +312,7 @@ pub fn dkg_finish(
             }
     };
     tracing::info!(
-        "[{user_id_hex}] DKG finish from {}",
+        "DKG finish from {}",
         hex::encode(&req.identifier)
     );
 
@@ -349,7 +343,7 @@ pub fn dkg_finish(
 
     // Finalize: derive the group key V, persist the policy + the member→group index.
     let finalized = (|| -> Result<(), Status> {
-        tracing::info!("[{user_id_hex}] DKG: computing KeyPackage");
+        tracing::info!("DKG: computing KeyPackage");
 
         // 2-of-2 {wallet, cosigner}: the wallet is the only non-server dealer.
         let wallet_id = sess
@@ -390,10 +384,6 @@ pub fn dkg_finish(
         let kp_json = kp.to_json();
         let pkp_json = pkp.to_json();
 
-        // `policy_user_id` = the wallet's VERIFYING SHARE — the id the client uses for ALL
-        // post-DKG requests (`_userId = compressed(verifyingShare)`). The DKG-time `user_id_hex`
-        // is a temp id that's never used again, so the routing index keys on THIS, not that.
-        let policy_user_id = parsers::extract_verifying_share(&pkp_json, &wallet_identifier_hex)?;
         let group_key = parsers::extract_verifying_key(&pkp_json)?;
 
         let user_signing_identifier_hex = Some(wallet_identifier_hex);
@@ -407,14 +397,7 @@ pub fn dkg_finish(
             server_dkg_secret_hex,
         });
 
-        store
-            
-            .put("policy_owner_idx", &policy_user_id, &group_key)
-            .map_err(|e| {
-                tracing::error!("persist policy_owner_idx/{policy_user_id} failed: {e}");
-                Status::internal(format!("persist policy_owner_idx failed: {e}"))
-            })?;
-        tracing::info!("[{user_id_hex}] Onboarding complete; cosigner_id (group key)={group_key}");
+        tracing::info!("Onboarding complete; cosigner_id (group key)={group_key}");
         Ok(())
     })();
     finalized?;
