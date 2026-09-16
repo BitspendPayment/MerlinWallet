@@ -1,9 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show PlatformException;
+import 'package:convert/convert.dart' show hex;
+import 'package:fixnum/fixnum.dart';
 import 'package:hive/hive.dart';
+import 'package:protobuf/protobuf.dart' show GeneratedMessageGenericExtensions;
 import 'package:path_provider/path_provider.dart';
 // `ArkInfo` also exists as a proto message; the ASP's value type is the one meant here.
 import 'package:protocol/protocol.dart' hide ArkInfo;
@@ -202,7 +206,7 @@ class MpcService extends ChangeNotifier {
       }
 
       // Migrate from the old client-side network selection: the wallet
-      // network now comes from the server via `getServerInfo()`, so any
+      // network now comes from the ASP (see `_bitcoinNetwork`), so any
       // persisted 'network' key from prior versions is dead weight.
       // No-op if the key isn't present.
       await _identityBox!.delete('network');
@@ -217,14 +221,10 @@ class MpcService extends ChangeNotifier {
       _offlineModeForced =
           _identityBox!.get('offlineMode', defaultValue: false) as bool;
 
-      // What the cosigner's sealed delegate already covers. Restoring this is
-      // the whole point of persisting it: without it a cold start reads as "no
-      // delegate" and settles again — a real ASP batch round, minutes long and
-      // a biometric prompt, for a delegate that is already signed and sealed.
-      final delegated = _identityBox!.get('delegatedOutpoints');
-      if (delegated is List) {
-        _delegatedOutpoints = delegated.cast<String>().toSet();
-      }
+      // Replaced by the watch the client persists with its own state.
+      await _identityBox!.delete('delegatedOutpoints');
+
+      _loadLocalLists();
 
       _isInitialized = true;
     } catch (e) {
@@ -246,48 +246,50 @@ class MpcService extends ChangeNotifier {
     super.dispose();
   }
 
-  /// Fetch deployment metadata from the cosigner with bounded
-  /// retry. Address rendering depends on `bitcoinNetwork`, so we refuse
-  /// to proceed without a non-empty value — silently defaulting was the
-  /// regression that the empty-string check guards against.
-  Future<GetServerInfoResponse> _fetchServerInfoWithRetry() async {
+  /// The Bitcoin network, from the ASP — never the cosigner.
+  ///
+  /// It used to be `GetServerInfo`, which is a cosigner call, and every cosigner call is a passkey
+  /// approval: asking on every cold start meant a fingerprint before the wallet could even show a
+  /// balance. The ASP answers the same question without one, and its answer is the one that matters
+  /// anyway — addresses have to match what the ASP validates, and the cosigner refuses to sign for a
+  /// network that is not its own. Cached, so a cold start does not ask at all.
+  ///
+  /// Refuses to proceed without a value: address rendering depends on it, and silently defaulting
+  /// was the regression the empty check guards against.
+  Future<String> _bitcoinNetwork() async {
+    final cached = _identityBox!.get('bitcoinNetwork') as String?;
+    if (cached != null && cached.isNotEmpty) return cached;
     Object? lastError;
     for (int attempt = 1; attempt <= 3; attempt++) {
       try {
-        final info = await _client!.getServerInfo();
-        if (info.bitcoinNetwork.isEmpty) {
-          throw StateError(
-              "Server returned empty bitcoin_network; refusing to construct "
-              "wallet without a known HRP source");
+        final network = (await _client!.getArkInfo()).network;
+        if (network.isEmpty) {
+          throw StateError('the ASP reported no network; refusing to build a wallet without one');
         }
-        return info;
+        await _identityBox!.put('bitcoinNetwork', network);
+        return network;
       } catch (e) {
         lastError = e;
-        debugPrint(
-            "getServerInfo attempt $attempt/3 failed: $e; "
-            "${attempt < 3 ? 'retrying in ${attempt}s' : 'giving up'}");
-        if (attempt < 3) {
-          await Future.delayed(Duration(seconds: attempt));
-        }
+        debugPrint("ASP getInfo attempt $attempt/3 failed: $e");
+        if (attempt < 3) await Future.delayed(Duration(seconds: attempt));
       }
     }
-    throw StateError(
-        "Cosigner unreachable: getServerInfo failed after 3 attempts. "
-        "Last error: $lastError. Check that the server is running and "
-        "reachable at $_host.");
+    throw StateError("ASP unreachable: getInfo failed after 3 attempts. Last error: $lastError. "
+        "Check that it is running and reachable from $_host.");
   }
 
-  /// Set the server endpoint. The Bitcoin network is no longer carried in
-  /// app state — it's fetched from the server via `getServerInfo()` at the
-  /// moment the wallet is constructed (see `restoreSession`/`doDkg`).
+  /// Set the server endpoint. The Bitcoin network comes from that host's ASP when the wallet is
+  /// constructed — see [_bitcoinNetwork].
   Future<void> setHost(String host) async {
     if (_host == host && _isInitialized) return;
 
     debugPrint("MPC Service: Switching host to $host");
     _host = host;
 
-    // Pins belong to a host. Whatever was fetched for the last one says nothing about this one.
+    // Pins and the network belong to a host. Whatever was learned for the last one says nothing
+    // about this one.
     _remotePins = null;
+    await _identityBox?.delete('bitcoinNetwork');
     _closeGate();
 
     await _ensurePersistenceInitialized();
@@ -371,10 +373,9 @@ class MpcService extends ChangeNotifier {
     final enrolment = await gate.enrol(_passkey!, displayName: 'Merlin');
     await _identityBox!.put('passkeyCredentialId', enrolment.credentialId);
     await _identityBox!.put('tenantId', enrolment.tenantId);
+    // The DKG that follows is its first use, and waits for it to become findable — see
+    // `PlatformPasskey.assertion`. No sign-in of its own here, so setup is one fingerprint.
     _passkey!.adopt(enrolment.credentialId);
-    // Before anything asks for it: a passkey created a moment ago is not findable yet, and the DKG
-    // that comes next would get "Sign in another way" instead of a fingerprint prompt.
-    await _passkey!.waitUntilUsable();
     gate.authenticator = _passkey;
     notifyListeners();
     debugPrint('Passkey registered: tenant ${enrolment.tenantId}');
@@ -393,9 +394,8 @@ class MpcService extends ChangeNotifier {
     final storageId = _storageId ?? 'mpc_wallet_state_default';
 
     _client = await _createMpcClient(storageId: storageId);
-    final serverInfo = await _fetchServerInfoWithRetry();
     _wallet = MpcBitcoinWallet(_client!,
-        networkName: serverInfo.bitcoinNetwork, storageId: storageId);
+        networkName: await _bitcoinNetwork(), storageId: storageId);
     _wallet!.onSyncComplete = _onWalletSyncComplete;
 
     // wallet.init() restores persisted state or, on a fresh wallet, runs the
@@ -421,9 +421,8 @@ class MpcService extends ChangeNotifier {
     final storageId = _storageId ?? 'mpc_wallet_state_default';
 
     _client = await _createMpcClient(storageId: storageId);
-    final serverInfo = await _fetchServerInfoWithRetry();
     _wallet = MpcBitcoinWallet(_client!,
-        networkName: serverInfo.bitcoinNetwork, storageId: storageId);
+        networkName: await _bitcoinNetwork(), storageId: storageId);
     _wallet!.onSyncComplete = _onWalletSyncComplete;
 
     await _wallet!.init();
@@ -497,34 +496,8 @@ class MpcService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Outpoints (`txid:vout`) seen on the previous refresh. Used to detect
-  /// "new VTXO arrived" so the auto-settle re-delegation can fire even when
-  /// the push notification path didn't deliver (denied perms, force-quit, etc).
-  final Set<String> _previousVtxoOutpoints = <String>{};
-
-  /// The outpoints the last settle covered, persisted.
-  ///
-  /// This replaces `ListVtxosResponse.has_active_delegate`, which the cosigner
-  /// answered from its own view of the ASP. It has no such view — it is called
-  /// rather than running — so the fact has to live where the knowledge is. It is
-  /// persisted rather than held in memory because a cold start would otherwise
-  /// read as "no delegate" and settle again: a real ASP batch round, minutes
-  /// long and a biometric prompt, for a delegate that is already sealed.
-  Set<String> _delegatedOutpoints = <String>{};
+  /// A refresh round in progress — [delegateNow] refuses a second.
   bool _delegateInFlight = false;
-
-  /// Don't retry a failed auto-delegate before this. With a passkey-gated
-  /// share, `settleDelegate` is a signing op that can pop a biometric prompt;
-  /// without a cooldown a persistent failure would re-prompt on EVERY poll
-  /// tick (~10s).
-  DateTime? _delegateRetryAfter;
-  static const Duration _delegateFailureCooldown = Duration(minutes: 5);
-
-  /// A re-delegate is needed but signing it would pop a biometric prompt, so
-  /// we wait for the user instead: the Ark tab shows a delegate button while
-  /// this is true (see [delegateNow]).
-  bool _delegateActionNeeded = false;
-  bool get needsDelegateAction => _delegateActionNeeded;
 
   /// Periodic VTXO poll. Off-chain receives don't trigger the on-chain electrs
   /// sync, so without this, received VTXOs only show up on a manual refresh.
@@ -533,24 +506,35 @@ class MpcService extends ChangeNotifier {
   bool _vtxoPollInFlight = false;
   static const Duration _vtxoPollInterval = Duration(seconds: 10);
 
-  /// Whether the cosigner's sealed delegate still covers everything we hold.
+  /// What the wallet holds now.
+  Iterable<IndexerVtxo> get _held => _vtxos.where((v) => !v.isSpent);
+
+  /// Whether a sealed delegate covers everything held — so the cosigner will refresh it on its own,
+  /// from the enclave, before it expires.
   ///
-  /// A delegate is signed over a specific set of VTXOs, so a new one appearing
-  /// makes it stale — that is the whole trigger for re-delegating. Used by
-  /// integration tests to verify the auto-delegate flow fired.
-  bool get hasActiveDelegate =>
-      _vtxos.isNotEmpty && _delegateCoversCurrentVtxos;
-
-  bool get _delegateCoversCurrentVtxos {
-    final current = _vtxos.map((v) => v.outpoint).toSet();
-    return current.isNotEmpty && current.difference(_delegatedOutpoints).isEmpty;
+  /// Answered locally, from the indexer and the delegate the last send, settle or [protectFunds]
+  /// sealed — no call to the cosigner, so no passkey prompt. It stops being true when funds arrive
+  /// that no delegate covers: a receive, or the VTXO the cosigner produced when it ran one.
+  bool get fundsProtected {
+    final delegate = _client?.delegateStatus;
+    final held = _held.toList();
+    return held.isNotEmpty && delegate != null && held.every(delegate.covers);
   }
 
-  /// Record that a settle just covered what we hold, and remember it across restarts.
-  void _markDelegated() {
-    _delegatedOutpoints = _vtxos.map((v) => v.outpoint).toSet();
-    _identityBox?.put('delegatedOutpoints', _delegatedOutpoints.toList());
+  /// Whether anything held is inside its refresh window now — the cosigner should have run its
+  /// delegate by this point, so this means it could not (or none covered these funds).
+  bool get refreshDue {
+    final margin = _client?.delegateStatus?.margin ?? const Duration(minutes: 30);
+    final now = DateTime.now();
+    return _held.any((v) =>
+        v.expiresAt > 0 &&
+        !DateTime.fromMillisecondsSinceEpoch(v.expiresAt * 1000).subtract(margin).isAfter(now));
   }
+
+  /// Whether the Ark tab should ask the user for something: to protect funds no delegate covers
+  /// ([protectFunds]), or to refresh funds that are due and were not ([delegateNow]). Never acted on
+  /// without them — each is a passkey approval, and an approval is a person.
+  bool get needsDelegateAction => _held.isNotEmpty && (refreshDue || !fundsProtected);
 
   /// Whether the last [refreshVtxos] failure was our credentials being refused
   /// rather than the ASP being unreachable. The poll loop must not treat the
@@ -568,7 +552,7 @@ class MpcService extends ChangeNotifier {
       // carried the balance and whether the cosigner held a delegate; both came
       // from a cosigner that was watching the ASP for us. It no longer can, so
       // the balance is a sum and the delegate is tracked here — see
-      // [_delegateCoversCurrentVtxos].
+      // [fundsProtected].
       _vtxos = await _client!.listVtxos();
       _arkBalance = _vtxos.fold(BigInt.zero, (sum, v) => sum + BigInt.from(v.amountSats));
       ok = true;
@@ -581,96 +565,37 @@ class MpcService extends ChangeNotifier {
       debugPrint("Refresh VTXOs failed: $e");
     }
     notifyListeners();
-    unawaited(_delegateIfNeeded());
     return ok;
   }
 
-  /// A re-delegate is needed when either:
-  /// - A new VTXO appeared since the last refresh that wasn't created by us
-  ///   (i.e. an external receive), OR
-  /// - VTXOs exist but the server reports no active delegate (cosigner
-  ///   restart, or first refresh after login).
-  ///
-  /// Self-originated change (txid matches a recent send/board/settle) is
-  /// skipped since the corresponding handler already invalidated the delegate
-  /// on the server side and a fresh re-delegate covers the new change VTXO.
-  ///
-  /// Signing the delegate needs the passkey. Only sign SILENTLY when no
-  /// biometric prompt would appear (wallet un-gated, or the PRF seed is still
-  /// cached from a just-finished user op). Otherwise raise [needsDelegateAction]
-  /// so the Ark tab shows a delegate button — the cosigner's "Funds received"
-  /// notification brings the user there.
-  ///
-  /// **This got much more expensive.** It used to be `settleDelegate(storeOnly:
-  /// true)` — one call that had the cosigner seal an intent for its own later
-  /// use. The cosigner cannot settle for itself any more (a guest has no
-  /// egress), so the only way to renew is to drive a real ASP batch round from
-  /// here: register an intent, wait for the ASP's next round, sign the tree,
-  /// submit forfeits. That waits on the ASP's schedule, which is minutes, and
-  /// it dies if the app is backgrounded part-way through.
-  ///
-  /// Firing that automatically on every receive is kept for now because it is
-  /// what keeps a delegate armed and the watch running, and because the
-  /// `promptless` guard below already stops it interrupting the user. Whether
-  /// an unattended multi-minute round should start without being asked for is a
-  /// product call, and [needsDelegateAction] is the mechanism if the answer is
-  /// no — flip the condition to always raise it.
-  Future<void> _delegateIfNeeded() async {
-    if (_client == null || _delegateInFlight || _vtxos.isEmpty) return;
-
-    final current = _vtxos.map((v) => '${v.txid}:${v.vout}').toSet();
-    final newOutpoints = current.difference(_previousVtxoOutpoints);
-    _previousVtxoOutpoints
-      ..clear()
-      ..addAll(current);
-
-    // Every new outpoint counts as external now. This used to subtract our own sends, using the
-    // cosigner's Ark history — a log it can no longer keep, since it is called rather than running
-    // and never saw the receives. The cost is a delegate refreshed after our own change lands as
-    // well as after a real receive, which is conservative rather than wrong.
-    final needsDelegate = newOutpoints.isNotEmpty || !_delegateCoversCurrentVtxos;
-    if (!needsDelegate) {
-      if (_delegateActionNeeded) {
-        _delegateActionNeeded = false;
-        notifyListeners();
-      }
-      return;
-    }
-
-    final promptless =
-        !(_client!.isShareGated) || (_passkey?.hasFreshSeed ?? false);
-    if (!promptless) {
-      if (!_delegateActionNeeded) {
-        _delegateActionNeeded = true;
-        notifyListeners();
-      }
-      return;
-    }
-
-    final retryAfter = _delegateRetryAfter;
-    if (retryAfter != null && DateTime.now().isBefore(retryAfter)) return;
-
-    _delegateInFlight = true;
-    try {
-      await _client!.settleDelegate();
-      _markDelegated();
-      _delegateActionNeeded = false;
-      _delegateRetryAfter = null;
-      await refreshVtxos();
-      notifyListeners();
-    } catch (e) {
-      _delegateRetryAfter = DateTime.now().add(_delegateFailureCooldown);
-      debugPrint("[auto-settle] re-delegate failed (cooldown "
-          "${_delegateFailureCooldown.inMinutes}m): $e");
-    } finally {
-      _delegateInFlight = false;
-    }
+  /// Enrol this device for wakes, if [token] is not the one already enrolled. Returns whether it
+  /// asked the cosigner — a passkey approval, so only when the token actually changed, which FCM
+  /// does rarely, rather than on every start.
+  Future<bool> enrolDevice(String token) async {
+    final client = _client;
+    if (client == null) throw StateError('wallet not initialized');
+    if (_identityBox?.get('pushToken') == token) return false;
+    await client.registerDevice(token);
+    await _identityBox?.put('pushToken', token);
+    return true;
   }
 
-  /// User-triggered delegate (the Ark-tab button). Runs `settleDelegate`
-  /// directly — with a gated share this pops the passkey prompt, which is
-  /// expected here because the user just asked for it. Throws on failure so
-  /// the UI can surface it.
+  /// Seal a delegate over what is held, so the cosigner refreshes it on its own before it expires.
+  /// One passkey approval.
+  ///
+  /// For funds no delegate covers — a receive, or what the cosigner produced by running one. A send
+  /// or a settle seals on its way out with no approval of its own, so this is only needed when
+  /// [fundsProtected] is false and nothing is being sent.
+  Future<void> protectFunds() async {
+    final client = _client;
+    if (client == null) throw StateError('wallet not initialized');
+    await client.protectFunds();
+    notifyListeners();
+  }
+
+  /// Refresh everything held in a batch round now — for funds past due that the cosigner could not
+  /// refresh itself. One passkey approval, and it seals a new delegate on its way out. Throws on
+  /// failure so the UI can surface it.
   Future<void> delegateNow() async {
     final client = _client;
     if (client == null) throw StateError('wallet not initialized');
@@ -680,9 +605,6 @@ class MpcService extends ChangeNotifier {
     _delegateInFlight = true;
     try {
       await client.settleDelegate();
-      _markDelegated();
-      _delegateActionNeeded = false;
-      _delegateRetryAfter = null;
       await refreshVtxos();
       notifyListeners();
     } finally {
@@ -804,11 +726,36 @@ class MpcService extends ChangeNotifier {
   // A party is identified by its GROUP key — what another wallet allowlists, and what a payer's
   // cosigner derives our payee address from.
 
+  //
+  // Both lists are kept here, and persisted, as what the app shows — not fetched to show them.
+  // Reading either from the cosigner is a call, and every call is a passkey approval, so opening a
+  // screen used to cost a fingerprint or two. Nothing else writes them: contacts are added and
+  // removed from this app, and a request reaches the cosigner only when this app delivers it. So
+  // each change this app makes is applied to the local copy as the cosigner confirms it, and a
+  // pull-to-refresh is the only read.
+
   List<Contact> _contacts = [];
   List<Contact> get contacts => List.unmodifiable(_contacts);
 
   List<PaymentIntent> _paymentRequests = [];
   List<PaymentIntent> get paymentRequests => List.unmodifiable(_paymentRequests);
+
+  void _loadLocalLists() {
+    List<T> read<T>(String key, T Function(List<int>) decode) {
+      final stored = _identityBox?.get(key);
+      if (stored is! List) return [];
+      return [for (final b64 in stored.cast<String>()) decode(base64.decode(b64))];
+    }
+
+    _contacts = read('contacts', Contact.fromBuffer);
+    _paymentRequests = read('paymentRequests', PaymentIntent.fromBuffer);
+  }
+
+  Future<void> _saveLocalLists() async {
+    await _identityBox?.put('contacts', [for (final c in _contacts) base64.encode(c.writeToBuffer())]);
+    await _identityBox
+        ?.put('paymentRequests', [for (final i in _paymentRequests) base64.encode(i.writeToBuffer())]);
+  }
 
   /// Requests still awaiting a decision — what the inbox badge counts.
   List<PaymentIntent> get pendingPaymentRequests =>
@@ -817,31 +764,55 @@ class MpcService extends ChangeNotifier {
   /// This wallet's shareable identity: give it to someone so they can allowlist you.
   String? get myGroupKey => _client?.groupKeyHex;
 
+  /// Re-read contacts from the cosigner. A passkey approval — pull-to-refresh only.
   Future<void> refreshContacts() async {
     if (_client == null) return;
     _contacts = await _client!.contactList();
+    await _saveLocalLists();
     notifyListeners();
   }
 
+  /// Re-read the inbox from the cosigner. A passkey approval — pull-to-refresh only.
   Future<void> refreshPaymentRequests() async {
     if (_client == null) return;
     _paymentRequests = await _client!.paymentRequests();
+    await _saveLocalLists();
     notifyListeners();
   }
 
   /// Authorize someone to bill this wallet.
   Future<void> addContact(String contactGroupKeyHex, String label) async {
     if (_client == null) throw StateError('Client not initialized');
-    await _client!.contactAdd(contactGroupKeyHex.trim(), label.trim());
-    await refreshContacts();
+    final key = contactGroupKeyHex.trim();
+    await _client!.contactAdd(key, label.trim());
+    _contacts = [
+      for (final c in _contacts)
+        if (hex.encode(c.verifyingKey) != key) c,
+      Contact(
+        verifyingKey: hex.decode(key),
+        label: label.trim(),
+        addedAt: Int64(DateTime.now().millisecondsSinceEpoch ~/ 1000),
+      ),
+    ];
+    await _saveLocalLists();
+    notifyListeners();
   }
 
   /// Revoke a contact; the cosigner drops their pending requests too.
   Future<void> removeContact(String contactGroupKeyHex) async {
     if (_client == null) throw StateError('Client not initialized');
     await _client!.contactRemove(contactGroupKeyHex);
-    await refreshContacts();
-    await refreshPaymentRequests();
+    _contacts = [
+      for (final c in _contacts)
+        if (hex.encode(c.verifyingKey) != contactGroupKeyHex) c,
+    ];
+    // What the cosigner did with them, mirrored: a revoked contact's pending requests go with it.
+    _paymentRequests = [
+      for (final i in _paymentRequests)
+        if (!(i.status == 'pending' && hex.encode(i.fromVerifyingKey) == contactGroupKeyHex)) i,
+    ];
+    await _saveLocalLists();
+    notifyListeners();
   }
 
   /// Ask [payerGroupKeyHex] to pay us. **Not reachable from the app today.**
@@ -882,14 +853,27 @@ class MpcService extends ChangeNotifier {
       throw StateError('Request is ${intent.status}, not pending');
     }
     final txid = await sendArk(intent.toArkAddress, intent.amountSats.toInt());
-    await refreshPaymentRequests();
+    // The cosigner marks it fulfilled as it records the send; mirrored rather than re-read.
+    _setRequest(intent.id, (i) => i
+      ..status = 'fulfilled'
+      ..arkTxid = txid);
+    await _saveLocalLists();
+    notifyListeners();
     return txid;
   }
 
   Future<void> declinePaymentRequest(String id) async {
     if (_client == null) throw StateError('Client not initialized');
     await _client!.declinePaymentRequest(id);
-    await refreshPaymentRequests();
+    _setRequest(id, (i) => i..status = 'declined');
+    await _saveLocalLists();
+    notifyListeners();
+  }
+
+  void _setRequest(String id, PaymentIntent Function(PaymentIntent) change) {
+    _paymentRequests = [
+      for (final i in _paymentRequests) i.id == id ? change(i.deepCopy()) : i,
+    ];
   }
 
   Future<String> settleDelegate() async {

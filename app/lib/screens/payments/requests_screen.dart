@@ -18,15 +18,11 @@ class RequestsScreen extends StatefulWidget {
 }
 
 class _RequestsScreenState extends State<RequestsScreen> {
-  bool _loading = true;
+  // Shown from the service's local copy at once; reading the cosigner is a passkey approval, so it
+  // only happens on pull-to-refresh.
+  bool _loading = false;
   String? _error;
   String? _busyId;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
-  }
 
   Future<void> _refresh() async {
     setState(() {
@@ -34,9 +30,8 @@ class _RequestsScreenState extends State<RequestsScreen> {
       _error = null;
     });
     try {
-      final svc = context.read<MpcService>();
-      await svc.refreshPaymentRequests();
-      await svc.refreshContacts();
+      // One read, one approval: contact names come from the local copy.
+      await context.read<MpcService>().refreshPaymentRequests();
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     } finally {

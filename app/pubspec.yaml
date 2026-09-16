@@ -50,6 +50,7 @@ dependencies:
   hive: ^2.2.3
   hive_flutter: ^1.1.0
   convert: ^3.1.1
+  protobuf: ^3.1.0
   cryptography: ^2.7.0
   # Passkey authenticator: cosigner WebAuthn calls (http) + PRF salt hash (crypto).
   http: ^1.2.0

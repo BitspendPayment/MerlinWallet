@@ -67,7 +67,13 @@ class PlatformPasskey implements Authenticator, PasskeyRegistrar {
   bool get isRegistered => _credentialId != null;
 
   /// Take the credential id the runtime assigned at registration.
-  void adopt(String credentialId) => _credentialId = credentialId;
+  void adopt(String credentialId) {
+    _credentialId = credentialId;
+    _justRegistered = true;
+  }
+
+  /// Registered moments ago and not used yet — see [assertion].
+  bool _justRegistered = false;
 
   /// The PRF salt: a fixed context tag. A constant so the same passkey always yields the same seed,
   /// which is what makes the blinded share reconstructable.
@@ -122,25 +128,28 @@ class PlatformPasskey implements Authenticator, PasskeyRegistrar {
     return credential;
   }
 
-  @override
-  Future<Map<String, dynamic>> assertion(Map<String, dynamic> publicKey, String origin) =>
-      _get(publicKey);
-
-  /// Wait until the passkey just registered can actually sign, and take its seed while at it.
+  /// The gate's approval — with the PRF evaluated in the same gesture.
   ///
-  /// A provider indexes a new passkey asynchronously. Asking for it straight away — which the DKG
-  /// that follows registration does — finds nothing, and Credential Manager answers with its "Sign in
-  /// another way" sheet, from which there is no getting the passkey back. So this asks with
-  /// `immediate`, which fails quietly while the passkey is not there yet, until it is. The one that
-  /// succeeds is the user's fingerprint for setup, and leaves the PRF seed the DKG blinds the share
-  /// with.
-  Future<void> waitUntilUsable({Duration timeout = const Duration(seconds: 30)}) async {
+  /// The first one after registering waits for the passkey to become findable, retrying quietly: a
+  /// provider indexes a new passkey asynchronously, and asking too soon opens Credential Manager's
+  /// "Sign in another way" sheet, from which there is no getting it back. Folding that wait into the
+  /// first real approval, rather than a sign-in of its own beforehand, is what makes onboarding one
+  /// fingerprint instead of two.
+  @override
+  Future<Map<String, dynamic>> assertion(Map<String, dynamic> publicKey, String origin) async {
+    if (!_justRegistered) return _get(publicKey);
+    final credential = await _whenFindable(() => _get(publicKey, immediate: true));
+    _justRegistered = false;
+    return credential;
+  }
+
+  Future<T> _whenFindable<T>(Future<T> Function() attempt,
+      {Duration timeout = const Duration(seconds: 30)}) async {
     final deadline = DateTime.now().add(timeout);
     var delay = const Duration(milliseconds: 500);
     while (true) {
       try {
-        await _get(_localRequest(), immediate: true);
-        return;
+        return await attempt();
       } on PlatformException catch (e) {
         if (e.code != PasskeyChannel.noCredential || DateTime.now().isAfter(deadline)) rethrow;
       }
@@ -148,6 +157,12 @@ class PlatformPasskey implements Authenticator, PasskeyRegistrar {
       if (delay < const Duration(seconds: 3)) delay *= 2;
     }
   }
+
+  /// Check that a stored passkey can still sign on this device, with a sign-in of its own that goes
+  /// nowhere. Fails quietly with [PasskeyChannel.noCredential] while it cannot, until [timeout].
+  /// A fingerprint — only for recovering an onboarding that stopped part-way.
+  Future<void> waitUntilUsable({Duration timeout = const Duration(seconds: 30)}) =>
+      _whenFindable(() => _get(_localRequest(), immediate: true), timeout: timeout);
 
   /// An assertion request that goes nowhere: a challenge made here, for this credential.
   Map<String, dynamic> _localRequest() => {

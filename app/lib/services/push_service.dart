@@ -41,10 +41,20 @@ class PushService {
   /// foreground push handler can drive a re-delegate while the app is open.
   static MpcService? _svc;
 
-  /// The one category anything sends today: the cosigner's settle watch found
-  /// its sealed delegate due and woke its owner to come and finish the round.
-  /// Mirrors `CATEGORY_SETTLE_DUE` in `cosigner/src/handlers/watch.rs`.
+  /// The cosigner's watch found its sealed delegate due and could not run it
+  /// itself — no ASP reachable, or the round failed — so it woke its owner to
+  /// refresh in person. Mirrors `CATEGORY_SETTLE_DUE` in
+  /// `cosigner/src/handlers/watch.rs`.
   static const String categorySettleDue = 'settle-due';
+
+  /// The cosigner ran its sealed delegate: the funds were refreshed, and the
+  /// VTXO that produced has no delegate yet. Mirrors
+  /// `CATEGORY_DELEGATE_SETTLED`.
+  static const String categoryDelegateSettled = 'delegate-settled';
+
+  static bool _isOurs(RemoteMessage msg) =>
+      msg.data['category'] == categorySettleDue ||
+      msg.data['category'] == categoryDelegateSettled;
 
   /// Set when a wake reached us before the service was ready; acted on in
   /// [registerCurrentToken] once it is.
@@ -116,8 +126,7 @@ class PushService {
         debugPrint('[push] FCM returned no token — not enrolled');
         return;
       }
-      await client.registerDevice(token);
-      debugPrint('[push] enrolled for wakes');
+      if (await svc.enrolDevice(token)) debugPrint('[push] enrolled for wakes');
     } catch (e) {
       // Not fatal: the wallet works, it just will not be woken before a
       // renewal falls due. Worth being loud about rather than silent.
@@ -140,8 +149,8 @@ class PushService {
       debugPrint('[push] foreground wake but no live service yet');
       return;
     }
-    if (msg.data['category'] != categorySettleDue) return;
-    // Refreshing is the response: it recomputes whether the sealed delegate
+    if (!_isOurs(msg)) return;
+    // Refreshing is the response: it recomputes whether a sealed delegate
     // still covers what we hold and raises the Ark-tab banner if it does not.
     try {
       await svc.refreshVtxos();
@@ -158,7 +167,7 @@ class PushService {
   /// for a user to tap. Kept because the cold-start path is real and because
   /// this is where a tap would land once wakes are surfaced locally.
   static Future<void> _handleOpenedApp(RemoteMessage msg) async {
-    if (msg.data['category'] != categorySettleDue) return;
+    if (!_isOurs(msg)) return;
     final svc = _svc;
     if (svc == null) {
       // Opened before the service was ready; acted on in registerCurrentToken.
@@ -179,27 +188,16 @@ class PushService {
 /// (non-class) function and annotated with `@pragma('vm:entry-point')` so the
 /// background isolate can resolve it after Tree Shaking.
 ///
-/// # It cannot do the work, and it cannot yet say so
+/// # There is nothing for it to do
 ///
-/// This used to restore the wallet from Hive and call
-/// `settleDelegate(storeOnly: true)` — have the cosigner seal a renewal for its
-/// own later use. That is gone on both ends: there is no `storeOnly`, because
-/// renewing now means driving a real ASP batch round that waits on the ASP's
-/// schedule rather than an 8-second timeout in an isolate the OS may kill; and
-/// the cosigner could not use a sealed renewal by itself anyway, since a Wasm
-/// guest has no egress at all. Waking its owner is what it does *instead*, so a
-/// background isolate finishing the job on the owner's behalf is precisely the
-/// thing that cannot happen.
-///
-/// What it should do is tell the user to open the app. **It cannot**: the wake
-/// is data-only by design and the app has no local-notification plugin, so
-/// there is nothing to display with. Until one is added, a wake that arrives
-/// while the app is backgrounded is logged and the user finds out on next open
-/// — `registerCurrentToken` and the foreground handler both refresh, and the
-/// Ark tab raises its banner if the renewal no longer covers what is held.
+/// Renewal is the cosigner's: it runs the sealed delegate itself, from the
+/// enclave, against the ASP. The wakes that reach this isolate say that it did
+/// (`delegate-settled`) or that it could not (`settle-due`), and either way what
+/// follows needs the user — sealing a new delegate, or refreshing in person —
+/// which a background isolate cannot ask for. The wake is data-only, so there is
+/// nothing to display; the next foreground refresh raises the Ark-tab banner.
 @pragma('vm:entry-point')
 Future<void> _handleBackgroundMessage(RemoteMessage msg) async {
-  if (msg.data['category'] != PushService.categorySettleDue) return;
-  debugPrint('[push:bg] settle-due wake — nothing to display and nothing a '
-      'background isolate can settle; the next foreground refreshes');
+  if (!PushService._isOurs(msg)) return;
+  debugPrint('[push:bg] ${msg.data['category']} wake — the next foreground refreshes');
 }

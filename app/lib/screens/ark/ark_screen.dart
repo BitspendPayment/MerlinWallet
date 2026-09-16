@@ -163,7 +163,7 @@ class ArkScreen extends StatelessWidget {
     // renewed VTXO, so the soonest-expiring VTXO is the whole wallet's next
     // renewal deadline (min expiresAt, skipping not-yet-backfilled 0s).
     final hasFunds = balance > BigInt.zero;
-    final delegated = mpcService.hasActiveDelegate;
+    final delegated = !mpcService.needsDelegateAction;
     int? soonestExp;
     IndexerVtxo? soonest;
     for (final v in mpcService.vtxos) {
@@ -338,15 +338,18 @@ class ArkScreen extends StatelessWidget {
     );
   }
 
-  /// Shown when the balance isn't auto-renewing — never delegated, or a
-  /// receive/send invalidated the delegate and it needs the user's signature.
-  /// The tap delegates now (pops the passkey), covering every un-delegated case.
+  /// Shown when the user has to do something: refresh funds that are due, or be reminded about funds
+  /// that arrived since the watch was armed. Each is one passkey prompt, and only on this tap —
+  /// nothing here happens unasked.
   Widget _buildEnableAutoRenew(BuildContext context, MpcService mpcService) {
+    final due = mpcService.refreshDue;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          "Your funds aren't auto-renewing yet",
+          due
+              ? 'Some of your funds need refreshing now'
+              : "New funds aren't set to renew themselves yet",
           style: GoogleFonts.inter(color: Colors.white38, fontSize: 12),
         ),
         const SizedBox(height: 8),
@@ -357,18 +360,24 @@ class ArkScreen extends StatelessWidget {
             onPressed: () async {
               final messenger = ScaffoldMessenger.of(context);
               try {
-                await mpcService.delegateNow();
-                messenger.showSnackBar(const SnackBar(
-                    content: Text('Auto-settle protection active')));
+                if (due) {
+                  await mpcService.delegateNow();
+                  messenger.showSnackBar(
+                      const SnackBar(content: Text('Funds refreshed')));
+                } else {
+                  await mpcService.protectFunds();
+                  messenger.showSnackBar(const SnackBar(
+                      content: Text('These funds will renew themselves before they expire')));
+                }
               } catch (e) {
-                messenger.showSnackBar(
-                    SnackBar(content: Text('Delegate failed: $e')));
+                messenger.showSnackBar(SnackBar(
+                    content: Text(due ? 'Refresh failed: $e' : 'Could not protect these funds: $e')));
               }
             },
             icon: Icon(Icons.shield_outlined,
                 size: 18, color: Colors.tealAccent.withOpacity(0.9)),
             label: Text(
-              'Enable auto-renew',
+              due ? 'Refresh funds' : 'Renew automatically',
               style: GoogleFonts.inter(
                 color: Colors.tealAccent.withOpacity(0.9),
                 fontWeight: FontWeight.w600,
@@ -449,7 +458,7 @@ class ArkScreen extends StatelessWidget {
         : null;
     final nowSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final overdue = hasExpiry && expiresAt <= nowSecs;
-    final delegated = mpcService.hasActiveDelegate;
+    final delegated = mpcService.fundsProtected;
 
     showModalBottomSheet(
       context: context,
@@ -469,7 +478,7 @@ class ArkScreen extends StatelessWidget {
                     size: 20, color: Colors.tealAccent.withOpacity(0.9)),
                 const SizedBox(width: 8),
                 Text(
-                  delegated ? 'Renewal armed' : 'Renewal needed',
+                  delegated ? 'Renews automatically' : 'Not set to renew',
                   style: GoogleFonts.inter(
                     fontWeight: FontWeight.w600,
                     color: Colors.white,
@@ -488,12 +497,12 @@ class ArkScreen extends StatelessWidget {
             // watch the clock, waking this device when the deadline nears.
             Text(
               delegated
-                  ? 'Your renewal is signed and held by the cosigner. It cannot '
-                      'submit it for you — it has no network access — so it will '
-                      'notify you here in time to refresh these funds.'
-                  : 'These funds have no signed renewal yet. Refresh them from '
-                      'the Ark tab so a renewal is prepared and you get reminded '
-                      'before they expire.',
+                  ? 'You signed a renewal for these funds, and the secure enclave '
+                      'holding the other half of your key will submit it before they '
+                      'expire — nothing for you to do, even with your phone off.'
+                  : 'No signed renewal covers these funds yet. Tap "Renew '
+                      'automatically" on the Ark tab — or send or refresh, which '
+                      'sets it up on the way.',
               style: GoogleFonts.inter(
                 color: Colors.white60,
                 fontSize: 13,

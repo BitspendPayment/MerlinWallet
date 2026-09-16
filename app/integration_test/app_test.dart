@@ -105,11 +105,11 @@ void main() {
         await svcBoard.refreshVtxos();
         final delegDeadline =
             DateTime.now().add(const Duration(seconds: 30));
-        while (!svcBoard.hasActiveDelegate &&
+        while (!svcBoard.fundsProtected &&
             DateTime.now().isBefore(delegDeadline)) {
           await tester.pump(const Duration(seconds: 1));
         }
-        expect(svcBoard.hasActiveDelegate, isTrue,
+        expect(svcBoard.fundsProtected, isTrue,
             reason:
                 'after boarding + refresh, _delegateIfNeeded must have '
                 'stored a delegate intent. If false, the foreground '
@@ -177,7 +177,7 @@ void main() {
         // _delegateIfNeeded settles again and re-arms it.
         await svcBoard.refreshVtxos();
         final bgDeadline = DateTime.now().add(const Duration(minutes: 3));
-        while (!svcBoard.hasActiveDelegate &&
+        while (!svcBoard.fundsProtected &&
             DateTime.now().isBefore(bgDeadline)) {
           await tester.pump(const Duration(seconds: 1));
           await svcBoard.refreshVtxos();
@@ -185,7 +185,7 @@ void main() {
         expect(svcBoard.arkBalance, greaterThanOrEqualTo(
             preBgArkBalance + BigInt.from(1000)),
             reason: 'Alice should hold Bob\'s 1500-sat VTXO (after fees)');
-        expect(svcBoard.hasActiveDelegate, isTrue,
+        expect(svcBoard.fundsProtected, isTrue,
             reason:
                 'a fresh outpoint should have triggered a settle, leaving a '
                 'renewal that covers it. If false, _delegateIfNeeded did not '
