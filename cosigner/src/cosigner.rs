@@ -106,6 +106,8 @@ pub struct Cosigner {
     policy: Option<Policy>,
     /// A `ReadyToSettle` delegate session the core can drive autonomously (auto-settle).
     pub(crate) delegate_session: Option<DelegateSettleSession>,
+    /// See `SnapshotState::delegate_intent_id`.
+    pub(crate) delegate_intent_id: Option<String>,
     /// In-flight GUEST-style boarding settle, held across the commitment-FROST pause (the client
     /// must FROST-sign the commitment sighashes between step 2 and step 3). Native: no held stream
     /// (step 3 finalizes optimistically). Transient — never snapshotted.
@@ -192,6 +194,7 @@ impl Cosigner {
         Self {
             policy: None,
             delegate_session: None,
+            delegate_intent_id: None,
             boarding_settle: None,
             settle_inflight: None,
             ark_cosigner_secret_hex: None,
@@ -225,6 +228,7 @@ impl Cosigner {
                 .as_ref()
                 .and_then(|s| s.to_persisted().ok())
                 .and_then(|p| serde_json::to_string(&p).ok()),
+            delegate_intent_id: self.delegate_intent_id.clone(),
             contacts: self.contacts.clone(),
             payment_intents: self.payment_intents.clone(),
             seen_request_nonces: self.seen_request_nonces.clone(),
@@ -255,6 +259,7 @@ impl Cosigner {
         self.contacts = snap.contacts;
         self.payment_intents = snap.payment_intents;
         self.seen_request_nonces = snap.seen_request_nonces;
+        self.delegate_intent_id = snap.delegate_intent_id;
         // Restore a pending ReadyToSettle delegate (needs the cosigner secret to re-derive its kp).
         self.delegate_session = match (snap.delegate_json, self.ark_secret()) {
             (Some(dj), Some(secret)) => {
@@ -311,23 +316,22 @@ impl Cosigner {
             if accepted.iter().any(|e| e.txid == v.txid && e.vout == v.vout) {
                 return Err(format!("vtxo {}:{} named twice", v.txid, v.vout));
             }
-            // Expiry is the ASP's and is not on the wire; 0 reads as "unknown" downstream, which
-            // `build_delegate_step1` skips conservatively rather than settling against a guess.
+            // Expiry is the indexer's, relayed by the caller; 0 reads as "unknown" downstream, which
+            // `build_delegate_step1` skips conservatively rather than scheduling against a guess.
             accepted.push(VtxoEntry {
                 txid: v.txid,
                 vout: v.vout,
                 amount: v.amount_sats,
                 exit_delay: v.exit_delay,
                 created_at: now,
-                expires_at: 0,
+                expires_at: v.expires_at.max(0),
             });
         }
         self.owned_vtxos = accepted;
         Ok(())
     }
 
-    /// The owned set in the shape ark's session builders take. Expiry is dropped here because
-    /// nothing downstream of a send or a settle build uses it.
+    /// The owned set in the shape ark's session builders take.
     pub fn vtxos(&self) -> Vec<VtxoInput> {
         self.owned_vtxos
             .iter()
@@ -336,6 +340,7 @@ impl Cosigner {
                 vout: e.vout,
                 amount_sats: e.amount,
                 exit_delay: e.exit_delay,
+                expires_at: e.expires_at,
             })
             .collect()
     }
@@ -622,25 +627,14 @@ impl Cosigner {
             .as_mut()
             .ok_or("no delegate session")?;
         session.sign_with_frost(signatures)?;
-
-        // The delegate is signed and ReadyToSettle from here, so this is the moment to arm the
-        // watch: `enqueue` is interactive-only, and this is the last interactive call the settle
-        // has. Best-effort — a wallet running detached from a runtime has no queue, and refusing
-        // the settle over a missing background nicety would be the wrong trade.
-        match self.settle_deadline() {
-            Some(deadline) => {
-                if let Err(e) = self.arm_settle_watch(deadline) {
-                    tracing::warn!("settle watch not armed: {e}");
-                }
-            }
-            None => tracing::debug!("settle watch not armed: VTXO expiries unknown"),
-        }
+        // Arming the watch is sealing's business (`seal_delegate_finish`), not signing's: a delegate
+        // signed for a refresh the owner asked for now is spent in the same round.
         Ok(())
     }
 
     /// When the delegate's intent becomes valid: earliest covered expiry minus the safety margin.
     /// `None` when no covered VTXO has a known expiry — the ASP had not indexed them yet.
-    fn settle_deadline(&self) -> Option<u64> {
+    pub(crate) fn settle_deadline(&self) -> Option<u64> {
         self.prepare_delegate().ok().and_then(|(_, valid_at)| valid_at)
     }
 
@@ -1049,12 +1043,19 @@ impl Cosigner {
 
     /// Delegate phase 1: build the pre-authorized intent + forfeit PSBTs (after `GetInfo`) and return
     /// the sighashes the client must FROST-sign. The Ark cosigner secret never leaves the core.
+    /// `deferred`: valid from the renewal deadline (a sealed delegate), or from now (a refresh the
+    /// owner is asking for in person — the ASP refuses an intent valid in the future until then).
     pub fn generate_delegate_for(
         &mut self,
         info: &ArkInfo,
+        deferred: bool,
     ) -> Result<Vec<Vec<u8>>, String> {
         let req = GenerateDelegate {
-            intent_valid_at: self.prepare_delegate().map(|(_, v)| v).unwrap_or(None),
+            intent_valid_at: if deferred {
+                self.prepare_delegate().map(|(_, v)| v).unwrap_or(None)
+            } else {
+                None
+            },
         };
         let (owner_pk_hex, cosigner_secret_hex, vtxos) = {
             let owner = match self.owner_pk_hex() {

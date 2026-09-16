@@ -531,13 +531,40 @@ async fn send(
     };
 
     duplex.send(proto::SendServerMsg {
-        session_id,
+        session_id: session_id.clone(),
         seq: 4,
         body: Some(proto::send_server_msg::Body::Complete(proto::SendComplete {
             ark_txid: resp.ark_txid,
             change: None,
         })),
     });
+
+    // --- Optionally, seal a delegate over what the wallet holds now -------------------------
+    //
+    // On this stream so it rides the approval — and the passkey seed — the send already had. A
+    // caller that closes instead has simply not asked for it.
+    if let Some(msg) = duplex.recv().await {
+        let seal = match msg.body {
+            Some(proto::send_client_msg::Body::Seal(seal)) => seal,
+            _ => return Err(Status::invalid_argument("after SendComplete only a seal may follow")),
+        };
+        let (round, sighashes, commitments) = seal_open(&cosigner, seal)?;
+        duplex.send(proto::SendServerMsg {
+            session_id: session_id.clone(),
+            seq: 5,
+            body: Some(proto::send_server_msg::Body::Sighashes(sighashes_msg(sighashes, commitments))),
+        });
+        let signed = match next_body(&duplex, "the delegate's signatures").await? {
+            proto::send_client_msg::Body::Signed(s) => s,
+            _ => return Err(Status::invalid_argument("expected the delegate's signatures")),
+        };
+        let sealed = seal_finish(&cosigner, round, signed.rounds)?;
+        duplex.send(proto::SendServerMsg {
+            session_id,
+            seq: 6,
+            body: Some(proto::send_server_msg::Body::Sealed(sealed)),
+        });
+    }
     Ok(())
 }
 
@@ -564,6 +591,14 @@ async fn settle(
         .ark_info
         .map(ark_info_from_proto)
         .ok_or_else(|| Status::invalid_argument("SettleOpen carried no ark_info"))?;
+    if open.seal_only {
+        // Nothing to refresh now; seal a delegate over the set and close.
+        let seal = proto::SealDelegate {
+            vtxos: open.vtxos,
+            ark_info: Some(info_to_proto(&info)),
+        };
+        return settle_seal(&cosigner, &duplex, seal, &session_id, 1).await;
+    }
     let boarding_utxo = open.boarding_utxo.map(|u| (u.txid, u.vout, u.amount_sats));
     let vtxos = vtxos_from_proto(open.vtxos);
 
@@ -621,10 +656,23 @@ async fn settle(
                     c.seal();
                 }
                 duplex.send(proto::SettleServerMsg {
-                    session_id,
+                    session_id: session_id.clone(),
                     seq,
                     body: Some(proto::settle_server_msg::Body::Complete(complete)),
                 });
+                // Optionally, seal a delegate over what the wallet holds now — on this stream, so it
+                // rides the approval and the passkey seed the settle already had.
+                if let Some(msg) = duplex.recv().await {
+                    let seal = match msg.body {
+                        Some(proto::settle_client_msg::Body::Seal(seal)) => seal,
+                        _ => {
+                            return Err(Status::invalid_argument(
+                                "after SettleComplete only a seal may follow",
+                            ))
+                        }
+                    };
+                    settle_seal(&cosigner, &duplex, seal, &session_id, seq + 1).await?;
+                }
                 return Ok(());
             }
         };
@@ -666,6 +714,9 @@ async fn settle(
             },
             proto::settle_client_msg::Body::Open(_) => {
                 return Err(Status::invalid_argument("the session is already open"))
+            }
+            proto::settle_client_msg::Body::Seal(_) => {
+                return Err(Status::invalid_argument("a seal follows SettleComplete, not the round"))
             }
         };
         drop(c);
@@ -757,8 +808,91 @@ fn vtxos_from_proto(v: Vec<proto::VtxoInput>) -> Vec<crate::types::VtxoInput> {
             vout: i.vout,
             amount_sats: i.amount_sats,
             exit_delay: i.exit_delay,
+            expires_at: i.expires_at,
         })
         .collect()
+}
+
+/// Build the delegate over the set the caller reports, and open the FROST round that signs it.
+fn seal_open(
+    cosigner: &Arc<Mutex<Cosigner>>,
+    seal: proto::SealDelegate,
+) -> Result<(crate::cosigner::InBandRound, Vec<Vec<u8>>, Vec<crate::types::Commitment>), Status> {
+    let info = seal
+        .ark_info
+        .map(ark_info_from_proto)
+        .ok_or_else(|| Status::invalid_argument("SealDelegate carried no ark_info"))?;
+    let mut c = lock(cosigner);
+    let sighashes = c
+        .seal_delegate_open(vtxos_from_proto(seal.vtxos), &info)
+        .map_err(Status::failed_precondition)?;
+    let (round, commitments) = c.sign_in_band_begin(&sighashes).map_err(Status::internal)?;
+    Ok((round, sighashes, commitments))
+}
+
+/// Finish the round, seal the delegate, and arm the watch.
+fn seal_finish(
+    cosigner: &Arc<Mutex<Cosigner>>,
+    round: crate::cosigner::InBandRound,
+    rounds: Vec<proto::WalletRound>,
+) -> Result<proto::DelegateSealed, Status> {
+    let mut c = lock(cosigner);
+    // A bad share is the caller's fault, and is reported as such.
+    let signatures = c
+        .sign_in_band_finish(round, wallet_halves(rounds))
+        .map_err(Status::invalid_argument)?;
+    let sealed = c.seal_delegate_finish(signatures).map_err(Status::internal)?;
+    c.seal();
+    Ok(proto::DelegateSealed {
+        valid_at_secs: sealed.valid_at,
+        margin_secs: sealed.margin,
+        covered: sealed.covered,
+    })
+}
+
+/// The seal exchange on a `Settle` stream: sighashes out, signatures in, sealed out.
+async fn settle_seal(
+    cosigner: &Arc<Mutex<Cosigner>>,
+    duplex: &Duplex<proto::SettleClientMsg, proto::SettleServerMsg>,
+    seal: proto::SealDelegate,
+    session_id: &str,
+    seq: u64,
+) -> Result<(), Status> {
+    let (round, sighashes, commitments) = seal_open(cosigner, seal)?;
+    duplex.send(proto::SettleServerMsg {
+        session_id: session_id.to_string(),
+        seq,
+        body: Some(proto::settle_server_msg::Body::Sighashes(settle_sighashes_msg(
+            sighashes,
+            commitments,
+        ))),
+    });
+    let signed = match duplex.expect("the delegate's signatures").await?.body {
+        Some(proto::settle_client_msg::Body::Signed(s)) => s,
+        _ => return Err(Status::invalid_argument("expected the delegate's signatures")),
+    };
+    let sealed = seal_finish(cosigner, round, signed.rounds)?;
+    duplex.send(proto::SettleServerMsg {
+        session_id: session_id.to_string(),
+        seq: seq + 1,
+        body: Some(proto::settle_server_msg::Body::Sealed(sealed)),
+    });
+    Ok(())
+}
+
+fn info_to_proto(i: &ark::client::types::ArkInfo) -> wp::ArkInfo {
+    wp::ArkInfo {
+        signer_pubkey: i.signer_pubkey.clone(),
+        forfeit_pubkey: i.forfeit_pubkey.clone(),
+        forfeit_address: i.forfeit_address.clone(),
+        checkpoint_tapscript: i.checkpoint_tapscript.clone(),
+        network: i.network.clone(),
+        session_duration: i.session_duration,
+        unilateral_exit_delay: i.unilateral_exit_delay,
+        boarding_exit_delay: i.boarding_exit_delay,
+        vtxo_min_amount: i.vtxo_min_amount,
+        dust: i.dust,
+    }
 }
 
 fn ark_info_from_proto(i: wp::ArkInfo) -> ark::client::types::ArkInfo {

@@ -32,6 +32,7 @@ fn vtxo(txid: &str, amount: u64, exit_delay: u32) -> VtxoInput {
         vout: 0,
         amount_sats: amount,
         exit_delay,
+        expires_at: 0,
     }
 }
 

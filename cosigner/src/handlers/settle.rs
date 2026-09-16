@@ -100,7 +100,8 @@ impl Cosigner {
         let sighashes = if boarding {
             self.boarding_settle_start(boarding_utxo, &info)?
         } else {
-            self.generate_delegate_for(&info)?
+            // Now, not deferred: the owner is here asking for a refresh.
+            self.generate_delegate_for(&info, false)?
         };
         self.settle_inflight = Some(InFlight {
             phase: Phase::Intent,

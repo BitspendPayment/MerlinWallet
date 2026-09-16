@@ -165,16 +165,24 @@ mod runtime {
     ///
     /// The runtime calls this on its own schedule with no request in flight, so it opens the wallet
     /// itself rather than sharing one — there is no instance kept between a request and a task to
-    /// share. What it does with it is deliberately small: read the sealed delegate, compare its
-    /// deadline to the clock, and wake the owner if it has come due. It cannot settle, because a
-    /// guest has no egress in a task any more than in a request.
+    /// share. When the sealed delegate has come due it runs it against the ASP the image names —
+    /// see `handlers/watch.rs` — and wakes the owner only when it cannot.
     struct Background;
 
     impl bindings::Guest for Background {
         fn run_task(task_id: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
-            let cfg = cosigner::config::ServerConfig::from_environment();
-            let mut wallet = super::open_cosigner(&cfg).map_err(|e| e.to_string())?;
-            wallet.run_task(&task_id, &payload)
+            // The runtime records a failed run's error inside the sealed task record, where nobody
+            // reads it; stderr reaches the console. Said here too, so a watch that keeps failing
+            // says why.
+            let run = || {
+                let cfg = cosigner::config::ServerConfig::from_environment();
+                let mut wallet = super::open_cosigner(&cfg).map_err(|e| e.to_string())?;
+                // The ASP, when the image names one — a due delegate is then run here, not handed
+                // back to a phone.
+                let mut asp = cosigner::asp::rest::AspRest::from_env();
+                wstd::runtime::block_on(wallet.run_task_with(&task_id, &payload, asp.as_mut()))
+            };
+            run().inspect_err(|e| eprintln!("background task {task_id} failed: {e}"))
         }
     }
 

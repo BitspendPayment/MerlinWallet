@@ -94,6 +94,7 @@ service Cosigner {
   rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
   rpc ForgetDevice(ForgetDeviceRequest) returns (ForgetDeviceResponse);
   rpc DeviceCount(DeviceCountRequest) returns (DeviceCountResponse);
+
 }
 
 // 32-512 characters of [A-Za-z0-9_:.-], as `notify.wit` specifies.
@@ -131,6 +132,8 @@ message SettleClientMsg {
     SettleSigned signed = 4;
     IntentRegistered registered = 5;
     AspEvent event = 6;
+    // After `SettleComplete`, optionally: seal a delegate over the wallet's set as it now stands.
+    SealDelegate seal = 7;
   }
 }
 
@@ -149,6 +152,9 @@ message SettleOpen {
   mpc_wallet.ArkInfo ark_info = 5;
   // The set to refresh, when `boarding_utxo` is absent. Ignored for a boarding settle.
   repeated VtxoInput vtxos = 6;
+  // Refresh nothing now: seal a delegate over `vtxos` and close. The in-band exchange `SealDelegate`
+  // describes — `sighashes`, `signed`, `sealed` — with no round before it.
+  bool seal_only = 7;
 }
 
 
@@ -170,6 +176,38 @@ message VtxoInput {
   uint32 vout = 2;
   uint64 amount_sats = 3;
   uint32 exit_delay = 4;
+  // Unix seconds the ASP says it expires at, as the indexer reports it. 0 when not yet known. Only
+  // ever used to schedule a wake — a wrong value costs the wallet an early or late reminder, not
+  // funds — so it is taken as given.
+  int64 expires_at = 5;
+}
+
+// Seal a delegate over these VTXOs: the wallet's whole current set.
+//
+// A VTXO has to be refreshed in a batch round before the ASP's expiry. A delegate lets the cosigner
+// do that alone: the wallet signs, now, an intent to refresh everything it holds — valid from the
+// earliest expiry less a safety margin — and the forfeits the round will need, and the cosigner
+// seals them. When the deadline comes, its background task registers the intent with its ASP itself,
+// follows the round, and signs the tree with its own key. No wallet signature, no phone.
+//
+// Sent in-band as the last exchange of `Send` and `Settle`, once the operation's result is indexed:
+// the cosigner answers with the sighashes to sign (in the stream's `sighashes`), the wallet with
+// `signed`, and the cosigner with `sealed`. It rides the approval the operation already had, and
+// the passkey seed the operation already derived. `SettleOpen.seal_only` does it on its own, for
+// funds that arrived by a receive.
+message SealDelegate {
+  repeated VtxoInput vtxos = 1;
+  mpc_wallet.ArkInfo ark_info = 2;
+}
+
+message DelegateSealed {
+  // When the delegate becomes valid and the cosigner will run it: the earliest expiry, less the
+  // margin. Unix seconds.
+  uint64 valid_at_secs = 1;
+  // That margin, so the wallet can tell whether a VTXO that arrives later expires before it.
+  uint64 margin_secs = 2;
+  // `txid:vout` of each VTXO the delegate refreshes.
+  repeated string covered = 3;
 }
 
 message SettleSigned {
@@ -208,6 +246,8 @@ message SettleServerMsg {
     AspSubmit submit = 5;
     SettleIdle idle = 6;
     SettleComplete complete = 7;
+    // The delegate, sealed. See `SealDelegate`.
+    DelegateSealed sealed = 8;
   }
 }
 
@@ -278,6 +318,8 @@ message SendClientMsg {
     SendSigned signed = 4;
     SendSubmitted submitted = 5;
     SendFinalized finalized = 6;
+    // After `SendComplete`, optionally: seal a delegate over the wallet's set as it now stands.
+    SealDelegate seal = 7;
   }
 }
 
@@ -328,6 +370,8 @@ message SendServerMsg {
     SendSubmit submit = 4;
     SendFinalize finalize = 5;
     SendComplete complete = 6;
+    // The delegate, sealed. See `SealDelegate`.
+    DelegateSealed sealed = 7;
   }
 }
 

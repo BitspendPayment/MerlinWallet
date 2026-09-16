@@ -38,6 +38,10 @@ pub struct VtxoInput {
     pub vout: u32,
     pub amount_sats: u64,
     pub exit_delay: u32,
+    /// Unix seconds, as the ASP's indexer reports it; 0 when not known. Schedules a wake, nothing
+    /// more.
+    #[serde(default)]
+    pub expires_at: i64,
 }
 
 
@@ -115,6 +119,10 @@ pub struct SnapshotState {
     /// one is pending. Lets durable auto-settle survive actor eviction. Only ever
     /// `ReadyToSettle` (never a `Settling`-phase session — MuSig2 nonces must not persist).
     pub delegate_json: Option<String>,
+    /// The id the ASP gave the sealed delegate's registration, once the watch registered it — so a
+    /// retried run follows that registration instead of making a second. `default` for older seals.
+    #[serde(default)]
+    pub delegate_intent_id: Option<String>,
     /// Parties authorized to send this wallet payment requests. `default` so seals written
     /// before request-to-pay restore cleanly.
     #[serde(default)]

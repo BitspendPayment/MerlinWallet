@@ -15,7 +15,17 @@ interface queue {
 
 world background {
     import queue;
-    /// task-id remains stable across retries of the same occurrence.
+    /// task-id is a run id, not the id the task was enqueued under. Its form
+    /// is `<id>:<generation>:<occurrence>`: the enqueued id, 32 lowercase hex
+    /// digits minted at enqueue, and a decimal count of recurring occurrences
+    /// starting at 0. An id cannot contain ':', so the enqueued id is
+    /// everything before the first one.
+    ///
+    /// It remains stable across retries of the same occurrence, and changes
+    /// for the next occurrence of a recurring task or for a task enqueued again
+    /// under the same id after `forget`. Deduplicate effects by the whole run
+    /// id; look up application state by the enqueued id.
+    ///
     /// A successful result is persisted for the client; errors are retried.
     export run-task: func(task-id: string, payload: list<u8>) -> result<list<u8>, string>;
 }

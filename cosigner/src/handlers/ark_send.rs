@@ -35,6 +35,7 @@ pub fn build_delegate_step1(
             vout: e.vout,
             amount_sats: e.amount,
             exit_delay: e.exit_delay,
+            expires_at: e.expires_at,
         })
         .collect();
     let earliest = owned

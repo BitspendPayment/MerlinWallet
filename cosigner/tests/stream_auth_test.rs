@@ -43,7 +43,7 @@ const METHODS: &[&str] = &[
     "Sign", "Dkg", "Send", "Settle",
     "ContactAdd", "ContactRemove", "ContactList",
     "PaymentRequestCreate", "PaymentRequestList", "PaymentRequestDecline",
-    "GetServerInfo", "RegisterDevice", "ForgetDevice", "DeviceCount",
+    "GetServerInfo", "RegisterDevice", "ForgetDevice", "DeviceCount", "Watch",
 ];
 
 /// Drive a future to completion on this thread.
