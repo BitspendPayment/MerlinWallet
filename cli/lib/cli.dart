@@ -30,7 +30,8 @@ receive                          an Ark address to be paid at
 boarding-address                 the on-chain address that boards into Ark
 fund <sats>                      bitcoind pays the boarding address, then board
 board                            settle every confirmed boarding deposit into Ark
-balance                          VTXOs held
+balance                          VTXOs held, and whether a sealed delegate renews them
+protect                          seal a delegate over what is held, so the cosigner renews it itself
 send <ark-address|wallet> <sats> pay, off-chain
 
 contacts                         who may send this wallet payment requests
@@ -140,6 +141,20 @@ class Cli {
           print('  ${v.amountSats} sats  ${v.txid}:${v.vout}  exit delay ${v.exitDelay}');
         }
         print('${_total(vtxos)} sats in ${vtxos.length} VTXO(s)');
+        final delegate = w.client.delegateStatus;
+        final unprotected = await w.client.unprotectedVtxos();
+        if (vtxos.isEmpty) {
+          // Nothing to renew.
+        } else if (delegate == null || unprotected.isNotEmpty) {
+          print('not protected: ${unprotected.length} VTXO(s) — `protect` to have them renewed');
+        } else {
+          print('protected: the cosigner renews them at ${delegate.validAt.toLocal()}');
+        }
+      case 'protect':
+        final (_, w) = await _active();
+        final sealed = await w.client.protectFunds();
+        print('protected ${sealed.covered.length} VTXO(s): the cosigner renews them at '
+            '${sealed.validAt.toLocal()}');
       case 'send':
         final (_, w) = await _active();
         final to = _arg(rest, 0, 'ark address or wallet');
@@ -342,7 +357,7 @@ Cli fromEnvironment() {
   final (electrumHost, electrumPort) = hostPort(env['ELECTRUM'], '127.0.0.1:50001');
   return Cli(
     enclave: enclave,
-    home: CliHome.forEnclave(enclave.pins.trustRoot),
+    home: CliHome.forEnclave(enclave.pins.trustRoot, storeId: enclave.storeId),
     aspHost: aspHost,
     aspPort: aspPort,
     bitcoind: Bitcoind(Uri.parse(env['BITCOIN_RPC_URL'] ?? 'http://admin1:123@127.0.0.1:18443'),

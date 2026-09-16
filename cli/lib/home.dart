@@ -4,10 +4,11 @@
 /// key in JSON, as `passkey-client` writes it) and a Hive box with the wallet's FROST share. Either
 /// alone is enough to act as that wallet against its enclave.
 ///
-/// Wallets are kept **per enclave boot**, under the fingerprint of that boot's trust root. A dev
-/// enclave rebuilds its store from nothing each time it starts, so a passkey from an earlier boot
-/// names a tenant that no longer exists — and a share from one would be paired with a cosigner that
-/// never heard of it. Scoping by root makes a new boot a clean slate instead of a confusing one.
+/// Wallets are kept **per enclave store**. A kept store (`make up-enclave`) has an id that survives
+/// restarts, so its wallets do too. An enclave booted without one starts from nothing, so its
+/// wallets are kept under that boot's trust root instead: a passkey from an earlier boot would name
+/// a tenant that no longer exists, and a share would be paired with a cosigner that never heard of
+/// it. Either way a new store is a clean slate rather than a confusing one.
 library;
 
 import 'dart:convert';
@@ -26,11 +27,13 @@ class WalletRecord {
 class CliHome {
   CliHome._(this.dir, this.enclaveId);
 
-  /// The home for the enclave whose trust root is [trustRoot].
-  static CliHome forEnclave(List<int> trustRoot) {
+  /// The home for an enclave: its kept store's [storeId], or else this boot's [trustRoot].
+  static CliHome forEnclave(List<int> trustRoot, {String? storeId}) {
     final root = Platform.environment['MERLIN_CLI_HOME'] ??
         '${Platform.environment['HOME']}/.merlin-cli';
-    final id = crypto.sha256.convert(trustRoot).toString().substring(0, 16);
+    final id = storeId != null && storeId.isNotEmpty
+        ? 'store-${storeId.substring(0, 16)}'
+        : crypto.sha256.convert(trustRoot).toString().substring(0, 16);
     final dir = Directory('$root/enclaves/$id')..createSync(recursive: true);
     Directory('${dir.path}/passkeys').createSync();
     return CliHome._(dir, id);
