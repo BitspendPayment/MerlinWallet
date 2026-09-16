@@ -2,8 +2,8 @@
 #  MPC Wallet — Makefile
 #
 #  Primary commands:
-#    make e2e     Run the Ark E2E suite (regtest + arkd, built and torn up fresh)
-#    make up      Start regtest + arkd + the cosigner in the foreground
+#    make e2e     Run the Ark E2E suite against a real enclave (alias for e2e-enclave)
+#    make up      Regtest + arkd, and the cosigner in a QEMU enclave, in the foreground
 #    make down    Stop everything
 #
 #  Release (Firebase App Distribution):
@@ -15,7 +15,7 @@
 #    make release-testers-remove TESTERS="a@x.com"
 # ═══════════════════════════════════════════════════════════════════════════════
 
-.PHONY: e2e up down \
+.PHONY: e2e e2e-enclave up up-enclave down down-enclave \
 	bob-up bob-down bob-send \
 	ffi-build ffi-test ffi-android ffi-android-arm32 ffi-android-x86_64 ffi-android-all \
 	runtime-build cosigner-wasm cosigner-check \
@@ -92,61 +92,69 @@ version:
 #  PRIMARY COMMANDS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Run the Ark E2E suite — starts regtest + arkd, builds everything, tests, cleans up
-e2e: runtime-stop arkd-up bitcoin-init arkd-init ffi-build runtime-build db-reset
-	@echo "Running Ark E2E test..."
-	cd e2e && dart test test/ark_e2e_test.dart
+# The Ark E2E suite, against the cosigner component inside a real enclave.
+e2e: e2e-enclave
 
-# Start regtest + arkd with the software 2-of-2 signer, cosigner in the foreground
-up: runtime-build ffi-build ffi-android
-	@echo "=== Starting regtest + arkd ==="
-	docker compose -f docker-compose.yml -f docker-compose.ark.yml up -d
-	@echo "Waiting for services to stabilize (20s)..."
-	@sleep 20
-	@echo "=== Initializing Bitcoin chain ==="
-	./scripts/bitcoin.sh init
-	@echo "=== Initializing arkd ==="
-	./scripts/arkd_init.sh --fund
-	@echo "=== Waiting 10s for NBXplorer to index initial blocks ==="
-	@sleep 10
-	@echo "=== Setting up Bob (ark-sample counter-party) ==="
-	$(MAKE) bob-up 
-	@echo "=== Setting up ADB reverse ==="
-	-adb reverse tcp:7074 tcp:7074
-	-adb reverse tcp:50001 tcp:50001
-	-adb reverse tcp:7090 tcp:7090
-	@echo ""
-	@echo "==> Software 2-of-2 signer mode + Ark."
-	@echo "==> Run Flutter in a separate terminal:  cd app && flutter run"
-	@echo "==> Server logs below (Ctrl+C to stop server + mine loop):"
-	@echo ""
-	@bash -c 'set -m; \
-		(while true; do ./scripts/bitcoin.sh mine 2>/dev/null; sleep 10; done) & \
-		MINE_PID=$$!; \
-		trap "kill $$MINE_PID 2>/dev/null || true; wait $$MINE_PID 2>/dev/null || true" EXIT INT TERM; \
-		export ELECTRUM_URL=127.0.0.1 ELECTRUM_PORT=50001 \
-		       BITCOIN_RPC_USER=admin1 BITCOIN_RPC_PASSWORD=123 \
-		       ASP_URL=http://127.0.0.1:7070 \
-		       FCM_SERVICE_ACCOUNT_JSON="$$(cat $${FCM_SA_FILE:-$$HOME/Downloads/vtxos-key.json} 2>/dev/null)" \
-		       WEBAUTH_RP_ID=vtxos.com \
-		       WEBAUTH_RP_ORIGIN=https://vtxos.com \
-		       WEBAUTH_ANDROID_ORIGIN=android:apk-key-hash:u1pNepeObJUpSkSqH964HvFRqbhC_ejQP3GHA3-lreI,android:apk-key-hash:Lf1QIwQnlPBYPwDFhloUkYC-0tYAKSpKCQbEiyz118s \
-		       WEBAUTH_TOKEN_SECRET=$${WEBAUTH_TOKEN_SECRET:-6d706377616c6c65742d6465762d746f6b656e2d7365637265742d3332622121}; \
-		cd cosigner && cargo run --release --bin cosigner -- \
-			--port 7074'
+# The cosigner has no native server, so this is the only way it is exercised end to end: the
+# component runs under enclave-runtime's QEMU Nitro enclave, and every call goes through TLS, a
+# nonce and a WebAuthn assertion exactly as a phone's would.
+#
+# Two ways to run it:
+#
+#   make e2e-enclave
+#       Boots an enclave for the run and stops it after. Minutes warm; a cold Nix build of the
+#       image is much longer. The --timeout covers that boot, which happens in setUpAll and is
+#       otherwise held to package:test's 30-second default. Tests that do real work set their own.
+#
+#   make e2e-enclave ENCLAVE_RUN=$$HOME/enclave-runtime/target/qemu-nitro/merlin
+#       Attaches to one already up — the developer loop. Start it once in another terminal:
+#         cd $$HOME/enclave-runtime && ./deploy/qemu-nitro/dev-enclave.sh \
+#           --guest $(CURDIR)/cosigner/target/wasm32-wasip2/release/cosigner.wasm --name merlin
+#       and rebuild + restart it after changing the cosigner, since the running one serves the
+#       component it booted with.
+#
+# One enclave at a time (its MinIO port and vsock CID are fixed), and ENCLAVE_RUNTIME names the
+# runtime checkout, as for wit-drift.
+ENCLAVE_RUNTIME ?= $(HOME)/enclave-runtime
+ENCLAVE_RUN     ?=
+E2E_TIMEOUT     ?= 30m
 
-# Stop everything (cosigner, mine loop, Docker)
-down:
-	@echo "Stopping all services..."
-	-pkill -f "target/release/cosigner" || true
-	-pkill -f "bitcoin.sh mine" || true
-	-pkill -f "bob_proxy" || true
-	-sudo fuser -k 7074/tcp 2>/dev/null || true
-	-sudo fuser -k 7090/tcp 2>/dev/null || true
+e2e-enclave: cosigner-wasm ffi-build arkd-up bitcoin-init arkd-init
+	@echo "Running the Ark E2E suite against the enclave$(if $(ENCLAVE_RUN), at $(ENCLAVE_RUN), booting one)..."
+	cd e2e && dart pub get && \
+		ENCLAVE_RUNTIME=$(ENCLAVE_RUNTIME) MERLIN_ENCLAVE_RUN=$(ENCLAVE_RUN) \
+		dart test test/enclave_ark_test.dart --timeout $(E2E_TIMEOUT) --reporter expanded
+
+# A dev environment: regtest + arkd, and the cosigner serving inside a QEMU Nitro enclave, in the
+# foreground until Ctrl-C. Everything else attaches to it:
+#
+#   make cli                                                   a wallet REPL
+#   make e2e-enclave ENCLAVE_RUN=$(ENCLAVE_RUNTIME)/target/qemu-nitro/$(ENCLAVE_NAME)
+#   make flutter                                               the app, pinned to this boot
+#
+# A fresh store every start: the enclave boots into genesis, so wallets from an earlier boot do not
+# carry over (the CLI keeps each boot's wallets apart for that reason). Rebuilding the cosigner
+# means restarting this — the running enclave serves, and PCR16 measures, the component it booted.
+#
+# The image is built with rp id vtxos.com and the app's signing-key origins, so a phone can register
+# a passkey against it; ENCLAVE_RP_ID= boots the runtime's default (enclave.test) instead. See
+# scripts/up-enclave.sh.
+ENCLAVE_NAME ?= merlin
+ENCLAVE_PORT ?= 8443
+
+up-enclave: cosigner-wasm ffi-build arkd-up bitcoin-init arkd-init
+	@ENCLAVE_RUNTIME=$(ENCLAVE_RUNTIME) ENCLAVE_NAME=$(ENCLAVE_NAME) ENCLAVE_PORT=$(ENCLAVE_PORT) \
+		./scripts/up-enclave.sh
+
+up: up-enclave
+
+# Stop the enclave from another terminal, and whatever an interrupted one left holding its ports.
+down-enclave:
+	@ENCLAVE_NAME=$(ENCLAVE_NAME) ./scripts/down-enclave.sh
+
+# Stop everything: the enclave, then regtest + arkd with their volumes.
+down: down-enclave
 	-docker compose -f docker-compose.yml -f docker-compose.ark.yml down -v 2>/dev/null || true
-	sudo rm -rf /root/.mpc_wallet/cosigner/db 2>/dev/null || true
-	sudo rm -rf $(DATA_DIR) 2>/dev/null || true
-	@echo "All stopped."
 
 # Bring up Bob — ark-sample wallet that acts as counter-party for the Flutter
 # integration test. Requires arkd already running (call after arkd-init).
@@ -258,10 +266,12 @@ mine-loop:
 
 adb-reverse:
 	@echo "Setting up ADB reverse port forwarding..."
-	-adb reverse tcp:7074 tcp:7074
+	-adb reverse tcp:8443 tcp:8443
+	-adb reverse tcp:7070 tcp:7070
 	-adb reverse tcp:50001 tcp:50001
-	@echo "Forwarding active: phone 127.0.0.1:7074 -> PC REST server"
-	@echo "Forwarding active: phone 127.0.0.1:50001 -> PC Electrs"
+	@echo "Forwarding active: phone 127.0.0.1:8443 -> dev enclave"
+	@echo "Forwarding active: phone 127.0.0.1:7070 -> arkd"
+	@echo "Forwarding active: phone 127.0.0.1:50001 -> Electrs"
 
 # There is no native server to start any more.
 #
@@ -362,14 +372,23 @@ threshold-test:
 	@echo "Running threshold tests..."
 	cd crates/threshold && cargo test --features std
 
+# The app against a dev enclave: its per-boot trust root, Pebble root and PCRs go in as
+# --dart-define, since a dev enclave mints new ones every boot. Rebuild after restarting it.
+# ENCLAVE_RUN names another run directory.
+#
+# Read before `cd app`, and required: a build without them cannot verify the enclave, so it refuses
+# every connection — better to fail here than on the phone.
+FLUTTER_RUN = defines="$$($(CURDIR)/scripts/dev-enclave-defines.sh $(ENCLAVE_RUN))" && \
+	cd app && flutter run $$defines
+
 flutter: ffi-android
-	cd app && flutter run
+	@$(FLUTTER_RUN)
 
 flutter-32: ffi-android-all
-	cd app && flutter run
+	@$(FLUTTER_RUN)
 
 flutter-x86: ffi-android-x86_64
-	cd app && flutter run
+	@$(FLUTTER_RUN)
 
 ark-newaddress:
 	@cd e2e && dart run bin/ark_newaddress.dart
@@ -426,30 +445,33 @@ e2e-mutinynet: ffi-build runtime-build
 e2e-mutinynet-ark: ffi-build runtime-build
 	@echo "Running MutinyNet Ark E2E test..."
 	cd e2e && dart test test/mutinynet_ark_e2e_test.dart --timeout 900s
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CLI — regtest REPL wallet
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Interactive wallet REPL for driving a running stack by hand: onboard, fund,
-# board, send, contacts and payment requests. Point it at whatever cosigner is
-# up — `make regtest-ark` locally, or a deployment.
+# A wallet REPL for driving a dev enclave by hand: new wallets (each a passkey, so a tenant), fund,
+# board, send, contacts and payment requests. Every call is approved by a passkey and every
+# approval attests the enclave, exactly as in the e2e suite — it is the same wiring.
 #
-# REGTEST ONLY. The keystore (~/.merlin-cli/wallets.json) holds PLAINTEXT
-# signing secrets.
+# Needs a dev enclave up (see e2e-enclave) and the regtest stack (arkd-up, bitcoin-init, arkd-init).
 #
-#   make cli                      # against the local runtime on :7074
-#   make cli URL=https://mutiny.vtxos.network
-CLI_URL ?= http://127.0.0.1:7074
-URL     ?= $(CLI_URL)
+# REGTEST ONLY. Passkeys and FROST shares are plaintext, under ~/.merlin-cli/enclaves/<boot>/ — one
+# directory per enclave boot, since a reboot starts the store from nothing.
+#
+#   make cli                                       the REPL
+#   make cli ARGS="fund 100000"                    one command
+#   make cli ENCLAVE_RUN=/path/to/qemu-nitro/<name>
+CLI_ENCLAVE_RUN ?= $(ENCLAVE_RUNTIME)/target/qemu-nitro/merlin
+ARGS ?=
 
-cli:
-	@echo "merlin CLI → $(URL)  (regtest only: keystore secrets are plaintext)"
-	cd cli && COSIGNER_URL=$(URL) cargo run --release
+cli: ffi-build
+	cd cli && dart pub get >/dev/null && \
+		MERLIN_ENCLAVE_RUN=$(or $(ENCLAVE_RUN),$(CLI_ENCLAVE_RUN)) ENCLAVE_RUNTIME=$(ENCLAVE_RUNTIME) \
+		dart run bin/merlin.dart $(ARGS)
 
-# Compile without running — what CI would check.
+# Analyze without running — what CI would check.
 cli-build:
-	cd cli && cargo build --release
+	cd cli && dart pub get && dart analyze
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LEGACY ALIASES (old names still work)
