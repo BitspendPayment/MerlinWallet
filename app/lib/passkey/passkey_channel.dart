@@ -14,6 +14,15 @@ class PasskeyChannel {
       (await _ch.invokeMethod<String>('create', {'requestJson': requestJson}))!;
 
   /// WebAuthn assertion (use a passkey). Returns authenticationResponseJson.
-  static Future<String> get(String requestJson) async =>
-      (await _ch.invokeMethod<String>('get', {'requestJson': requestJson}))!;
+  ///
+  /// With [immediate], a passkey that is not usable right now fails fast with [noCredential]
+  /// rather than showing the "Sign in another way" sheet.
+  static Future<String> get(String requestJson, {bool immediate = false}) async =>
+      (await _ch.invokeMethod<String>('get', {'requestJson': requestJson, 'immediate': immediate}))!;
+
+  /// The error code for "no passkey on this device matches the request".
+  static const noCredential = 'passkey_no_credential';
+
+  /// The error code for the user dismissing the prompt.
+  static const cancelled = 'passkey_cancelled';
 }

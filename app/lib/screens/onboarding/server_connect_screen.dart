@@ -28,7 +28,7 @@ class _ServerConnectionScreenState extends State<ServerConnectionScreen> {
     try {
       await context.read<MpcService>().setHost(host);
       if (!mounted) return;
-      context.push('/onboarding/dkg', extra: extras);
+      context.push('/onboarding/passkey', extra: extras);
     } catch (e) {
       if (!mounted) return;
       setState(() => _selecting = null);

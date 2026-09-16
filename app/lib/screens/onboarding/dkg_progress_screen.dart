@@ -51,7 +51,7 @@ class _DkgProgressScreenState extends State<DkgProgressScreen> {
       await Future.delayed(const Duration(seconds: 1));
 
       if (mounted) {
-        context.push('/onboarding/passkey');
+        context.push('/onboarding/ready');
       }
     } catch (e) {
       await _addLog('Error: $e');

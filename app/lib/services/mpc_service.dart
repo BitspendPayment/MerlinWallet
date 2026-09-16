@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:math';
 
-import 'package:convert/convert.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:hive/hive.dart';
 import 'package:path_provider/path_provider.dart';
 // `ArkInfo` also exists as a proto message; the ASP's value type is the one meant here.
@@ -12,9 +12,12 @@ import 'package:app_core/asp/asp_client.dart';
 import 'package:app_core/bitcoin.dart';
 import 'package:app_core/client.dart';
 import 'package:app_core/cosigner/connection.dart' show CosignerException;
+import 'package:app_core/enclave/attestation.dart';
+import 'package:app_core/enclave/gate.dart';
 import 'package:app_core/enclave/manifest.dart' as manifest;
 
-import '../passkey/passkey_authenticator.dart';
+import '../passkey/passkey_channel.dart';
+import '../passkey/platform_passkey.dart';
 import 'server_host.dart' as server_host;
 
 class MpcService extends ChangeNotifier {
@@ -27,14 +30,16 @@ class MpcService extends ChangeNotifier {
 
   String? _storageId;
 
-  /// Passkey authenticator, set once a passkey is provisioned at onboarding.
-  /// Supplies the PRF blinding seed (to reconstruct the gated share) and the
-  /// session token (auth). Null ⇒ no passkey; the wallet stays un-gated on the
-  /// legacy Schnorr auth path.
-  PasskeyAuthenticator? _passkeyAuth;
+  /// The wallet's passkey. It approves every cosigner call — enclave-runtime gates each request on
+  /// a fresh assertion — and its PRF output blinds the FROST share. Null until onboarding registers
+  /// one, and nothing reaches the cosigner before that.
+  PlatformPasskey? _passkey;
 
-  /// Whether a passkey is provisioned and wired (share PRF-gated, token auth).
-  bool get passkeyEnabled => _passkeyAuth != null;
+  /// The enclave's front door for this host: attests it on every approval, and mints the approvals.
+  EnclaveGate? _gate;
+
+  /// Whether a passkey is registered for this wallet.
+  bool get passkeyEnabled => _passkey?.isRegistered ?? false;
 
   MpcService();
 
@@ -142,32 +147,31 @@ class MpcService extends ChangeNotifier {
   // Hardcoded for now, could be configurable
   String _host = '10.0.2.2'; // Default, will be overwritten by persistence
 
-  /// GitHub repo for fetching deployment manifest (PCR0).
-  /// Set to empty to disable attestation (uses plain REST).
+  /// Where a remote enclave's measurements are published.
   static const String _manifestRepo = 'BitspendPayment/MPCWallet';
   static const String _manifestTag = 'eif-latest';
 
-  /// Cached PCR0 from the deployment manifest.
-  String? _expectedPcr0;
+  /// What a remote host's enclave must attest to, from the deployment manifest. Local hosts are a
+  /// dev enclave, whose pins come from the build — see `DevEnclaveConfig`.
+  EnclavePins? _remotePins;
 
-  /// The runtime's HTTP surface — passkeys and the manifest, not the cosigner.
-  /// The cosigner is gRPC and is dialled by host and port, not by URL.
-  String get _baseUrl => server_host.hostBaseUrl(_host);
-
-  /// The expected PCR0 (from manifest). Null if not yet fetched.
-  String? get expectedPcr0 => _expectedPcr0;
-
-  /// Fetch PCR0 from the deployment manifest.
-  /// Throws if the manifest cannot be fetched or PCR0 is invalid —
-  /// attestation is mandatory for non-local connections.
+  /// Fetch a remote enclave's pins from the deployment manifest.
   Future<void> fetchManifest() async {
-    if (_manifestRepo.isEmpty) return;
     final m = await manifest.fetchManifest(_manifestRepo, tag: _manifestTag);
-    if (m.pcr0.length != 96 || !RegExp(r'^[a-f0-9]{96}$').hasMatch(m.pcr0)) {
-      throw StateError('Invalid PCR0 from manifest: ${m.pcr0.length} chars');
+    final measurement = RegExp(r'^[a-f0-9]{96}$');
+    if (!measurement.hasMatch(m.pcr0) || !measurement.hasMatch(m.pcr16)) {
+      throw StateError('the deployment manifest does not carry a valid PCR0 and PCR16');
     }
-    _expectedPcr0 = m.pcr0;
-    debugPrint('Fetched manifest: pcr0=${m.pcr0.substring(0, 16)}...');
+    _remotePins = EnclavePins.aws(pcr0: m.pcr0, pcr16: m.pcr16);
+    debugPrint('Fetched manifest: pcr0=${m.pcr0.substring(0, 16)}… pcr16=${m.pcr16.substring(0, 16)}…');
+  }
+
+  /// What this host's enclave must attest to. Throws when there is nothing to pin — talking to an
+  /// enclave that has not proved what it is would be the one thing all of this exists to prevent.
+  Future<EnclavePins> _pins() async {
+    if (server_host.isLocalHost(_host)) return server_host.DevEnclaveConfig.fromDefines.pins();
+    if (_remotePins == null) await fetchManifest();
+    return _remotePins!;
   }
 
   Future<void> _ensurePersistenceInitialized() async {
@@ -189,16 +193,6 @@ class MpcService extends ChangeNotifier {
 
       _host = _identityBox!.get('serverHost', defaultValue: '10.0.2.2');
       debugPrint("MPC Service: Using host: $_host");
-
-      // Fetch deployment manifest for enclave PCR0.
-      // For remote hosts this is mandatory — failure will propagate.
-      // For local dev, manifest fetch failure is non-fatal.
-      try {
-        await fetchManifest();
-      } catch (e) {
-        if (_requiresAttestation) rethrow;
-        debugPrint('Manifest fetch skipped for local dev: $e');
-      }
 
       _dkgComplete = _identityBox!.get('dkgComplete', defaultValue: false);
       _storageId = _identityBox!.get('storageId') as String?;
@@ -292,13 +286,9 @@ class MpcService extends ChangeNotifier {
     debugPrint("MPC Service: Switching host to $host");
     _host = host;
 
-    // Remote hosts require attestation. If we switched in from a local host
-    // where manifest fetch was skipped or silently failed, refresh now so the
-    // failure surfaces here (with network context) instead of later as a
-    // confusing "no PCR0 available" error inside _createMpcClient.
-    if (_requiresAttestation && (_expectedPcr0 == null || _expectedPcr0!.isEmpty)) {
-      await fetchManifest();
-    }
+    // Pins belong to a host. Whatever was fetched for the last one says nothing about this one.
+    _remotePins = null;
+    _closeGate();
 
     await _ensurePersistenceInitialized();
     if (_identityBox == null || !_identityBox!.isOpen) {
@@ -307,50 +297,92 @@ class MpcService extends ChangeNotifier {
     await _identityBox!.put('serverHost', host);
   }
 
-  /// Whether the current host requires attestation. See `server_host.dart` —
-  /// required by default, waived only for local dev and the explicitly listed
-  /// non-enclave deployments (mutinynet today; never mainnet).
-  bool get _requiresAttestation => server_host.requiresAttestation(_host);
-
-  /// Connect to this host's cosigner and its ASP.
-  ///
-  /// One transport now, where there were two. REST is gone, and with it the
-  /// attested-REST variant: attestation verified a BIP-340 signature on every
-  /// REST response body, and there are no response bodies to sign — a
-  /// bidirectional stream has no per-response header to put one in.
-  ///
-  /// **The PCR0 check below no longer verifies anything**, and is kept anyway.
-  /// What it asserts today is narrower than it reads — that a manifest naming a
-  /// measurement exists — but dropping it would turn "this host must prove it
-  /// is an enclave" into "this host is trusted", with nothing in the diff
-  /// saying so. It stays until per-request attestation replaces it, which is
-  /// where verification belongs: a badge polled once a second could only ever
-  /// describe some earlier request, never the one carrying your money.
-  Future<MpcClient> _createMpcClient({
-    String? storageId,
-  }) async {
-    if (_requiresAttestation && (_expectedPcr0 == null || _expectedPcr0!.isEmpty)) {
-      throw StateError(
-          'Attestation required for remote host $_host but no PCR0 available. '
-          'Check network connection and retry.');
-    }
-    final cosigner = server_host.cosignerEndpoint(_host);
-    final asp = server_host.aspEndpoint(_host);
-    return MpcClient.grpc(
-      cosignerHost: cosigner.host,
-      cosignerPort: cosigner.port,
-      aspHost: asp.host,
-      aspPort: asp.port,
-      secure: cosigner.secure,
-      storageId: storageId,
+  /// The gate for this host, built once and kept: its attested certificate is what the cosigner
+  /// channel pins, and its passkey is what approves each call.
+  Future<EnclaveGate> _ensureGate() async {
+    final existing = _gate;
+    if (existing != null) return existing;
+    final gate = EnclaveGate(
+      endpoint: server_host.enclaveEndpoint(_host),
+      pins: await _pins(),
+      origin: server_host.origin(_host),
     );
+    final credentialId = _identityBox!.get('passkeyCredentialId') as String?;
+    _passkey = PlatformPasskey(rpId: server_host.relyingPartyId(_host), credentialId: credentialId);
+    if (credentialId != null) gate.authenticator = _passkey;
+    return _gate = gate;
   }
 
-  /// Run initial DKG. This is a pure 2-of-2 {wallet, cosigner} DKG: the wallet
-  /// generates its own dealer secret in-process (see [MpcClient.doDkg]) — no
-  /// external signer is attached. Spending is gated afterwards via
-  /// [enablePasskey] (the passkey-setup onboarding step). There is no cloud
-  /// backup — the share lives only on this device.
+  void _closeGate() {
+    _gate?.close();
+    _gate = null;
+    _passkey = null;
+  }
+
+  /// Connect to this host's cosigner, through its enclave, and its ASP.
+  Future<MpcClient> _createMpcClient({String? storageId}) async {
+    final gate = await _ensureGate();
+    if (gate.authenticator == null) {
+      throw StateError('no passkey yet — every cosigner call needs one; register it first');
+    }
+    final asp = server_host.aspEndpoint(_host);
+    final client = MpcClient.enclave(
+      gate: gate,
+      aspHost: asp.host,
+      aspPort: asp.port,
+      aspSecure: asp.secure,
+      storageId: storageId,
+    );
+    // Before anything that might sign: the share is blinded under the passkey's PRF at DKG, and
+    // reconstructed from it at every spend.
+    client.setSeedSource(_passkey!.seedSource);
+    return client;
+  }
+
+  /// Register this wallet's passkey, which is also its tenant in the enclave.
+  ///
+  /// The first onboarding step after choosing a host, and before DKG: enclave-runtime gates every
+  /// request on a passkey, so without one there is no cosigner to run a ceremony with. The DKG that
+  /// follows blinds the share under this passkey's PRF from the start — the raw share is never
+  /// stored.
+  ///
+  /// Idempotent: a passkey already registered for this host is kept.
+  Future<void> enablePasskey() async {
+    if (!_isInitialized) throw StateError("MPC Service not initialized");
+    final gate = await _ensureGate();
+    if (_passkey!.isRegistered) {
+      // Registered on an earlier attempt that did not get as far as DKG. Use it if the device can
+      // still sign with it; if not — deleted, or created as a credential this device cannot find
+      // (see PlatformPasskey.createCredential) — start over with a new one. Nothing is lost: no key
+      // exists yet, and its tenant in the enclave is simply never used again.
+      try {
+        if (!_passkey!.hasFreshSeed) await _passkey!.waitUntilUsable(timeout: const Duration(seconds: 10));
+        return;
+      } on PlatformException catch (e) {
+        if (e.code != PasskeyChannel.noCredential) rethrow;
+        debugPrint('Stored passkey is not usable on this device (${e.message}); registering a new one');
+        await _identityBox!.delete('passkeyCredentialId');
+        await _identityBox!.delete('tenantId');
+        _passkey = PlatformPasskey(rpId: server_host.relyingPartyId(_host));
+        gate.authenticator = null;
+      }
+    }
+
+    final enrolment = await gate.enrol(_passkey!, displayName: 'Merlin');
+    await _identityBox!.put('passkeyCredentialId', enrolment.credentialId);
+    await _identityBox!.put('tenantId', enrolment.tenantId);
+    _passkey!.adopt(enrolment.credentialId);
+    // Before anything asks for it: a passkey created a moment ago is not findable yet, and the DKG
+    // that comes next would get "Sign in another way" instead of a fingerprint prompt.
+    await _passkey!.waitUntilUsable();
+    gate.authenticator = _passkey;
+    notifyListeners();
+    debugPrint('Passkey registered: tenant ${enrolment.tenantId}');
+  }
+
+  /// Run initial DKG: a pure 2-of-2 {wallet, cosigner}. The wallet generates its own dealer secret
+  /// in-process (see [MpcClient.doDkg]), and its share is blinded under the passkey's PRF as it is
+  /// finalized. There is no cloud backup — the share lives only on this device.
   Future<void> doDkg() async {
     if (!_isInitialized) throw StateError("MPC Service not initialized");
 
@@ -379,112 +411,6 @@ class MpcService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Provision a passkey for this wallet and gate the FROST share on its PRF
-  /// output. Driven by the passkey-setup onboarding step (after DKG — it
-  /// needs the userId). Registration + one assertion: the assertion yields
-  /// the 32-byte blinding seed (which reblinds the stored share) and a
-  /// session token; the seed/token sources are then handed to the client so
-  /// every later spend re-derives the seed from a fresh gesture.
-  ///
-  /// Throws on failure so the UI can offer retry; until it succeeds the
-  /// wallet stays on the legacy Schnorr-auth path with an un-gated share.
-  Future<void> enablePasskey() async {
-    final client = _client;
-    final userId = client?.userId;
-    if (client == null || userId == null) {
-      throw StateError('wallet not initialized — run DKG first');
-    }
-    if (client.isShareGated) {
-      _rewirePasskeyOnRestore();
-      return;
-    }
-    final auth = _newPasskeyAuth();
-    // Assert-first: if a credential already exists (e.g. a previous attempt
-    // registered but the user cancelled the seed assertion), registering again
-    // would be refused via the excludeCredentials list. Only register when the
-    // cosigner reports no credential to assert against.
-    Uint8List seed;
-    try {
-      seed = await auth.seedSource(userId).deriveSeed();
-    } on StateError catch (e) {
-      if (!e.toString().contains('/assert/begin')) rethrow;
-      // Signed with the wallet key while the share is still un-gated — the
-      // cosigner will not attach an authenticator without that proof.
-      final sig = client.signForPasskeyRegister();
-      await auth.register(
-        userId,
-        signatureHex: hex.encode(sig.signature),
-        timestampMs: sig.timestampMs.toInt(),
-      );
-      seed = await _deriveSeedAfterRegister(auth, userId);
-    }
-    await client.gateShare(seed);
-    _wirePasskeySources(client, auth, userId);
-    notifyListeners();
-    debugPrint('Passkey enabled: share PRF-gated + token auth wired');
-  }
-
-  /// Assert a just-registered passkey to derive the seed and mint the session
-  /// token, retrying with backoff while Google Password Manager indexes the new
-  /// credential (an immediate assertion shows "Sign in another way").
-  Future<Uint8List> _deriveSeedAfterRegister(
-      PasskeyAuthenticator auth, String userId) async {
-    const maxAttempts = 4;
-    Object? lastError;
-    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
-      await Future.delayed(Duration(seconds: 1 + attempt)); // 2s, 3s, 4s, 5s
-      try {
-        return await auth.seedSource(userId).deriveSeed();
-      } catch (e) {
-        lastError = e;
-        debugPrint('post-register assertion attempt $attempt/$maxAttempts failed: $e');
-      }
-    }
-    throw StateError('Passkey created but follow-up sign-in failed: $lastError');
-  }
-
-  /// Re-attach the passkey seed + session-token sources for an already-gated
-  /// wallet on cold-start restore. Does NOT register (the credential already
-  /// exists) or re-blind (the persisted share is already `δ`). Only meaningful
-  /// when the share is gated; an un-gated wallet stays on Schnorr auth.
-  void _rewirePasskeyOnRestore() {
-    final client = _client;
-    final userId = client?.userId;
-    if (client == null || userId == null || !client.isShareGated) return;
-    final auth = _newPasskeyAuth();
-    _wirePasskeySources(client, auth, userId);
-    debugPrint('Passkey restored: seed + token sources re-attached');
-  }
-
-  void _wirePasskeySources(
-      MpcClient client, PasskeyAuthenticator auth, String userId) {
-    client.setSeedSource(auth.seedSource(userId));
-    client.setSessionTokenSource(auth.sessionTokenSource(userId));
-    _passkeyAuth = auth;
-  }
-
-  /// Build a [PasskeyAuthenticator] seeded with the persisted session token,
-  /// persisting each newly-minted one. Tokens are long-lived (~30 days), so
-  /// carrying them across app restarts means a cold start needs no biometric
-  /// prompt until the token actually expires.
-  PasskeyAuthenticator _newPasskeyAuth() {
-    final box = _identityBox;
-    final token = box?.get('passkeySessionToken') as String?;
-    final expiryMs = box?.get('passkeySessionTokenExpiry') as int?;
-    return PasskeyAuthenticator(
-      _baseUrl,
-      initialToken: token,
-      initialTokenExpiry: expiryMs != null
-          ? DateTime.fromMillisecondsSinceEpoch(expiryMs)
-          : null,
-      onTokenMinted: (t, expiry) {
-        _identityBox?.put('passkeySessionToken', t);
-        _identityBox?.put(
-            'passkeySessionTokenExpiry', expiry.millisecondsSinceEpoch);
-      },
-    );
-  }
-
   /// Restores a previously completed session without re-running DKG.
   /// Creates gRPC channel + MpcClient + MpcBitcoinWallet, then calls
   /// wallet.init() which restores keys from Hive persistence.
@@ -501,11 +427,6 @@ class MpcService extends ChangeNotifier {
     _wallet!.onSyncComplete = _onWalletSyncComplete;
 
     await _wallet!.init();
-    // A gated share needs its passkey seed + token sources re-attached before
-    // any authenticated read or ARK sign. Must run AFTER wallet.init(): that's
-    // where client.restoreState() loads userId + the shareBlinded flag this
-    // rewire keys off — earlier, isShareGated is still false and it no-ops.
-    _rewirePasskeyOnRestore();
     _balance = await _wallet!.getBalance();
     _isConnected = true;
 
@@ -522,7 +443,7 @@ class MpcService extends ChangeNotifier {
     notifyListeners();
 
     try {
-      // REST client cleanup handled by MpcClient
+      await _client?.close();
     } catch (_) {}
     _client = null;
     _wallet = null;
@@ -717,7 +638,7 @@ class MpcService extends ChangeNotifier {
     }
 
     final promptless =
-        !(_client!.isShareGated) || (_passkeyAuth?.hasFreshSeed ?? false);
+        !(_client!.isShareGated) || (_passkey?.hasFreshSeed ?? false);
     if (!promptless) {
       if (!_delegateActionNeeded) {
         _delegateActionNeeded = true;

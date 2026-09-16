@@ -5,13 +5,13 @@ import 'package:provider/provider.dart';
 
 import '../../services/mpc_service.dart';
 
-/// Post-DKG onboarding step: create the passkey that gates spending.
+/// Onboarding step between choosing a server and DKG: create the wallet's passkey.
 ///
-/// The passkey's PRF output blinds the FROST signing share, so every payment
-/// needs a fresh biometric/screen-lock gesture. Registration needs the DKG'd
-/// user id, which is why this step comes after DKG rather than before.
-/// Skipping leaves the wallet un-gated (legacy Schnorr auth); it can be
-/// retried here since [MpcService.enablePasskey] is idempotent-safe.
+/// Not skippable, and before DKG rather than after: the enclave approves every request to the
+/// cosigner with a passkey assertion, so without one there is no cosigner to generate a key with.
+/// The same passkey's PRF output then blinds the FROST share as DKG finalizes it, so every payment
+/// needs a gesture. [MpcService.enablePasskey] keeps an already-registered passkey, so retrying is
+/// safe.
 class PasskeySetupScreen extends StatefulWidget {
   const PasskeySetupScreen({super.key});
 
@@ -30,7 +30,7 @@ class _PasskeySetupScreenState extends State<PasskeySetupScreen> {
     });
     try {
       await context.read<MpcService>().enablePasskey();
-      if (mounted) context.push('/onboarding/ready');
+      if (mounted) context.push('/onboarding/dkg');
     } catch (e) {
       setState(() => _error = '$e');
     } finally {
@@ -61,9 +61,10 @@ class _PasskeySetupScreenState extends State<PasskeySetupScreen> {
               ),
               const SizedBox(height: 16),
               Text(
-                'Create a passkey to lock your signing key. Every payment will '
-                'ask for your fingerprint, face, or screen lock — nothing to '
-                'remember, nothing that can be guessed.',
+                'Create a passkey. It is how the secure enclave holding the other '
+                'half of your key knows it is you, and it locks your half too: '
+                'every payment asks for your fingerprint, face, or screen lock — '
+                'nothing to remember, nothing that can be guessed.',
                 style: GoogleFonts.inter(
                     color: Colors.white70, fontSize: 16, height: 1.5),
                 textAlign: TextAlign.center,
@@ -86,8 +87,7 @@ class _PasskeySetupScreenState extends State<PasskeySetupScreen> {
               if (_busy) ...[
                 const SizedBox(height: 24),
                 Text(
-                  'Securing your wallet… one moment.\n'
-                  'Your phone may ask for your fingerprint once more to finish.',
+                  'Creating your passkey… one moment.',
                   style: GoogleFonts.inter(color: Colors.white70, fontSize: 14),
                   textAlign: TextAlign.center,
                 ),
@@ -103,16 +103,6 @@ class _PasskeySetupScreenState extends State<PasskeySetupScreen> {
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
                     : Text(_error == null ? 'Create passkey' : 'Try again'),
-              ),
-              const SizedBox(height: 8),
-              TextButton(
-                key: const Key('passkeySkipBtn'),
-                onPressed:
-                    _busy ? null : () => context.push('/onboarding/ready'),
-                child: Text(
-                  'Skip for now (payments won\'t require a passkey)',
-                  style: GoogleFonts.inter(color: Colors.white54, fontSize: 13),
-                ),
               ),
             ],
           ),
