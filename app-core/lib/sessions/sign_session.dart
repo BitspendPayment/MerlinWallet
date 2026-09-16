@@ -28,9 +28,6 @@ class SignSession {
     required Uint8List message,
     required threshold.KeyPackage keyPkg,
     required threshold.PublicKeyPackage groupPubKey,
-    required List<int> userId,
-    required List<int> signature,
-    required int timestampMs,
     List<int>? fullTransaction,
     bool applyTweak = true,
   }) async {
@@ -41,9 +38,6 @@ class SignSession {
         sessionId: '',
         seq: Int64(0),
         open: cs.SignOpen(
-          userId: userId,
-          signature: signature,
-          timestampMs: Int64(timestampMs),
           hidingCommitment: round1.hiding,
           bindingCommitment: round1.binding,
           messageToSign: message,

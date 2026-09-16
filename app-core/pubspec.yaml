@@ -20,6 +20,7 @@ dependencies:
   path: ^1.9.0
   synchronized: ^3.1.0
   crypto: ^3.0.5
+  http2: ^2.3.1
   cryptography: ^2.7.0
   ffi: '>=2.1.0 <2.1.4'
   # Note: 'ffi' above is dart:ffi version constraint.

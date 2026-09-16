@@ -1,8 +1,8 @@
-/// Deployment manifest fetching for enclave PCR0 discovery.
+/// Deployment manifest fetching: what a remote enclave should measure to.
 ///
-/// The enclave build publishes a `deployment.json` to GitHub Releases
-/// containing the PCR0 and other metadata. The app fetches this at
-/// startup to know what PCR0 to verify against.
+/// The enclave build publishes a `deployment.json` to GitHub Releases with the image's PCR0 and the
+/// cosigner component's PCR16. The app pins both — PCR0 alone says which runtime, not which guest
+/// that runtime is serving.
 library;
 
 import 'dart:convert';
@@ -12,6 +12,7 @@ import 'package:http/http.dart' as http;
 class DeploymentManifest {
   final String baseUrl;
   final String pcr0;
+  final String pcr16;
   final String pcr1;
   final String pcr2;
   final String timestamp;
@@ -21,6 +22,7 @@ class DeploymentManifest {
   DeploymentManifest({
     required this.baseUrl,
     required this.pcr0,
+    this.pcr16 = '',
     this.pcr1 = '',
     this.pcr2 = '',
     this.timestamp = '',
@@ -32,6 +34,7 @@ class DeploymentManifest {
     return DeploymentManifest(
       baseUrl: json['base_url'] as String? ?? '',
       pcr0: json['pcr0'] as String? ?? '',
+      pcr16: json['pcr16'] as String? ?? '',
       pcr1: json['pcr1'] as String? ?? '',
       pcr2: json['pcr2'] as String? ?? '',
       timestamp: json['timestamp'] as String? ?? '',

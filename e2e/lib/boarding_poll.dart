@@ -3,7 +3,8 @@ import 'package:app_core/electrum.dart';
 import 'package:bitcoin_base/bitcoin_base.dart';
 import 'package:blockchain_utils/blockchain_utils.dart' hide hex;
 import 'package:fixnum/fixnum.dart';
-import 'package:protocol/protocol.dart';
+// `BoardingUtxo` lives in the cosigner's own proto now, not the shared message set.
+import 'package:protocol/cosigner_v1.dart';
 
 /// Polls the boarding address via the wallet's electrum client (the only
 /// component with a chain view) until at least [minSats] is seen, returning the

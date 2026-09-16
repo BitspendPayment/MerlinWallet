@@ -20,6 +20,7 @@ dependencies:
   args: ^2.4.0
   # Ed25519 signing to mint session tokens for the gated-wallet e2e (matches the cosigner's key).
   cryptography: ^2.7.0
+  crypto: ^3.0.5
 
 dev_dependencies:
   test: ^1.24.0

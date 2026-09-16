@@ -1,16 +1,18 @@
 import 'dart:async';
+import 'dart:math' show Random;
 import 'dart:typed_data';
 
 import 'package:app_core/policy.dart';
-import 'package:app_core/auth_helper.dart';
 import 'package:app_core/ark/ark.dart' as ark_addr;
 import 'package:app_core/asp/asp_client.dart';
+import 'enclave/gate.dart';
 import 'package:app_core/cosigner/connection.dart';
 import 'package:app_core/sessions/dkg_session.dart';
 import 'package:app_core/sessions/send_session.dart';
 import 'package:app_core/sessions/settle_session.dart';
 import 'package:app_core/sessions/sign_session.dart';
-import 'package:app_core/passkey/session_token_source.dart';
+import 'package:app_core/requests/authorship.dart';
+import 'package:app_core/threshold/frost/ceremony.dart' show schnorr64;
 import 'package:app_core/passkey/seed_source.dart';
 import 'package:app_core/pin_blinding.dart';
 import 'package:protocol/cosigner_v1.dart' as cs;
@@ -20,6 +22,7 @@ import 'package:app_core/threshold/threshold.dart' as threshold;
 // the wallet actually passes around. `SendSession.arkInfoToProto` converts at the boundary.
 import 'package:protocol/protocol.dart' hide ArkInfo;
 import 'package:fixnum/fixnum.dart';
+import 'package:protobuf/protobuf.dart' show GeneratedMessageGenericExtensions;
 import 'package:hive/hive.dart';
 import 'dart:io';
 import 'package:path/path.dart' as p;
@@ -30,6 +33,9 @@ import 'package:app_core/persistence/wallet_store.dart';
 class MpcClient {
   /// The cosigner: four ceremony streams and seven single-round calls.
   final CosignerConnection _conn;
+
+  /// Nonces for payment requests. A repeated nonce is refused by the payer as a replay.
+  static final _secureRandom = Random.secure();
 
   /// The ASP. The wallet's own now — the cosigner renounced its socket, so whoever calls it drives
   /// the Ark protocol and relays what it learns.
@@ -68,12 +74,11 @@ class MpcClient {
   final int _maxSigners;
   final int _minSigners;
 
-  threshold.SecretKey? _signingSecret;
-
   /// PIN/passkey-PRF share gating. When a [SeedSource] is configured the wallet's FROST share is
   /// stored BLINDED (δ = share − b(seed)) inside `_normalPolicy.keyPackage.secretShare`; the raw
   /// share is never persisted and is reconstructed transiently only for an ARK sign / contract
-  /// op (see [_walletKeyPackage]). Reads + auth then need no share (auth rides the session token).
+  /// op (see [_walletKeyPackage]). Nothing else needs the share: requests are approved by the enclave's
+  /// passkey gate, not by anything the share signs.
   SeedSource? _seedSource;
 
   /// Whether the stored share is blinded (a persistent property set at DKG time; loaded from state).
@@ -103,39 +108,49 @@ class MpcClient {
       ? null
       : Uint8List.fromList(threshold.bigIntToBytes(_onchainSecret!.scalar));
 
-  // Auth helper for signing requests (initialized after DKG or restore)
-  ClientAuthHelper? _authHelper;
-
   SpendingPolicy? _normalPolicy;
 
-  /// Creates a client that manages two shares (identities).
+  /// A wallet whose cosigner runs inside an enclave, reached through [gate].
   ///
-  /// [channel] - gRPC channel to the MPC server
-  /// [maxSigners] - Maximum number of signers in the threshold scheme
-  /// [minSigners] - Minimum signers required (threshold)
-  /// [storageId] - Unique identifier for the Hive box
-  /// [encryptionCipher] - Optional cipher for encrypted storage.
-  ///                      Use HiveAesCipher for AES-256 encryption.
-  ///                      When null, data is stored unencrypted.
-  /// Connect to a cosigner and an ASP.
+  /// The gate attests the enclave on every approval and the channel only talks to a socket serving
+  /// the certificate it attested — see `CosignerConnection.enclave`.
   ///
-  /// One transport now. REST is gone — the cosigner serves a single gRPC service — and with it the
-  /// attested-REST variant, whose per-response signature header had nothing to attach to on a
-  /// bidirectional stream. Attestation belongs per request, in gRPC metadata, once the runtime
-  /// serves a document to verify against; the FFI verifier in `enclave/` is untouched and is the
-  /// half worth keeping.
-  MpcClient.grpc({
-    required String cosignerHost,
-    required int cosignerPort,
+  /// The ASP is a separate party and takes none of that: it is arkd, reached directly.
+  ///
+  /// [storageId] names the Hive box the wallet's half of the key lives in; [encryptionCipher]
+  /// encrypts it (`HiveAesCipher`), and without one it is stored in the clear.
+  MpcClient.enclave({
+    required EnclaveGate gate,
     required String aspHost,
     required int aspPort,
-    bool secure = false,
+    bool aspSecure = false,
     int maxSigners = 2,
     int minSigners = 2,
     String? storageId,
     HiveCipher? encryptionCipher,
-  })  : _conn = CosignerConnection.connect(cosignerHost, cosignerPort, secure: secure),
-        _asp = AspClient.connect(aspHost, aspPort, secure: secure),
+  }) : this.withConnection(
+          CosignerConnection.enclave(gate),
+          aspHost: aspHost,
+          aspPort: aspPort,
+          aspSecure: aspSecure,
+          maxSigners: maxSigners,
+          minSigners: minSigners,
+          storageId: storageId,
+          encryptionCipher: encryptionCipher,
+        );
+
+  /// A wallet over a cosigner connection built some other way.
+  MpcClient.withConnection(
+    CosignerConnection connection, {
+    required String aspHost,
+    required int aspPort,
+    bool aspSecure = false,
+    int maxSigners = 2,
+    int minSigners = 2,
+    String? storageId,
+    HiveCipher? encryptionCipher,
+  })  : _conn = connection,
+        _asp = AspClient.connect(aspHost, aspPort, secure: aspSecure),
         _maxSigners = maxSigners,
         _minSigners = minSigners {
     _store = WalletStore(
@@ -147,9 +162,18 @@ class MpcClient {
   /// The ASP, for a caller that needs to ask it something directly — chiefly polling for receives.
   AspClient get asp => _asp;
 
-  /// No-op. The Bearer session token rode HTTP headers on the REST transport; there are none. When
-  /// tokens return they ride gRPC metadata, which is an interceptor on [CosignerConnection].
-  void setSessionTokenSource(SessionTokenSource source) {}
+  /// The cosigner connection.
+  ///
+  /// Exposed because a payment request is addressed to *somebody else's* cosigner, so a caller has
+  /// to be able to name one — see [writePaymentRequest]. Also what a test harness drives a raw
+  /// stream with.
+  CosignerConnection get cosigner => _conn;
+
+  /// Hang up on both. Neither is usable afterwards.
+  Future<void> close() async {
+    await _conn.shutdown();
+    await _asp.shutdown();
+  }
 
   /// Initializes persistence for the client.
   ///
@@ -200,16 +224,8 @@ class MpcClient {
     }
     _userId = hex.decode(storedUserId);
 
-    // Restore signing secret for authentication. Absent for a gated wallet (share stored blinded);
-    // then `_authHelper` stays null and auth rides the session token.
-    if (state['signingSecret'] != null) {
-      final secretHex = state['signingSecret'] as String;
-      final secretBytes = Uint8List.fromList(hex.decode(secretHex));
-      _signingSecret =
-          threshold.SecretKey(threshold.bytesToBigInt(secretBytes));
-      _authHelper =
-          ClientAuthHelper.fromSigningSecret(_signingSecret!, _userId!);
-    }
+    // `signingSecret` may still be in an older state, and is ignored. It was a second plaintext copy
+    // of the wallet's share, kept only to sign request authentication the cosigner no longer reads.
     // Gated wallet: `_normalPolicy.keyPackage.secretShare` holds δ; reconstruct at sign time.
     _shareBlinded = state['shareBlinded'] == true;
 
@@ -233,10 +249,6 @@ class MpcClient {
     final state = <String, dynamic>{
       'userId': hex.encode(_userId!),
     };
-    if (_signingSecret != null) {
-      state['signingSecret'] =
-          hex.encode(threshold.bigIntToBytes(_signingSecret!.scalar));
-    }
     if (_onchainSecret != null) {
       state['onchainSecret'] =
           hex.encode(threshold.bigIntToBytes(_onchainSecret!.scalar));
@@ -287,33 +299,6 @@ class MpcClient {
   }
 
 
-  /// Auth signature for a request. With share gating on, `_authHelper` is null and the cosigner
-  /// authenticates the Bearer session token at the REST boundary, so we send an empty Schnorr
-  /// signature. Un-gated, this is the usual share-derived signature.
-  AuthSignature _authSig(AuthSignature Function(ClientAuthHelper) sign) {
-    final h = _authHelper;
-    if (h != null) return sign(h);
-    return AuthSignature(
-        Uint8List(0), Int64(DateTime.now().millisecondsSinceEpoch));
-  }
-
-  /// Auth signature authorizing a passkey to be attached to this wallet.
-  ///
-  /// Deliberately NOT routed through [_authSig]: that falls back to an empty
-  /// signature once the share is gated, and the cosigner rejects an empty one
-  /// here — a session token is what a passkey mints, so accepting one would be
-  /// circular. Call this while the share is still un-gated (during
-  /// `enablePasskey`, before `gateShare`).
-  AuthSignature signForPasskeyRegister() {
-    final h = _authHelper;
-    if (h == null) {
-      throw StateError(
-          'passkey registration must be signed with the wallet key, but the '
-          'share is already gated — re-run before gateShare()');
-    }
-    return h.signForPasskeyRegister();
-  }
-
   /// The wallet's key package carrying the REAL share for a single op. Gated: reconstruct
   /// `P_full = δ + b(seed)` from `_seedSource` (throws if no seed is wired — an ARK sign needs the
   /// PIN/passkey). Un-gated: the stored key package already holds the real share. The reconstructed
@@ -336,8 +321,8 @@ class MpcClient {
 
   /// Finalize the wallet's freshly-DKG'd share into `_normalPolicy` + auth state. When a
   /// [SeedSource] is configured, store the share BLINDED (δ) — the raw share is never persisted and
-  /// never lingers in memory; it's reconstructed transiently at sign time. Auth then rides the
-  /// session token (no share-derived helper). Un-gated: keep the raw share + the Schnorr helper.
+  /// never lingers in memory; it's reconstructed transiently at sign time. Without one the raw share
+  /// is kept.
   Future<void> _finalizeWalletShare(threshold.KeyPackage walletKeyPkg,
       threshold.PublicKeyPackage pubKeyPkg) async {
     _userId =
@@ -357,21 +342,16 @@ class MpcClient {
           keyPackage: blindedKp,
           publicKeyPackage: pubKeyPkg);
       _shareBlinded = true;
-      _signingSecret = null;
-      _authHelper = null;
     } else {
-      _signingSecret = threshold.SecretKey(walletKeyPkg.secretShare);
       _normalPolicy = SpendingPolicy(
           id: "normal_policy_id",
           keyPackage: walletKeyPkg,
           publicKeyPackage: pubKeyPkg);
-      _authHelper =
-          ClientAuthHelper.fromSigningSecret(_signingSecret!, _userId!);
     }
   }
 
   /// Gate an already-DKG'd (raw) share retroactively: blind it to δ under [seed], persist δ, and drop
-  /// the raw share + Schnorr auth helper. Used when the seed only exists after DKG — a passkey's PRF
+  /// the raw share. Used when the seed only exists after DKG — a passkey's PRF
   /// needs the post-DKG user id to register/assert. No-op if already gated.
   Future<void> gateShare(Uint8List seed) async {
     if (_shareBlinded) return;
@@ -385,11 +365,9 @@ class MpcClient {
             kp.verifyingKey, kp.minSigners),
         publicKeyPackage: _normalPolicy!.publicKeyPackage);
     _shareBlinded = true;
-    _signingSecret = null;
-    _authHelper = null;
     await _saveState();
-    // Hive appends; without compaction the pre-gating state (raw share +
-    // signingSecret) would remain readable in the box file.
+    // Hive appends; without compaction the pre-gating state (the raw share, and any `signingSecret`
+    // an older version wrote) would remain readable in the box file.
     await _store.compact();
   }
 
@@ -425,18 +403,10 @@ class MpcClient {
     List<int>? fullTransaction, {
     bool applyTweak = true,
   }) async {
-    final userId = _userId;
-    if (userId == null) {
-      throw StateError('User ID is null, cannot proceed with signing.');
-    }
-    final auth = _authSig((h) => h.signForSignStep1());
     return SignSession(_conn).sign(
       message: message,
       keyPkg: keyPkg,
       groupPubKey: groupPubKey,
-      userId: userId,
-      signature: auth.signature,
-      timestampMs: auth.timestampMs.toInt(),
       fullTransaction: fullTransaction,
       applyTweak: applyTweak,
     );
@@ -506,14 +476,6 @@ class MpcClient {
     );
   }
 
-  /// Our own verifying share, or a clear failure. Every authenticated call needs it, and "null
-  /// user id" surfaces far from the call that forgot to run DKG.
-  List<int> _idOrThrow() {
-    final id = _userId;
-    if (id == null) throw StateError('No user id yet — run DKG first.');
-    return id;
-  }
-
   static String _hexOf(List<int> bytes) =>
       bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
@@ -523,9 +485,6 @@ class MpcClient {
   /// FROST-sign. What the wallet does instead is talk to the ASP: `SubmitTx`, then `FinalizeTx`,
   /// then tell the cosigner it was accepted so the send is recorded only once it is real.
   Future<String> sendVtxo(String recipientArkAddress, int amountSats) async {
-    final userId = _userId;
-    if (userId == null) throw StateError('User ID is null, cannot send.');
-    final auth = _authSig((h) => h.signForSendVtxo());
     final info = await _asp.getInfo();
     return SendSession(_conn, _asp).send(
       recipientArkAddress: recipientArkAddress,
@@ -534,9 +493,6 @@ class MpcClient {
       info: info,
       keyPkg: await _walletKeyPackage(),
       groupPubKey: _normalPolicy!.publicKeyPackage,
-      userId: userId,
-      signature: auth.signature,
-      timestampMs: auth.timestampMs.toInt(),
     );
   }
 
@@ -555,17 +511,11 @@ class MpcClient {
         'settle them individually',
       );
     }
-    final userId = _userId;
-    if (userId == null) throw StateError('User ID is null, cannot settle.');
-    final auth = _authSig((h) => h.signForSettle());
     final info = await _asp.getInfo();
     final result = await SettleSession(_conn, _asp).settle(
       info: info,
       keyPkg: await _walletKeyPackage(),
       groupPubKey: _normalPolicy!.publicKeyPackage,
-      userId: userId,
-      signature: auth.signature,
-      timestampMs: auth.timestampMs.toInt(),
       boardingUtxo: boardingUtxos.isEmpty ? null : boardingUtxos.first,
       vtxos: boardingUtxos.isEmpty ? await listVtxos() : const [],
       onProgress: onProgress,
@@ -582,81 +532,106 @@ class MpcClient {
       settle(onProgress: onProgress);
 
   Future<void> contactAdd(String contactGroupKeyHex, String label) async {
-    final auth = _authSig((h) => h.signForContactAdd());
     await _conn.contactAdd(ContactAddRequest()
-      ..userId = _idOrThrow()
       ..contactVerifyingKey = hex.decode(contactGroupKeyHex)
-      ..label = label
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
+      ..label = label);
   }
 
   /// Revoke a contact. Their pending requests are dropped too.
   Future<void> contactRemove(String contactGroupKeyHex) async {
-    final auth = _authSig((h) => h.signForContactRemove());
     await _conn.contactRemove(ContactRemoveRequest()
-      ..userId = _idOrThrow()
-      ..contactVerifyingKey = hex.decode(contactGroupKeyHex)
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
+      ..contactVerifyingKey = hex.decode(contactGroupKeyHex));
   }
 
   Future<List<Contact>> contactList() async {
-    final auth = _authSig((h) => h.signForContactList());
-    final resp = await _conn.contactList(ContactListRequest()
-      ..userId = _idOrThrow()
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
+    final resp = await _conn.contactList(ContactListRequest());
     return resp.contacts;
   }
 
-  /// Ask to be paid.
+  /// Write a request for [payerGroupKeyHex] to pay this wallet, signed as this wallet.
   ///
-  /// Signed by US and addressed to the PAYER's cosigner — their allowlist is the authorization,
-  /// which is why there is no ownership check on the other side. The payee address is derived there
-  /// from our allowlisted key; we never supply one, or a contact could redirect the payment.
+  /// The result is the whole of the request — serialize it with `writeToBuffer()` and carry it however
+  /// requests travel: a QR code, a link. It cannot be sent to the payer's cosigner from here: the
+  /// runtime resolves a tenant from the caller's own token, so every connection this wallet opens
+  /// lands in its own instance. The payer's app receives it into theirs — see
+  /// [receivePaymentRequest].
   ///
-  /// [conn] must point at the payer's cosigner. There is no routing argument any more: one process
-  /// serves one wallet, so which cosigner you are talking to *is* which payer you are billing.
-  Future<PaymentIntent> requestPayment(
-    CosignerConnection conn,
+  /// The signature is by this wallet's **group** key, made with this wallet's own cosigner, over a
+  /// digest that names the payer, the amount, the memo, an expiry and a fresh nonce. So it cannot be
+  /// forged by anyone holding only a share, redirected to another payer, altered, or replayed.
+  ///
+  /// `ark_info` is left unset. The payer supplies it from their own view of the ASP, and it is not
+  /// signed: the payee address is derived from the key that signed, so ASP parameters cannot send
+  /// the payment anywhere this wallet does not control.
+  Future<PaymentRequestCreateRequest> writePaymentRequest(
+    String payerGroupKeyHex,
     int amountSats, {
     String memo = '',
     int expiresInSecs = 0,
+    Duration validFor = const Duration(hours: 1),
   }) async {
-    final auth = _authSig((h) => h.signForPayreqCreate());
-    // The payer's cosigner derives our address from these; it has no ASP of its own to ask.
-    final info = await _asp.getInfo();
-    final resp = await conn.paymentRequestCreate(
-      PaymentRequestCreateRequest()
-        ..userId = _idOrThrow()
-        ..amountSats = Int64(amountSats)
-        ..memo = memo
-        ..expiresInSecs = Int64(expiresInSecs)
-        ..signature = auth.signature
-        ..timestampMs = auth.timestampMs
-        ..arkInfo = arkInfoToProto(info),
+    if (validFor > maxRequestValidity) {
+      throw ArgumentError('a request may be valid for at most ${maxRequestValidity.inHours}h');
+    }
+    final requesterHex = groupKeyHex;
+    if (requesterHex == null) throw StateError('no wallet key yet — run DKG first');
+
+    final payer = hex.decode(payerGroupKeyHex);
+    final requester = hex.decode(requesterHex);
+    final nonce = List<int>.generate(16, (_) => _secureRandom.nextInt(256));
+    final notAfter = DateTime.now().add(validFor).millisecondsSinceEpoch ~/ 1000;
+
+    final digest = requestDigest(
+      payerGroupKey: payer,
+      requesterGroupKey: requester,
+      amountSats: amountSats,
+      expiresInSecs: expiresInSecs,
+      notAfter: notAfter,
+      nonce: nonce,
+      memo: memo,
     );
+    // Untweaked: this is a statement by the group key, not a taproot key-path spend.
+    final signature = await SignSession(_conn).sign(
+      message: digest,
+      keyPkg: await _walletKeyPackage(),
+      groupPubKey: _normalPolicy!.publicKeyPackage,
+      applyTweak: false,
+    );
+
+    return PaymentRequestCreateRequest()
+      ..amountSats = Int64(amountSats)
+      ..memo = memo
+      ..expiresInSecs = Int64(expiresInSecs)
+      ..authorship = (RequestAuthorship()
+        ..requesterGroupKey = requester
+        ..payerGroupKey = payer
+        ..notAfter = Int64(notAfter)
+        ..nonce = nonce
+        ..signature = schnorr64(signature));
+  }
+
+  /// Take a request somebody wrote and put it in this wallet's inbox.
+  ///
+  /// The other half of [writePaymentRequest]. This wallet's cosigner checks the signature, that the
+  /// request names this wallet, that it is fresh and not seen before, and that its author is an
+  /// allowlisted contact — and derives the payee address from the key that signed.
+  Future<PaymentIntent> receivePaymentRequest(PaymentRequestCreateRequest request) async {
+    // Our own view of the ASP, since the payee address is derived under it and we are the one who
+    // will pay. Copied rather than mutated: the caller's request is left as it was received.
+    final withInfo = request.deepCopy()..arkInfo = arkInfoToProto(await _asp.getInfo());
+    final resp = await _conn.paymentRequestCreate(withInfo);
     return resp.intent;
   }
 
   /// Payment requests addressed to this wallet, newest first.
   Future<List<PaymentIntent>> paymentRequests() async {
-    final auth = _authSig((h) => h.signForPayreqList());
-    final resp = await _conn.paymentRequestList(PaymentRequestListRequest()
-      ..userId = _idOrThrow()
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
+    final resp = await _conn.paymentRequestList(PaymentRequestListRequest());
     return resp.intents;
   }
 
   Future<void> declinePaymentRequest(String id) async {
-    final auth = _authSig((h) => h.signForPayreqDecline());
     await _conn.paymentRequestDecline(PaymentRequestDeclineRequest()
-      ..userId = _idOrThrow()
-      ..id = id
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
+      ..id = id);
   }
 
   // --- Devices ----------------------------------------------------------------------------------
@@ -671,31 +646,19 @@ class MpcClient {
 
   /// Enrol [token] so this wallet's cosigner can wake this device.
   Future<void> registerDevice(String token) async {
-    final auth = _authSig((h) => h.signForRegisterDeviceToken());
     await _conn.registerDevice(cs.RegisterDeviceRequest()
-      ..userId = _idOrThrow()
-      ..token = token
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
+      ..token = token);
   }
 
   /// Stop waking the device behind [token] — a sign-out, or a token FCM rotated away.
   Future<void> forgetDevice(String token) async {
-    final auth = _authSig((h) => h.signForRegisterDeviceToken());
     await _conn.forgetDevice(cs.ForgetDeviceRequest()
-      ..userId = _idOrThrow()
-      ..token = token
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
+      ..token = token);
   }
 
   /// How many devices are enrolled. A count, never the tokens: the cosigner is not meant to be
   /// able to enumerate them.
   Future<int> deviceCount() async {
-    final auth = _authSig((h) => h.signForRegisterDeviceToken());
-    return _conn.deviceCount(cs.DeviceCountRequest()
-      ..userId = _idOrThrow()
-      ..signature = auth.signature
-      ..timestampMs = auth.timestampMs);
+    return _conn.deviceCount(cs.DeviceCountRequest());
   }
 }

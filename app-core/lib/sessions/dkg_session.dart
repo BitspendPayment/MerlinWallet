@@ -11,7 +11,6 @@
 library;
 
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:fixnum/fixnum.dart';
 import 'package:protocol/cosigner_v1.dart' as cs;
@@ -53,10 +52,9 @@ class DkgSession {
         threshold.elemSerializeCompressed(r1Pkg.commitment.toVerifyingKey().E);
     final walletIdentifier = threshold.Identifier.derive(walletVkBytes);
 
-    // The wallet's identity during the ceremony. There is no owner key to authenticate with yet —
-    // the ceremony is what mints it — which is why `Dkg` is the one stream the cosigner does not
-    // check. Its integrity comes from FROST and from living on one stream.
-    final tempUserId = Uint8List.fromList(walletVkBytes);
+    // No identity is sent. There is no owner key to prove anything with yet — the ceremony mints it
+    // — and none is needed: the runtime approved this stream with the tenant's passkey, which is
+    // not the key being made and so can vouch for making it.
 
     final duplex = _conn.openDkg();
     try {
@@ -64,9 +62,6 @@ class DkgSession {
         sessionId: '',
         seq: Int64(0),
         open: cs.DkgOpen(
-          userId: tempUserId,
-          signature: const [],
-          timestampMs: Int64(DateTime.now().millisecondsSinceEpoch),
           identifier: walletIdentifier.serialize(),
           round1Package: jsonEncode(r1Pkg.toJson()),
         ),

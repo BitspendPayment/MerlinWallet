@@ -5,7 +5,7 @@ import 'package:app_core/pin_blinding.dart' show seedFromPin;
 /// Source of the 32-byte blinding seed for the wallet's FROST share (see
 /// `pin_blinding.dart`). The consumer treats the seed as OPAQUE bytes, so the
 /// source is swappable without touching the blinding math:
-///  - [PasskeyPrfSeedSource] (production, device-only) — the authenticator's PRF
+///  - the app's `PlatformPasskey.seedSource` (production, device-only) — the passkey's PRF
 ///    output `prfResults.first` (32 unguessable bytes → real security).
 ///  - [PinSeedSource] — `sha256(PIN)` (a UX lock; low entropy, brute-forceable).
 ///  - [FixedSeedSource] — a constant seed standing in for a PRF output in
@@ -15,7 +15,7 @@ abstract class SeedSource {
 }
 
 /// PIN-derived seed. Reads the PIN on demand (via the supplied callback) so the
-/// PIN is never cached in this object. UX lock only — swap for [PasskeyPrfSeedSource].
+/// PIN is never cached in this object. UX lock only — a passkey's PRF is the real thing.
 class PinSeedSource implements SeedSource {
   final String Function() _readPin;
 

@@ -1,0 +1,12 @@
+analyzer:
+  exclude:
+    # Suites written against the REST cosigner and its native binary, neither of which exists.
+    # Kept rather than deleted because most of what they assert is still worth asserting — the
+    # mixed-exit-delay send, the cold FROST-from-seal restart, the request-to-pay flow — and
+    # porting them is easier with the original in front of you than out of git.
+    #
+    # `enclave_ark_test.dart` is where they are going, one at a time. What will not come across is
+    # anything testing behaviour that was deleted: the auto-settle tick, the delegate-survives-
+    # restart pair, the cold-spawn tick, the stress ping-pong, and the stale-VTXO test that pokes
+    # the store with the `sqlite3` CLI — the store is a directory of files now.
+    - archive/**

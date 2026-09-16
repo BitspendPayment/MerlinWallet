@@ -23,6 +23,7 @@ import 'package:protocol/cosigner_v1.dart' as cs;
 import '../asp/asp_client.dart';
 import '../cosigner/connection.dart';
 import '../threshold_types.dart' as threshold;
+import 'in_band_round.dart';
 import 'send_session.dart';
 
 /// What a settle produced.
@@ -55,9 +56,6 @@ class SettleSession {
     required ArkInfo info,
     required threshold.KeyPackage keyPkg,
     required threshold.PublicKeyPackage groupPubKey,
-    required List<int> userId,
-    required List<int> signature,
-    required int timestampMs,
     cs.BoardingUtxo? boardingUtxo,
     List<IndexerVtxo> vtxos = const [],
     void Function(SettlePhase)? onProgress,
@@ -74,9 +72,6 @@ class SettleSession {
         sessionId: '',
         seq: Int64(seq++),
         open: cs.SettleOpen(
-          userId: userId,
-          signature: signature,
-          timestampMs: Int64(timestampMs),
           boardingUtxo: boardingUtxo,
           arkInfo: arkInfoToProto(info),
           vtxos: vtxosToProto(vtxos),
@@ -87,22 +82,24 @@ class SettleSession {
         final msg = await duplex.next('the next step');
 
         switch (msg.whichBody()) {
-          // FROST signatures, on the intent proof first and the commitment transaction later.
+          // FROST signatures, on the intent proof first and the commitment transaction later —
+          // in-band, on this stream. A nested `Sign` would wait forever for the tenant this stream
+          // is holding. See `in_band_round.dart`.
           case cs.SettleServerMsg_Body.sighashes:
-            final signed = await signEach(
-              _conn,
-              msg.sighashes.messagesToSign,
-              keyPkg: keyPkg,
-              groupPubKey: groupPubKey,
-              userId: userId,
-              signature: signature,
-              timestampMs: timestampMs,
-              scriptPathSpend: msg.sighashes.scriptPathSpend,
-            );
+            final h = msg.sighashes;
             duplex.send(cs.SettleClientMsg(
               sessionId: '',
               seq: Int64(seq++),
-              signed: cs.SettleSigned(signedMessages: signed),
+              signed: cs.SettleSigned(
+                rounds: answerRound(
+                  sighashes: h.messagesToSign,
+                  cosignerCommitments: h.cosignerCommitments,
+                  cosignerIdentifier: h.cosignerIdentifier,
+                  scriptPathSpend: h.scriptPathSpend,
+                  keyPkg: keyPkg,
+                  groupPubKey: groupPubKey,
+                ),
+              ),
             ));
 
           // Register the intent, then subscribe — in that order, because the topics ride with the

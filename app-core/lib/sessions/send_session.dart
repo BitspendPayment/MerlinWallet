@@ -11,7 +11,6 @@
 /// a half-signed transaction nor a recorded spend that never happened.
 library;
 
-import 'dart:typed_data';
 
 import 'package:fixnum/fixnum.dart';
 import 'package:protocol/cosigner_v1.dart' as cs;
@@ -19,8 +18,7 @@ import 'package:protocol/protocol.dart' as pb;
 
 import '../asp/asp_client.dart';
 import '../cosigner/connection.dart';
-import '../threshold/frost/ceremony.dart';
-import 'sign_session.dart';
+import 'in_band_round.dart';
 import '../threshold_types.dart' as threshold;
 
 class SendSession {
@@ -40,9 +38,6 @@ class SendSession {
     required ArkInfo info,
     required threshold.KeyPackage keyPkg,
     required threshold.PublicKeyPackage groupPubKey,
-    required List<int> userId,
-    required List<int> signature,
-    required int timestampMs,
   }) async {
     final duplex = _conn.openSend();
     try {
@@ -50,9 +45,6 @@ class SendSession {
         sessionId: '',
         seq: Int64(0),
         open: cs.SendOpen(
-          userId: userId,
-          signature: signature,
-          timestampMs: Int64(timestampMs),
           recipientArkAddress: recipientArkAddress,
           amount: Int64(amountSats),
           arkInfo: arkInfoToProto(info),
@@ -60,25 +52,28 @@ class SendSession {
         ),
       ));
 
-      // --- Sign what it built ---------------------------------------------------------------
+      // --- Sign what it built, on this stream ------------------------------------------------
+      //
+      // In-band, not a nested `Sign` per sighash: this stream holds the tenant for its whole life,
+      // so a second call would wait for it forever. See `in_band_round.dart`.
       final sighashes = await duplex.next('the sighashes');
       if (!sighashes.hasSighashes()) {
         throw CosignerException('expected the sighashes, got ${sighashes.whichBody()}');
       }
-      final signed = await signEach(
-        _conn,
-        sighashes.sighashes.messagesToSign,
-        keyPkg: keyPkg,
-        groupPubKey: groupPubKey,
-        userId: userId,
-        signature: signature,
-        timestampMs: timestampMs,
-        scriptPathSpend: sighashes.sighashes.scriptPathSpend,
-      );
+      final h = sighashes.sighashes;
       duplex.send(cs.SendClientMsg(
         sessionId: '',
         seq: Int64(1),
-        signed: cs.SendSigned(signedMessages: signed),
+        signed: cs.SendSigned(
+          rounds: answerRound(
+            sighashes: h.messagesToSign,
+            cosignerCommitments: h.cosignerCommitments,
+            cosignerIdentifier: h.cosignerIdentifier,
+            scriptPathSpend: h.scriptPathSpend,
+            keyPkg: keyPkg,
+            groupPubKey: groupPubKey,
+          ),
+        ),
       ));
 
       // --- Submit it to the ASP --------------------------------------------------------------
@@ -123,39 +118,6 @@ class SendSession {
       await duplex.close();
     }
   }
-}
-
-/// FROST-sign each sighash the cosigner handed back, in order.
-///
-/// One nested `Sign` session per sighash, and they are sequential on purpose: each consumes a
-/// single-use nonce, and the cosigner takes its lock per message rather than across a round, so
-/// these interleave with the outer session safely.
-Future<List<List<int>>> signEach(
-  CosignerConnection conn,
-  List<List<int>> sighashes, {
-  required threshold.KeyPackage keyPkg,
-  required threshold.PublicKeyPackage groupPubKey,
-  required List<int> userId,
-  required List<int> signature,
-  required int timestampMs,
-  required bool scriptPathSpend,
-}) async {
-  final signer = SignSession(conn);
-  final out = <List<int>>[];
-  for (final sighash in sighashes) {
-    final sig = await signer.sign(
-      message: Uint8List.fromList(sighash),
-      keyPkg: keyPkg,
-      groupPubKey: groupPubKey,
-      userId: userId,
-      signature: signature,
-      timestampMs: timestampMs,
-      // A script-path spend takes no taproot tweak; a key-path one does. The cosigner says which.
-      applyTweak: !scriptPathSpend,
-    );
-    out.add(schnorr64(sig));
-  }
-  return out;
 }
 
 /// The ASP parameters, on the wire.
