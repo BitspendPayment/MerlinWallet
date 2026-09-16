@@ -11,6 +11,7 @@ import 'package:app_core/sessions/dkg_session.dart';
 import 'package:app_core/sessions/send_session.dart';
 import 'package:app_core/sessions/settle_session.dart';
 import 'package:app_core/sessions/sign_session.dart';
+import 'package:app_core/sessions/delegate.dart';
 import 'package:app_core/requests/authorship.dart';
 import 'package:app_core/threshold/frost/ceremony.dart' show schnorr64;
 import 'package:app_core/passkey/seed_source.dart';
@@ -242,6 +243,10 @@ class MpcClient {
           Map<String, dynamic>.from(state['spendingPolicies']));
     }
 
+    final delegate = state['delegate'];
+    _delegate =
+        delegate is Map ? DelegateStatus.fromJson(Map<String, dynamic>.from(delegate)) : null;
+
     return true;
   }
 
@@ -259,6 +264,7 @@ class MpcClient {
       state['spendingPolicies'] = _normalPolicy!.toJson();
     }
     state['shareBlinded'] = _shareBlinded;
+    if (_delegate != null) state['delegate'] = _delegate!.toJson();
     await _store.saveClientState(state);
   }
 
@@ -486,14 +492,60 @@ class MpcClient {
   /// then tell the cosigner it was accepted so the send is recorded only once it is real.
   Future<String> sendVtxo(String recipientArkAddress, int amountSats) async {
     final info = await _asp.getInfo();
-    return SendSession(_conn, _asp).send(
+    final result = await SendSession(_conn, _asp).send(
       recipientArkAddress: recipientArkAddress,
       amountSats: amountSats,
       vtxos: await listVtxos(),
       info: info,
       keyPkg: await _walletKeyPackage(),
       groupPubKey: _normalPolicy!.publicKeyPackage,
+      readHeld: listVtxos,
     );
+    // A send spends what the old delegate covered, so the cosigner dropped it: what is sealed now is
+    // whatever this send sealed, or nothing.
+    await _recordDelegate(result.delegate);
+    return result.arkTxid;
+  }
+
+  // --- The delegate ----------------------------------------------------------------------------
+
+  DelegateStatus? _delegate;
+
+  /// The delegate last sealed for this wallet — what the cosigner will refresh on its own, and when.
+  /// Null until a send, a settle or [protectFunds] sealed one. See `sessions/delegate.dart`.
+  DelegateStatus? get delegateStatus => _delegate;
+
+  /// Held VTXOs no sealed delegate covers: arrived since it was sealed (a receive), or produced by
+  /// the cosigner running it. Answered from the indexer alone; asks the cosigner nothing.
+  Future<List<IndexerVtxo>> unprotectedVtxos() async {
+    final held = (await listVtxos()).where((v) => !v.isSpent).toList();
+    final delegate = _delegate;
+    return delegate == null ? held : held.where((v) => !delegate.covers(v)).toList();
+  }
+
+  /// Seal a delegate over everything held now, so the cosigner refreshes it on its own before it
+  /// expires. One approval — for funds that arrived without an operation of ours; a send or a settle
+  /// seals on its way out at no extra cost.
+  Future<DelegateStatus> protectFunds() async {
+    final info = await _asp.getInfo();
+    final held = await heldOnceIndexed(listVtxos, timeout: const Duration(seconds: 10));
+    if (held == null) {
+      throw StateError('the indexer has not reported every VTXO\'s expiry yet — try again shortly');
+    }
+    if (held.isEmpty) throw StateError('nothing is held, so there is nothing to protect');
+    final sealed = await SettleSession(_conn, _asp).seal(
+      info: info,
+      keyPkg: await _walletKeyPackage(),
+      groupPubKey: _normalPolicy!.publicKeyPackage,
+      vtxos: held,
+    );
+    await _recordDelegate(sealed);
+    return sealed;
+  }
+
+  Future<void> _recordDelegate(DelegateStatus? delegate) async {
+    _delegate = delegate;
+    await _saveState();
   }
 
   /// Board an on-chain output into Ark, or refresh what is already held.
@@ -519,7 +571,11 @@ class MpcClient {
       boardingUtxo: boardingUtxos.isEmpty ? null : boardingUtxos.first,
       vtxos: boardingUtxos.isEmpty ? await listVtxos() : const [],
       onProgress: onProgress,
+      readHeld: listVtxos,
     );
+    // A refresh spends the old delegate's inputs; boarding leaves it standing. Either way what this
+    // settle sealed, when it sealed, supersedes it.
+    if (result.delegate != null || boardingUtxos.isEmpty) await _recordDelegate(result.delegate);
     return result.commitmentTxid;
   }
 

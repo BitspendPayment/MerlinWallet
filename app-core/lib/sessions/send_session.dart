@@ -19,25 +19,40 @@ import 'package:protocol/protocol.dart' as pb;
 import '../asp/asp_client.dart';
 import '../cosigner/connection.dart';
 import 'in_band_round.dart';
+import 'delegate.dart';
 import '../threshold_types.dart' as threshold;
+
+/// What a send produced.
+class SendResult {
+  SendResult(this.arkTxid, this.delegate);
+  final String arkTxid;
+
+  /// The delegate sealed over the wallet's set after the send, when [SendSession.send] was asked to
+  /// and could. See `delegate.dart`.
+  final DelegateStatus? delegate;
+}
 
 class SendSession {
   SendSession(this._conn, this._asp);
   final CosignerConnection _conn;
   final AspClient _asp;
 
-  /// Send [amountSats] to [recipientArkAddress]. Returns the ark txid.
+  /// Send [amountSats] to [recipientArkAddress].
+  ///
+  /// With [readHeld], once the send completes the wallet's set is re-read until the indexer
+  /// reflects it and a delegate is sealed over it, on this stream — see `delegate.dart`.
   ///
   /// [vtxos] is what this wallet holds, from the indexer. The cosigner validates every one against
   /// the scriptPubKey it derives from its own owner key before selecting from them, so naming a
   /// VTXO here cannot widen what the wallet owns.
-  Future<String> send({
+  Future<SendResult> send({
     required String recipientArkAddress,
     required int amountSats,
     required List<IndexerVtxo> vtxos,
     required ArkInfo info,
     required threshold.KeyPackage keyPkg,
     required threshold.PublicKeyPackage groupPubKey,
+    Future<List<IndexerVtxo>> Function()? readHeld,
   }) async {
     final duplex = _conn.openSend();
     try {
@@ -113,7 +128,33 @@ class SendSession {
       if (!complete.hasComplete()) {
         throw CosignerException('expected the result, got ${complete.whichBody()}');
       }
-      return complete.complete.arkTxid;
+      final arkTxid = complete.complete.arkTxid;
+
+      // --- Seal a delegate over what is held now, before closing -----------------------------
+      final delegate = readHeld == null
+          ? null
+          : await sealAfter<cs.SendClientMsg, cs.SendServerMsg>(
+              duplex: duplex,
+              // A send spends every input it was given; what remains is its change, and whatever
+              // arrived meanwhile.
+              held: heldOnceIndexed(readHeld, gone: {for (final v in vtxos) '${v.txid}:${v.vout}'}),
+              info: info,
+              keyPkg: keyPkg,
+              groupPubKey: groupPubKey,
+              seal: (s) => cs.SendClientMsg(sessionId: '', seq: Int64(4), seal: s),
+              sighashesOf: (r) => r.hasSighashes()
+                  ? (
+                      sighashes: r.sighashes.messagesToSign,
+                      commitments: r.sighashes.cosignerCommitments,
+                      identifier: r.sighashes.cosignerIdentifier,
+                      scriptPathSpend: r.sighashes.scriptPathSpend,
+                    )
+                  : null,
+              signed: (rounds) =>
+                  cs.SendClientMsg(sessionId: '', seq: Int64(5), signed: cs.SendSigned(rounds: rounds)),
+              sealedOf: (r) => r.hasSealed() ? r.sealed : null,
+            );
+      return SendResult(arkTxid, delegate);
     } finally {
       await duplex.close();
     }
@@ -145,5 +186,6 @@ List<cs.VtxoInput> vtxosToProto(List<IndexerVtxo> vtxos) => [
           // Resolved by `AspClient.getOwnedVtxos` from the script the VTXO came under — the
           // indexer does not report it.
           exitDelay: v.exitDelay,
+          expiresAt: Int64(v.expiresAt),
         ),
     ];

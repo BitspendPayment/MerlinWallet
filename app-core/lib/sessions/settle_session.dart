@@ -25,6 +25,7 @@ import '../cosigner/connection.dart';
 import '../threshold_types.dart' as threshold;
 import 'in_band_round.dart';
 import 'send_session.dart';
+import 'delegate.dart';
 
 /// What a settle produced.
 class SettleResult {
@@ -34,12 +35,17 @@ class SettleResult {
     required this.vtxoVout,
     required this.amountSats,
     required this.exitDelay,
+    this.delegate,
   });
   final String commitmentTxid;
   final String vtxoTxid;
   final int vtxoVout;
   final int amountSats;
   final int exitDelay;
+
+  /// The delegate sealed over the wallet's set after the settle, when asked for and possible. See
+  /// `delegate.dart`.
+  final DelegateStatus? delegate;
 }
 
 /// Progress, for a UI that has to show something while a batch round runs. Settling waits on the
@@ -51,6 +57,49 @@ class SettleSession {
   final CosignerConnection _conn;
   final AspClient _asp;
 
+  /// Seal a delegate over [vtxos] — the wallet's whole current set — without refreshing anything
+  /// now. For funds that arrived by a receive; a send or a settle seals on its way out.
+  Future<DelegateStatus> seal({
+    required ArkInfo info,
+    required threshold.KeyPackage keyPkg,
+    required threshold.PublicKeyPackage groupPubKey,
+    required List<IndexerVtxo> vtxos,
+  }) async {
+    final duplex = _conn.openSettle();
+    try {
+      duplex.send(cs.SettleClientMsg(
+        sessionId: '',
+        seq: Int64(0),
+        open: cs.SettleOpen(arkInfo: arkInfoToProto(info), vtxos: vtxosToProto(vtxos), sealOnly: true),
+      ));
+      return await answerSeal<cs.SettleClientMsg, cs.SettleServerMsg>(
+        duplex: duplex,
+        keyPkg: keyPkg,
+        groupPubKey: groupPubKey,
+        sighashesOf: _sighashesOf,
+        signed: (rounds) =>
+            cs.SettleClientMsg(sessionId: '', seq: Int64(1), signed: cs.SettleSigned(rounds: rounds)),
+        sealedOf: (r) => r.hasSealed() ? r.sealed : null,
+      );
+    } finally {
+      await duplex.close();
+    }
+  }
+
+  static ({
+    List<List<int>> sighashes,
+    List<cs.Commitment> commitments,
+    String identifier,
+    bool scriptPathSpend,
+  })? _sighashesOf(cs.SettleServerMsg r) => r.hasSighashes()
+      ? (
+          sighashes: r.sighashes.messagesToSign,
+          commitments: r.sighashes.cosignerCommitments,
+          identifier: r.sighashes.cosignerIdentifier,
+          scriptPathSpend: r.sighashes.scriptPathSpend,
+        )
+      : null;
+
   /// Settle. Returns when the batch finalizes.
   Future<SettleResult> settle({
     required ArkInfo info,
@@ -59,6 +108,7 @@ class SettleSession {
     cs.BoardingUtxo? boardingUtxo,
     List<IndexerVtxo> vtxos = const [],
     void Function(SettlePhase)? onProgress,
+    Future<List<IndexerVtxo>> Function()? readHeld,
   }) async {
     final duplex = _conn.openSettle();
     StreamQueue<ark.GetEventStreamResponse>? events;
@@ -128,14 +178,46 @@ class SettleSession {
             duplex.send(await _relayNext(events, seq++));
 
           case cs.SettleServerMsg_Body.complete:
+            // The round is over; stop listening to the ASP before waiting on the indexer.
+            await events?.cancel(immediate: true);
+            events = null;
+            final c = msg.complete;
+            // Seal a delegate over what is held now, before closing. A refresh spent every VTXO it
+            // was given; a boarding settle spent none. Either way the new VTXO has to be indexed.
+            final delegate = readHeld == null
+                ? null
+                : await sealAfter<cs.SettleClientMsg, cs.SettleServerMsg>(
+                    duplex: duplex,
+                    held: heldOnceIndexed(
+                      readHeld,
+                      gone: {for (final v in vtxos) '${v.txid}:${v.vout}'},
+                      // Only a boarding settle reports its new outpoint reliably; a refresh can fall
+                      // back to the commitment txid, which is not one.
+                      arrived: boardingUtxo == null || c.vtxoTxid.isEmpty
+                          ? null
+                          : '${c.vtxoTxid}:${c.vtxoVout}',
+                    ),
+                    info: info,
+                    keyPkg: keyPkg,
+                    groupPubKey: groupPubKey,
+                    seal: (s) => cs.SettleClientMsg(sessionId: '', seq: Int64(seq++), seal: s),
+                    sighashesOf: _sighashesOf,
+                    signed: (rounds) => cs.SettleClientMsg(
+                        sessionId: '', seq: Int64(seq++), signed: cs.SettleSigned(rounds: rounds)),
+                    sealedOf: (r) => r.hasSealed() ? r.sealed : null,
+                  );
             report(SettlePhase.done);
             return SettleResult(
-              commitmentTxid: msg.complete.commitmentTxid,
-              vtxoTxid: msg.complete.vtxoTxid,
-              vtxoVout: msg.complete.vtxoVout,
-              amountSats: msg.complete.amountSats.toInt(),
-              exitDelay: msg.complete.exitDelay,
+              commitmentTxid: c.commitmentTxid,
+              vtxoTxid: c.vtxoTxid,
+              vtxoVout: c.vtxoVout,
+              amountSats: c.amountSats.toInt(),
+              exitDelay: c.exitDelay,
+              delegate: delegate,
             );
+
+          case cs.SettleServerMsg_Body.sealed:
+            throw CosignerException('the cosigner sealed a delegate nobody asked for yet');
 
           case cs.SettleServerMsg_Body.notSet:
             throw CosignerException('the cosigner sent an empty settle message');

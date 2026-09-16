@@ -67,7 +67,16 @@ class DevEnclave {
   /// The root the attestation document chains to. A new one each boot.
   String get trustRoot => '$runDir/trust-root.der';
 
-  /// Pebble's root, which signed the certificate the enclave serves. Nothing public does.
+  /// A stable name for the enclave's store, when it is kept across restarts (`dev-enclave.sh
+  /// --keep-store`); null when every boot starts a new one. The trust root is new every boot, so it
+  /// cannot name a store that outlives one.
+  String? get storeId {
+    final file = File('$runDir-store/id');
+    return file.existsSync() ? file.readAsStringSync().trim() : null;
+  }
+
+  /// Pebble's roots — every one that issued a certificate a kept store may still serve. Nothing
+  /// public signs them.
   late final List<int> ca = File('$runDir/pebble-root.pem').readAsBytesSync();
 
   /// Loopback, verified as [certificateName], under Pebble's root.

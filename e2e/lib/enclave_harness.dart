@@ -132,7 +132,16 @@ class EnclaveHarness {
     Log.info('booting an enclave with $wasm');
     final proc = await Process.start(
       '$_runtimeRepo/deploy/qemu-nitro/dev-enclave.sh',
-      ['--guest', wasm, '--name', name, '--port', '$port'],
+      [
+        '--guest', wasm, '--name', name, '--port', '$port',
+        // The cosigner runs sealed delegates itself, against arkd on the host — which is
+        // 192.168.127.254 from inside the enclave. The margin makes a delegate come due about five
+        // minutes after its VTXOs were made (regtest VTXOs live 15360s), so a test can watch one run.
+        '--guest-egress', 'http://192.168.127.254:7070',
+        '--guest-env', 'ASP_URL=http://192.168.127.254:7070',
+        '--guest-env', 'AUTO_SETTLE_SAFETY_MARGIN_SECS=15060',
+        '--background-timeout', '600',
+      ],
       workingDirectory: _runtimeRepo,
     );
 

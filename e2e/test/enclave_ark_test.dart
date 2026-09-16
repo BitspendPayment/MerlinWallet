@@ -339,17 +339,91 @@ void main() {
         // by a subscription the cosigner ran; nothing runs one now.
         expect(vtxo.expiresAt, greaterThan(0));
 
+        // The settle sealed a delegate on its way out, on the same stream and approval: over the one
+        // VTXO held, valid from its expiry less the margin.
+        final boarded = alice.client.delegateStatus;
+        expect(boarded, isNotNull, reason: 'the settle should seal a delegate before closing');
+        expect(boarded!.covered, {'${vtxo.txid}:${vtxo.vout}'});
+        expect(boarded.validAt,
+            DateTime.fromMillisecondsSinceEpoch(vtxo.expiresAt * 1000).subtract(boarded.margin));
+        expect(await alice.client.unprotectedVtxos(), isEmpty);
+
         await sendAndSettleBalances(alice, bob, 100000);
         await sendAndSettleBalances(alice, bob, 50000);
         // Spends the change the previous send produced — a unilateral-delay VTXO, not the boarded one.
         await sendAndSettleBalances(alice, bob, 20000);
 
         expect((await bob.client.listVtxos()).totalSats, 170000);
+
+        // Each send sealed a new delegate over what was left, so Alice's change is covered with no
+        // call of its own.
+        expect(alice.client.delegateStatus, isNotNull);
+        expect(await alice.client.unprotectedVtxos(), isEmpty,
+            reason: 'a send should seal a delegate over its change before closing');
+
+        // Bob only received. No delegate covers those funds until he seals one — one call, and then
+        // one does.
+        expect(bob.client.delegateStatus, isNull);
+        expect(await bob.client.unprotectedVtxos(), hasLength(3));
+        final sealed = await bob.client.protectFunds();
+        expect(sealed.covered, hasLength(3));
+        expect(await bob.client.unprotectedVtxos(), isEmpty);
       } finally {
         await alice.close();
         await bob.close();
       }
     }, timeout: const Timeout(Duration(minutes: 15)));
+  });
+
+  group('the delegate', () {
+    /// The point of a delegate: the wallet signs a refresh while it is here, and the cosigner runs it
+    /// when it comes due — registering with the ASP itself, from a background task, over the one
+    /// origin the enclave lets it reach. Nothing on this side does anything but wait.
+    test('the cosigner refreshes the funds itself when the delegate comes due', () async {
+      final erin = await wallet('delegate_erin');
+      try {
+        await erin.client.doDkg();
+        final held = await boardAndSettle(erin, 0.005);
+        final before = held.single;
+        final delegate = erin.client.delegateStatus!;
+        expect(delegate.covered, {'${before.txid}:${before.vout}'});
+
+        final due = delegate.validAt.difference(DateTime.now());
+        if (due > const Duration(minutes: 12)) {
+          markTestSkipped('the delegate comes due in $due — this enclave was booted with a '
+              'production-like margin; the harness and `make up-enclave` use 15060s');
+          return;
+        }
+        Log.info('delegate due in ${due.inSeconds}s; waiting for the cosigner to run it');
+
+        // Only mining, which regtest needs for anything to confirm. No call from this client.
+        final refreshed = await whileMining(
+          btc,
+          () => eventually(
+            'the cosigner to refresh ${before.txid}:${before.vout} on its own',
+            erin.client.listVtxos,
+            (List<IndexerVtxo> v) {
+              final unspent = v.where((x) => !x.isSpent).toList();
+              return unspent.length == 1 &&
+                  unspent.single.txid != before.txid &&
+                  unspent.single.amountSats <= before.amountSats &&
+                  unspent.single.amountSats > before.amountSats * 0.9;
+            },
+            timeout: due + const Duration(minutes: 6),
+          ),
+        );
+        final after = refreshed.where((x) => !x.isSpent).single;
+        expect(after.expiresAt, greaterThan(before.expiresAt),
+            reason: 'a refresh is a new VTXO in a new batch, with a later expiry');
+
+        // The refreshed VTXO has no delegate of its own until the wallet is next here to sign one.
+        expect(await erin.client.unprotectedVtxos(), hasLength(1));
+        final resealed = await erin.client.protectFunds();
+        expect(resealed.covered, {'${after.txid}:${after.vout}'});
+      } finally {
+        await erin.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 20)));
   });
 
   group('contacts', () {
