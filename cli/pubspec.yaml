@@ -1,0 +1,22 @@
+name: merlin_cli
+description: A regtest wallet REPL against the cosigner inside a dev enclave.
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  app_core:
+    path: ../app-core
+  protocol:
+    path: ../protocol
+  bitcoin_base: ^7.0.0
+  blockchain_utils: ^5.4.0
+  crypto: ^3.0.5
+  fixnum: ^1.1.1
+  hive: ^2.2.3
+  http: ^1.2.0
+
+dev_dependencies:
+  lints: ^3.0.0
