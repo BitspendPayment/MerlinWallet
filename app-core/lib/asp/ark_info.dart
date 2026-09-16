@@ -79,6 +79,11 @@ class IndexerVtxo {
     required this.createdAt,
     required this.expiresAt,
     this.exitDelay = 0,
+    this.isPreconfirmed = false,
+    this.spentBy = '',
+    this.settledBy = '',
+    this.arkTxid = '',
+    this.commitmentTxids = const [],
   });
 
   final String txid;
@@ -96,6 +101,18 @@ class IndexerVtxo {
   /// [withExitDelay].
   final int exitDelay;
 
+  /// Made by an off-chain Ark transaction not yet in a batch. Spendable all the same.
+  final bool isPreconfirmed;
+
+  /// What spent it, when spent: the checkpoint txid ([spentBy]) and the Ark txid ([arkTxid]) of an
+  /// off-chain spend, or the commitment txid ([settledBy]) of a batch that refreshed it.
+  final String spentBy;
+  final String settledBy;
+  final String arkTxid;
+
+  /// The batches it descends from, newest last as the indexer reports them.
+  final List<String> commitmentTxids;
+
   String get outpoint => '$txid:$vout';
 
   /// The indexer does not report an exit delay — it is implied by which of the wallet's two scripts
@@ -111,5 +128,10 @@ class IndexerVtxo {
         createdAt: createdAt,
         expiresAt: expiresAt,
         exitDelay: delay,
+        isPreconfirmed: isPreconfirmed,
+        spentBy: spentBy,
+        settledBy: settledBy,
+        arkTxid: arkTxid,
+        commitmentTxids: commitmentTxids,
       );
 }

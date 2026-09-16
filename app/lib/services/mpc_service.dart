@@ -13,6 +13,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:protocol/protocol.dart' hide ArkInfo;
 
 import 'package:app_core/asp/asp_client.dart';
+import 'package:app_core/asp/history.dart';
 import 'package:app_core/bitcoin.dart';
 import 'package:app_core/client.dart';
 import 'package:app_core/cosigner/connection.dart' show CosignerException;
@@ -78,6 +79,11 @@ class MpcService extends ChangeNotifier {
   String? get boardingAddress => _boardingAddress;
   List<IndexerVtxo> _vtxos = [];
   List<IndexerVtxo> get vtxos => _vtxos;
+
+  /// The Ark tab's transaction list, newest first — rebuilt from the indexer on each
+  /// [refreshVtxos], so it includes what others sent us and costs no passkey prompt.
+  List<ArkTransaction> _arkHistory = [];
+  List<ArkTransaction> get arkHistory => _arkHistory;
   BigInt _arkBalance = BigInt.zero;
   BigInt get arkBalance => _arkBalance;
 
@@ -338,6 +344,12 @@ class MpcService extends ChangeNotifier {
     // Before anything that might sign: the share is blinded under the passkey's PRF at DKG, and
     // reconstructed from it at every spend.
     client.setSeedSource(_passkey!.seedSource);
+    // Before the DKG, so the ceremony carries the push token and no enrolment call follows it.
+    client.onDeviceEnrolled = (token) {
+      _identityBox?.put('pushToken', token);
+      debugPrint('[push] enrolled for wakes');
+    };
+    client.offerDeviceToken(_unenrolledToken);
     return client;
   }
 
@@ -553,7 +565,11 @@ class MpcService extends ChangeNotifier {
       // from a cosigner that was watching the ASP for us. It no longer can, so
       // the balance is a sum and the delegate is tracked here — see
       // [fundsProtected].
-      _vtxos = await _client!.listVtxos();
+      //
+      // Spent ones too, in the same call: they are what the history is rebuilt from.
+      final all = await _client!.listVtxos(includeSpent: true);
+      _arkHistory = arkHistoryOf(all);
+      _vtxos = all.where((v) => !v.isSpent).toList();
       _arkBalance = _vtxos.fold(BigInt.zero, (sum, v) => sum + BigInt.from(v.amountSats));
       ok = true;
     } on CosignerException catch (e) {
@@ -568,16 +584,23 @@ class MpcService extends ChangeNotifier {
     return ok;
   }
 
-  /// Enrol this device for wakes, if [token] is not the one already enrolled. Returns whether it
-  /// asked the cosigner — a passkey approval, so only when the token actually changed, which FCM
-  /// does rarely, rather than on every start.
-  Future<bool> enrolDevice(String token) async {
-    final client = _client;
-    if (client == null) throw StateError('wallet not initialized');
-    if (_identityBox?.get('pushToken') == token) return false;
-    await client.registerDevice(token);
-    await _identityBox?.put('pushToken', token);
-    return true;
+  /// This device's push token, as FCM last reported it.
+  String? _pushToken;
+
+  /// [_pushToken], unless the cosigner already has it.
+  String? get _unenrolledToken {
+    final token = _pushToken;
+    if (token == null || _identityBox?.get('pushToken') == token) return null;
+    return token;
+  }
+
+  /// Have the cosigner enrol [token] for wakes — on the DKG, or on the next delegate seal (a send, a
+  /// settle, or "Renew automatically"), never as a call of its own. Every call is a passkey approval,
+  /// and a separate enrolment was a fingerprint the user never asked for. Nothing is missed by
+  /// waiting: a wake is only ever about a sealed delegate, and the seal is what carries the token.
+  void offerDeviceToken(String token) {
+    _pushToken = token;
+    _client?.offerDeviceToken(_unenrolledToken);
   }
 
   /// Seal a delegate over what is held, so the cosigner refreshes it on its own before it expires.

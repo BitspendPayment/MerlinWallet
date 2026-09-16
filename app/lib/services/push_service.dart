@@ -1,7 +1,9 @@
 /// FCM push handling.
 ///
-/// Initializes Firebase, enrols the device token with the cosigner, and keeps
-/// that enrolment in sync with FCM rotations.
+/// Initializes Firebase and hands the device token — and each FCM rotation of
+/// it — to [MpcService.offerDeviceToken], which has the cosigner enrol it on the
+/// next call the user makes anyway. There is no enrolment call of its own: every
+/// cosigner call is a passkey approval.
 ///
 /// # A wake carries nothing
 ///
@@ -37,8 +39,8 @@ import 'mpc_service.dart';
 class PushService {
   static bool _initialized = false;
 
-  /// The live, logged-in service. Set by [registerCurrentToken] so the
-  /// foreground push handler can drive a re-delegate while the app is open.
+  /// The live, logged-in service. Set by [onLoggedIn] so the foreground push
+  /// handler can refresh while the app is open.
   static MpcService? _svc;
 
   /// The cosigner's watch found its sealed delegate due and could not run it
@@ -57,7 +59,7 @@ class PushService {
       msg.data['category'] == categoryDelegateSettled;
 
   /// Set when a wake reached us before the service was ready; acted on in
-  /// [registerCurrentToken] once it is.
+  /// [onLoggedIn] once it is.
   static bool _pendingWake = false;
 
   /// Foreground init. Called from `main()` before runApp.
@@ -92,15 +94,32 @@ class PushService {
     }
   }
 
-  /// Enrol the current FCM token with the cosigner. Call after login, once
-  /// `MpcService` has a client. Idempotent — enrolling a token the tenant
-  /// already has is success and changes nothing.
+  /// Offer this device's FCM token, and every rotation of it, to [svc]. Call
+  /// as soon as the service exists — before onboarding, so the DKG can carry
+  /// it. Asks the cosigner nothing itself; see [MpcService.offerDeviceToken].
   ///
-  /// This is what makes the cosigner's settle watch able to reach anybody. The
-  /// cosigner never sees the token twice and has no channel to send on; it
+  /// This is what makes the cosigner's settle watch able to reach anybody: it
   /// forwards the enrolment to the runtime, which owns the FCM credentials.
   /// Without it `wake` has no devices and the watch runs and notifies nothing.
-  static Future<void> registerCurrentToken(MpcService svc) async {
+  static Future<void> offerToken(MpcService svc) async {
+    if (!_initialized) return;
+    try {
+      FirebaseMessaging.instance.onTokenRefresh.listen(svc.offerDeviceToken);
+      final token = await FirebaseMessaging.instance.getToken();
+      if (token == null || token.isEmpty) {
+        debugPrint('[push] FCM returned no token — no wakes will arrive');
+        return;
+      }
+      svc.offerDeviceToken(token);
+    } catch (e) {
+      // Not fatal: the wallet works, it just will not be woken before a
+      // renewal falls due. Worth being loud about rather than silent.
+      debugPrint('[push] no FCM token — no wakes will arrive: $e');
+    }
+  }
+
+  /// The wallet is open: wakes can be acted on.
+  static Future<void> onLoggedIn(MpcService svc) async {
     _svc = svc;
 
     // A wake reached us before the service was ready. Refreshing is the whole
@@ -113,24 +132,6 @@ class PushService {
       } catch (e) {
         debugPrint('[push] pending wake refresh failed: $e');
       }
-    }
-
-    final client = svc.client;
-    if (client == null) {
-      debugPrint('[push] no client yet — cannot enrol for wakes');
-      return;
-    }
-    try {
-      final token = await FirebaseMessaging.instance.getToken();
-      if (token == null || token.isEmpty) {
-        debugPrint('[push] FCM returned no token — not enrolled');
-        return;
-      }
-      if (await svc.enrolDevice(token)) debugPrint('[push] enrolled for wakes');
-    } catch (e) {
-      // Not fatal: the wallet works, it just will not be woken before a
-      // renewal falls due. Worth being loud about rather than silent.
-      debugPrint('[push] device enrolment failed — no wakes will arrive: $e');
     }
   }
 
@@ -170,7 +171,7 @@ class PushService {
     if (!_isOurs(msg)) return;
     final svc = _svc;
     if (svc == null) {
-      // Opened before the service was ready; acted on in registerCurrentToken.
+      // Opened before the service was ready; acted on in onLoggedIn.
       _pendingWake = true;
       return;
     }

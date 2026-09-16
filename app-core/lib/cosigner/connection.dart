@@ -91,12 +91,40 @@ class CosignerConnection {
   final cs.CosignerClient _stub;
   final Approver? _approver;
 
+  /// Approvals obtained by [approveAhead], each waiting for the next call to its method.
+  final Map<String, (Map<String, String>, DateTime)> _ahead = {};
+
+  /// How long an approval obtained ahead is used. The runtime's tokens last 60 s; past this one is
+  /// dropped and the call asks again, rather than being refused at open.
+  static const Duration _aheadFor = Duration(seconds: 45);
+
+  /// Obtain the approval for the next call to [method] now, before it is made.
+  ///
+  /// For an operation that also needs the wallet's share: the passkey gesture that approves the call
+  /// yields the seed that unblinds the share, so approving first and unlocking second costs one
+  /// fingerprint. The other way round is two — the share asks for a gesture of its own, then the
+  /// call asks again.
+  Future<void> approveAhead(String method) async {
+    final approver = _approver;
+    if (approver == null) return;
+    _ahead[method] = (await approver(_path(method)), DateTime.now());
+  }
+
+  /// Drop an approval obtained ahead that will not be used.
+  void discardApproval(String method) => _ahead.remove(method);
+
+  static String _path(String method) => '/cosigner.v1.Cosigner/$method';
+
   /// The options for one call to [method], approval included. Awaited before the call exists, never
   /// inside it — see `Approver` for why.
   Future<CallOptions> _approved(String method) async {
     final approver = _approver;
     if (approver == null) return CallOptions();
-    return CallOptions(metadata: await approver('/cosigner.v1.Cosigner/$method'));
+    final ahead = _ahead.remove(method);
+    if (ahead != null && DateTime.now().difference(ahead.$2) < _aheadFor) {
+      return CallOptions(metadata: ahead.$1);
+    }
+    return CallOptions(metadata: await approver(_path(method)));
   }
 
   /// A stream that opens once its approval is in hand. The duplex exists at once so a driver can

@@ -4,6 +4,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import 'package:app_core/asp/asp_client.dart' show IndexerVtxo;
+import 'package:app_core/asp/history.dart';
 import 'package:app/services/mpc_service.dart';
 import 'package:app/widgets/app_bottom_nav.dart';
 
@@ -91,37 +92,119 @@ class ArkScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  // No history to show. The cosigner kept an Ark transaction log and served it
-                  // over `ListArkTransactions`; it is called rather than running now, so it never
-                  // sees a receive and could only ever log what it performed itself — a wallet
-                  // that appears never to have been paid. Rebuilding this from the ASP indexer's
-                  // `GetVirtualTxs` is its own piece of work.
+                  // Rebuilt from the ASP indexer on each refresh — receives included, and no
+                  // cosigner call, so no passkey prompt. See `app_core/asp/history.dart`.
                   Expanded(
-                    child: Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.receipt_long_outlined,
-                              size: 48, color: Colors.white24),
-                          const SizedBox(height: 12),
-                          Text(
-                            'History unavailable',
-                            style: GoogleFonts.inter(color: Colors.white38),
+                    child: mpcService.arkHistory.isEmpty
+                        ? _buildEmptyHistory()
+                        : RefreshIndicator(
+                            onRefresh: mpcService.refreshVtxos,
+                            child: ListView.builder(
+                              padding: const EdgeInsets.symmetric(horizontal: 24),
+                              itemCount: mpcService.arkHistory.length,
+                              itemBuilder: (context, i) =>
+                                  _buildTransactionItem(mpcService.arkHistory[i]),
+                            ),
                           ),
-                          const SizedBox(height: 4),
-                          Text(
-                            'Your balance above is current',
-                            style: GoogleFonts.inter(
-                                color: Colors.white24, fontSize: 12),
-                          ),
-                        ],
-                      ),
-                    ),
                   ),
                 ],
               ),
       ),
       bottomNavigationBar: _buildBottomNav(context),
+    );
+  }
+
+  Widget _buildEmptyHistory() {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.receipt_long_outlined, size: 48, color: Colors.white24),
+          const SizedBox(height: 12),
+          Text(
+            'No transactions yet',
+            style: GoogleFonts.inter(color: Colors.white38),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTransactionItem(ArkTransaction tx) {
+    final (title, icon, incoming) = switch (tx.kind) {
+      ArkTransactionKind.received => ('Received', Icons.arrow_downward, true),
+      ArkTransactionKind.sent => ('Sent', Icons.arrow_upward, false),
+      ArkTransactionKind.boarded => ('Boarded', Icons.login, true),
+      ArkTransactionKind.renewed => ('Renewed', Icons.autorenew, false),
+    };
+    final amount = NumberFormat("#,##0", "en_US").format(tx.amountSats);
+    final sign = switch (tx.kind) {
+      ArkTransactionKind.received || ArkTransactionKind.boarded => '+',
+      ArkTransactionKind.sent => '-',
+      ArkTransactionKind.renewed => '',
+    };
+    final accent = incoming ? Colors.greenAccent : Colors.white;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1E1E),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              color: incoming ? Colors.green.withOpacity(0.1) : Colors.white10,
+              shape: BoxShape.circle,
+            ),
+            child: Icon(icon, color: accent, size: 20),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      title,
+                      style: GoogleFonts.inter(
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                    // Spendable already; only not yet in a batch.
+                    if (!tx.settled)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 8.0),
+                        child: Text(
+                          'Preconfirmed',
+                          style: GoogleFonts.inter(
+                              color: Colors.white38, fontSize: 10),
+                        ),
+                      ),
+                  ],
+                ),
+                Text(
+                  DateFormat('MMM d, HH:mm').format(tx.timestamp),
+                  style: GoogleFonts.inter(color: Colors.white38, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          Text(
+            '$sign$amount Sats',
+            style: GoogleFonts.inter(
+              fontWeight: FontWeight.bold,
+              color: tx.kind == ArkTransactionKind.renewed ? Colors.white54 : accent,
+            ),
+          ),
+        ],
+      ),
     );
   }
 

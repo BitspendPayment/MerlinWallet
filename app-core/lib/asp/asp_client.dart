@@ -172,11 +172,14 @@ class AspClient {
   /// wallet holds a mixed set: a boarded VTXO keeps the boarding delay while received and refreshed
   /// ones use the unilateral delay, so they sit under different scripts. Asking for one makes the
   /// other bucket invisible, and invisible is indistinguishable from empty.
-  Future<List<IndexerVtxo>> getVtxosByScripts(List<String> scripts) async {
+  ///
+  /// [spendableOnly] false returns spent ones too — the wallet's whole history, which is what a
+  /// transaction list is rebuilt from.
+  Future<List<IndexerVtxo>> getVtxosByScripts(List<String> scripts, {bool spendableOnly = true}) async {
     if (scripts.isEmpty) return const [];
     final resp = await _call(
       'GetVtxos',
-      () => _indexer.getVtxos(ark.GetVtxosRequest(scripts: scripts, spendableOnly: true)),
+      () => _indexer.getVtxos(ark.GetVtxosRequest(scripts: scripts, spendableOnly: spendableOnly)),
     );
     return resp.vtxos.map(_vtxo).toList();
   }
@@ -196,12 +199,16 @@ class AspClient {
     required String unilateralScript,
     required String boardingScript,
     required ArkInfo info,
+    bool includeSpent = false,
   }) async {
     final byScript = {
       unilateralScript.toLowerCase(): info.unilateralExitDelay,
       boardingScript.toLowerCase(): info.boardingExitDelay,
     };
-    final vtxos = await getVtxosByScripts([unilateralScript, boardingScript]);
+    final vtxos = await getVtxosByScripts(
+      [unilateralScript, boardingScript],
+      spendableOnly: !includeSpent,
+    );
     return [
       for (final v in vtxos)
         v.withExitDelay(byScript[v.script.toLowerCase()] ?? info.unilateralExitDelay),
@@ -226,6 +233,11 @@ class AspClient {
         isSpent: v.isSpent || v.isSwept || v.isUnrolled,
         createdAt: v.createdAt.toInt(),
         expiresAt: v.expiresAt.toInt(),
+        isPreconfirmed: v.isPreconfirmed,
+        spentBy: v.spentBy,
+        settledBy: v.settledBy,
+        arkTxid: v.arkTxid,
+        commitmentTxids: v.commitmentTxids.toList(),
       );
 
   Future<void> shutdown() => _channel.shutdown();

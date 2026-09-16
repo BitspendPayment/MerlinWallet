@@ -197,6 +197,25 @@ void main() {
       }
     });
 
+    /// Enrolling for wakes rides the ceremony: a `RegisterDevice` of its own would be a second
+    /// passkey approval straight after onboarding, for nothing the user asked for.
+    test('the ceremony enrols the device token it carries, with no call of its own', () async {
+      final dana = await harness!.wallet('dkg_dana', aspHost: aspHost, aspPort: aspPort);
+      try {
+        const token = 'e2e-dkg-device-token-0123456789abcdef';
+        final enrolled = <String>[];
+        dana.client.onDeviceEnrolled = enrolled.add;
+        dana.client.offerDeviceToken(token);
+
+        await dana.client.doDkg();
+
+        expect(enrolled, [token], reason: 'the cosigner should report the token enrolled');
+        expect(await dana.client.deviceCount(), 1);
+      } finally {
+        await dana.close();
+      }
+    });
+
     test('two passkeys are two tenants, with two wallets', () async {
       final alice = await harness!.wallet('tenant_alice', aspHost: aspHost, aspPort: aspPort);
       final bob = await harness!.wallet('tenant_bob', aspHost: aspHost, aspPort: aspPort);
@@ -329,7 +348,15 @@ void main() {
         await alice.client.doDkg();
         await bob.client.doDkg();
 
+        // A token that arrives after onboarding — FCM rotated it — rides the next seal.
+        const token = 'e2e-seal-device-token-0123456789abcdef';
+        final enrolled = <String>[];
+        alice.client.onDeviceEnrolled = enrolled.add;
+        alice.client.offerDeviceToken(token);
+
         final held = await boardAndSettle(alice, 0.01);
+        expect(enrolled, [token], reason: 'the settle\'s seal should carry the token and enrol it');
+        expect(await alice.client.deviceCount(), 1);
         expect(held, hasLength(1));
         final vtxo = held.single;
         expect(vtxo.exitDelay, greaterThan(0),

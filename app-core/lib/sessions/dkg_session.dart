@@ -38,9 +38,13 @@ class DkgSession {
   ///
   /// The wallet's own dealer secret is returned alongside, because it doubles as the single-key
   /// on-chain key.
-  Future<({DkgResult dkg, threshold.SecretKey onchainSecret})> run({
+  ///
+  /// [deviceToken], when not empty, is enrolled for wakes once the key exists; `deviceEnrolled` says
+  /// whether it was.
+  Future<({DkgResult dkg, threshold.SecretKey onchainSecret, bool deviceEnrolled})> run({
     required int maxSigners,
     required int minSigners,
+    String deviceToken = '',
   }) async {
     final secret = threshold.newSecretKey();
     final coefficients =
@@ -64,6 +68,7 @@ class DkgSession {
         open: cs.DkgOpen(
           identifier: walletIdentifier.serialize(),
           round1Package: jsonEncode(r1Pkg.toJson()),
+          deviceToken: deviceToken,
         ),
       ));
 
@@ -126,6 +131,7 @@ class DkgSession {
       return (
         dkg: DkgResult(keyPkg, pubKeyPkg, derived),
         onchainSecret: secret,
+        deviceEnrolled: complete.complete.deviceEnrolled,
       );
     } finally {
       await duplex.close();

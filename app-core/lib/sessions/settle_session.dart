@@ -64,13 +64,19 @@ class SettleSession {
     required threshold.KeyPackage keyPkg,
     required threshold.PublicKeyPackage groupPubKey,
     required List<IndexerVtxo> vtxos,
+    String deviceToken = '',
   }) async {
     final duplex = _conn.openSettle();
     try {
       duplex.send(cs.SettleClientMsg(
         sessionId: '',
         seq: Int64(0),
-        open: cs.SettleOpen(arkInfo: arkInfoToProto(info), vtxos: vtxosToProto(vtxos), sealOnly: true),
+        open: cs.SettleOpen(
+          arkInfo: arkInfoToProto(info),
+          vtxos: vtxosToProto(vtxos),
+          sealOnly: true,
+          deviceToken: deviceToken,
+        ),
       ));
       return await answerSeal<cs.SettleClientMsg, cs.SettleServerMsg>(
         duplex: duplex,
@@ -109,6 +115,7 @@ class SettleSession {
     List<IndexerVtxo> vtxos = const [],
     void Function(SettlePhase)? onProgress,
     Future<List<IndexerVtxo>> Function()? readHeld,
+    String deviceToken = '',
   }) async {
     final duplex = _conn.openSettle();
     StreamQueue<ark.GetEventStreamResponse>? events;
@@ -201,6 +208,7 @@ class SettleSession {
                     keyPkg: keyPkg,
                     groupPubKey: groupPubKey,
                     seal: (s) => cs.SettleClientMsg(sessionId: '', seq: Int64(seq++), seal: s),
+                    deviceToken: deviceToken,
                     sighashesOf: _sighashesOf,
                     signed: (rounds) => cs.SettleClientMsg(
                         sessionId: '', seq: Int64(seq++), signed: cs.SettleSigned(rounds: rounds)),

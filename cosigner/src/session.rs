@@ -405,12 +405,16 @@ async fn dkg(
         c.seal();
     }
 
+    // After the key, so a refused enrolment cannot cost the wallet its ceremony.
+    let device_enrolled = enrol_device(&cosigner, &open.device_token);
+
     duplex.send(proto::DkgServerMsg {
         session_id,
         seq: 2,
         body: Some(proto::dkg_server_msg::Body::Complete(proto::DkgComplete {
             round2_packages_for_me: r3.round2_packages_for_me,
             group_key,
+            device_enrolled,
         })),
     });
     Ok(())
@@ -544,10 +548,11 @@ async fn send(
     // On this stream so it rides the approval — and the passkey seed — the send already had. A
     // caller that closes instead has simply not asked for it.
     if let Some(msg) = duplex.recv().await {
-        let seal = match msg.body {
+        let mut seal = match msg.body {
             Some(proto::send_client_msg::Body::Seal(seal)) => seal,
             _ => return Err(Status::invalid_argument("after SendComplete only a seal may follow")),
         };
+        let device_token = std::mem::take(&mut seal.device_token);
         let (round, sighashes, commitments) = seal_open(&cosigner, seal)?;
         duplex.send(proto::SendServerMsg {
             session_id: session_id.clone(),
@@ -558,7 +563,7 @@ async fn send(
             proto::send_client_msg::Body::Signed(s) => s,
             _ => return Err(Status::invalid_argument("expected the delegate's signatures")),
         };
-        let sealed = seal_finish(&cosigner, round, signed.rounds)?;
+        let sealed = seal_finish(&cosigner, round, signed.rounds, &device_token)?;
         duplex.send(proto::SendServerMsg {
             session_id,
             seq: 6,
@@ -596,6 +601,7 @@ async fn settle(
         let seal = proto::SealDelegate {
             vtxos: open.vtxos,
             ark_info: Some(info_to_proto(&info)),
+            device_token: open.device_token,
         };
         return settle_seal(&cosigner, &duplex, seal, &session_id, 1).await;
     }
@@ -830,12 +836,15 @@ fn seal_open(
     Ok((round, sighashes, commitments))
 }
 
-/// Finish the round, seal the delegate, and arm the watch.
+/// Finish the round, seal the delegate, and arm the watch — and enrol [device_token] for the wakes
+/// that watch sends, when the seal carried one.
 fn seal_finish(
     cosigner: &Arc<Mutex<Cosigner>>,
     round: crate::cosigner::InBandRound,
     rounds: Vec<proto::WalletRound>,
+    device_token: &str,
 ) -> Result<proto::DelegateSealed, Status> {
+    let device_enrolled = enrol_device(cosigner, device_token);
     let mut c = lock(cosigner);
     // A bad share is the caller's fault, and is reported as such.
     let signatures = c
@@ -847,17 +856,29 @@ fn seal_finish(
         valid_at_secs: sealed.valid_at,
         margin_secs: sealed.margin,
         covered: sealed.covered,
+        device_enrolled,
     })
+}
+
+/// Enrol a device token carried in-band, if there is one. Whether it was, rather than an error: the
+/// operation it rode on is what the caller asked for, and must not fail because a wake could not be
+/// arranged — the wallet sends the token again next time.
+fn enrol_device(cosigner: &Arc<Mutex<Cosigner>>, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    lock(cosigner).host.register_device(token).is_ok()
 }
 
 /// The seal exchange on a `Settle` stream: sighashes out, signatures in, sealed out.
 async fn settle_seal(
     cosigner: &Arc<Mutex<Cosigner>>,
     duplex: &Duplex<proto::SettleClientMsg, proto::SettleServerMsg>,
-    seal: proto::SealDelegate,
+    mut seal: proto::SealDelegate,
     session_id: &str,
     seq: u64,
 ) -> Result<(), Status> {
+    let device_token = std::mem::take(&mut seal.device_token);
     let (round, sighashes, commitments) = seal_open(cosigner, seal)?;
     duplex.send(proto::SettleServerMsg {
         session_id: session_id.to_string(),
@@ -871,7 +892,7 @@ async fn settle_seal(
         Some(proto::settle_client_msg::Body::Signed(s)) => s,
         _ => return Err(Status::invalid_argument("expected the delegate's signatures")),
     };
-    let sealed = seal_finish(cosigner, round, signed.rounds)?;
+    let sealed = seal_finish(cosigner, round, signed.rounds, &device_token)?;
     duplex.send(proto::SettleServerMsg {
         session_id: session_id.to_string(),
         seq: seq + 1,

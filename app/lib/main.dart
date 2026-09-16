@@ -35,19 +35,19 @@ void main() async {
         ChangeNotifierProvider(create: (_) {
           final svc = MpcService();
           svc.initFuture = svc.init();
-          // The FCM token can only be registered once the wallet is
-          // authenticated — DKG or session restore is what populates
-          // client.userId. init() alone doesn't log in, so register on the
-          // first change where a user id exists. Idempotent; PushService also
-          // re-registers on token rotation.
-          late final VoidCallback tokenListener;
-          tokenListener = () {
+          // Offered now, before onboarding, so the DKG carries the token and
+          // no enrolment call — no second fingerprint — follows it.
+          PushService.offerToken(svc);
+          // Wakes are acted on once a wallet is open: DKG or session restore
+          // is what populates client.userId.
+          late final VoidCallback loginListener;
+          loginListener = () {
             if (svc.client?.userId != null) {
-              svc.removeListener(tokenListener);
-              PushService.registerCurrentToken(svc);
+              svc.removeListener(loginListener);
+              PushService.onLoggedIn(svc);
             }
           };
-          svc.addListener(tokenListener);
+          svc.addListener(loginListener);
           return svc;
         }),
       ],

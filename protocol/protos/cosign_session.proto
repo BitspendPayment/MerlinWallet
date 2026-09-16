@@ -155,6 +155,8 @@ message SettleOpen {
   // Refresh nothing now: seal a delegate over `vtxos` and close. The in-band exchange `SealDelegate`
   // describes — `sighashes`, `signed`, `sealed` — with no round before it.
   bool seal_only = 7;
+  // With `seal_only`: the device token the seal carries, as `SealDelegate.device_token`.
+  string device_token = 8;
 }
 
 
@@ -198,6 +200,8 @@ message VtxoInput {
 message SealDelegate {
   repeated VtxoInput vtxos = 1;
   mpc_wallet.ArkInfo ark_info = 2;
+  // This device's push token, when the cosigner has not been given it yet — see `DkgOpen`.
+  string device_token = 3;
 }
 
 message DelegateSealed {
@@ -208,6 +212,8 @@ message DelegateSealed {
   uint64 margin_secs = 2;
   // `txid:vout` of each VTXO the delegate refreshes.
   repeated string covered = 3;
+  // Whether the `device_token` that came with the seal was enrolled for wakes.
+  bool device_enrolled = 4;
 }
 
 message SettleSigned {
@@ -507,6 +513,13 @@ message DkgOpen {
   reserved "user_id", "signature", "timestamp_ms";
   bytes identifier = 4;
   string round1_package = 5; // JSON
+  // This device's push token, enrolled for wakes once the key exists.
+  //
+  // Carried here, not sent as a `RegisterDevice` of its own, because every call is a passkey
+  // approval: a separate enrolment right after onboarding was a second fingerprint for nothing the
+  // user asked for. A token FCM rotates later rides the next `SealDelegate` the same way — a wake is
+  // only ever about a sealed delegate, so none is missed by waiting for one.
+  string device_token = 6;
 }
 
 // The wallet's round-2 packages, one per recipient.
@@ -533,4 +546,6 @@ message DkgComplete {
   // The group key the ceremony produced. The wallet derives the same one from its own part 3;
   // this is here so it can check them against each other rather than discover a mismatch later.
   string group_key = 2;
+  // Whether `DkgOpen.device_token` was enrolled for wakes. Not having been is not a failed ceremony.
+  bool device_enrolled = 3;
 }

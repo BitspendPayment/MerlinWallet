@@ -21,12 +21,18 @@ import 'send_session.dart';
 
 /// What the sealed delegate covers.
 class DelegateStatus {
-  DelegateStatus({required this.validAt, required this.margin, required this.covered});
+  DelegateStatus({
+    required this.validAt,
+    required this.margin,
+    required this.covered,
+    this.deviceEnrolled = false,
+  });
 
   factory DelegateStatus.fromSealed(cs.DelegateSealed s) => DelegateStatus(
         validAt: DateTime.fromMillisecondsSinceEpoch(s.validAtSecs.toInt() * 1000),
         margin: Duration(seconds: s.marginSecs.toInt()),
         covered: s.covered.toSet(),
+        deviceEnrolled: s.deviceEnrolled,
       );
 
   factory DelegateStatus.fromJson(Map<String, dynamic> j) => DelegateStatus(
@@ -49,6 +55,10 @@ class DelegateStatus {
 
   /// `txid:vout` of each VTXO it refreshes.
   final Set<String> covered;
+
+  /// Whether the device token the seal carried was enrolled for wakes. Only meaningful on the seal
+  /// that carried one, so not persisted.
+  final bool deviceEnrolled;
 
   bool covers(IndexerVtxo vtxo) => covered.contains('${vtxo.txid}:${vtxo.vout}');
 }
@@ -75,8 +85,10 @@ Future<List<IndexerVtxo>?> heldOnceIndexed(
   }
 }
 
-cs.SealDelegate sealMessage(List<IndexerVtxo> held, ArkInfo info) =>
-    cs.SealDelegate(vtxos: vtxosToProto(held), arkInfo: arkInfoToProto(info));
+/// [deviceToken], when not empty, is enrolled for wakes as the delegate is sealed — see `DkgOpen` in
+/// `cosign_session.proto` for why it rides here.
+cs.SealDelegate sealMessage(List<IndexerVtxo> held, ArkInfo info, {String deviceToken = ''}) =>
+    cs.SealDelegate(vtxos: vtxosToProto(held), arkInfo: arkInfoToProto(info), deviceToken: deviceToken);
 
 /// The in-band seal exchange: sighashes in, the wallet's half of the round out, the sealed delegate
 /// in. The caller has already sent whatever opens it — `SealDelegate` after a `Complete`, or a
@@ -119,6 +131,7 @@ Future<DelegateStatus?> sealAfter<Q, R>({
   required threshold.KeyPackage keyPkg,
   required threshold.PublicKeyPackage groupPubKey,
   required Q Function(cs.SealDelegate) seal,
+  String deviceToken = '',
   required ({
     List<List<int>> sighashes,
     List<cs.Commitment> commitments,
@@ -131,7 +144,7 @@ Future<DelegateStatus?> sealAfter<Q, R>({
   try {
     final set = await held;
     if (set == null || set.isEmpty) return null;
-    duplex.send(seal(sealMessage(set, info)));
+    duplex.send(seal(sealMessage(set, info, deviceToken: deviceToken)));
     return await answerSeal(
       duplex: duplex,
       keyPkg: keyPkg,

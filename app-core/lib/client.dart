@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:app_core/policy.dart';
 import 'package:app_core/ark/ark.dart' as ark_addr;
 import 'package:app_core/asp/asp_client.dart';
+import 'package:app_core/asp/history.dart';
 import 'enclave/gate.dart';
 import 'package:app_core/cosigner/connection.dart';
 import 'package:app_core/sessions/dkg_session.dart';
@@ -288,11 +289,35 @@ class MpcClient {
     final result = await DkgSession(_conn).run(
       maxSigners: _maxSigners,
       minSigners: _minSigners,
+      deviceToken: _deviceToken ?? '',
     );
     // The wallet's dealer secret doubles as its single-key on-chain key.
     _onchainSecret = result.onchainSecret;
     await _finalizeWalletShare(result.dkg.keyPackage, result.dkg.publicKeyPackage);
     await _saveState();
+    _deviceTokenCarried(result.deviceEnrolled);
+  }
+
+  // --- Wakes ---
+  //
+  // The cosigner wakes this device when a sealed delegate needs it, and for that has to be given the
+  // device's push token. Not with a `RegisterDevice` of its own — every call is a passkey approval —
+  // but carried on a call the user already made: the DKG, or the next seal.
+
+  String? _deviceToken;
+
+  /// Called with a token once the cosigner has enrolled it, so the caller can stop offering it.
+  void Function(String token)? onDeviceEnrolled;
+
+  /// Carry [token] on the next DKG or delegate seal, until one enrolls it. Null offers nothing — the
+  /// token is already enrolled, or there is none.
+  void offerDeviceToken(String? token) => _deviceToken = token;
+
+  void _deviceTokenCarried(bool enrolled) {
+    final token = _deviceToken;
+    if (!enrolled || token == null) return;
+    _deviceToken = null;
+    onDeviceEnrolled?.call(token);
   }
 
   PublicKeyPackage? getTweakedPublicKeyPackage(List<int>? merkle_root) {
@@ -323,6 +348,21 @@ class MpcClient {
         .scalar;
     return threshold.KeyPackage(kp.identifier, pFull, kp.verifyingShare,
         kp.verifyingKey, kp.minSigners);
+  }
+
+  /// The share for an operation that opens [method] — with the call approved first.
+  ///
+  /// A gated share is unblinded by the passkey's PRF, and so is every call approved: one gesture
+  /// yields both, as long as the approval comes first. Unlocking the share first cost a fingerprint
+  /// of its own, then the call asked for another. See `CosignerConnection.approveAhead`.
+  Future<threshold.KeyPackage> _keyPackageFor(String method) async {
+    await _conn.approveAhead(method);
+    try {
+      return await _walletKeyPackage();
+    } catch (_) {
+      _conn.discardApproval(method);
+      rethrow;
+    }
   }
 
   /// Finalize the wallet's freshly-DKG'd share into `_normalPolicy` + auth state. When a
@@ -381,7 +421,7 @@ class MpcClient {
 
   Future<threshold.Signature> sign(Uint8List message,
       {List<int>? fullTransaction, bool applyTweak = true}) async {
-    final keyPackage = await _walletKeyPackage();
+    final keyPackage = await _keyPackageFor('Sign');
     final groupPubKey = _normalPolicy!.publicKeyPackage;
 
     if (_userId == null) {
@@ -458,12 +498,19 @@ class MpcClient {
     );
   }
 
-  /// What this wallet holds, from the ASP's indexer.
+  /// The wallet's Ark transactions — receives, sends, boardings and renewals — newest first, rebuilt
+  /// from every VTXO its scripts ever held. Asks the ASP's indexer, never the cosigner, so it costs no
+  /// passkey prompt. See `asp/history.dart`.
+  Future<List<ArkTransaction>> arkHistory() async =>
+      arkHistoryOf(await listVtxos(includeSpent: true));
+
+  /// What this wallet holds, from the ASP's indexer — or, with [includeSpent], everything it ever
+  /// held.
   ///
   /// Both scripts — a boarded VTXO keeps the boarding delay while received and refreshed ones use
   /// the unilateral delay, so they sit under different ones, and asking for a single script makes
   /// the other bucket invisible.
-  Future<List<IndexerVtxo>> listVtxos() async {
+  Future<List<IndexerVtxo>> listVtxos({bool includeSpent = false}) async {
     final info = await _asp.getInfo();
     return _asp.getOwnedVtxos(
       unilateralScript: ark_addr.vtxoScriptPubkeyHex(
@@ -479,6 +526,7 @@ class MpcClient {
         network: info.network,
       ),
       info: info,
+      includeSpent: includeSpent,
     );
   }
 
@@ -492,15 +540,18 @@ class MpcClient {
   /// then tell the cosigner it was accepted so the send is recorded only once it is real.
   Future<String> sendVtxo(String recipientArkAddress, int amountSats) async {
     final info = await _asp.getInfo();
+    final vtxos = await listVtxos();
     final result = await SendSession(_conn, _asp).send(
       recipientArkAddress: recipientArkAddress,
       amountSats: amountSats,
-      vtxos: await listVtxos(),
+      vtxos: vtxos,
       info: info,
-      keyPkg: await _walletKeyPackage(),
+      keyPkg: await _keyPackageFor('Send'),
       groupPubKey: _normalPolicy!.publicKeyPackage,
       readHeld: listVtxos,
+      deviceToken: _deviceToken ?? '',
     );
+    _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
     // A send spends what the old delegate covered, so the cosigner dropped it: what is sealed now is
     // whatever this send sealed, or nothing.
     await _recordDelegate(result.delegate);
@@ -535,10 +586,12 @@ class MpcClient {
     if (held.isEmpty) throw StateError('nothing is held, so there is nothing to protect');
     final sealed = await SettleSession(_conn, _asp).seal(
       info: info,
-      keyPkg: await _walletKeyPackage(),
+      keyPkg: await _keyPackageFor('Settle'),
       groupPubKey: _normalPolicy!.publicKeyPackage,
       vtxos: held,
+      deviceToken: _deviceToken ?? '',
     );
+    _deviceTokenCarried(sealed.deviceEnrolled);
     await _recordDelegate(sealed);
     return sealed;
   }
@@ -564,15 +617,18 @@ class MpcClient {
       );
     }
     final info = await _asp.getInfo();
+    final vtxos = boardingUtxos.isEmpty ? await listVtxos() : const <IndexerVtxo>[];
     final result = await SettleSession(_conn, _asp).settle(
       info: info,
-      keyPkg: await _walletKeyPackage(),
+      keyPkg: await _keyPackageFor('Settle'),
       groupPubKey: _normalPolicy!.publicKeyPackage,
       boardingUtxo: boardingUtxos.isEmpty ? null : boardingUtxos.first,
-      vtxos: boardingUtxos.isEmpty ? await listVtxos() : const [],
+      vtxos: vtxos,
       onProgress: onProgress,
       readHeld: listVtxos,
+      deviceToken: _deviceToken ?? '',
     );
+    _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
     // A refresh spends the old delegate's inputs; boarding leaves it standing. Either way what this
     // settle sealed, when it sealed, supersedes it.
     if (result.delegate != null || boardingUtxos.isEmpty) await _recordDelegate(result.delegate);
@@ -649,7 +705,7 @@ class MpcClient {
     // Untweaked: this is a statement by the group key, not a taproot key-path spend.
     final signature = await SignSession(_conn).sign(
       message: digest,
-      keyPkg: await _walletKeyPackage(),
+      keyPkg: await _keyPackageFor('Sign'),
       groupPubKey: _normalPolicy!.publicKeyPackage,
       applyTweak: false,
     );

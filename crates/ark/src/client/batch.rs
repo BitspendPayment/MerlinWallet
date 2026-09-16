@@ -1239,6 +1239,9 @@ pub struct DelegateOutput {
 enum DelegatePhase {
     AwaitingSignatures,
     ReadyToSettle,
+    /// Entered only by the host-side `settle()` loop, which is behind the `client` feature. The
+    /// step methods a guest drives never set it, so without that feature nothing constructs it.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     Settling,
     Done,
 }

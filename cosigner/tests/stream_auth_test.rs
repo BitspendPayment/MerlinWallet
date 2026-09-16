@@ -270,6 +270,7 @@ fn a_second_dkg_is_refused_on_the_wire() {
         body: Some(proto::dkg_client_msg::Body::Open(proto::DkgOpen {
             identifier: vec![1; 32],
             round1_package: "{}".into(),
+            ..Default::default()
         })),
     };
     let answer = collect::<proto::DkgServerMsg>(block_on(

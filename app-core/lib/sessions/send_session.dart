@@ -53,6 +53,7 @@ class SendSession {
     required threshold.KeyPackage keyPkg,
     required threshold.PublicKeyPackage groupPubKey,
     Future<List<IndexerVtxo>> Function()? readHeld,
+    String deviceToken = '',
   }) async {
     final duplex = _conn.openSend();
     try {
@@ -142,6 +143,7 @@ class SendSession {
               keyPkg: keyPkg,
               groupPubKey: groupPubKey,
               seal: (s) => cs.SendClientMsg(sessionId: '', seq: Int64(4), seal: s),
+              deviceToken: deviceToken,
               sighashesOf: (r) => r.hasSighashes()
                   ? (
                       sighashes: r.sighashes.messagesToSign,
