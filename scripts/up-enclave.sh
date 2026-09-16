@@ -6,7 +6,7 @@
 #
 # The enclave is enclave-runtime's deploy/qemu-nitro/dev-enclave.sh: a real attested boot under
 # QEMU, a Pebble certificate for enclave.test on 127.0.0.1:$ENCLAVE_PORT, and every request gated on a
-# passkey. It is a fresh store every start, so wallets from a previous boot do not carry over.
+# passkey. The store is kept between starts; FRESH=1 starts it over.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -26,6 +26,28 @@ wasm="$repo/cosigner/target/wasm32-wasip2/release/cosigner.wasm"
 # the CLI and the e2e suite — can use. Either way the certificate is still for enclave.test.
 rp_id="${ENCLAVE_RP_ID-vtxos.com}"
 allowed_origins="${ENCLAVE_ALLOWED_ORIGINS-android:apk-key-hash:Lf1QIwQnlPBYPwDFhloUkYC-0tYAKSpKCQbEiyz118s,android:apk-key-hash:u1pNepeObJUpSkSqH964HvFRqbhC_ejQP3GHA3-lreI}"
+# The store is kept across restarts — tenants, passkeys, wallets — so a phone that onboarded
+# yesterday still has its wallet after a cosigner rebuild. FRESH=1 discards it first. Pins still
+# change every boot (the trust root always, PCR16 with the cosigner), so rebuild the app with
+# `make flutter`; its data survives.
+store=(--keep-store)
+[[ -n "${FRESH:-}" ]] && store+=(--fresh)
+
+# The cosigner reaches the ASP itself — to run a sealed delegate from a background task when its
+# deadline comes, with no phone involved. arkd from docker-compose.ark.yml listens on the host's
+# :7070, which is 192.168.127.254 from inside the enclave; nothing else is reachable. A batch round
+# waits on the ASP's schedule, so a background task gets minutes rather than the default 30 seconds.
+#
+# The safety margin decides when a delegate runs: at the earliest expiry less the margin. Regtest
+# VTXOs live 15360s, so the production-like 1800 would mean hours before anything visible happens;
+# 15060 runs a delegate about five minutes after the VTXOs it covers were made, which is what makes
+# the feature observable while developing. ENCLAVE_DELEGATE_MARGIN overrides it.
+asp_origin="${ENCLAVE_ASP_ORIGIN:-http://192.168.127.254:7070}"
+egress=(--guest-egress "$asp_origin"
+        --guest-env "ASP_URL=$asp_origin"
+        --guest-env "AUTO_SETTLE_SAFETY_MARGIN_SECS=${ENCLAVE_DELEGATE_MARGIN:-15060}"
+        --background-timeout "${ENCLAVE_TASK_TIMEOUT:-600}")
+
 webauthn=()
 if [[ -n "$rp_id" ]]; then
     webauthn+=(--rp-id "$rp_id")
@@ -71,6 +93,9 @@ hints() {
   e2e        make e2e-enclave ENCLAVE_RUN=$run
   app        make adb-reverse && make flutter           (pins this boot's root and PCRs into the build)
   rp id      ${rp_id:-enclave.test}
+  egress     $asp_origin (the ASP) — nothing else
+  delegates  run by the cosigner ${ENCLAVE_DELEGATE_MARGIN:-15060}s before the earliest expiry
+  store      kept in $run-store${FRESH:+ (started fresh)} — make up-enclave FRESH=1 discards it
 
   Regtest is mined every 10s while this runs. make down-enclave stops it from another terminal.
 
@@ -96,4 +121,4 @@ HINTS
 watcher=$!
 
 cd "$runtime"
-./deploy/qemu-nitro/dev-enclave.sh --guest "$wasm" --name "$name" --port "$port" "${webauthn[@]}"
+./deploy/qemu-nitro/dev-enclave.sh --guest "$wasm" --name "$name" --port "$port" "${webauthn[@]}" "${store[@]}" "${egress[@]}"

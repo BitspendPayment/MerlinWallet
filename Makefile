@@ -132,19 +132,22 @@ e2e-enclave: cosigner-wasm ffi-build arkd-up bitcoin-init arkd-init
 #   make e2e-enclave ENCLAVE_RUN=$(ENCLAVE_RUNTIME)/target/qemu-nitro/$(ENCLAVE_NAME)
 #   make flutter                                               the app, pinned to this boot
 #
-# A fresh store every start: the enclave boots into genesis, so wallets from an earlier boot do not
-# carry over (the CLI keeps each boot's wallets apart for that reason). Rebuilding the cosigner
-# means restarting this — the running enclave serves, and PCR16 measures, the component it booted.
+# The store is kept between starts — tenants, passkeys and wallets survive a restart and a cosigner
+# rebuild, which boots as an upgrade of the same store. `make up-enclave FRESH=1` discards it first.
+# Rebuilding the cosigner still means restarting this: the running enclave serves, and PCR16
+# measures, the component it booted. The trust root is new every boot and PCR16 changes with the
+# cosigner, so rebuild the app with `make flutter` afterwards; its data survives.
 #
 # The image is built with rp id vtxos.com and the app's signing-key origins, so a phone can register
 # a passkey against it; ENCLAVE_RP_ID= boots the runtime's default (enclave.test) instead. See
 # scripts/up-enclave.sh.
 ENCLAVE_NAME ?= merlin
 ENCLAVE_PORT ?= 8443
+FRESH        ?=
 
 up-enclave: cosigner-wasm ffi-build arkd-up bitcoin-init arkd-init
 	@ENCLAVE_RUNTIME=$(ENCLAVE_RUNTIME) ENCLAVE_NAME=$(ENCLAVE_NAME) ENCLAVE_PORT=$(ENCLAVE_PORT) \
-		./scripts/up-enclave.sh
+		FRESH=$(FRESH) ./scripts/up-enclave.sh
 
 up: up-enclave
 
