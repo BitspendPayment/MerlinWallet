@@ -130,14 +130,15 @@ make e2e               # Ark E2E: builds ffi + cosigner-runtime, starts regtest 
 
 The local cosigner runtime runs as a plain Rust binary (no enclave, no attestation) — the per-user native-actor isolation still applies. Useful for fast iteration.
 
-### Cloud deployment (signet / mutinynet / mainnet)
+### Cloud deployment (mutinynet)
 
 ```bash
-cd infrastructure/mutiny/tofu
-tofu apply             # provisions Nitro enclave host, KMS key, S3 buckets, SSM params
+cd infrastructure/mutinynet-qemu/tofu && tofu init && tofu plan -out plan.out && tofu apply plan.out
+make mutinynet-deploy  # build, pack, ship over S3, install over SSM
+make mutinynet-smoke   # attestation, two wallets, DKG — and funds, with MUTINYNET_FUNDER_KEY
 ```
 
-The enclave EIF is built by the [release-eif](.github/workflows/release-eif.yml) GitHub Action and published to GitHub Releases. Tofu pulls the artifact, uploads it to S3, and the EC2 supervisor boots it. The [verify](.github/workflows/verify.yml) workflow confirms the published build's `PCR0` before the wallet trusts a deployment.
+The cosigner runs in an **emulated** Nitro enclave (QEMU) on one EC2 instance at `mutiny.vtxos.network`, with a Let's Encrypt certificate and arkade's MutinyNet ASP. The app pins the image, the guest and the emulator's per-boot trust root from a manifest the host republishes on every boot. The step-by-step runbook is [infrastructure/mutinynet-qemu/README.md](infrastructure/mutinynet-qemu/README.md). Production is real Nitro, deployed with enclave-runtime's `deploy/tofu`.
 
 ### Mobile app
 
@@ -211,10 +212,10 @@ a destroyed KMS key, or a lost data volume is unrecoverable **by anyone, includi
 sealing that makes the operator untrusted for confidentiality makes AWS trusted for availability.
 That is a deliberate trade, and it is the whole reason the section below exists.
 
-The mutinynet deployment ([infrastructure/mutinynet/](infrastructure/mutinynet/)) is *not*
-enclave-backed — it runs the cosigner on a plain EC2 host with its shares in plaintext SQLite on
-EBS. It is signet-only for that reason, and the app enforces the split by refusing unattested
-transport for every host except that one.
+The mutinynet deployment ([infrastructure/mutinynet-qemu/](infrastructure/mutinynet-qemu/)) runs
+the cosigner in an *emulated* enclave. The app attests it like any other, but on an emulator the
+host's operator can read every tenant's data and sign attestation documents, so it proves the image
+and the guest, not the hardware. It is signet-only for that reason.
 
 ### The ASP
 

@@ -113,6 +113,17 @@ String relyingPartyId(String host, {DevEnclaveConfig dev = DevEnclaveConfig.from
 String origin(String host, {DevEnclaveConfig dev = DevEnclaveConfig.fromDefines}) =>
     'https://${relyingPartyId(host, dev: dev)}';
 
+/// Where [host]'s deployment publishes what its enclave must attest to, or null for a host that
+/// publishes to the release manifest instead.
+///
+/// The MutinyNet host is an emulated enclave: it mints its attestation root at every boot and
+/// publishes it here with its measurements, from infrastructure/mutinynet-qemu.
+Uri? pinsUrl(String host) => switch (host) {
+      'mutiny.vtxos.network' =>
+        Uri.parse('https://vtxos-mutinynet-enclave.s3.amazonaws.com/pins/deployment.json'),
+      _ => null,
+    };
+
 /// An endpoint to dial: a host, a port, and whether to use TLS.
 class Endpoint {
   const Endpoint(this.host, this.port, {this.secure = false});

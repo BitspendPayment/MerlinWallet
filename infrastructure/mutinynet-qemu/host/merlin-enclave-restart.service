@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart the MutinyNet enclave before its attestation chain expires
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart merlin-enclave.service

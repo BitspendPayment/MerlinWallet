@@ -1,0 +1,46 @@
+#!/bin/bash
+# First boot: make this an enclave host. What runs on it arrives later, with `deploy.sh`.
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y docker.io python3 jq curl openssl rsync "linux-modules-extra-$(uname -r)" \
+  || apt-get install -y docker.io python3 jq curl openssl rsync
+snap install aws-cli --classic || true
+export PATH="$PATH:/snap/bin"
+
+# The emulated enclave's transport, and gvproxy on :443 without root.
+modprobe vsock_loopback
+echo vsock_loopback > /etc/modules-load.d/vsock-loopback.conf
+echo 'net.ipv4.ip_unprivileged_port_start=443' > /etc/sysctl.d/60-merlin-port.conf
+sysctl --system >/dev/null
+
+# 4 GiB of memory; swap so a burst is slow rather than an OOM kill.
+if ! swapon --show | grep -q /swapfile; then
+  fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  swapon /swapfile
+fi
+
+# Home under /home: the snap-packaged AWS CLI refuses to run for a user whose home is elsewhere.
+id merlin >/dev/null 2>&1 || useradd --system --create-home --home-dir /home/merlin --shell /bin/bash merlin
+usermod -aG docker,kvm merlin
+
+# The store volume: NVMe on this instance family, named by its volume id. Formatted only if blank.
+dev="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${replace(volume_id, "-", "")}"
+for _ in $(seq 120); do [ -e "$dev" ] && break; sleep 2; done
+[ -e "$dev" ]
+blkid "$dev" || mkfs.ext4 -L merlin-store "$dev"
+mkdir -p /srv/merlin/work
+grep -q merlin-store /etc/fstab || echo 'LABEL=merlin-store /srv/merlin/work ext4 defaults,nofail 0 2'  >> /etc/fstab
+mount -a
+chown -R merlin:merlin /srv/merlin
+
+echo "${bucket}" > /etc/merlin-bucket
+
+# A deploy that happened before this boot finished — or an instance replaced under a kept volume.
+if aws s3 ls "s3://${bucket}/artifacts/host/install.sh" >/dev/null 2>&1; then
+  aws s3 cp "s3://${bucket}/artifacts/host/install.sh" /usr/local/sbin/merlin-install
+  chmod 755 /usr/local/sbin/merlin-install
+  /usr/local/sbin/merlin-install
+fi

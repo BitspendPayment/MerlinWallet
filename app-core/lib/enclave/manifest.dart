@@ -1,8 +1,12 @@
 /// Deployment manifest fetching: what a remote enclave should measure to.
 ///
-/// The enclave build publishes a `deployment.json` to GitHub Releases with the image's PCR0 and the
-/// cosigner component's PCR16. The app pins both — PCR0 alone says which runtime, not which guest
-/// that runtime is serving.
+/// A deployment publishes a `deployment.json` with the image's PCR0 and the cosigner component's
+/// PCR16. The app pins both — PCR0 alone says which runtime, not which guest that runtime is
+/// serving.
+///
+/// An emulated enclave (the MutinyNet host) also publishes `trust_root`: the root its attestation
+/// documents chain to, which it mints at every boot, and `host`, the name it serves. Real Nitro
+/// publishes neither; its root is AWS's.
 library;
 
 import 'dart:convert';
@@ -19,6 +23,15 @@ class DeploymentManifest {
   final String commit;
   final String repo;
 
+  /// The host this deployment serves. Empty in a manifest that does not say.
+  final String host;
+
+  /// DER of the attestation root, for an emulated enclave. Null means AWS's.
+  final List<int>? trustRoot;
+
+  /// The WebAuthn relying party the image was built with. Empty when not published.
+  final String rpId;
+
   DeploymentManifest({
     required this.baseUrl,
     required this.pcr0,
@@ -28,6 +41,9 @@ class DeploymentManifest {
     this.timestamp = '',
     this.commit = '',
     this.repo = '',
+    this.host = '',
+    this.trustRoot,
+    this.rpId = '',
   });
 
   factory DeploymentManifest.fromJson(Map<String, dynamic> json) {
@@ -40,6 +56,12 @@ class DeploymentManifest {
       timestamp: json['timestamp'] as String? ?? '',
       commit: json['commit'] as String? ?? '',
       repo: json['repo'] as String? ?? '',
+      host: json['host'] as String? ?? '',
+      trustRoot: switch (json['trust_root']) {
+        final String b64 when b64.isNotEmpty => base64.decode(b64),
+        _ => null,
+      },
+      rpId: json['rp_id'] as String? ?? '',
     );
   }
 }
@@ -47,6 +69,15 @@ class DeploymentManifest {
 /// Construct the GitHub Releases URL for a deployment manifest.
 String manifestUrl(String repo, String tag) {
   return 'https://github.com/$repo/releases/download/$tag/deployment.json';
+}
+
+/// Fetch the deployment manifest published at [url].
+Future<DeploymentManifest> fetchManifestFrom(Uri url, {http.Client? client}) async {
+  final resp = await (client?.get(url) ?? http.get(url));
+  if (resp.statusCode != 200) {
+    throw Exception('Failed to fetch manifest from $url: HTTP ${resp.statusCode}');
+  }
+  return DeploymentManifest.fromJson(jsonDecode(resp.body) as Map<String, dynamic>);
 }
 
 /// Fetch the deployment manifest from GitHub Releases.

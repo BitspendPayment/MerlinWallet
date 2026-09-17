@@ -92,6 +92,18 @@ void main() {
     });
   });
 
+  group('pinsUrl', () {
+    test('the MutinyNet host publishes its own pins, trust root included', () {
+      expect(pinsUrl('mutiny.vtxos.network').toString(),
+          'https://vtxos-mutinynet-enclave.s3.amazonaws.com/pins/deployment.json');
+    });
+
+    test('any other host falls back to the release manifest', () {
+      expect(pinsUrl('mainnet.vtxos.network'), isNull);
+      expect(pinsUrl('10.0.2.2'), isNull);
+    });
+  });
+
   group('isLocalHost', () {
     test('does not treat remote deployments as local', () {
       expect(isLocalHost('mutiny.vtxos.network'), isFalse);

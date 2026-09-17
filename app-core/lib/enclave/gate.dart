@@ -70,11 +70,13 @@ class Enrolment {
 class EnclaveGate {
   EnclaveGate({
     required this.endpoint,
-    required this.pins,
+    required EnclavePins pins,
     required this.origin,
     this.authenticator,
+    this.refreshPins,
     ConnectionVerifier verifier = verifyConnection,
-  }) : _verifier = verifier {
+  })  : _pins = pins,
+        _verifier = verifier {
     _http = HttpClient(context: endpoint.securityContext())
       ..connectionFactory = (uri, proxyHost, proxyPort) {
         // The TLS handshake happens here, not in `HttpClient`, so the socket can go to
@@ -84,7 +86,18 @@ class EnclaveGate {
   }
 
   final EnclaveEndpoint endpoint;
-  final EnclavePins pins;
+
+  /// What the enclave must attest to. Replaced only by [refreshPins].
+  EnclavePins get pins => _pins;
+  EnclavePins _pins;
+
+  /// Where newer pins come from, when a document fails against the current ones.
+  ///
+  /// For an enclave whose pins change while the app runs: a redeploy changes PCR16, and an emulated
+  /// enclave mints a new trust root every boot. Asked once per failure; the same document is then
+  /// checked against what it returns, so a refresh can only ever accept what a publisher vouches
+  /// for, and a document that fails both is refused as before. Null means pins never change.
+  final Future<EnclavePins> Function()? refreshPins;
 
   /// What an assertion claims, e.g. `https://enclave.test`.
   ///
@@ -212,12 +225,26 @@ class EnclaveGate {
         '$path answered ${resp.statusCode} with ${header == null ? 'no attestation document' : 'no certificate'}',
       );
     }
-    final attested = _verifier(
-      document: base64.decode(header),
-      pins: pins,
-      servedCertificate: served.der,
-      nonce: nonce,
-    );
+    final document = base64.decode(header);
+    AttestedConnection verifyWith(EnclavePins p) =>
+        _verifier(document: document, pins: p, servedCertificate: served.der, nonce: nonce);
+    late AttestedConnection attested;
+    try {
+      attested = verifyWith(_pins);
+    } on AttestationException catch (refused, trace) {
+      final refresh = refreshPins;
+      if (refresh == null) rethrow;
+      // Pins that cannot be fetched leave the document refused for the reason it was: an
+      // unreachable manifest must not read as a network fault instead of an attestation failure.
+      final EnclavePins fresh;
+      try {
+        fresh = await refresh();
+      } catch (_) {
+        Error.throwWithStackTrace(refused, trace);
+      }
+      attested = verifyWith(fresh);
+      _pins = fresh;
+    }
     // Belt and braces: the verifier compared the same bytes, but the pin is what everything after
     // this relies on, so it is derived here from what the socket presented.
     final servedHash = crypto.sha256.convert(served.der).toString();

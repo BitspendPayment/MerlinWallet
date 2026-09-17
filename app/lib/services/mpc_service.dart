@@ -157,8 +157,9 @@ class MpcService extends ChangeNotifier {
   // Hardcoded for now, could be configurable
   String _host = '10.0.2.2'; // Default, will be overwritten by persistence
 
-  /// Where a remote enclave's measurements are published.
-  static const String _manifestRepo = 'BitspendPayment/MPCWallet';
+  /// Where a remote enclave's measurements are published, for a host with no pins URL of its own
+  /// (`server_host.pinsUrl`).
+  static const String _manifestRepo = 'BitspendPayment/MerlinWallet';
   static const String _manifestTag = 'eif-latest';
 
   /// What a remote host's enclave must attest to, from the deployment manifest. Local hosts are a
@@ -166,22 +167,41 @@ class MpcService extends ChangeNotifier {
   EnclavePins? _remotePins;
 
   /// Fetch a remote enclave's pins from the deployment manifest.
-  Future<void> fetchManifest() async {
-    final m = await manifest.fetchManifest(_manifestRepo, tag: _manifestTag);
+  Future<EnclavePins> fetchManifest() async {
+    final host = _host;
+    final url = server_host.pinsUrl(host);
+    final m = url != null
+        ? await manifest.fetchManifestFrom(url)
+        : await manifest.fetchManifest(_manifestRepo, tag: _manifestTag);
     final measurement = RegExp(r'^[a-f0-9]{96}$');
     if (!measurement.hasMatch(m.pcr0) || !measurement.hasMatch(m.pcr16)) {
       throw StateError('the deployment manifest does not carry a valid PCR0 and PCR16');
     }
-    _remotePins = EnclavePins.aws(pcr0: m.pcr0, pcr16: m.pcr16);
-    debugPrint('Fetched manifest: pcr0=${m.pcr0.substring(0, 16)}… pcr16=${m.pcr16.substring(0, 16)}…');
+    // A manifest that names its host must name this one, and the relying party it was built with
+    // must be the one passkeys are made for — otherwise every approval would be refused, later and
+    // less clearly.
+    if (m.host.isNotEmpty && m.host != host) {
+      throw StateError('the deployment manifest is for ${m.host}, not $host');
+    }
+    final rpId = server_host.relyingPartyId(host);
+    if (m.rpId.isNotEmpty && m.rpId != rpId) {
+      throw StateError('the enclave at $host accepts passkeys for ${m.rpId}, not $rpId');
+    }
+    final trustRoot = m.trustRoot;
+    final pins = trustRoot == null
+        ? EnclavePins.aws(pcr0: m.pcr0, pcr16: m.pcr16)
+        : EnclavePins(trustRoot: trustRoot, pcr0: m.pcr0, pcr16: m.pcr16);
+    if (host == _host) _remotePins = pins;
+    debugPrint('Fetched manifest: pcr0=${m.pcr0.substring(0, 16)}… pcr16=${m.pcr16.substring(0, 16)}…'
+        '${trustRoot == null ? '' : ' (emulated enclave root)'}');
+    return pins;
   }
 
   /// What this host's enclave must attest to. Throws when there is nothing to pin — talking to an
   /// enclave that has not proved what it is would be the one thing all of this exists to prevent.
   Future<EnclavePins> _pins() async {
     if (server_host.isLocalHost(_host)) return server_host.DevEnclaveConfig.fromDefines.pins();
-    if (_remotePins == null) await fetchManifest();
-    return _remotePins!;
+    return _remotePins ?? await fetchManifest();
   }
 
   Future<void> _ensurePersistenceInitialized() async {
@@ -314,6 +334,9 @@ class MpcService extends ChangeNotifier {
       endpoint: server_host.enclaveEndpoint(_host),
       pins: await _pins(),
       origin: server_host.origin(_host),
+      // A remote enclave's pins change under a running app — a redeploy's PCR16, an emulated
+      // enclave's per-boot root — and the gate asks for the current ones when a document fails.
+      refreshPins: server_host.isLocalHost(_host) ? null : fetchManifest,
     );
     final credentialId = _identityBox!.get('passkeyCredentialId') as String?;
     _passkey = PlatformPasskey(rpId: server_host.relyingPartyId(_host), credentialId: credentialId);

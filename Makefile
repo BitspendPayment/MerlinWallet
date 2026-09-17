@@ -25,7 +25,7 @@
 	proto proto-check wit-drift threshold-test \
 	flutter flutter-32 flutter-x86 ark-newaddress crypto-bench \
 	stress-test load-test \
-	signet-hardware-ark signet-down e2e-mutinynet e2e-mutinynet-ark \
+	mutinynet-deploy mutinynet-smoke \
 	e2e-test e2e-ark-test regtest regtest-ark regtest-down \
 	cli cli-build version \
 	release release-apk release-apk-fat release-testers-add release-testers-remove
@@ -40,7 +40,6 @@ export STORE_DIR=/tmp/mpc_cosigner/store
 NDK_VERSION ?= 27.0.12077973
 NDK_HOME     = $(HOME)/Android/Sdk/ndk/$(NDK_VERSION)
 
-MUTINYNET_ASP_URL ?= http://localhost:7070
 SESSIONS          ?= 10
 CONCURRENCY       ?= 5
 SERVER            ?= 127.0.0.1:7074
@@ -283,8 +282,7 @@ adb-reverse:
 # the host binary hits `wstd`'s `unreachable!()` stub instead of serving anything, so this refuses
 # rather than starting something that cannot work.
 #
-# Hosting it under enclave-runtime is the remaining step. `up`, `signet-hardware` and
-# `e2e-mutinynet` still carry their own `cargo run --bin cosigner` lines and need the same fix.
+# Locally that is `make up-enclave`; on MutinyNet it is `make mutinynet-deploy`.
 runtime-run: cosigner-wasm
 	@echo "The cosigner is a Wasm component; there is no native server to run."
 	@echo "Built: cosigner/target/wasm32-wasip2/release/cosigner.wasm"
@@ -422,32 +420,15 @@ load-test: runtime-stop regtest-up bitcoin-init runtime-run
 #  SIGNET / MUTINYNET
 # ═══════════════════════════════════════════════════════════════════════════════
 
-signet-hardware-ark: runtime-build ffi-build ffi-android
-	@echo "=== Setting up ADB reverse ==="
-	-adb reverse tcp:7074 tcp:7074
-	@echo ""
-	@echo "==> Run Flutter in a separate terminal:  cd app && flutter run"
-	@echo "==> Server logs below (Ctrl+C to stop):"
-	@echo ""
-	export ELECTRUM_URL=electrum.mutinynet.com && \
-	export ELECTRUM_PORT=50001 && \
-	export BITCOIN_NETWORK=signet && \
-	export ASP_URL=$(MUTINYNET_ASP_URL) && \
-	cd cosigner && cargo run --release --bin cosigner -- \
-		--port 7074
+# The cosigner on MutinyNet: an emulated enclave on EC2 at mutiny.vtxos.network. Test coins only —
+# see infrastructure/mutinynet-qemu/README.md for the whole runbook, including the first deploy.
+mutinynet-deploy:
+	infrastructure/mutinynet-qemu/deploy.sh
 
-signet-down:
-	@echo "Stopping MPC server..."
-	-pkill -f "target/release/cosigner" || true
-	@echo "Stopped."
-
-e2e-mutinynet: ffi-build runtime-build
-	@echo "Running MutinyNet E2E test..."
-	cd e2e && dart test test/mutinynet_e2e_test.dart --timeout 600s
-
-e2e-mutinynet-ark: ffi-build runtime-build
-	@echo "Running MutinyNet Ark E2E test..."
-	cd e2e && dart test test/mutinynet_ark_e2e_test.dart --timeout 900s
+# Against the live host: attestation, two wallets, DKG. With MUTINYNET_FUNDER_KEY set, also board,
+# send and read history — which spends a little signet from that key.
+mutinynet-smoke: ffi-build
+	cd e2e && dart run bin/mutinynet_smoke.dart
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CLI — regtest REPL wallet
 # ═══════════════════════════════════════════════════════════════════════════════

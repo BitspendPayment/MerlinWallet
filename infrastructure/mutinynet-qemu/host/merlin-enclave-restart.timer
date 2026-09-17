@@ -1,0 +1,14 @@
+[Unit]
+Description=Restart the MutinyNet enclave every two weeks
+
+# The emulator mints its attestation chain at boot, valid for 30 days
+# (CHAIN_VALIDITY in enclave-runtime's runtime/src/testing/cosign.rs). After that
+# every document fails verification. The store is kept, so a restart is a new
+# trust root, republished, and nothing else.
+[Timer]
+OnCalendar=*-*-01,15 04:00:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
