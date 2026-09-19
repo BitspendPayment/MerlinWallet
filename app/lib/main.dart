@@ -5,6 +5,7 @@ import 'screens/onboarding/welcome_screen.dart';
 import 'screens/onboarding/server_connect_screen.dart';
 import 'screens/onboarding/dkg_progress_screen.dart';
 import 'screens/onboarding/passkey_setup_screen.dart';
+import 'screens/onboarding/restore_wallet_screen.dart';
 import 'screens/onboarding/wallet_ready_screen.dart';
 import 'screens/spending/send_screen.dart';
 import 'screens/spending/review_screen.dart';
@@ -112,6 +113,10 @@ GoRouter _buildRouter(MpcService mpc) => GoRouter(
     GoRoute(
       path: '/onboarding/passkey',
       builder: (context, state) => const PasskeySetupScreen(),
+    ),
+    GoRoute(
+      path: '/onboarding/restore',
+      builder: (context, state) => const RestoreWalletScreen(),
     ),
 GoRoute(
       path: '/onboarding/ready',

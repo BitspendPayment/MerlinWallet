@@ -79,6 +79,9 @@ Future<({MpcClient client, EnclaveGate gate})> wallet(String name, EnclavePins p
     aspSecure: true,
     storageId: 'smoke_$name',
   );
+  // The wallet's key is derived from its passkey's PRF, so it needs one before any ceremony —
+  // exactly as the app wires the platform passkey's. See `SoftwareAuthenticator.seedSource`.
+  client.setSeedSource((gate.authenticator! as SoftwareAuthenticator).seedSource);
   return (client: client, gate: gate);
 }
 

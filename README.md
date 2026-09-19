@@ -164,6 +164,7 @@ make stress-test                  # multi-user E2E stress test
 - **The full private key never exists on any single device.** The Ark owner key is a 2-of-2 FROST split between the phone and the cosigner.
 - **The cosigner cannot unilaterally sign.** It always needs cooperation from the phone.
 - **The phone's FROST share is passkey-gated.** It is stored blinded and reconstructed transiently, only for a sign, from a passkey PRF gesture.
+- **The passkey *is* the wallet.** The phone's dealer polynomial is derived from the passkey's PRF (`app-core/lib/passkey/key_derivation.dart`), not drawn at random, and the cosigner seals the half it dealt back. So the same passkey on a new phone reproduces its half and asks the cosigner (`Recover`) for the other — no seed phrase, no export, nothing to back up separately. The flip side is stated plainly: the passkey alone is now enough to reconstruct the share, so the platform's passkey security is the wallet's security.
 - **The cosigner runs in a Nitro Enclave with attested boot.** Clients refuse to send DKG packets to a runtime whose `PCR0` doesn't match a known build, and bind its response-signing key to the attestation.
 - **KMS secrets are PCR0-locked.** A modified runtime can't decrypt them even with the same IAM role.
 - **FROST keys are held by an isolated per-user native actor** — no shared mutable state, serial per-user processing, panic-recovered from a sealed snapshot.

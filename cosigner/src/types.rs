@@ -112,6 +112,14 @@ pub struct SnapshotState {
     pub public_key_package_json: String,
     pub user_signing_identifier_hex: Option<String>,
     pub ark_cosigner_secret_hex: Option<String>,
+    /// `f_cosigner(wallet_identifier)`, hex: the share this cosigner dealt the wallet at DKG.
+    ///
+    /// Kept so a wallet can be rebuilt on a new device. Its owner re-derives the other half of its
+    /// share from the passkey's PRF and adds this one; the sum is checked against the verifying
+    /// share in `public_key_package_json` before anything is saved. `default` for seals written
+    /// before this existed — those wallets have no restore path, and `Recover` says so.
+    #[serde(default)]
+    pub wallet_dealt_share_hex: Option<String>,
     /// The owned set, with expiry. `VtxoInput` before — a shape that dropped the expiry a
     /// delegate's renewal deadline needs, which is why a second set existed alongside it.
     pub vtxos: Vec<VtxoEntry>,

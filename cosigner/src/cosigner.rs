@@ -117,6 +117,9 @@ pub struct Cosigner {
     pub(crate) settle_inflight: Option<crate::handlers::settle::InFlight>,
     /// The Ark cosigner (MuSig2) secret, hex — zeroized on drop. Used for tree signing.
     ark_cosigner_secret_hex: Option<Zeroizing<String>>,
+    /// See `SnapshotState::wallet_dealt_share_hex`. Zeroized on drop like the secret above: it is
+    /// half of the owner's signing key, and the other half is one passkey away.
+    wallet_dealt_share_hex: Option<Zeroizing<String>>,
     /// Parties authorized to bill this wallet — the only authorization for an incoming request.
     contacts: Vec<Contact>,
     /// Request-to-pay records held for the payer (bounded; see `prune_intents`).
@@ -198,6 +201,7 @@ impl Cosigner {
             boarding_settle: None,
             settle_inflight: None,
             ark_cosigner_secret_hex: None,
+            wallet_dealt_share_hex: None,
             contacts: Vec::new(),
             payment_intents: Vec::new(),
             seen_request_nonces: BTreeMap::new(),
@@ -221,6 +225,10 @@ impl Cosigner {
                 .as_ref()
                 .map(|id| hex::encode(id.serialize())),
             ark_cosigner_secret_hex: self.ark_secret().map(|s| s.to_string()),
+            wallet_dealt_share_hex: self
+                .wallet_dealt_share_hex
+                .as_ref()
+                .map(|z| z.to_string()),
             vtxos: self.owned_vtxos.clone(),
             // Persist a ReadyToSettle delegate (to_persisted errors for other phases → None).
             delegate_json: self
@@ -255,6 +263,7 @@ impl Cosigner {
             user_signing_identifier,
         });
         self.ark_cosigner_secret_hex = snap.ark_cosigner_secret_hex.map(Zeroizing::new);
+        self.wallet_dealt_share_hex = snap.wallet_dealt_share_hex.map(Zeroizing::new);
         self.owned_vtxos = snap.vtxos;
         self.contacts = snap.contacts;
         self.payment_intents = snap.payment_intents;
@@ -279,6 +288,12 @@ impl Cosigner {
 
     pub fn ark_cosigner_secret_hex(&self) -> Option<&str> {
         self.ark_secret()
+    }
+
+    /// The share this cosigner dealt the wallet at DKG, hex, if this wallet was onboarded after
+    /// recovery existed. See `SnapshotState::wallet_dealt_share_hex`.
+    pub(crate) fn wallet_dealt_share_hex(&self) -> Option<&str> {
+        self.wallet_dealt_share_hex.as_ref().map(|z| z.as_str())
     }
 
     /// Take the caller's account of what this wallet holds.
@@ -647,6 +662,7 @@ impl Cosigner {
         public_key_package_json: &str,
         user_signing_identifier_hex: Option<&str>,
         server_dkg_secret_hex: Option<String>,
+        wallet_dealt_share_hex: Option<String>,
     ) -> Result<(), String> {
         let key_package =
             KeyPackage::from_json(key_package_json).map_err(|e| format!("bad key package: {e}"))?;
@@ -663,6 +679,7 @@ impl Cosigner {
             user_signing_identifier,
         });
         self.ark_cosigner_secret_hex = server_dkg_secret_hex.map(Zeroizing::new);
+        self.wallet_dealt_share_hex = wallet_dealt_share_hex.map(Zeroizing::new);
         Ok(())
     }
 
@@ -671,6 +688,17 @@ impl Cosigner {
     /// This wallet's group key, hex, once it has one.
     pub(crate) fn policy_group_key(&self) -> Option<String> {
         self.policy.as_ref().map(|p| p.group_key.clone())
+    }
+
+    /// The ceremony's public key package, JSON: the group key and both verifying shares. Public by
+    /// construction — it is what a recovering wallet checks its rebuilt share against.
+    pub(crate) fn policy_public_key_package_json(&self) -> Option<String> {
+        self.policy.as_ref().map(|p| p.public_key_package.to_json())
+    }
+
+    /// The owner's FROST identifier, as the ceremony recorded it.
+    pub(crate) fn user_signing_identifier(&self) -> Option<Identifier> {
+        self.policy.as_ref().and_then(|p| p.user_signing_identifier.clone())
     }
 
     /// Refuse a second DKG over a wallet that already has a key.

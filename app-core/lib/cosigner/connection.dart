@@ -183,5 +183,10 @@ class CosignerConnection {
   Future<int> deviceCount(cs.DeviceCountRequest r) async =>
       (await _stub.deviceCount(r, options: await _approved('DeviceCount'))).devices;
 
+  /// Ask the cosigner for the half of this wallet's key it dealt at DKG. See
+  /// `MpcClient.recover` — one approval, and the only call a wiped device can usefully make.
+  Future<cs.RecoverResponse> recover(cs.RecoverRequest r) async =>
+      _stub.recover(r, options: await _approved('Recover'));
+
   Future<void> shutdown() => _channel.shutdown();
 }

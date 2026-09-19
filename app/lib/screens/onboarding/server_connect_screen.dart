@@ -28,7 +28,11 @@ class _ServerConnectionScreenState extends State<ServerConnectionScreen> {
     try {
       await context.read<MpcService>().setHost(host);
       if (!mounted) return;
-      context.push('/onboarding/passkey', extra: extras);
+      // A restore skips creating a passkey: it goes looking for the one that already exists.
+      context.push(
+        extras['isRestore'] == true ? '/onboarding/restore' : '/onboarding/passkey',
+        extra: extras,
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() => _selecting = null);

@@ -128,6 +128,7 @@ impl CosignerService {
             "RegisterDevice" => unary!(self.register_device(body)),
             "ForgetDevice" => unary!(self.forget_device(body)),
             "DeviceCount" => unary!(self.device_count(body)),
+            "Recover" => unary!(self.recover(body)),
             other => grpc::failed(Status::unimplemented(format!("no such method: {other}"))),
         }
     }
@@ -217,6 +218,12 @@ impl CosignerService {
         let _: proto::DeviceCountRequest = grpc::one_message(body).await?;
         let devices = lock(&self.cosigner).host.devices().map_err(Status::unavailable)?;
         Ok(proto::DeviceCountResponse { devices })
+    }
+
+    /// See [`crate::handlers::recover`]. Reads the seal; installs nothing.
+    async fn recover(&self, body: Body) -> Result<proto::RecoverResponse, Status> {
+        let req: proto::RecoverRequest = grpc::one_message(body).await?;
+        crate::handlers::recover::recover(&lock(&self.cosigner), req)
     }
 }
 
@@ -400,6 +407,7 @@ async fn dkg(
             &mat.public_key_package_json,
             mat.user_signing_identifier_hex.as_deref(),
             mat.server_dkg_secret_hex,
+            mat.wallet_dealt_share_hex,
         )
         .map_err(Status::internal)?;
         c.seal();

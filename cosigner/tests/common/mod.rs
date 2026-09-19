@@ -105,6 +105,28 @@ pub fn seed_policy(
     pkp: &PublicKeyPackage,
     ark_cosigner_secret_hex: Option<String>,
 ) {
+    seed_policy_with_dealt_share(
+        cosigner,
+        group_key,
+        kp_cosigner,
+        kp_user,
+        pkp,
+        ark_cosigner_secret_hex,
+        None,
+    );
+}
+
+/// As [`seed_policy`], plus the share the cosigner dealt the wallet at DKG — what `Recover` hands
+/// back. `None` is a wallet onboarded before recovery existed.
+pub fn seed_policy_with_dealt_share(
+    cosigner: &Mutex<Cosigner>,
+    group_key: &str,
+    kp_cosigner: &KeyPackage,
+    kp_user: &KeyPackage,
+    pkp: &PublicKeyPackage,
+    ark_cosigner_secret_hex: Option<String>,
+    wallet_dealt_share_hex: Option<String>,
+) {
     let mut actor = cosigner.lock().unwrap();
     actor
         .install_policy(
@@ -113,6 +135,7 @@ pub fn seed_policy(
             &pkp.to_json(),
             Some(&hex::encode(kp_user.identifier.serialize())),
             ark_cosigner_secret_hex,
+            wallet_dealt_share_hex,
             )
         .expect("install policy");
     actor.seal();

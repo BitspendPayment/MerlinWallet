@@ -358,9 +358,13 @@ class MpcService extends ChangeNotifier {
     debugPrint('Passkey registered: tenant ${enrolment.tenantId}');
   }
 
-  /// Run initial DKG: a pure 2-of-2 {wallet, cosigner}. The wallet generates its own dealer secret
-  /// in-process (see [MpcClient.doDkg]), and its share is blinded under the passkey's PRF as it is
-  /// finalized. There is no cloud backup — the share lives only on this device.
+  /// Run initial DKG: a pure 2-of-2 {wallet, cosigner}. The wallet derives its own dealer
+  /// polynomial from the passkey's PRF (see [MpcClient.doDkg]), and its share is blinded under the
+  /// same PRF as it is finalized.
+  ///
+  /// The share on this device is a cache, not the only copy: it is derived, and the passkey that
+  /// derives it is synced by the platform. A new phone with the same passkey rebuilds it — see
+  /// [restoreWallet].
   Future<void> doDkg() async {
     if (!_isInitialized) throw StateError("MPC Service not initialized");
 
@@ -371,6 +375,47 @@ class MpcService extends ChangeNotifier {
     _client = await _createMpcClient(storageId: _storageId ?? 'mpc_wallet_state_default');
     // Nothing to restore on a wallet that has never run a ceremony, so this is the ceremony.
     if (!await _client!.restoreState()) await _client!.doDkg();
+
+    _dkgComplete = true;
+    _isConnected = true;
+    await _identityBox!.put('dkgComplete', true);
+
+    await initArk();
+    notifyListeners();
+  }
+
+  /// Rebuild a wallet on a device that has never held it, from its passkey.
+  ///
+  /// The counterpart of [enablePasskey] + [doDkg], and the reason the wallet's key is derived from
+  /// the passkey rather than drawn at random. Three steps, one fingerprint each at most:
+  ///
+  ///  1. **Find the passkey.** Nothing is stored yet, so the phone is asked which of its passkeys
+  ///     for this relying party to use ([PlatformPasskey.discover]). Its id is what the gate needs,
+  ///     and the same gesture yields the PRF seed.
+  ///  2. **Ask the cosigner** for the half of the key it dealt at DKG, and rebuild the share — see
+  ///     [MpcClient.recover], which refuses anything that does not match what the ceremony
+  ///     recorded.
+  ///  3. **Open the wallet.** Its VTXOs, delegate and contacts were never on the old phone in the
+  ///     first place: they come back from the cosigner's seal as they always do.
+  ///
+  /// The exits do not come back — they are this device's copies of transactions signed for the old
+  /// one — so the exit address is asked for again and the next seal reissues them.
+  ///
+  /// Throws if this install already has a wallet: recovering over one would replace it.
+  Future<void> restoreWallet() async {
+    if (!_isInitialized) throw StateError("MPC Service not initialized");
+    if (_dkgComplete) throw StateError('this device already has a wallet');
+
+    final gate = await _ensureGate();
+    final credentialId = await _passkey!.discover();
+    await _identityBox!.put('passkeyCredentialId', credentialId);
+    // No tenant id is stored or needed: the runtime keys its credential store by credential id and
+    // resolves the tenant from it. That is what makes a wiped device able to find its way back —
+    // the tenant is minted from the enclave's own entropy and was never this device's to know.
+    gate.authenticator = _passkey;
+
+    _client = await _createMpcClient(storageId: _storageId ?? 'mpc_wallet_state_default');
+    await _client!.recover();
 
     _dkgComplete = true;
     _isConnected = true;

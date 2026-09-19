@@ -62,6 +62,18 @@ class WelcomeScreen extends StatelessWidget {
                 },
                 child: const Text('Create MPC Wallet'),
               ),
+              const SizedBox(height: 12),
+              TextButton(
+                key: const Key('welcomeRestoreBtn'),
+                onPressed: () {
+                  // Same passkey, new phone: the wallet is derived from it, so there is nothing
+                  // else to bring across. See `RestoreWalletScreen`.
+                  context.push('/onboarding/server', extra: {
+                    'isRestore': true,
+                  });
+                },
+                child: const Text('I already have a wallet'),
+              ),
             ],
           ),
         ),

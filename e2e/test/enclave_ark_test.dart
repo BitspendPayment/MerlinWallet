@@ -858,6 +858,78 @@ void main() {
       }
     }, timeout: const Timeout(Duration(minutes: 15)));
   });
+
+  group('a wallet on a new phone', () {
+    /// The passkey is the whole wallet: nothing else crosses from the old device.
+    ///
+    /// The share this client rebuilds is half derived from the passkey's PRF and half handed back
+    /// by the cosigner, which sealed it at the ceremony. Reporting the same group key would not
+    /// prove the share is right — that is public. Spending does: a FROST signature the cosigner
+    /// accepts and the ASP mines cannot be made with a share that is off by anything at all.
+    test('the passkey alone brings it back, and it can still spend', () async {
+      final erin = await wallet('recover_erin');
+      final frank = await wallet('recover_frank');
+      late String key;
+      late int held;
+      try {
+        await erin.client.doDkg();
+        await frank.client.doDkg();
+        key = erin.client.groupKeyHex!;
+        held = (await boardAndSettle(erin, 0.005)).totalSats;
+      } finally {
+        await erin.close();
+      }
+
+      // A new phone: the same passkey, an empty store.
+      final newPhone =
+          await harness!.newDeviceFor('recover_erin', aspHost: aspHost, aspPort: aspPort);
+      try {
+        expect(await newPhone.client.restoreState(), isFalse,
+            reason: 'this device has never held the wallet');
+
+        await newPhone.client.recover();
+
+        expect(newPhone.client.groupKeyHex, key, reason: 'the same wallet, not a new one');
+        expect(newPhone.client.userId, isNotNull);
+        expect((await newPhone.client.listVtxos()).totalSats, held,
+            reason: 'the balance was never on the old phone either — it comes from the ASP');
+
+        await sendAndSettleBalances(newPhone, frank, 100000);
+      } finally {
+        await newPhone.close();
+        await frank.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 20)));
+
+    /// The failure that matters: a PRF that answers differently on this device.
+    ///
+    /// Nothing in WebAuthn promises a synced passkey yields the same PRF output everywhere, and a
+    /// wallet rebuilt from the wrong half would look fine until the first payment failed. So the
+    /// cosigner checks the identifier the caller derived against the one the ceremony recorded, and
+    /// refuses rather than answer.
+    test('a passkey whose PRF answers differently is refused, not half-served', () async {
+      final gina = await wallet('recover_gina');
+      try {
+        await gina.client.doDkg();
+      } finally {
+        await gina.close();
+      }
+
+      final newPhone =
+          await harness!.newDeviceFor('recover_gina', aspHost: aspHost, aspPort: aspPort);
+      try {
+        newPhone.client
+            .setSeedSource(FixedSeedSource(Uint8List.fromList(List.filled(32, 0xab))));
+        await expectLater(
+          newPhone.client.recover(),
+          throwsA(predicate((e) => '$e'.contains('does not derive this wallet'))),
+        );
+        expect(newPhone.client.groupKeyHex, isNull, reason: 'a refused recovery saves nothing');
+      } finally {
+        await newPhone.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 10)));
+  });
 }
 
 String _hex(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();

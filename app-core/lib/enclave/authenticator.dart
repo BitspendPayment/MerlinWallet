@@ -13,6 +13,7 @@ library;
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:app_core/passkey/seed_source.dart';
 import 'package:blockchain_utils/blockchain_utils.dart';
 import 'package:crypto/crypto.dart' as crypto;
 
@@ -59,13 +60,29 @@ abstract class PasskeyRegistrar {
 /// for the attestation object — stays in the tool that already does it, and this only ever asserts.
 class SoftwareAuthenticator implements Authenticator {
   SoftwareAuthenticator({
-    required this.rpId,
+    required String rpId,
     required String credentialId,
     required List<int> privateKeyPkcs8,
     int counter = 0,
+    void Function(int counter)? onCounter,
+  }) : this._(
+          rpId: rpId,
+          credentialId: credentialId,
+          keyBytes: _scalarFromPkcs8(privateKeyPkcs8),
+          counter: counter,
+          onCounter: onCounter,
+        );
+
+  // The scalar is pulled out once and kept: the signer needs it, and so does the PRF.
+  SoftwareAuthenticator._({
+    required this.rpId,
+    required String credentialId,
+    required List<int> keyBytes,
+    required int counter,
     this.onCounter,
   })  : _credentialId = credentialId,
-        _signer = Nist256p1Signer.fromKeyBytes(_scalarFromPkcs8(privateKeyPkcs8)),
+        _keyBytes = keyBytes,
+        _signer = Nist256p1Signer.fromKeyBytes(keyBytes),
         _counter = counter;
 
   /// Restore the passkey `passkey-client --state <file>` persisted.
@@ -93,6 +110,7 @@ class SoftwareAuthenticator implements Authenticator {
   final String rpId;
 
   final String _credentialId;
+  final List<int> _keyBytes;
   final Nist256p1Signer _signer;
   int _counter;
 
@@ -103,6 +121,28 @@ class SoftwareAuthenticator implements Authenticator {
   String get credentialId => _credentialId;
 
   int get counter => _counter;
+
+  /// This passkey's PRF, as a platform authenticator's is: a secret held by the credential, mixed
+  /// with a caller's salt.
+  ///
+  /// WebAuthn's `prf` extension is HMAC-secret — `HMAC-SHA256(credRandom, salt)`, where `credRandom`
+  /// belongs to the credential and never leaves the authenticator. The same is done here over the
+  /// credential's own key material, one hash removed so the signing key is not also an HMAC key.
+  /// What matters for the wallet is the property, not the construction: the same passkey yields the
+  /// same seed, every time and wherever it is restored from — which is what makes a wallet derived
+  /// from it recoverable.
+  SeedSource get seedSource => _SoftwarePrf(this);
+
+  static final Uint8List _prfSalt =
+      Uint8List.fromList(crypto.sha256.convert(utf8.encode('mpcwallet-prf-v1')).bytes);
+
+  Uint8List _prf() {
+    final credRandom = crypto.sha256
+        .convert(utf8.encode('merlin/software-passkey/cred-random/v1') + _keyBytes)
+        .bytes;
+    return Uint8List.fromList(
+        crypto.Hmac(crypto.sha256, credRandom).convert(_prfSalt).bytes);
+  }
 
   @override
   Future<Map<String, dynamic>> assertion(Map<String, dynamic> publicKey, String origin) async {
@@ -210,3 +250,12 @@ String _b64u(List<int> bytes) => base64Url.encode(bytes).replaceAll('=', '');
 
 List<int> _b64uDecode(String s) =>
     base64Url.decode(s.padRight(s.length + ((4 - s.length % 4) % 4), '='));
+
+/// The PRF of a [SoftwareAuthenticator], as a [SeedSource].
+class _SoftwarePrf implements SeedSource {
+  _SoftwarePrf(this._passkey);
+  final SoftwareAuthenticator _passkey;
+
+  @override
+  Future<Uint8List> deriveSeed() async => _passkey._prf();
+}

@@ -135,14 +135,24 @@ class DevEnclave {
     required int aspPort,
     bool aspSecure = false,
     String? storageId,
-  }) =>
-      MpcClient.enclave(
-        gate: gate,
-        aspHost: aspHost,
-        aspPort: aspPort,
-        aspSecure: aspSecure,
-        storageId: storageId,
-      );
+  }) {
+    final client = MpcClient.enclave(
+      gate: gate,
+      aspHost: aspHost,
+      aspPort: aspPort,
+      aspSecure: aspSecure,
+      storageId: storageId,
+    );
+    // The same wiring the app does with a platform passkey: the wallet's key is derived from the
+    // credential's PRF, and its share is blinded under it. A software passkey has one too — see
+    // `SoftwareAuthenticator.seedSource` — so a test wallet behaves exactly like a real one, down
+    // to being recoverable from its state file alone.
+    final authenticator = gate.authenticator;
+    if (authenticator is SoftwareAuthenticator) {
+      client.setSeedSource(authenticator.seedSource);
+    }
+    return client;
+  }
 
   /// The runtime writes its log with colour, and the escapes land between the field name and its
   /// value — `pcr0` and `=8f20…` are separated by a reset sequence — so a pattern that reads like

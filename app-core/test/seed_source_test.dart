@@ -11,8 +11,6 @@ import 'package:app_core/threshold/threshold.dart' as threshold;
 /// (PRF stand-in) blinds + reconstructs the share, and the PIN source matches
 /// [seedFromPin].
 void main() {
-  final id = threshold.Identifier.derive(
-      Uint8List.fromList(List<int>.generate(33, (i) => (i * 5 + 3) & 0xff)));
   final share = threshold.newSecretKey();
 
   group('SeedSource', () {
@@ -20,8 +18,8 @@ void main() {
       final src = FixedSeedSource(
           Uint8List.fromList(List<int>.generate(32, (i) => (i * 13 + 7) & 0xff)));
       final seed = await src.deriveSeed();
-      final delta = blindShare(share, id, seed);
-      final recovered = reconstructShare(delta, id, await src.deriveSeed());
+      final delta = await blindShare(share, seed);
+      final recovered = await reconstructShare(delta, await src.deriveSeed());
       expect(recovered.scalar, equals(share.scalar));
     });
 
@@ -43,8 +41,8 @@ void main() {
           Uint8List.fromList(List<int>.generate(32, (i) => i & 0xff)));
       final bad = FixedSeedSource(
           Uint8List.fromList(List<int>.generate(32, (i) => (i + 1) & 0xff)));
-      final delta = blindShare(share, id, await good.deriveSeed());
-      final wrong = reconstructShare(delta, id, await bad.deriveSeed());
+      final delta = await blindShare(share, await good.deriveSeed());
+      final wrong = await reconstructShare(delta, await bad.deriveSeed());
       expect(wrong.scalar, isNot(equals(share.scalar)));
     });
   });

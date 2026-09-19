@@ -200,6 +200,27 @@ class EnclaveHarness {
     );
   }
 
+  /// The same passkey on a phone that has never held this wallet's key.
+  ///
+  /// Its enrolled credential — so the runtime resolves the same tenant and the same cosigner — with
+  /// a gate of its own and an empty store. What a reinstall looks like, and the only honest way to
+  /// test recovery: a client that has never run the ceremony it is recovering from.
+  Future<Wallet> newDeviceFor(String name,
+      {required String aspHost, required int aspPort}) async {
+    await _initPersistence();
+    final state = File('$runDir/$name-$runId.json');
+    if (!state.existsSync()) {
+      throw StateError('$name has no passkey to recover with');
+    }
+    final gate = enclave.gate(state);
+    return Wallet(
+      name,
+      enclave.client(gate,
+          aspHost: aspHost, aspPort: aspPort, storageId: 'e2e_${name}_device2_$runId'),
+      gate,
+    );
+  }
+
   /// Hive, once per process, under a directory this run owns.
   ///
   /// Wallet state is the client's half of the key — the FROST share, the policy, the on-chain

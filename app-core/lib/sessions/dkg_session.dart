@@ -16,6 +16,7 @@ import 'package:fixnum/fixnum.dart';
 import 'package:protocol/cosigner_v1.dart' as cs;
 
 import '../cosigner/connection.dart';
+import '../passkey/key_derivation.dart';
 import '../threshold_types.dart' as threshold;
 
 /// What a completed ceremony hands back.
@@ -34,23 +35,38 @@ class DkgSession {
   final CosignerConnection _conn;
 
   /// Run the ceremony. 2-of-2 {wallet, cosigner}: both deal, both hold a share, both are needed to
-  /// sign. No hardware signer and no recovery share.
+  /// sign. No hardware signer, and no recovery share — the passkey is the recovery, because the
+  /// wallet's own dealer is derived from it and the cosigner seals the half it deals back.
   ///
   /// The wallet's own dealer secret is returned alongside, because it doubles as the single-key
   /// on-chain key.
   ///
   /// [deviceToken], when not empty, is enrolled for wakes once the key exists; `deviceEnrolled` says
   /// whether it was.
+  /// [polynomial] is what this wallet deals, derived from its passkey rather than drawn at random
+  /// — see `passkey/key_derivation.dart`. That is what makes the wallet recoverable: the same
+  /// passkey re-derives the same polynomial, and so the same identifier and the same half of the
+  /// share. Nothing else in the ceremony needs to be deterministic; `dkgPart1`'s own randomness is
+  /// the proof-of-knowledge nonce, which no key material depends on.
   Future<({DkgResult dkg, threshold.SecretKey onchainSecret, bool deviceEnrolled})> run({
     required int maxSigners,
     required int minSigners,
+    required WalletPolynomial polynomial,
     String deviceToken = '',
   }) async {
-    final secret = threshold.newSecretKey();
-    final coefficients =
-        List<BigInt>.generate(minSigners - 1, (_) => threshold.modNRandom());
-    final (r1Secret, r1Pkg) =
-        threshold.dkgPart1(maxSigners, minSigners, secret, coefficients);
+    final secret = polynomial.a0;
+    // A dealer's polynomial has degree `minSigners - 1`, and `walletPolynomial` derives exactly the
+    // two coefficients a 2-of-2 needs. A higher threshold would need labels this KDF does not
+    // define, and passing too few here would quietly deal a lower-degree polynomial — a weaker
+    // secret sharing that only fails later, at the peer's commitment-length check.
+    if (polynomial.higherCoefficients.length != minSigners - 1) {
+      throw ArgumentError(
+        'a $minSigners-of-$maxSigners ceremony needs ${minSigners - 1} coefficients above a0, and '
+        'this polynomial has ${polynomial.higherCoefficients.length}',
+      );
+    }
+    final (r1Secret, r1Pkg) = threshold.dkgPart1(
+        maxSigners, minSigners, secret, polynomial.higherCoefficients);
 
     final walletVkBytes =
         threshold.elemSerializeCompressed(r1Pkg.commitment.toVerifyingKey().E);

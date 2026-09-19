@@ -158,6 +158,39 @@ class PlatformPasskey implements Authenticator, PasskeyRegistrar {
     }
   }
 
+  /// Find this app's passkey on a device that has never seen it, and become it.
+  ///
+  /// A wiped install knows the relying party and nothing else, but the gate's every call names a
+  /// credential id. So this asks for an assertion with **no** `allowCredentials`: the platform lists
+  /// the discoverable passkeys it holds for [rpId], the owner picks one, and its id is what the gate
+  /// needs. Passkeys here are created discoverable for exactly this reason
+  /// (`residentKey: required` — see [createCredential]).
+  ///
+  /// The assertion goes nowhere: the challenge is made here and the signature is thrown away. What
+  /// is kept is the credential id and, because [_get] evaluates the PRF in the same gesture, the
+  /// seed — so a recovery is one fingerprint for both, and the wallet's own half of its key is
+  /// already in hand when the cosigner is asked for the other.
+  ///
+  /// Throws [PasskeyChannel.noCredential] when the device holds none, which is the honest answer to
+  /// "restore my wallet" on a phone the passkey never synced to.
+  Future<String> discover() async {
+    final credential = await _get({
+      'challenge': _b64u(List<int>.generate(32, (_) => _random.nextInt(256))),
+      'rpId': rpId,
+      // No `allowCredentials`: that is the whole point.
+      'userVerification': 'required',
+      'timeout': 300000,
+    });
+    final id = credential['id'] ?? credential['rawId'];
+    if (id is! String || id.isEmpty) {
+      throw StateError('the passkey returned no credential id to recover with');
+    }
+    _credentialId = id;
+    // Not newly registered: it is already findable, or it would not have answered.
+    _justRegistered = false;
+    return id;
+  }
+
   /// Check that a stored passkey can still sign on this device, with a sign-in of its own that goes
   /// nowhere. Fails quietly with [PasskeyChannel.noCredential] while it cannot, until [timeout].
   /// A fingerprint — only for recovering an onboarding that stopped part-way.

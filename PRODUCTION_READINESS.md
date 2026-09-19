@@ -41,6 +41,11 @@ The MPC Wallet has working cryptography (FROST 2-of-2, Ark integration, MutinyNe
 - No key share backup/export mechanism anywhere in the codebase
 - If Sled DB is lost, all user wallets are permanently unrecoverable
 - **Impact**: Single point of failure for all funds
+- **Note (client-side recovery):** the *phone* half is now recoverable — it is derived from the
+  passkey's PRF, and the cosigner seals the half it dealt so a new device can rebuild the share
+  (`cosigner/src/handlers/recover.rs`). That makes this item **more** load-bearing, not less: the
+  cosigner's seal is now the only copy of anything, and losing it loses both the cosigner's share
+  and the half a user would recover with.
 
 ---
 

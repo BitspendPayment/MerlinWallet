@@ -95,6 +95,18 @@ service Cosigner {
   rpc ForgetDevice(ForgetDeviceRequest) returns (ForgetDeviceResponse);
   rpc DeviceCount(DeviceCountRequest) returns (DeviceCountResponse);
 
+  // Rebuilding a wallet on a new device, from nothing but its passkey.
+  //
+  // A wallet's FROST share is the sum of both dealers' polynomials at its identifier. The owner
+  // re-derives its own dealer from the passkey's PRF — the same passkey, on any device it syncs to,
+  // gives the same polynomial — and this returns the other half, the share the cosigner dealt it
+  // when the wallet was made. Neither half is the key. Together they are, which is why this answers
+  // only for the identifier the ceremony recorded, and only to a caller the runtime has already
+  // authenticated as this tenant.
+  //
+  // It reads; it never installs. A recovery that re-keyed would strand everything the seal holds.
+  rpc Recover(RecoverRequest) returns (RecoverResponse);
+
 }
 
 // 32-512 characters of [A-Za-z0-9_:.-], as `notify.wit` specifies.
@@ -122,6 +134,26 @@ message DeviceCountRequest {
 // How many devices are enrolled. Never which.
 message DeviceCountResponse {
   uint32 devices = 1;
+}
+
+// The identifier the caller re-derived from its passkey, to be matched against the ceremony's.
+message RecoverRequest {
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
+  // 32 bytes, big-endian: `Identifier::derive(compressed(a0*G))`.
+  bytes identifier = 4;
+}
+// Everything the wallet cannot derive for itself.
+message RecoverResponse {
+  // `f_cosigner(identifier)`, 32 bytes big-endian. Half of the caller's signing share.
+  bytes dealt_share = 1;
+  // The ceremony's public key package, JSON: the group key and every verifying share. The caller
+  // checks its rebuilt share against its own verifying share in here before saving anything.
+  string public_key_package_json = 2;
+  // The group key, hex — also inside the package above, returned plainly so a caller can compare
+  // without parsing.
+  string group_key = 3;
 }
 
 message SettleClientMsg {

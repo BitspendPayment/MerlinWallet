@@ -183,3 +183,94 @@ fn a_wallet_with_a_key_refuses_a_second_dkg() {
         .expect_err("a second DKG over an existing key must be refused");
     assert_eq!(err.code(), cosigner::grpc::Code::FailedPrecondition);
 }
+
+/// Recovery's arithmetic, over a real ceremony.
+///
+/// A wallet's share is `f_wallet(id) + f_cosigner(id)`. A new phone can reproduce the first term
+/// from the passkey's PRF; the second is the scalar the cosigner now seals. This proves the two add
+/// up to the share the wallet actually ended the ceremony with — up to the even-Y normalization
+/// `dkg_part3` applies to everybody, which is why the recovering wallet tries both signs and keeps
+/// the one matching its sealed verifying share.
+#[test]
+fn the_sealed_dealt_share_rebuilds_the_wallet_share() {
+    let Some(store) = common::try_store() else {
+        return;
+    };
+
+    // The wallet's polynomial. Random here; derived from the passkey on a real device — what
+    // matters to this test is only that the wallet still has it at the end.
+    let mut rng = OsRng;
+    let secret = random::mod_n_random(&mut rng);
+    let coefficients = vec![random::mod_n_random(&mut rng)];
+    let (w_r1_secret, w_r1_pub) = dkg::dkg_part1(2, 2, &secret, &coefficients, &mut rng).unwrap();
+    let wallet_id = w_r1_secret.identifier.clone();
+    let mut sess = OnboardingSession::new();
+
+    let r1 = ob::dkg_open(
+        &mut sess,
+        DkgStep1Request {
+            identifier: wallet_id.serialize().to_vec(),
+            round1_package: w_r1_pub.to_json(),
+        },
+    )
+    .expect("open");
+    let all_r1 = parse_wire(&r1.round1_packages);
+    let others_r1: BTreeMap<Identifier, Round1Package> = all_r1
+        .iter()
+        .filter(|(id, _)| **id != wallet_id)
+        .map(|(id, p)| (id.clone(), p.clone()))
+        .collect();
+    let (w_r2_secret, w_r2_out) = dkg::dkg_part2(&w_r1_secret, &others_r1, &[]).unwrap();
+
+    let r3 = ob::dkg_finish(
+        &mut sess,
+        DkgStep3Request {
+            identifier: wallet_id.serialize().to_vec(),
+            round2_packages_for_others: w_r2_out
+                .iter()
+                .map(|(id, p)| (hex::encode(id.serialize()), p.to_json()))
+                .collect(),
+        },
+    )
+    .expect("finish");
+    let mat = sess.seed_material.take().expect("key material");
+
+    let our_r2: BTreeMap<Identifier, Round2Package> = r3
+        .round2_packages_for_me
+        .iter()
+        .map(|(id_hex, json)| {
+            let bytes: [u8; 32] = hex::decode(id_hex).unwrap().try_into().unwrap();
+            (
+                Identifier::deserialize(&bytes).unwrap(),
+                Round2Package::from_json(json).unwrap(),
+            )
+        })
+        .collect();
+    let (wallet_kp, _) = dkg::dkg_part3(&w_r1_secret, &w_r2_secret, &others_r1, &our_r2, &[])
+        .expect("wallet part3");
+
+    // What the cosigner sealed, and what the wallet can work out on its own.
+    let dealt_hex = mat
+        .wallet_dealt_share_hex
+        .expect("the ceremony must seal the share dealt to the wallet");
+    let dealt = threshold::scalar::scalar_from_bytes(
+        &hex::decode(&dealt_hex).unwrap().try_into().unwrap(),
+    )
+    .expect("the sealed share is a scalar");
+    let own = threshold::polynomial::evaluate_polynomial(&wallet_id, &w_r1_secret.coefficients);
+
+    let rebuilt = own + dealt;
+    let negated = -rebuilt;
+    assert!(
+        rebuilt == wallet_kp.secret_share || negated == wallet_kp.secret_share,
+        "f_wallet(id) + the sealed dealt share must be the wallet's own share, up to parity"
+    );
+
+    // And nothing else would do: a share off by one is not a share.
+    assert_ne!(
+        own, wallet_kp.secret_share,
+        "the wallet's own half alone is not its share — the sealed half is what makes it one"
+    );
+
+    let _ = store.delete("sealed_state", &mat.group_key);
+}

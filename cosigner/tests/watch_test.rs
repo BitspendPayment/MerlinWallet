@@ -229,6 +229,7 @@ fn with_delegate(
         &pkp.to_json(),
         Some(&hex::encode(kps[0].identifier.serialize())),
         Some(hex::encode([9u8; 32])),
+        None,
     )
     .expect("install policy");
     c.accept_vtxos(

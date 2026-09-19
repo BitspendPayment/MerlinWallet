@@ -43,6 +43,14 @@ pub struct SeedMaterial {
     pub public_key_package_json: String,
     pub user_signing_identifier_hex: Option<String>,
     pub server_dkg_secret_hex: Option<String>,
+    /// `f_cosigner(wallet_identifier)`: the share this cosigner dealt to the wallet during the
+    /// ceremony, kept so the wallet can be rebuilt on another device.
+    ///
+    /// A wallet's share is the sum of both dealers' polynomials at its identifier. The wallet
+    /// re-derives its own half from its passkey, and this is the half it cannot: the polynomial it
+    /// came from is destroyed when round two ends. Worth nothing alone — without the passkey's
+    /// half it is one term of a sum — and it never leaves the tenant that owns it.
+    pub wallet_dealt_share_hex: Option<String>,
 }
 
 pub struct OnboardingSession {
@@ -389,12 +397,20 @@ pub fn dkg_finish(
         let user_signing_identifier_hex = Some(wallet_identifier_hex);
         let server_dkg_secret_hex = Some(sess.server_internal_secret_hex.clone());
 
+        // The one thing from this ceremony the wallet could never reconstruct for itself.
+        let wallet_dealt_share_hex = sess
+            .rounds
+            .round2_local
+            .get(&wallet_id)
+            .map(|pkg| hex::encode(scalar_to_bytes(&pkg.secret_share)));
+
         sess.seed_material = Some(SeedMaterial {
             group_key: group_key.clone(),
             key_package_json: kp_json,
             public_key_package_json: pkp_json,
             user_signing_identifier_hex,
             server_dkg_secret_hex,
+            wallet_dealt_share_hex,
         });
 
         tracing::info!("Onboarding complete; cosigner_id (group key)={group_key}");

@@ -40,7 +40,11 @@ Do NOT fix yet — just record. Fix pass happens once, after this list is comple
 - [~] **TH-5** PARTIAL — ✓ fixed the worst offenders: both ark hex decoders (`ark/send.rs`, `ark/mod.rs`) now use `hex::decode` (no panic on odd-length / multi-byte-UTF-8 ASP input). ffi builds. REMAINING (lower priority, all have odd-length guards): threshold-ffi str-slice decoders (ffi_signing/ffi_utils/ffi_auth/ffi_dkg) UTF-8-boundary edge; identity-point panics (point.rs:32/60, low reachability); `min_signers` underflow (ffi_dkg); a `catch_unwind` backstop on all `extern "C"` bodies.
 - [ ] **TH-8** tag FFI handles by type (kill `free_handle` type-confusion / double-free / secret-leak). NOTE: FFI's only caller is the trusted Dart wrapper (correct type_ids + lifecycle), so this is defense-in-depth hardening, not a live exploit. Proper fix = enum-tagged handle across ~13 box/borrow/free sites (cargo-verifiable; handle lifecycle not e2e-testable here).
 - [x] **TH-3** ✓ FIXED (Debug part) — redacting `Debug` on all 5 secret structs (KeyPackage, SigningNonce, Round1/2 secret pkgs, Round2Package); ffi builds + 38 threshold tests pass. Zeroize-on-drop DEFERRED: `Drop` fights Rust move-semantics on the `Copy` scalars (forces `.clone()` churn in the tweak/sign hot path) for marginal gain — needs a non-Copy secret-wrapper refactor.
-- [ ] **TH-6** derive refresh/reshare seeds from CSPRNG+session context (or drop the seeded path in prod).
+- [~] **TH-6** PARTIAL — the wallet no longer uses the improvised seeded derivation: share blinding and
+  the DKG polynomial both come from one labelled HKDF (`app-core/lib/passkey/key_derivation.dart`),
+  so the Dart/Rust disagreement in `dkgRefreshPart1(seed:)` is no longer on any wallet path.
+  REMAINING: `dkgRefreshPart1`/`modNRandomSeeded` and `dkg_refresh_part1` still exist and still
+  disagree — drop the seeded path, or make the two definitions one.
 - [ ] **CL-3** attestation from build-flavor/allowlist (not host-string); treat persisted serverHost untrusted; sign/pin manifest.
 - [ ] **CL-5** attested transport in the FCM background isolate for remote hosts.
 - [ ] **IN-6** [UNCERTAIN] verify an ASP tree leaf pays owner_pk+amount before signing (batch.rs:920-982) — confirm ark_core doesn't already.
@@ -72,6 +76,32 @@ Do NOT fix yet — just record. Fix pass happens once, after this list is comple
   named keys.rs/dkg.rs/auth.rs — verify each.)
 - **[TH-4] LOW CONFIRMED** — `crates/threshold/src/ecies.rs:88` — MAC compared with `!=`
   (non-constant-time). *Fix:* constant-time compare (`subtle`).
+
+## ACCEPTED BY DESIGN (recorded so it is not re-raised as a finding)
+
+- **[RC-1] The passkey is now the single factor.** `app-core/lib/passkey/key_derivation.dart`,
+  `cosigner/src/handlers/recover.rs`. The wallet's FROST dealer polynomial is derived from the
+  passkey's PRF, and the cosigner seals `f_cosigner(wallet_id)` — the half it dealt — so `Recover`
+  plus the passkey reconstructs the share on any device. Before this, an attacker needed the
+  device's Hive box **and** the PRF; now the passkey alone is enough. That is the stated goal
+  (a wallet that survives a lost phone), and it moves the whole weight of the design onto two
+  things worth stating plainly:
+  - **the platform's passkey security** — Google Password Manager / iCloud Keychain sync, and the
+    user verification in front of it. A passkey exported or synced to an attacker's device is the
+    wallet.
+  - **the runtime's tenant resolution** (`runtime/src/auth/credential.rs`) — the credential-id →
+    tenant mapping is the only thing between a caller and the sealed half. It is not a new
+    exposure (the same gate guards signing) but its blast radius is now larger: half the key
+    material, rather than one signature.
+  Mitigations already in place: `Recover` refuses unless the caller's re-derived identifier equals
+  the one the ceremony recorded; it never installs a policy; and the returned scalar is useless
+  without the PRF-derived half. Nothing is escrowed that could sign on its own.
+- **[RC-2] PRF stability across devices is assumed, not guaranteed.** WebAuthn does not promise a
+  synced passkey yields the same PRF output on another device; it holds in practice for the two
+  platform providers and not at all for a hardware key. The design fails *loudly* — the rebuilt
+  share is checked against the sealed verifying share and refused if it does not match — rather
+  than producing a wallet that cannot sign. A two-device manual test is the only real check;
+  see the plan's verification notes.
 
 ## REFUTED (checked — NOT a bug)
 

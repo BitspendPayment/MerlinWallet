@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' show Random;
 import 'dart:typed_data';
 
@@ -18,6 +19,7 @@ import 'package:app_core/sessions/delegate.dart';
 import 'package:app_core/sessions/exit_plan.dart' show ExitTx;
 import 'package:app_core/requests/authorship.dart';
 import 'package:app_core/threshold/frost/ceremony.dart' show schnorr64;
+import 'package:app_core/passkey/key_derivation.dart';
 import 'package:app_core/passkey/seed_source.dart';
 import 'package:app_core/pin_blinding.dart';
 import 'package:protocol/cosigner_v1.dart' as cs;
@@ -295,6 +297,7 @@ class MpcClient {
     final result = await DkgSession(_conn).run(
       maxSigners: _maxSigners,
       minSigners: _minSigners,
+      polynomial: await _walletPolynomial(),
       deviceToken: _deviceToken ?? '',
     );
     // The wallet's dealer secret doubles as its single-key on-chain key.
@@ -302,6 +305,95 @@ class MpcClient {
     await _finalizeWalletShare(result.dkg.keyPackage, result.dkg.publicKeyPackage);
     await _saveState();
     _deviceTokenCarried(result.deviceEnrolled);
+  }
+
+  // --- Recovery ---
+
+  /// Rebuild this wallet on a device that has never seen it, from its passkey alone.
+  ///
+  /// A share is the sum of both dealers' polynomials at the wallet's identifier:
+  ///
+  /// ```text
+  ///   s = f_wallet(id) + f_cosigner(id)
+  /// ```
+  ///
+  /// The first term is derived here, from the same passkey PRF the wallet was made with — so the
+  /// same passkey gives the same polynomial, and therefore the same `id`. The second is the scalar
+  /// the cosigner sealed at DKG and hands back; it is half a key and nothing else. Neither side
+  /// could do this alone, which is the point.
+  ///
+  /// Nothing is trusted on the cosigner's word. The rebuilt share is checked against the verifying
+  /// share in the ceremony's public key package — `s·G` must be it — and a wallet that fails that
+  /// check is refused rather than saved. There is no in-between state to clean up: the share is
+  /// written only once it has been shown to be the right one.
+  ///
+  /// Throws if this device already holds a share: recovering over a live wallet would replace it,
+  /// and a 2-of-2 has no way back from that.
+  Future<void> recover() async {
+    // Asked of the store, not of memory: a device with a share in Hive is not a device to recover
+    // onto, and a wallet replaced here could never be signed for again.
+    if (await restoreState()) {
+      throw StateError('this device already holds a share for a wallet; nothing to recover');
+    }
+
+    final polynomial = await _walletPolynomial();
+    final coefficients = [polynomial.a0.scalar, ...polynomial.higherCoefficients];
+    final identifier = threshold.Identifier.derive(
+        threshold.elemSerializeCompressed(threshold.elemBaseMul(polynomial.a0.scalar)));
+
+    final resp = await _conn.recover(cs.RecoverRequest(identifier: identifier.serialize()));
+
+    final pubKeyPkg = threshold.PublicKeyPackage.fromJson(
+        jsonDecode(resp.publicKeyPackageJson) as Map<String, dynamic>);
+    // Hex from two languages: compared as bytes would be, not as the strings happen to be cased.
+    final derivedGroupKey =
+        hex.encode(threshold.elemSerializeCompressed(pubKeyPkg.verifyingKey.E)).toLowerCase();
+    if (derivedGroupKey != resp.groupKey.toLowerCase()) {
+      throw StateError(
+        'the cosigner returned a key package for a different wallet: it says ${resp.groupKey}, '
+        'the package says $derivedGroupKey',
+      );
+    }
+
+    final expectedVerifyingShare = pubKeyPkg.verifyingShares[identifier]?.toLowerCase();
+    if (expectedVerifyingShare == null) {
+      throw StateError(
+        'this wallet is not a member of the ceremony the cosigner returned — its identifier is '
+        'not in the key package',
+      );
+    }
+
+    // Both halves, added. `dkg_part3` normalizes every share to an even-Y group key, which negates
+    // it when the group key came out odd — so the reconstruction is right up to a sign, and the
+    // verifying share says which. Trying both is not guesswork: exactly one can match.
+    final own = threshold.evaluatePolynomial(identifier, coefficients);
+    final dealt = threshold.bytesToBigInt(Uint8List.fromList(resp.dealtShare));
+    final n = threshold.secp256k1Curve.n;
+    final sum = (own + dealt) % n;
+    final candidates = [sum, (n - sum) % n];
+    final share = candidates.firstWhere(
+      (c) => threshold.elemBaseMul(c).toLowerCase() == expectedVerifyingShare,
+      orElse: () => throw StateError(
+        'the share this passkey rebuilds does not match the one this wallet signs with. The '
+        'passkey is the wrong one, or its PRF answers differently on this device — either way '
+        'the wallet cannot be recovered here.',
+      ),
+    );
+
+    // The wallet's dealer secret doubles as its single-key on-chain key, exactly as after DKG. It
+    // is `a0` whatever the group's parity: the normalization above is the share's, not this key's.
+    _onchainSecret = polynomial.a0;
+    await _finalizeWalletShare(
+      threshold.KeyPackage(
+        identifier,
+        share,
+        expectedVerifyingShare,
+        pubKeyPkg.verifyingKey,
+        _minSigners,
+      ),
+      pubKeyPkg,
+    );
+    await _saveState();
   }
 
   // --- The way out ---
@@ -416,9 +508,20 @@ class MpcClient {
           'signing requires the wallet seed (PIN/passkey) — none configured');
     }
     final seed = await src.deriveSeed();
-    final pFull = reconstructShare(
-            threshold.bigIntToBytes(kp.secretShare), kp.identifier, seed)
-        .scalar;
+    final pFull =
+        (await reconstructShare(threshold.bigIntToBytes(kp.secretShare), seed)).scalar;
+    // The share is public-checkable even though it is secret: `s·G` is the verifying share the
+    // ceremony recorded, and it is stored beside it. Checking costs one multiplication and turns
+    // every way this can go wrong — a different passkey, a PRF that changed, a wallet blinded
+    // under an older derivation — into one honest message here, instead of a FROST aggregation
+    // failure several calls later that names none of them.
+    if (threshold.elemBaseMul(pFull).toLowerCase() != kp.verifyingShare.toLowerCase()) {
+      throw StateError(
+        'this wallet\'s share could not be unblinded: what the passkey reconstructs is not the '
+        'share this wallet signs with. Either it is a different passkey, or its PRF answers '
+        'differently than when the wallet was made.',
+      );
+    }
     return threshold.KeyPackage(kp.identifier, pFull, kp.verifyingShare,
         kp.verifyingKey, kp.minSigners);
   }
@@ -438,6 +541,21 @@ class MpcClient {
     }
   }
 
+  /// What this wallet deals at DKG, derived from the passkey so it can be derived again on another
+  /// device. Without a seed source there is nothing to derive from, and a wallet made from
+  /// randomness would be one that dies with this phone — so that is refused rather than quietly
+  /// produced.
+  Future<WalletPolynomial> _walletPolynomial() async {
+    final src = _seedSource;
+    if (src == null) {
+      throw StateError(
+        'a wallet is derived from its passkey — no seed source is wired, and a key made from '
+        'randomness could never be recovered',
+      );
+    }
+    return walletPolynomial(await src.deriveSeed());
+  }
+
   /// Finalize the wallet's freshly-DKG'd share into `_normalPolicy` + auth state. When a
   /// [SeedSource] is configured, store the share BLINDED (δ) — the raw share is never persisted and
   /// never lingers in memory; it's reconstructed transiently at sign time. Without one the raw share
@@ -449,10 +567,8 @@ class MpcClient {
     final src = _seedSource;
     if (src != null) {
       final seed = await src.deriveSeed();
-      final delta = threshold.bytesToBigInt(blindShare(
-          threshold.SecretKey(walletKeyPkg.secretShare),
-          walletKeyPkg.identifier,
-          seed));
+      final delta = threshold.bytesToBigInt(
+          await blindShare(threshold.SecretKey(walletKeyPkg.secretShare), seed));
       final blindedKp = threshold.KeyPackage(walletKeyPkg.identifier, delta,
           walletKeyPkg.verifyingShare, walletKeyPkg.verifyingKey,
           walletKeyPkg.minSigners);
@@ -477,7 +593,7 @@ class MpcClient {
     final kp = _normalPolicy?.keyPackage;
     if (kp == null) throw StateError('no wallet share to gate');
     final delta = threshold.bytesToBigInt(
-        blindShare(threshold.SecretKey(kp.secretShare), kp.identifier, seed));
+        await blindShare(threshold.SecretKey(kp.secretShare), seed));
     _normalPolicy = SpendingPolicy(
         id: "normal_policy_id",
         keyPackage: threshold.KeyPackage(kp.identifier, delta, kp.verifyingShare,
