@@ -13,9 +13,11 @@ import 'package:path_provider/path_provider.dart';
 import 'package:protocol/protocol.dart' hide ArkInfo;
 
 import 'package:app_core/asp/asp_client.dart';
+import 'package:app_core/asp/exit_chain.dart';
 import 'package:app_core/asp/history.dart';
-import 'package:app_core/bitcoin.dart';
+import 'package:app_core/boarding.dart';
 import 'package:app_core/client.dart';
+import 'package:app_core/sessions/exit_plan.dart' show ExitTx;
 import 'package:app_core/cosigner/connection.dart' show CosignerException;
 import 'package:app_core/enclave/attestation.dart';
 import 'package:app_core/enclave/gate.dart';
@@ -57,20 +59,10 @@ class MpcService extends ChangeNotifier {
   bool get dkgComplete => _dkgComplete;
   bool get isConnected => _isConnected;
 
-  MpcBitcoinWallet? _wallet;
-  MpcBitcoinWallet? get wallet => _wallet;
+  /// Deposits only: this wallet holds no on-chain coins and spends none. See `app_core/boarding`.
+  BoardingScanner? _boarding;
 
 
-  BigInt _balance = BigInt.zero;
-  BigInt get balance => _balance;
-  List<WalletTransaction> get transactions => _wallet?.transactions ?? [];
-
-  // --- Ark state ---
-  //
-  // `ArkInfo` and `IndexerVtxo` come from the ASP directly now. They were
-  // `GetArkInfoResponse` and `VtxoInfo`, proto messages the cosigner relayed
-  // from its own ASP connection — it has no socket, so the app asks and passes
-  // what it learns back in on each `SendOpen`/`SettleOpen`.
   ArkInfo? _arkInfo;
   ArkInfo? get arkInfo => _arkInfo;
   String? _arkAddress;
@@ -100,58 +92,8 @@ class MpcService extends ChangeNotifier {
   bool _arkAvailable = false;
   bool get arkAvailable => _arkAvailable;
 
-  /// User-forced offline mode (persisted). When true the wallet stays on-chain
-  /// only regardless of ASP reachability. [offlineMode] is the effective state:
-  /// forced OR the ASP is unreachable.
-  bool _offlineModeForced = false;
-  bool get offlineModeForced => _offlineModeForced;
-
-  /// On-chain-only mode: the Ark ASP is unavailable (auto-detected) or the user
-  /// forced it. In this mode the UI hides Ark + Services and only Bitcoin
-  /// (receive / balance / on-chain send) is usable.
-  bool get offlineMode => _offlineModeForced || !_arkAvailable;
-
-  /// Toggle user-forced offline mode. Persisted so it survives cold starts.
-  /// Turning it OFF kicks an immediate ASP re-probe so Ark comes back promptly;
-  /// turning it ON drops Ark polling/state right away.
-  Future<void> setOfflineMode(bool forced) async {
-    if (_offlineModeForced == forced) return;
-    _offlineModeForced = forced;
-    if (_identityBox != null && _identityBox!.isOpen) {
-      await _identityBox!.put('offlineMode', forced);
-    }
-    if (forced) {
-      _vtxoPollTimer?.cancel();
-      _arkAvailable = false;
-      notifyListeners();
-    } else {
-      notifyListeners();
-      // Re-probe the ASP; initArk restores Ark state + polling on success.
-      await initArk();
-    }
-  }
-
   void policyUpdated() {
     notifyListeners();
-  }
-
-  String? get receiveAddress {
-    if (_wallet == null) return null;
-    return _wallet!.toAddress();
-  }
-
-  Future<void> refreshHistory() async {
-    if (_wallet != null) {
-      try {
-        await _wallet!.sync();
-        _balance = await _wallet!.getBalance();
-        _isConnected = true;
-      } catch (e) {
-        debugPrint("Refresh failed: $e");
-        _isConnected = false;
-      }
-      notifyListeners();
-    }
   }
 
   // Hardcoded for now, could be configurable
@@ -242,10 +184,10 @@ class MpcService extends ChangeNotifier {
       // persisted 'signerKind' key from prior versions. No-op if absent.
       await _identityBox!.delete('signerKind');
 
-      // User-forced offline mode (on-chain only). Defaults to false; when true
-      // the wallet stays on-chain only even if the ASP is reachable.
-      _offlineModeForced =
-          _identityBox!.get('offlineMode', defaultValue: false) as bool;
+      // Offline mode was the on-chain half of a wallet that no longer has one.
+      await _identityBox!.delete('offlineMode');
+
+      _exitAddress = _identityBox!.get('exitAddress') as String?;
 
       // Replaced by the watch the client persists with its own state.
       await _identityBox!.delete('delegatedOutpoints');
@@ -426,17 +368,9 @@ class MpcService extends ChangeNotifier {
       throw StateError("DKG already completed for this user.");
     }
 
-    final storageId = _storageId ?? 'mpc_wallet_state_default';
-
-    _client = await _createMpcClient(storageId: storageId);
-    _wallet = MpcBitcoinWallet(_client!,
-        networkName: await _bitcoinNetwork(), storageId: storageId);
-    _wallet!.onSyncComplete = _onWalletSyncComplete;
-
-    // wallet.init() restores persisted state or, on a fresh wallet, runs the
-    // 2-of-2 DKG (MpcBitcoinWallet.initializeNewWallet -> client.doDkg()).
-    await _wallet!.init();
-    _balance = await _wallet!.getBalance();
+    _client = await _createMpcClient(storageId: _storageId ?? 'mpc_wallet_state_default');
+    // Nothing to restore on a wallet that has never run a ceremony, so this is the ceremony.
+    if (!await _client!.restoreState()) await _client!.doDkg();
 
     _dkgComplete = true;
     _isConnected = true;
@@ -453,15 +387,10 @@ class MpcService extends ChangeNotifier {
     if (!_isInitialized) throw StateError("MPC Service not initialized");
     if (!_dkgComplete) throw StateError("DKG not completed. Cannot restore.");
 
-    final storageId = _storageId ?? 'mpc_wallet_state_default';
-
-    _client = await _createMpcClient(storageId: storageId);
-    _wallet = MpcBitcoinWallet(_client!,
-        networkName: await _bitcoinNetwork(), storageId: storageId);
-    _wallet!.onSyncComplete = _onWalletSyncComplete;
-
-    await _wallet!.init();
-    _balance = await _wallet!.getBalance();
+    _client = await _createMpcClient(storageId: _storageId ?? 'mpc_wallet_state_default');
+    if (!await _client!.restoreState()) {
+      throw StateError('this wallet has no key on this device to restore');
+    }
     _isConnected = true;
 
     await initArk();
@@ -480,7 +409,8 @@ class MpcService extends ChangeNotifier {
       await _client?.close();
     } catch (_) {}
     _client = null;
-    _wallet = null;
+    _boarding?.close();
+    _boarding = null;
 
     try {
       await restoreSession();
@@ -491,30 +421,10 @@ class MpcService extends ChangeNotifier {
     }
   }
 
-  /// Called by MpcBitcoinWallet when a background sync completes
-  /// (e.g. after a transaction notification from the server).
-  Future<void> _onWalletSyncComplete() async {
-    try {
-      _balance = await _wallet!.getBalance();
-      _isConnected = true;
-    } catch (e) {
-      debugPrint("Post-sync balance update failed: $e");
-    }
-    notifyListeners();
-  }
-
   // --- Ark methods ---
 
   Future<void> initArk() async {
     if (_client == null) return;
-    // User forced on-chain-only: don't touch the ASP at all. The un-toggle path
-    // (setOfflineMode(false) -> initArk) restarts polling.
-    if (_offlineModeForced) {
-      _arkAvailable = false;
-      _vtxoPollTimer?.cancel();
-      notifyListeners();
-      return;
-    }
     try {
       _arkInfo = await _client!.getArkInfo();
       _arkAddress = await _client!.getArkAddress();
@@ -556,14 +466,87 @@ class MpcService extends ChangeNotifier {
     return held.isNotEmpty && delegate != null && held.every(delegate.covers);
   }
 
-  /// Whether anything held is inside its refresh window now — the cosigner should have run its
-  /// delegate by this point, so this means it could not (or none covered these funds).
+  /// How long after a delegate's moment the cosigner is given before the owner is asked to step in.
+  ///
+  /// A batch round waits on the ASP's own schedule and can be retried, so the renewal is not late
+  /// the instant it is due. Asking sooner would mean asking every time the machinery is simply
+  /// working — the button would be on screen exactly when the cosigner was about to act.
+  static const Duration _renewalGrace = Duration(minutes: 10);
+
+  /// The last moment a renewal can wait: past this, ask rather than hope.
+  static const Duration _expiryFloor = Duration(minutes: 30);
+
+  /// Whether the cosigner's own renewal has failed to happen, so the owner has to do it.
+  ///
+  /// Not "the renewal is due" — that moment is when the *cosigner* acts, and it needs no help.
+  /// This is later: either the delegate's moment passed and the funds it covered are still sitting
+  /// here, or something is close enough to expiry that waiting is no longer safe whatever the
+  /// reason.
   bool get refreshDue {
-    final margin = _client?.delegateStatus?.margin ?? const Duration(minutes: 30);
     final now = DateTime.now();
-    return _held.any((v) =>
+    final expiring = _held.any((v) =>
         v.expiresAt > 0 &&
-        !DateTime.fromMillisecondsSinceEpoch(v.expiresAt * 1000).subtract(margin).isAfter(now));
+        DateTime.fromMillisecondsSinceEpoch(v.expiresAt * 1000)
+            .isBefore(now.add(_expiryFloor)));
+    if (expiring) return true;
+
+    final delegate = _client?.delegateStatus;
+    if (delegate == null) return false; // Nothing was scheduled; that is what `fundsProtected` says.
+    final late = now.isAfter(delegate.validAt.add(_renewalGrace));
+    return late && _held.any(delegate.covers);
+  }
+
+  // --- The way out ------------------------------------------------------------------------------
+  //
+  // Every seal signs one unilateral exit per VTXO, paying an address this wallet does not control.
+  // They are what the money is if the cosigner is never heard from again, so what matters here is
+  // which funds have one and which do not.
+
+  String? _exitAddress;
+
+  /// Where unilateral exits pay. Null until the user has given one.
+  String? get exitAddress => _exitAddress;
+
+  bool get hasExitAddress => (_exitAddress ?? '').isNotEmpty;
+
+  /// The exits this wallet holds, from the last seal.
+  List<ExitTx> get exits => _client?.exits ?? const [];
+
+  /// Held VTXOs with no exit signed for them.
+  ///
+  /// Anything received since the last seal, and — the one that matters — everything the cosigner
+  /// made by running a delegate while nobody was here: a renewal spends the VTXOs the old exits
+  /// named and makes a new one, which cannot be pre-signed until it exists. Sealing again covers
+  /// it, which is what [protectFunds] does.
+  List<IndexerVtxo> get vtxosWithoutExit {
+    final covered = {for (final e in exits) e.outpoint};
+    return _held.where((v) => !covered.contains('${v.txid}:${v.vout}')).toList();
+  }
+
+  /// Every transaction that has to reach the chain before [exit] can: the commitment, the batch
+  /// tree below it, and — for money that moved since — the checkpoint and Ark transactions, ending
+  /// with the exit itself.
+  ///
+  /// Read from the ASP's indexer, which has them all and signs nothing new, so this costs no
+  /// approval. Cached per exit while the screen is open; a path does not change unless the exit
+  /// does.
+  Future<ExitChain> exitChain(ExitTx exit) async {
+    final client = _client;
+    if (client == null) throw StateError('wallet not initialized');
+    return _chains[exit.outpoint] ??= await client.exitChain(exit);
+  }
+
+  final Map<String, ExitChain> _chains = {};
+
+  /// Set the address unilateral exits pay to. Checked against the ASP's network, so a mistake is
+  /// caught now rather than on the day it is the only thing that matters.
+  Future<void> setExitAddress(String address) async {
+    final client = _client;
+    if (client == null) throw StateError('wallet not initialized');
+    await client.setExitAddress(address);
+    _exitAddress = address.trim();
+    await _identityBox?.put('exitAddress', _exitAddress);
+    notifyListeners();
   }
 
   /// Whether the Ark tab should ask the user for something: to protect funds no delegate covers
@@ -590,6 +573,7 @@ class MpcService extends ChangeNotifier {
       // [fundsProtected].
       //
       // Spent ones too, in the same call: they are what the history is rebuilt from.
+      _chains.removeWhere((outpoint, _) => !exits.any((e) => e.outpoint == outpoint));
       final all = await _client!.listVtxos(includeSpent: true);
       _arkHistory = arkHistoryOf(all);
       _vtxos = all.where((v) => !v.isSpent).toList();
@@ -642,7 +626,11 @@ class MpcService extends ChangeNotifier {
   /// Refresh everything held in a batch round now — for funds past due that the cosigner could not
   /// refresh itself. One passkey approval, and it seals a new delegate on its way out. Throws on
   /// failure so the UI can surface it.
-  Future<void> delegateNow() async {
+  /// Returns whether the renewal was re-armed on the way out. A refresh seals a new delegate on
+  /// the same stream and the same approval, so this is normally true; it is false when the indexer
+  /// had not caught up in time, and then the owner has to seal again — which is worth saying
+  /// rather than reporting success.
+  Future<bool> delegateNow() async {
     final client = _client;
     if (client == null) throw StateError('wallet not initialized');
     // Throw rather than silently return: the button's success feedback must
@@ -653,6 +641,7 @@ class MpcService extends ChangeNotifier {
       await client.settleDelegate();
       await refreshVtxos();
       notifyListeners();
+      return fundsProtected;
     } finally {
       _delegateInFlight = false;
     }
@@ -669,7 +658,7 @@ class MpcService extends ChangeNotifier {
   void _startVtxoPolling() {
     _vtxoPollTimer?.cancel();
     _vtxoPollTimer = Timer.periodic(_vtxoPollInterval, (_) async {
-      if (_client == null || _vtxoPollInFlight || _offlineModeForced) return;
+      if (_client == null || _vtxoPollInFlight) return;
       _vtxoPollInFlight = true;
       try {
         if (_arkAvailable) {
@@ -708,18 +697,23 @@ class MpcService extends ChangeNotifier {
     }
   }
 
+  /// The chain-viewer, built on the network the ASP reports. Deposits are the only thing this
+  /// wallet reads the chain for.
+  Future<BoardingScanner> _boardingScanner() async =>
+      _boarding ??= BoardingScanner(networkName: await _bitcoinNetwork());
+
   Future<void> refreshBoardingBalance() async {
-    if (_client == null || _wallet == null) return;
+    if (_client == null) return;
     try {
-      // The wallet (the only chain-viewer) scans its boarding address directly.
+      final scanner = await _boardingScanner();
       final boardingAddress = await _client!.getBoardingAddress();
-      final utxos = await _wallet!.scanBoarding(boardingAddress);
+      final utxos = await scanner.scan(boardingAddress);
       _boardingBalance = utxos.fold<int>(0, (s, u) => s + u.amountSats.toInt());
       _boardingUtxoCount = utxos.length;
       // Tracked separately because only confirmed deposits are boardable — the
       // ASP rejects the intent outright if any input is still in the mempool.
       // Without this a fresh deposit reads as "nothing arrived".
-      final pending = await _wallet!.scanBoardingPending(boardingAddress);
+      final pending = await scanner.scanPending(boardingAddress);
       _boardingPendingBalance =
           pending.fold<int>(0, (s, u) => s + u.amountSats.toInt());
     } catch (e) {
@@ -729,9 +723,7 @@ class MpcService extends ChangeNotifier {
   }
 
   Future<String> boardFunds() async {
-    if (_client == null || _wallet == null) {
-      throw StateError("Client not initialized");
-    }
+    if (_client == null) throw StateError("Client not initialized");
     // Scan the boarding deposits on-chain and hand them to the cosigner's settle.
     //
     // ONE PER SETTLE. The cosigner's boarding session builds an intent proof for a
@@ -740,7 +732,7 @@ class MpcService extends ChangeNotifier {
     // Looping keeps "Boarding Complete" honest; the cosigner now rejects a batch
     // of more than one outright rather than truncating.
     final boardingAddress = await _client!.getBoardingAddress();
-    final utxos = await _wallet!.scanBoarding(boardingAddress);
+    final utxos = await (await _boardingScanner()).scan(boardingAddress);
     if (utxos.isEmpty) {
       throw StateError('No confirmed boarding deposits to settle.');
     }

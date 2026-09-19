@@ -4,7 +4,9 @@ import 'dart:typed_data';
 
 import 'package:app_core/policy.dart';
 import 'package:app_core/ark/ark.dart' as ark_addr;
+import 'package:app_core/ark/exit.dart' as ark_exit;
 import 'package:app_core/asp/asp_client.dart';
+import 'package:app_core/asp/exit_chain.dart';
 import 'package:app_core/asp/history.dart';
 import 'enclave/gate.dart';
 import 'package:app_core/cosigner/connection.dart';
@@ -13,6 +15,7 @@ import 'package:app_core/sessions/send_session.dart';
 import 'package:app_core/sessions/settle_session.dart';
 import 'package:app_core/sessions/sign_session.dart';
 import 'package:app_core/sessions/delegate.dart';
+import 'package:app_core/sessions/exit_plan.dart' show ExitTx;
 import 'package:app_core/requests/authorship.dart';
 import 'package:app_core/threshold/frost/ceremony.dart' show schnorr64;
 import 'package:app_core/passkey/seed_source.dart';
@@ -247,6 +250,8 @@ class MpcClient {
     final delegate = state['delegate'];
     _delegate =
         delegate is Map ? DelegateStatus.fromJson(Map<String, dynamic>.from(delegate)) : null;
+    final exitScript = state['exitScriptPubkey'];
+    _exitScriptPubkeyHex = exitScript is String && exitScript.isNotEmpty ? exitScript : null;
 
     return true;
   }
@@ -266,6 +271,7 @@ class MpcClient {
     }
     state['shareBlinded'] = _shareBlinded;
     if (_delegate != null) state['delegate'] = _delegate!.toJson();
+    if (_exitScriptPubkeyHex != null) state['exitScriptPubkey'] = _exitScriptPubkeyHex;
     await _store.saveClientState(state);
   }
 
@@ -296,6 +302,73 @@ class MpcClient {
     await _finalizeWalletShare(result.dkg.keyPackage, result.dkg.publicKeyPackage);
     await _saveState();
     _deviceTokenCarried(result.deviceEnrolled);
+  }
+
+  // --- The way out ---
+  //
+  // Where this wallet's money goes if the cosigner is never heard from again. Every seal signs one
+  // exit per VTXO to it, and the wallet keeps them — see `sessions/exit_plan.dart`. Without an
+  // address there is nothing to pre-sign to, which is why the app asks for one before it opens.
+
+  String? _exitScriptPubkeyHex;
+
+  /// The scriptPubKey exits pay, hex. Empty until an address is set.
+  String get exitScriptPubkeyHex => _exitScriptPubkeyHex ?? '';
+
+  bool get hasExitAddress => (_exitScriptPubkeyHex ?? '').isNotEmpty;
+
+  /// Set the address unilateral exits pay to, checked against the ASP's network.
+  ///
+  /// Throws if it is not an address, or belongs to another chain — a mistake here is only
+  /// discovered on the day nothing else works, so it is caught on the day it is typed. Exits
+  /// already signed still pay the old address; the next seal reissues them to this one.
+  Future<void> setExitAddress(String address) async {
+    final info = await _asp.getInfo();
+    _exitScriptPubkeyHex =
+        ark_exit.onchainScriptPubkey(address: address.trim(), network: info.network);
+    await _saveState();
+  }
+
+  /// Forget the exit address. The exits already signed are kept — they are still spendable.
+  Future<void> clearExitAddress() async {
+    _exitScriptPubkeyHex = null;
+    await _saveState();
+  }
+
+  /// The exits this wallet holds, newest issue first: one per VTXO the last seal covered.
+  List<ExitTx> get exits => _delegate?.exits ?? const [];
+
+  /// The whole path one exit has to take: every transaction from the commitment on-chain down to
+  /// the VTXO, and then the pre-signed exit itself.
+  ///
+  /// The transactions above the exit are the ASP's and the round's, already signed, and the
+  /// indexer hands them back on request — so this is a read, not a signature, and costs no
+  /// approval. What it is for is honesty: the exit alone is not enough, and the owner should be
+  /// able to see what else has to be published and whether it is all there.
+  Future<ExitChain> exitChain(ExitTx exit) async {
+    final parts = exit.outpoint.split(':');
+    final txid = parts.first;
+    final vout = int.tryParse(parts.length > 1 ? parts[1] : '0') ?? 0;
+    final links = await _asp.getVtxoChain(txid, vout);
+    // Everything but the commitment has to be published, so everything but the commitment is
+    // worth fetching. The commitment is already on-chain.
+    final wanted = [
+      for (final l in links)
+        if (l.kind != ChainKind.commitment) l.txid,
+    ];
+    final raw = await _asp.getVirtualTxs(wanted);
+    return ExitChain.fromLinks(
+      outpoint: exit.outpoint,
+      vtxoTxid: txid,
+      links: links,
+      rawTxs: raw,
+      exit: ExitHop(
+        txid: exit.txid,
+        kind: ChainKind.exit,
+        depth: 0, // Replaced by `fromLinks`: the exit is always last.
+        rawTx: exit.rawTx,
+      ),
+    );
   }
 
   // --- Wakes ---
@@ -550,6 +623,8 @@ class MpcClient {
       groupPubKey: _normalPolicy!.publicKeyPackage,
       readHeld: listVtxos,
       deviceToken: _deviceToken ?? '',
+      exitScriptPubkeyHex: exitScriptPubkeyHex,
+      ownerXOnlyHex: _ownerXOnly,
     );
     _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
     // A send spends what the old delegate covered, so the cosigner dropped it: what is sealed now is
@@ -575,11 +650,16 @@ class MpcClient {
   }
 
   /// Seal a delegate over everything held now, so the cosigner refreshes it on its own before it
-  /// expires. One approval — for funds that arrived without an operation of ours; a send or a settle
+  /// expires.
+  ///
+  /// [over] replaces the indexer's answer with a set the caller names. Only a test has any business
+  /// doing that — it is how an exit can be proven against bitcoind, by sealing over an output that
+  /// carries this wallet's VTXO script but that no ASP ever made. One approval — for funds that arrived without an operation of ours; a send or a settle
   /// seals on its way out at no extra cost.
-  Future<DelegateStatus> protectFunds() async {
+  Future<DelegateStatus> protectFunds({List<IndexerVtxo>? over}) async {
     final info = await _asp.getInfo();
-    final held = await heldOnceIndexed(listVtxos, timeout: const Duration(seconds: 10));
+    final held = over ??
+        await heldOnceIndexed(listVtxos, timeout: const Duration(seconds: 10));
     if (held == null) {
       throw StateError('the indexer has not reported every VTXO\'s expiry yet — try again shortly');
     }
@@ -590,6 +670,8 @@ class MpcClient {
       groupPubKey: _normalPolicy!.publicKeyPackage,
       vtxos: held,
       deviceToken: _deviceToken ?? '',
+      exitScriptPubkeyHex: exitScriptPubkeyHex,
+      ownerXOnlyHex: _ownerXOnly,
     );
     _deviceTokenCarried(sealed.deviceEnrolled);
     await _recordDelegate(sealed);
@@ -627,6 +709,8 @@ class MpcClient {
       onProgress: onProgress,
       readHeld: listVtxos,
       deviceToken: _deviceToken ?? '',
+      exitScriptPubkeyHex: exitScriptPubkeyHex,
+      ownerXOnlyHex: _ownerXOnly,
     );
     _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
     // A refresh spends the old delegate's inputs; boarding leaves it standing. Either way what this

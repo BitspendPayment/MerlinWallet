@@ -54,6 +54,8 @@ class SendSession {
     required threshold.PublicKeyPackage groupPubKey,
     Future<List<IndexerVtxo>> Function()? readHeld,
     String deviceToken = '',
+    String exitScriptPubkeyHex = '',
+    String ownerXOnlyHex = '',
   }) async {
     final duplex = _conn.openSend();
     try {
@@ -144,9 +146,12 @@ class SendSession {
               groupPubKey: groupPubKey,
               seal: (s) => cs.SendClientMsg(sessionId: '', seq: Int64(4), seal: s),
               deviceToken: deviceToken,
+              exitScriptPubkeyHex: exitScriptPubkeyHex,
+              ownerXOnlyHex: ownerXOnlyHex,
               sighashesOf: (r) => r.hasSighashes()
                   ? (
                       sighashes: r.sighashes.messagesToSign,
+                      exitMessages: r.sighashes.exitMessages,
                       commitments: r.sighashes.cosignerCommitments,
                       identifier: r.sighashes.cosignerIdentifier,
                       scriptPathSpend: r.sighashes.scriptPathSpend,

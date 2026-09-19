@@ -244,10 +244,35 @@ Treat Ark here as cheap, fast custody-minimised payments — not as anonymity.
 
 ## Emergency exit
 
-**Status: designed, not implemented. This is the first thing grant funding buys.**
+**Status: the fallback is built. The recovery leaf is still designed, not implemented.**
 
-As shipped, a permanent cosigner outage freezes Ark balances — see above. The fix is a **third
-taptree leaf spendable by a recovery key the phone controls alone**, after a long CSV delay:
+The wallet now holds **pre-signed exit transactions**, one per VTXO. At every seal — the end of
+each send, settle and renewal — the cosigner co-signs a spend of each VTXO through its *existing*
+exit leaf, paying an address in a wallet this app does not control, and the phone keeps it. They
+are on the Exit tab, and can be copied out as raw transactions. Nothing else is needed to broadcast
+them: no cosigner, no ASP, no key this phone does not already have.
+
+What it costs is per-VTXO bookkeeping and reissue on every operation, both of which ride the seal
+that already runs. What it does not cover is a VTXO created while nobody was here: a renewal the
+cosigner performs on its own makes a new output, and only its owner can sign its exit, so those
+funds have no exit until the wallet is next opened and seals again. The Exit tab says which funds
+are covered and which are not.
+
+An exit pays no fee. It carries a P2A anchor instead, so whoever broadcasts it attaches a child
+that pays for both — a fee fixed at signing time would be a guess about a fee market years away,
+and a wallet whose cosigner is gone cannot re-sign. Publishing the transactions that put the money
+off-chain in the first place — the batch tree branch, and the checkpoint and Ark transactions for
+funds not yet settled — is not in the app yet; the exit is the last hop, and the one that cannot be
+obtained later.
+
+Implementation: `crates/ark/src/exit.rs` (both sides build it), `ffi/src/ark/exit.rs` (and the
+wallet's check that what it is asked to sign is its own), `cosigner/src/handlers/delegate.rs`,
+`app-core/lib/sessions/exit_plan.dart`, `app/lib/screens/exit/exit_screen.dart`.
+
+### The better answer, still to come
+
+A pre-signed exit is a snapshot; a **third taptree leaf spendable by a recovery key the phone
+controls alone**, after a long CSV delay, would need no snapshots at all:
 
 ```
 forfeit  leaf:  <asp_pk>       OP_CHECKSIGVERIFY <group_pk>    OP_CHECKSIG   # cooperative, today
@@ -297,13 +322,10 @@ The honest costs:
 - **It depends on ASPs continuing not to constrain taptrees.** If arkade later requires
   registering or validating VTXO scripts, this needs their buy-in.
 
-That last risk is why the fallback stays documented rather than discarded: **pre-signed exit
-transactions**. At each settlement the cosigner also co-signs a spend of the current VTXO through
-the *existing* exit leaf, paying to the wallet's on-chain address; the phone stores it and can
-broadcast it unaided. It needs no script change at all, so it works even against an ASP that
-rejects non-default taptrees — at the cost of per-VTXO bookkeeping, reissue on every
-settle/send/receive, and no protection for VTXOs received after the outage begins. We would build
-it only if the recovery leaf turns out to be blocked.
+That last risk is why the pre-signed exits above were built first: they need no script change at
+all, so they work even against an ASP that rejects non-default taptrees. The recovery leaf would
+replace them with something that covers every VTXO the moment it exists, including the ones the
+cosigner makes while nobody is watching.
 
 Scope to close it: extend the taptree builder in `crates/ark` to the three-leaf form, thread
 `wallet_vk` through as the recovery key on both sides, add an exit-broadcast flow in the app, and

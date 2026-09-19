@@ -109,30 +109,6 @@ Future<void> pumpUntilTrue(
   throw TestFailure('pumpUntilTrue timed out${reason != null ? ' — $reason' : ''}');
 }
 
-/// Refreshes the wallet from electrs in a loop until [minimumSats] is visible
-/// in `MpcService.balance`. Use after funding the receive address from regtest.
-Future<void> waitForBalance(
-  WidgetTester tester,
-  BigInt minimumSats, {
-  Duration timeout = const Duration(seconds: 90),
-  Duration pollEvery = const Duration(seconds: 2),
-}) async {
-  final ctx = tester.element(find.byKey(const Key('homeSendBtn')));
-  final svc = Provider.of<MpcService>(ctx, listen: false);
-  final deadline = DateTime.now().add(timeout);
-  while (DateTime.now().isBefore(deadline)) {
-    try {
-      // Timeout the refresh itself — a hung electrs query would otherwise
-      // block this loop past the testWidgets cap.
-      await svc.refreshHistory().timeout(const Duration(seconds: 20));
-    } catch (_) {}
-    if (svc.balance >= minimumSats) return;
-    await tester.pump(pollEvery);
-  }
-  throw TestFailure(
-      'waitForBalance timed out — balance ${svc.balance} < $minimumSats sats');
-}
-
 /// Polls `MpcService.refreshVtxos()` until `arkBalance` >= [minimumSats]. Use
 /// after Bob (or anyone external) sends a VTXO to the wallet's ark address.
 /// Resolves the MpcService context from any of the Ark screen's known keys.
@@ -146,7 +122,6 @@ Future<void> waitForArkBalance(
     for (final keyName in const [
       'arkSendBtn',
       'arkRefreshBtn',
-      'homeSendBtn',
     ]) {
       final f = find.byKey(Key(keyName));
       if (f.evaluate().isNotEmpty) return tester.element(f);

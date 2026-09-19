@@ -157,6 +157,8 @@ message SettleOpen {
   bool seal_only = 7;
   // With `seal_only`: the device token the seal carries, as `SealDelegate.device_token`.
   string device_token = 8;
+  // With `seal_only`: where a unilateral exit pays, as `SealDelegate.exit_script_pubkey`.
+  bytes exit_script_pubkey = 9;
 }
 
 
@@ -202,6 +204,31 @@ message SealDelegate {
   mpc_wallet.ArkInfo ark_info = 2;
   // This device's push token, when the cosigner has not been given it yet — see `DkgOpen`.
   string device_token = 3;
+  // Where a unilateral exit should pay: a scriptPubKey the wallet's owner controls somewhere else.
+  //
+  // With it, the cosigner also builds one exit transaction per VTXO — a spend through the VTXO's
+  // own exit leaf, after its relative timelock — and signs it in the same FROST round as the
+  // delegate. The wallet keeps those transactions and can broadcast them with nobody's help,
+  // which is the one thing it cannot do if this cosigner stops answering. Empty means the wallet
+  // has no exit address yet, and then no exits are built.
+  bytes exit_script_pubkey = 4;
+}
+
+// One signed unilateral exit: everything needed to broadcast it, and nothing to be interpreted
+// first.
+message ExitTx {
+  // The VTXO it spends, `txid:vout`.
+  string outpoint = 1;
+  // The complete transaction, consensus-serialised.
+  bytes raw_tx = 2;
+  // The nSequence it carries: the VTXO's exit delay, BIP-68 encoded. It cannot confirm until that
+  // long after the transaction that created the VTXO did.
+  uint32 sequence = 3;
+  // What it pays out, which is the whole VTXO — an exit pays no fee, and carries an anchor output
+  // for whoever bumps it.
+  uint64 amount_sats = 4;
+  // Deliberately no txid: the wallet derives it from `raw_tx` while checking that the exit is the
+  // one it signed (`ark_verify_exit_tx`). An identity it can compute is not one to be told.
 }
 
 message DelegateSealed {
@@ -214,6 +241,8 @@ message DelegateSealed {
   repeated string covered = 3;
   // Whether the `device_token` that came with the seal was enrolled for wakes.
   bool device_enrolled = 4;
+  // One per VTXO, when the seal carried an `exit_script_pubkey`.
+  repeated ExitTx exit_txs = 5;
 }
 
 message SettleSigned {
@@ -268,6 +297,10 @@ message SettleSighashes {
   repeated Commitment cosigner_commitments = 3;
   // Whose commitments those are: the FROST identifier the aggregate keys them under, hex.
   string cosigner_identifier = 4;
+  // The exit transactions' sighashes, when the seal asked for exits. One round signs both halves:
+  // `cosigner_commitments` runs over `messages_to_sign` first and these after, in order, and the
+  // wallet's `rounds` come back in that same order.
+  repeated bytes exit_messages = 5;
 }
 
 // What the caller must send the ASP as `RegisterIntent`, followed by `GetEventStream(topics)`.
@@ -404,6 +437,8 @@ message SendSighashes {
   repeated Commitment cosigner_commitments = 3;
   // Whose commitments those are: the FROST identifier the aggregate keys them under, hex.
   string cosigner_identifier = 4;
+  // As `SettleSighashes.exit_messages`.
+  repeated bytes exit_messages = 5;
 }
 
 message SendComplete {

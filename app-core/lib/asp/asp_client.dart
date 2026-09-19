@@ -14,6 +14,7 @@ import 'package:grpc/grpc.dart';
 import 'package:protocol/ark_v1.dart' as ark;
 
 import 'ark_info.dart';
+import 'exit_chain.dart';
 
 export 'ark_info.dart';
 
@@ -224,6 +225,52 @@ class AspClient {
     );
     return resp.vtxos.map(_vtxo).toList();
   }
+
+  /// Every transaction between a VTXO and the chain, as the indexer knows them.
+  ///
+  /// A VTXO is an output of a transaction that was never published: to spend it unilaterally the
+  /// owner has to put that transaction on-chain first, and the one that made *its* input, back to
+  /// a commitment transaction that is already confirmed. This is that list — unordered, each entry
+  /// naming what it spends — and `ExitChain` is what makes a path out of it.
+  Future<List<ChainLink>> getVtxoChain(String txid, int vout) async {
+    final resp = await _call(
+      'GetVtxoChain',
+      () => _indexer.getVtxoChain(
+          ark.GetVtxoChainRequest(outpoint: ark.IndexerOutpoint(txid: txid, vout: vout))),
+    );
+    return [
+      for (final c in resp.chain)
+        ChainLink(
+          txid: c.txid,
+          kind: _chainKind(c.type),
+          spends: c.spends.toList(),
+          expiresAt: c.expiresAt.toInt(),
+        ),
+    ];
+  }
+
+  /// The transactions themselves, hex, for txids the chain named. Without these there is nothing
+  /// to broadcast — the chain is only a shape.
+  Future<Map<String, String>> getVirtualTxs(List<String> txids) async {
+    if (txids.isEmpty) return const {};
+    final resp = await _call(
+      'GetVirtualTxs',
+      () => _indexer.getVirtualTxs(ark.GetVirtualTxsRequest(txids: txids)),
+    );
+    // Answered in the order asked, which is the only correspondence the API offers.
+    final txs = resp.txs;
+    return {
+      for (var i = 0; i < txids.length && i < txs.length; i++) txids[i]: txs[i],
+    };
+  }
+
+  static ChainKind _chainKind(ark.IndexerChainedTxType type) => switch (type) {
+        ark.IndexerChainedTxType.INDEXER_CHAINED_TX_TYPE_COMMITMENT => ChainKind.commitment,
+        ark.IndexerChainedTxType.INDEXER_CHAINED_TX_TYPE_TREE => ChainKind.tree,
+        ark.IndexerChainedTxType.INDEXER_CHAINED_TX_TYPE_CHECKPOINT => ChainKind.checkpoint,
+        ark.IndexerChainedTxType.INDEXER_CHAINED_TX_TYPE_ARK => ChainKind.ark,
+        _ => ChainKind.unknown,
+      };
 
   static IndexerVtxo _vtxo(ark.IndexerVtxo v) => IndexerVtxo(
         txid: v.outpoint.txid,

@@ -5,9 +5,12 @@ import 'page_objects.dart';
 import 'test_setup.dart';
 
 class Flows {
+  /// Onboarding, up to the wallet opening. [exitAddress] is where unilateral exits will pay; the
+  /// step is blocking, because without one nothing can be pre-signed.
   static Future<void> completeOnboarding(
     WidgetTester tester, {
     String pin = '123456',
+    required String exitAddress,
   }) async {
     await pumpUntilFound(
       tester,
@@ -28,27 +31,11 @@ class Flows {
       tester,
       timeout: const Duration(minutes: 3),
     );
+    await pumpUntilFound(tester, find.byKey(const Key('exitAddressField')));
+    await ExitAddressPage.enter(tester, exitAddress);
+    await pumpUntilFound(tester, find.byKey(const Key('walletReadyBtn')));
     await WalletReadyPage.tapGoToWallet(tester);
     await tester.pumpAndSettle();
   }
 
-  /// Home → Send → Review → Sign → back to Home.
-  static Future<void> doOnChainSend(
-    WidgetTester tester, {
-    required String destination,
-    required String amountSats,
-  }) async {
-    await HomePage.tapSend(tester);
-    await tester.pumpAndSettle();
-    await SendPage.enterAddress(tester, destination);
-    await SendPage.enterAmount(tester, amountSats);
-    await SendPage.tapReview(tester);
-    await pumpUntilFound(tester, find.byKey(const Key('reviewSignBtn')));
-    await ReviewPage.tapSign(tester);
-    await pumpUntilFound(
-      tester,
-      find.byKey(const Key('homeSendBtn')),
-      timeout: const Duration(seconds: 90),
-    );
-  }
 }

@@ -8,7 +8,7 @@ name = "mpcwallet_ffi"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-ark = { path = "../crates/ark", features = ["std"] }
+ark = { path = "../crates/ark", features = ["std", "exit"] }
 ark-core = "0.9"
 bitcoin = { version = "0.32", features = ["serde"] }
 threshold = { path = "../crates/threshold", features = ["std"] }

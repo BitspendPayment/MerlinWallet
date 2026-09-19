@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'theme/app_theme.dart';
-import 'screens/home_screen.dart';
 import 'screens/onboarding/welcome_screen.dart';
 import 'screens/onboarding/server_connect_screen.dart';
 import 'screens/onboarding/dkg_progress_screen.dart';
@@ -10,10 +9,11 @@ import 'screens/onboarding/wallet_ready_screen.dart';
 import 'screens/spending/send_screen.dart';
 import 'screens/spending/review_screen.dart';
 import 'screens/spending/signing_screen.dart';
-import 'screens/receive_screen.dart';
 import 'screens/contacts/contacts_screen.dart';
 import 'screens/payments/requests_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/exit/exit_screen.dart';
+import 'screens/onboarding/exit_address_screen.dart';
 import 'screens/splash_screen.dart';
 import 'screens/ark/ark_screen.dart';
 import 'screens/ark/ark_receive_screen.dart';
@@ -83,22 +83,19 @@ class _MerlinWalletAppState extends State<MerlinWalletApp> {
 GoRouter _buildRouter(MpcService mpc) => GoRouter(
   initialLocation: '/splash',
   refreshListenable: mpc,
-  // In offline mode the Ark + Services routes are unreachable — bounce to Home.
-  redirect: (context, state) {
-    final path = state.uri.path;
-    final isArkRoute =
-        path == '/ark' || path.startsWith('/ark/') || path == '/services';
-    if (isArkRoute && mpc.offlineMode) return '/';
-    return null;
-  },
   routes: [
     GoRoute(
       path: '/splash',
       builder: (context, state) => const SplashScreen(),
     ),
+    // The wallet is the Ark wallet now; there is no other.
     GoRoute(
       path: '/',
-      builder: (context, state) => const HomeScreen(),
+      builder: (context, state) => const ArkScreen(),
+    ),
+    GoRoute(
+      path: '/exit',
+      builder: (context, state) => const ExitScreen(),
     ),
     GoRoute(
       path: '/onboarding/welcome',
@@ -125,8 +122,8 @@ GoRoute(
       builder: (context, state) => const SendScreen(),
     ),
     GoRoute(
-      path: '/receive',
-      builder: (context, state) => const ReceiveScreen(),
+      path: '/onboarding/exit-address',
+      builder: (context, state) => const ExitAddressScreen(),
     ),
     GoRoute(
       path: '/contacts',

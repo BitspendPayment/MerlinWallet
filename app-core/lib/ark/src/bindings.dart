@@ -131,3 +131,29 @@ typedef _ArkEvtxoArkAddressDart = Pointer<FfiResult> Function(Pointer<Utf8>);
 final arkEvtxoArkAddressFfi = nativeLib
     .lookupFunction<_ArkEvtxoArkAddressNative, _ArkEvtxoArkAddressDart>(
         'ark_evtxo_ark_address');
+
+// ---------------------------------------------------------------------------
+// The unilateral exit
+// ---------------------------------------------------------------------------
+//
+// JSON in, JSON out — see `ffi/src/ark/exit.rs`. The wallet builds the same exit transactions the
+// cosigner builds, so that it can check the sighashes it is asked to sign before signing them.
+// `ark_exit_spend_info` above is a different, older thing: it derives from a taptree real VTXOs do
+// not use, and is on its way out.
+
+typedef _ArkJsonNative = Pointer<FfiResult> Function(Pointer<Utf8>);
+typedef _ArkJsonDart = Pointer<FfiResult> Function(Pointer<Utf8>);
+
+final arkVtxoExitSpendInfoFfi = nativeLib
+    .lookupFunction<_ArkJsonNative, _ArkJsonDart>('ark_vtxo_exit_spend_info');
+final arkBuildExitTxFfi =
+    nativeLib.lookupFunction<_ArkJsonNative, _ArkJsonDart>('ark_build_exit_tx');
+final arkFinalizeExitTxFfi =
+    nativeLib.lookupFunction<_ArkJsonNative, _ArkJsonDart>('ark_finalize_exit_tx');
+final arkVerifyExitTxFfi =
+    nativeLib.lookupFunction<_ArkJsonNative, _ArkJsonDart>('ark_verify_exit_tx');
+
+typedef _ArkSpkNative = Pointer<FfiResult> Function(Pointer<Utf8>, Pointer<Utf8>);
+typedef _ArkSpkDart = Pointer<FfiResult> Function(Pointer<Utf8>, Pointer<Utf8>);
+final arkOnchainScriptPubkeyFfi = nativeLib
+    .lookupFunction<_ArkSpkNative, _ArkSpkDart>('ark_onchain_script_pubkey');

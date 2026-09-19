@@ -106,6 +106,62 @@ class RegtestHelper {
     return result == null ? null : (result as Map<String, dynamic>);
   }
 
+  // --- What proving a unilateral exit needs ------------------------------------------------------
+  //
+  // An exit waits out a relative timelock and then pays no fee, so getting one mined means moving
+  // the chain's clock forward and handing bitcoind the transaction directly or with the child that
+  // pays for it. All of this is regtest-only by nature.
+
+  /// Move the node's idea of now. A VTXO's exit delay is in seconds, so the median-time-past has to
+  /// be pushed past it — mine a few blocks after this for the median to follow.
+  Future<void> setMockTime(int unixSeconds) async {
+    await _call('setmocktime', [unixSeconds]);
+  }
+
+  /// The chain's median time past, which is what a time-based `OP_CHECKSEQUENCEVERIFY` is measured
+  /// against — not the latest block's timestamp.
+  Future<int> medianTime() async {
+    final info = await _call('getblockchaininfo');
+    return (info['mediantime'] as num).toInt();
+  }
+
+  /// Mine a block containing [rawTransactions], bypassing mempool policy.
+  ///
+  /// This is how a zero-fee transaction gets confirmed without a fee-paying child: it proves
+  /// consensus accepts it — script, timelock, signature and witness — which is a different claim
+  /// from a node being willing to relay it. [submitPackage] is the claim about relay.
+  Future<String> generateBlock(String address, List<String> rawTransactions) async {
+    final result = await _call('generateblock', [address, rawTransactions]);
+    return result['hash'] as String;
+  }
+
+  /// Submit a parent and the child that pays its fee, as one package.
+  Future<Map<String, dynamic>> submitPackage(List<String> rawTransactions) async {
+    return (await _call('submitpackage', [rawTransactions])) as Map<String, dynamic>;
+  }
+
+  /// Would the node accept these? Returns its reason when it would not.
+  Future<List<Map<String, dynamic>>> testMempoolAccept(List<String> rawTransactions) async {
+    final result = await _call('testmempoolaccept', [rawTransactions]);
+    return (result as List).cast<Map<String, dynamic>>();
+  }
+
+  Future<Map<String, dynamic>> decodeRawTransaction(String hex) async {
+    return (await _call('decoderawtransaction', [hex])) as Map<String, dynamic>;
+  }
+
+  Future<List<Map<String, dynamic>>> listUnspent({int minConf = 1}) async {
+    final result = await _call('listunspent', [minConf]);
+    return (result as List).cast<Map<String, dynamic>>();
+  }
+
+  /// Sign whatever inputs belong to the node's wallet, leaving the others alone — an anchor input
+  /// needs no signature, so `complete: false` is the expected answer.
+  Future<String> signWithWallet(String rawTransaction) async {
+    final result = await _call('signrawtransactionwithwallet', [rawTransaction]);
+    return result['hex'] as String;
+  }
+
   /// Scans the UTXO set for an address.
   /// Note: This is an expensive call on mainnet, but fine for regtest.
   Future<List<Map<String, dynamic>>> scanUtxos(String address) async {

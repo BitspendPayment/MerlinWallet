@@ -16,6 +16,7 @@ import 'package:protocol/cosigner_v1.dart' as cs;
 import '../asp/ark_info.dart';
 import '../cosigner/connection.dart';
 import '../threshold_types.dart' as threshold;
+import 'exit_plan.dart';
 import 'in_band_round.dart';
 import 'send_session.dart';
 
@@ -26,25 +27,33 @@ class DelegateStatus {
     required this.margin,
     required this.covered,
     this.deviceEnrolled = false,
+    this.exits = const [],
   });
 
-  factory DelegateStatus.fromSealed(cs.DelegateSealed s) => DelegateStatus(
+  factory DelegateStatus.fromSealed(cs.DelegateSealed s, {List<ExitTx> exits = const []}) =>
+      DelegateStatus(
         validAt: DateTime.fromMillisecondsSinceEpoch(s.validAtSecs.toInt() * 1000),
         margin: Duration(seconds: s.marginSecs.toInt()),
         covered: s.covered.toSet(),
         deviceEnrolled: s.deviceEnrolled,
+        exits: exits,
       );
 
   factory DelegateStatus.fromJson(Map<String, dynamic> j) => DelegateStatus(
         validAt: DateTime.fromMillisecondsSinceEpoch((j['validAt'] as num).toInt() * 1000),
         margin: Duration(seconds: (j['margin'] as num).toInt()),
         covered: (j['covered'] as List).cast<String>().toSet(),
+        exits: [
+          for (final e in (j['exits'] as List? ?? const []))
+            ExitTx.fromJson((e as Map).cast<String, dynamic>()),
+        ],
       );
 
   Map<String, dynamic> toJson() => {
         'validAt': validAt.millisecondsSinceEpoch ~/ 1000,
         'margin': margin.inSeconds,
         'covered': covered.toList(),
+        'exits': [for (final e in exits) e.toJson()],
       };
 
   /// When the cosigner will run it.
@@ -59,6 +68,11 @@ class DelegateStatus {
   /// Whether the device token the seal carried was enrolled for wakes. Only meaningful on the seal
   /// that carried one, so not persisted.
   final bool deviceEnrolled;
+
+  /// A signed unilateral exit per covered VTXO, when the wallet had an exit address to seal
+  /// against. What the owner broadcasts if this cosigner is never heard from again — see
+  /// `sessions/exit_plan.dart`.
+  final List<ExitTx> exits;
 
   bool covers(IndexerVtxo vtxo) => covered.contains('${vtxo.txid}:${vtxo.vout}');
 }
@@ -87,8 +101,24 @@ Future<List<IndexerVtxo>?> heldOnceIndexed(
 
 /// [deviceToken], when not empty, is enrolled for wakes as the delegate is sealed — see `DkgOpen` in
 /// `cosign_session.proto` for why it rides here.
-cs.SealDelegate sealMessage(List<IndexerVtxo> held, ArkInfo info, {String deviceToken = ''}) =>
-    cs.SealDelegate(vtxos: vtxosToProto(held), arkInfo: arkInfoToProto(info), deviceToken: deviceToken);
+cs.SealDelegate sealMessage(
+  List<IndexerVtxo> held,
+  ArkInfo info, {
+  String deviceToken = '',
+  String exitScriptPubkeyHex = '',
+}) =>
+    cs.SealDelegate(
+      vtxos: vtxosToProto(held),
+      arkInfo: arkInfoToProto(info),
+      deviceToken: deviceToken,
+      exitScriptPubkey: hexBytes(exitScriptPubkeyHex),
+    );
+
+/// Hex to bytes, for the scriptPubKey that rides the seal.
+List<int> hexBytes(String hex) => [
+      for (var i = 0; i + 1 < hex.length; i += 2)
+        int.parse(hex.substring(i, i + 2), radix: 16),
+    ];
 
 /// The in-band seal exchange: sighashes in, the wallet's half of the round out, the sealed delegate
 /// in. The caller has already sent whatever opens it — `SealDelegate` after a `Complete`, or a
@@ -99,17 +129,23 @@ Future<DelegateStatus> answerSeal<Q, R>({
   required threshold.PublicKeyPackage groupPubKey,
   required ({
     List<List<int>> sighashes,
+    List<List<int>> exitMessages,
     List<cs.Commitment> commitments,
     String identifier,
     bool scriptPathSpend,
   })? Function(R) sighashesOf,
   required Q Function(List<cs.WalletRound>) signed,
   required cs.DelegateSealed? Function(R) sealedOf,
+  ExitPlan? exits,
 }) async {
   final h = sighashesOf(await duplex.next("the delegate's sighashes"));
   if (h == null) throw CosignerException("expected the delegate's sighashes");
+  // One round signs the delegate and then the exits. What the cosigner asks for has to be what
+  // this wallet independently built, or nothing here is signed.
+  final plan = exits ?? ExitPlan.none;
+  plan.checkAsked(h.exitMessages);
   duplex.send(signed(answerRound(
-    sighashes: h.sighashes,
+    sighashes: [...h.sighashes, ...h.exitMessages],
     cosignerCommitments: h.commitments,
     cosignerIdentifier: h.identifier,
     scriptPathSpend: h.scriptPathSpend,
@@ -118,7 +154,7 @@ Future<DelegateStatus> answerSeal<Q, R>({
   )));
   final sealed = sealedOf(await duplex.next('the sealed delegate'));
   if (sealed == null) throw CosignerException('expected the sealed delegate');
-  return DelegateStatus.fromSealed(sealed);
+  return DelegateStatus.fromSealed(sealed, exits: plan.accept(sealed.exitTxs));
 }
 
 /// Seal a delegate as the last exchange of a stream that just completed. Null when it could not be —
@@ -132,19 +168,27 @@ Future<DelegateStatus?> sealAfter<Q, R>({
   required threshold.PublicKeyPackage groupPubKey,
   required Q Function(cs.SealDelegate) seal,
   String deviceToken = '',
+  String exitScriptPubkeyHex = '',
   required ({
     List<List<int>> sighashes,
+    List<List<int>> exitMessages,
     List<cs.Commitment> commitments,
     String identifier,
     bool scriptPathSpend,
   })? Function(R) sighashesOf,
   required Q Function(List<cs.WalletRound>) signed,
   required cs.DelegateSealed? Function(R) sealedOf,
+  String ownerXOnlyHex = '',
 }) async {
   try {
     final set = await held;
     if (set == null || set.isEmpty) return null;
-    duplex.send(seal(sealMessage(set, info, deviceToken: deviceToken)));
+    duplex.send(seal(sealMessage(
+      set,
+      info,
+      deviceToken: deviceToken,
+      exitScriptPubkeyHex: exitScriptPubkeyHex,
+    )));
     return await answerSeal(
       duplex: duplex,
       keyPkg: keyPkg,
@@ -152,6 +196,14 @@ Future<DelegateStatus?> sealAfter<Q, R>({
       sighashesOf: sighashesOf,
       signed: signed,
       sealedOf: sealedOf,
+      exits: exitScriptPubkeyHex.isEmpty
+          ? null
+          : ExitPlan(
+              ownerXOnlyHex: ownerXOnlyHex,
+              info: info,
+              destinationScriptPubkeyHex: exitScriptPubkeyHex,
+              vtxos: set,
+            ),
     );
   } catch (_) {
     return null;

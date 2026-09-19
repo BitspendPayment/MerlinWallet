@@ -444,9 +444,14 @@ class ArkScreen extends StatelessWidget {
               final messenger = ScaffoldMessenger.of(context);
               try {
                 if (due) {
-                  await mpcService.delegateNow();
-                  messenger.showSnackBar(
-                      const SnackBar(content: Text('Funds refreshed')));
+                  // A refresh seals a new delegate on its way out, so one approval normally does
+                  // both. When the indexer was too slow for that, saying so beats reporting a
+                  // success that leaves the renewal un-armed.
+                  final armed = await mpcService.delegateNow();
+                  messenger.showSnackBar(SnackBar(
+                      content: Text(armed
+                          ? 'Funds refreshed, and set to renew themselves again'
+                          : 'Funds refreshed — tap "Renew automatically" in a moment to re-arm')));
                 } else {
                   await mpcService.protectFunds();
                   messenger.showSnackBar(const SnackBar(
@@ -628,6 +633,6 @@ class ArkScreen extends StatelessWidget {
   }
 
   Widget _buildBottomNav(BuildContext context) {
-    return const AppBottomNav(current: '/ark');
+    return const AppBottomNav(current: '/');
   }
 }

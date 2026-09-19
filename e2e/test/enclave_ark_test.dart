@@ -19,7 +19,10 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:app_core/ark/ark.dart' as ark;
 import 'package:app_core/asp/asp_client.dart' show IndexerVtxo;
+import 'package:app_core/asp/exit_chain.dart' show ChainKind;
+import 'package:blockchain_utils/blockchain_utils.dart' show SegwitBech32Encoder;
 import 'package:app_core/client.dart';
 import 'package:app_core/enclave/attestation.dart';
 import 'package:app_core/enclave/authenticator.dart';
@@ -337,6 +340,184 @@ void main() {
       expect(v.script, isNotEmpty, reason: 'every VTXO sits under a script');
     }
   }
+
+  /// The exits are the point of the whole arrangement: a spend of each VTXO through its own exit
+  /// leaf, signed by the 2-of-2 while the cosigner is here, kept by the wallet. If the cosigner
+  /// never answers again, these are the money — so they are checked to be complete, correct and
+  /// re-issued whenever the set of VTXOs changes.
+  group('the way out', () {
+    test('every seal signs an exit for every VTXO it covers', () async {
+      final erin = await wallet('exit_erin');
+      try {
+        await erin.client.doDkg();
+
+        // Where the exits pay: an address in bitcoind's wallet, which this wallet cannot spend.
+        final exitAddress = await btc.getNewAddress();
+        await erin.client.setExitAddress(exitAddress);
+
+        final held = await boardAndSettle(erin, 0.005);
+        final vtxo = held.single;
+
+        final exits = erin.client.exits;
+        expect(exits, hasLength(1), reason: 'one exit per held VTXO');
+        final exit = exits.single;
+        expect(exit.outpoint, '${vtxo.txid}:${vtxo.vout}');
+        expect(exit.amountSats, vtxo.amountSats,
+            reason: 'an exit pays the whole VTXO — it carries an anchor instead of a fee');
+        expect(exit.sequence, greaterThan(0), reason: "it waits out the VTXO's exit delay");
+        expect(exit.rawTx.length, greaterThan(200),
+            reason: 'a signed transaction, not a stub');
+
+        // The exit is the last hop. Everything above it — the batch tree, down from a commitment
+        // transaction already on-chain — has to be published first, and the indexer is where those
+        // come from. Without this the wallet would be showing a signed transaction that spends an
+        // output nobody can see.
+        final chain = await erin.client.exitChain(exit);
+        expect(chain.missing, isEmpty, reason: 'the indexer should know the whole path');
+        expect(chain.hops.first.kind, ChainKind.commitment,
+            reason: 'a path starts at something already on-chain');
+        expect(chain.hops.last.kind, ChainKind.exit);
+        expect(chain.hops.last.rawTx, exit.rawTx);
+        expect(chain.hops.length, greaterThanOrEqualTo(3),
+            reason: 'commitment, at least one tree transaction, and the exit');
+        for (final hop in chain.toPublish) {
+          expect(hop.rawTx, isNotNull,
+              reason: '${hop.kind.name} ${hop.txid} has to be broadcastable, not just named');
+          expect(hop.rawTx, isNotEmpty);
+        }
+        Log.info('exit path: ${chain.hops.map((h) => h.kind.name).join(' -> ')}');
+
+        // Spending the VTXO makes its exit meaningless, and the seal on the way out replaces it.
+        final bob = await wallet('exit_bob');
+        await bob.client.doDkg();
+        final bobAddress = await bob.client.getArkAddress();
+        await whileMining(btc, () => erin.client.sendVtxo(bobAddress, 10000));
+        final after = erin.client.exits;
+        expect(after.map((e) => e.outpoint), isNot(contains(exit.outpoint)),
+            reason: 'the spent VTXO\'s exit is gone');
+        expect(after, isNotEmpty, reason: "the change VTXO has an exit of its own");
+        expect(after.single.amountSats, lessThan(vtxo.amountSats));
+
+        // Bob received, and nothing of his has been sealed yet: he holds money with no exit until
+        // he protects it. That gap is what the Exit tab shows, and what `protectFunds` closes.
+        expect(bob.client.exits, isEmpty);
+        await bob.client.setExitAddress(await btc.getNewAddress());
+        final sealed = await bob.client.protectFunds();
+        expect(sealed.exits, hasLength(1));
+        expect(bob.client.exits.single.amountSats, 10000);
+      } finally {
+        await erin.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 10)));
+
+    /// The claim every other exit test rests on: that these transactions actually spend.
+    ///
+    /// Everything else checks shape — the right outpoint, the right amount, a signature that
+    /// verifies against our own arithmetic. This one hands the transaction to bitcoind and sees
+    /// the money arrive, which is the only way to know the leaf, the timelock, the witness and the
+    /// 2-of-2's signature are all what consensus expects.
+    ///
+    /// The VTXO here is synthetic: an ordinary on-chain output carrying this wallet's VTXO script,
+    /// funded by bitcoind. A real VTXO lives in a batch tree whose branch would have to be
+    /// published first — a later piece of work — and that branch would change nothing about the
+    /// hop being proven here, which is the last one.
+    test('a signed exit really spends, and bitcoind agrees', () async {
+      final alice = await wallet('exit_spend');
+      try {
+        await alice.client.doDkg();
+        final exitAddress = await btc.getNewAddress();
+        await alice.client.setExitAddress(exitAddress);
+
+        // An output under this wallet's own VTXO script: same owner key, same ASP key, same exit
+        // delay, so the exit leaf the cosigner signs against is the one that guards it.
+        final info = await alice.client.getArkInfo();
+        final script = ark.vtxoScriptPubkeyHex(
+          ownerXOnlyHex: alice.client.groupXOnlyPubKey!,
+          aspPubkeyHex: info.signerPubkey,
+          exitDelay: info.unilateralExitDelay,
+          network: info.network,
+        );
+        final program = Uint8List.fromList([
+          for (var i = 4; i < script.length; i += 2)
+            int.parse(script.substring(i, i + 2), radix: 16),
+        ]);
+        final vtxoAddress = SegwitBech32Encoder.encode('bcrt', 1, program);
+
+        final fundingTxid = await btc.sendToAddress(vtxoAddress, 0.002);
+        await btc.generateToAddress(1, await btc.getNewAddress());
+        final funding = await btc.getRawTransaction(fundingTxid);
+        final output = (funding['vout'] as List)
+            .cast<Map<String, dynamic>>()
+            .firstWhere((o) => (o['scriptPubKey'] as Map)['hex'] == script);
+        final amountSats = ((output['value'] as num) * 1e8).round();
+        final fundedAt = (funding['blocktime'] as num).toInt();
+
+        // The cosigner signs its exit. It never asked the ASP whether this VTXO is real — it
+        // derives the script from its own key, so an output that is not ours is one it cannot
+        // produce a spendable signature for anyway.
+        final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        final sealed = await alice.client.protectFunds(over: [
+          IndexerVtxo(
+            txid: fundingTxid,
+            vout: (output['n'] as num).toInt(),
+            amountSats: amountSats,
+            script: script,
+            isSpent: false,
+            createdAt: now,
+            expiresAt: now + 86400,
+            exitDelay: info.unilateralExitDelay,
+          )
+        ]);
+        final exit = sealed.exits.single;
+        expect(exit.amountSats, amountSats);
+
+        // Too early: the timelock is the whole point of an exit, so it must actually bind.
+        final tooEarly = await btc.testMempoolAccept([exit.rawTx]);
+        expect(tooEarly.single['allowed'], isFalse,
+            reason: 'an exit must not be spendable before its delay');
+        expect('${tooEarly.single['reject-reason']}', contains('non-BIP68'),
+            reason: 'and the reason must be the timelock, not something else');
+
+        // Wait it out. The delay is in seconds, so what has to pass is the chain's median time —
+        // mined blocks follow the node's clock.
+        await btc.setMockTime(fundedAt + info.unilateralExitDelay + 3600);
+        await btc.generateToAddress(12, await btc.getNewAddress());
+        expect(await btc.medianTime(), greaterThan(fundedAt + info.unilateralExitDelay));
+
+        // Consensus: mined directly, because an exit pays no fee and a node will not relay it
+        // alone. What this proves is that the script, the sequence, the witness and the FROST
+        // signature are all valid — the parts nobody could add later.
+        final exitTxid = (await btc.decodeRawTransaction(exit.rawTx))['txid'] as String;
+        await btc.generateBlock(await btc.getNewAddress(), [exit.rawTx]);
+        final mined = await btc.getRawTransaction(exitTxid);
+        expect(mined['confirmations'], greaterThanOrEqualTo(1),
+            reason: 'the exit is in a block');
+
+        // And the money is where the owner said it should go.
+        final paid = (mined['vout'] as List)
+            .cast<Map<String, dynamic>>()
+            .firstWhere((o) => ((o['scriptPubKey'] as Map)['address'] ?? '') == exitAddress);
+        expect(((paid['value'] as num) * 1e8).round(), amountSats,
+            reason: 'an exit pays the whole VTXO — the fee comes from whoever bumps it');
+        Log.info('exit $exitTxid paid $amountSats sats to $exitAddress');
+      } finally {
+        await alice.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 10)));
+
+    /// A wallet that never set one still works — it simply has nothing to fall back on.
+    test('a wallet with no exit address still seals a delegate', () async {
+      final dana = await wallet('exit_dana');
+      try {
+        await dana.client.doDkg();
+        await boardAndSettle(dana, 0.005);
+        expect(dana.client.delegateStatus, isNotNull);
+        expect(dana.client.exits, isEmpty);
+      } finally {
+        await dana.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 10)));
+  });
 
   group('the full flow', () {
     /// Board, settle, then three sends — the third spending down the change of the second, which is a

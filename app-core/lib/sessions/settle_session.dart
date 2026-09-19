@@ -26,6 +26,7 @@ import '../threshold_types.dart' as threshold;
 import 'in_band_round.dart';
 import 'send_session.dart';
 import 'delegate.dart';
+import 'exit_plan.dart';
 
 /// What a settle produced.
 class SettleResult {
@@ -65,6 +66,8 @@ class SettleSession {
     required threshold.PublicKeyPackage groupPubKey,
     required List<IndexerVtxo> vtxos,
     String deviceToken = '',
+    String exitScriptPubkeyHex = '',
+    String ownerXOnlyHex = '',
   }) async {
     final duplex = _conn.openSettle();
     try {
@@ -76,6 +79,7 @@ class SettleSession {
           vtxos: vtxosToProto(vtxos),
           sealOnly: true,
           deviceToken: deviceToken,
+          exitScriptPubkey: hexBytes(exitScriptPubkeyHex),
         ),
       ));
       return await answerSeal<cs.SettleClientMsg, cs.SettleServerMsg>(
@@ -86,6 +90,14 @@ class SettleSession {
         signed: (rounds) =>
             cs.SettleClientMsg(sessionId: '', seq: Int64(1), signed: cs.SettleSigned(rounds: rounds)),
         sealedOf: (r) => r.hasSealed() ? r.sealed : null,
+        exits: exitScriptPubkeyHex.isEmpty
+            ? null
+            : ExitPlan(
+                ownerXOnlyHex: ownerXOnlyHex,
+                info: info,
+                destinationScriptPubkeyHex: exitScriptPubkeyHex,
+                vtxos: vtxos,
+              ),
       );
     } finally {
       await duplex.close();
@@ -94,12 +106,14 @@ class SettleSession {
 
   static ({
     List<List<int>> sighashes,
+    List<List<int>> exitMessages,
     List<cs.Commitment> commitments,
     String identifier,
     bool scriptPathSpend,
   })? _sighashesOf(cs.SettleServerMsg r) => r.hasSighashes()
       ? (
           sighashes: r.sighashes.messagesToSign,
+          exitMessages: r.sighashes.exitMessages,
           commitments: r.sighashes.cosignerCommitments,
           identifier: r.sighashes.cosignerIdentifier,
           scriptPathSpend: r.sighashes.scriptPathSpend,
@@ -116,6 +130,8 @@ class SettleSession {
     void Function(SettlePhase)? onProgress,
     Future<List<IndexerVtxo>> Function()? readHeld,
     String deviceToken = '',
+    String exitScriptPubkeyHex = '',
+    String ownerXOnlyHex = '',
   }) async {
     final duplex = _conn.openSettle();
     StreamQueue<ark.GetEventStreamResponse>? events;
@@ -197,6 +213,10 @@ class SettleSession {
                     duplex: duplex,
                     held: heldOnceIndexed(
                       readHeld,
+                      // A batch round's output reaches the indexer later than a send's change, and
+                      // giving up early is what used to leave a refreshed wallet un-armed — the
+                      // owner refreshed, and still had to seal again by hand.
+                      timeout: const Duration(seconds: 45),
                       gone: {for (final v in vtxos) '${v.txid}:${v.vout}'},
                       // Only a boarding settle reports its new outpoint reliably; a refresh can fall
                       // back to the commitment txid, which is not one.
@@ -209,6 +229,8 @@ class SettleSession {
                     groupPubKey: groupPubKey,
                     seal: (s) => cs.SettleClientMsg(sessionId: '', seq: Int64(seq++), seal: s),
                     deviceToken: deviceToken,
+                    exitScriptPubkeyHex: exitScriptPubkeyHex,
+                    ownerXOnlyHex: ownerXOnlyHex,
                     sighashesOf: _sighashesOf,
                     signed: (rounds) => cs.SettleClientMsg(
                         sessionId: '', seq: Int64(seq++), signed: cs.SettleSigned(rounds: rounds)),

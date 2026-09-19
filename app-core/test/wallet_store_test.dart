@@ -198,7 +198,7 @@ void main() {
       // Don't call init()
 
       expect(
-        () async => await store.getUtxos(),
+        () async => await store.getClientState(),
         throwsStateError,
       );
     });

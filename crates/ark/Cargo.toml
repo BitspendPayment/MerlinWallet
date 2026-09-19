@@ -24,9 +24,12 @@ hex = { version = "0.4", optional = true }
 [features]
 default = []
 std = ["threshold/std"]
+# `exit`: building and finalizing a unilateral exit spend (src/exit.rs). ark-core and bitcoin only —
+# no prost, no tonic-build, so the FFI can enable it without `protoc` on every cross-build host.
+exit = ["std", "ark-core", "bitcoin", "hex"]
 # `signing`: tx-building + FROST/MuSig2 signing math + prost message types. Builds for
 # wasm32-wasip2 (no tonic/tokio) — this is what the cosigner guest enables.
-signing = ["std", "ark-core", "bitcoin", "prost", "serde", "serde_json", "rand", "hex", "tonic-build"]
+signing = ["std", "exit", "ark-core", "bitcoin", "prost", "serde", "serde_json", "rand", "hex", "tonic-build"]
 # `client`: adds the ASP gRPC transport (tonic/tokio) on top of `signing` — host-only.
 client = ["signing", "tokio", "tonic", "tokio-stream"]
 

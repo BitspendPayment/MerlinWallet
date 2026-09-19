@@ -17,24 +17,17 @@ class _SendScreenState extends State<SendScreen> {
   final TextEditingController _amountController = TextEditingController();
   bool _isBtc = true;
 
-  bool _isArkAddress(String address) {
-    return address.startsWith('tark1') || address.startsWith('ark1');
-  }
-
-  bool _isBitcoinAddress(String address) {
-    return RegExp(r'^(bc1|tb1|bcrt1)[a-zA-Z0-9]{25,90}$').hasMatch(address);
-  }
+  /// The only kind of address this wallet can pay. On-chain sends went with the on-chain wallet;
+  /// money leaves here either to another Ark address or, if everything else fails, through the
+  /// pre-signed exits on the Exit tab.
+  bool _isArkAddress(String address) =>
+      address.startsWith('tark1') || address.startsWith('ark1');
 
   @override
   Widget build(BuildContext context) {
     final mpcService = context.watch<MpcService>();
-    final offline = mpcService.offlineMode;
-    final onChainBalance = mpcService.balance;
-    final arkBalance = mpcService.arkBalance;
-    final formattedOnChain = NumberFormat('#,###').format(onChainBalance.toInt());
-    final formattedArk = NumberFormat('#,###').format(arkBalance.toInt());
+    final formattedArk = NumberFormat('#,###').format(mpcService.arkBalance.toInt());
 
-    // Detect address type for dynamic hint
     final address = _addressController.text.trim();
     final isArk = _isArkAddress(address);
 
@@ -57,7 +50,7 @@ class _SendScreenState extends State<SendScreen> {
                         onChanged: (_) => setState(() {}),
                         decoration: InputDecoration(
                           labelText: 'Recipient Address',
-                          hintText: 'bc1q... or tark1...',
+                          hintText: 'tark1...',
                           suffixIcon: IconButton(
                             icon: const Icon(Icons.qr_code_scanner),
                             onPressed: () {},
@@ -68,28 +61,15 @@ class _SendScreenState extends State<SendScreen> {
                       if (address.isNotEmpty) ...[
                         const SizedBox(height: 8),
                         Builder(builder: (_) {
-                          final arkBlocked = isArk && offline;
-                          final color = arkBlocked
-                              ? Colors.amberAccent
-                              : (isArk ? Colors.blueAccent : Colors.white38);
+                          final color = isArk ? Colors.blueAccent : Colors.amberAccent;
                           return Row(
                             children: [
-                              Icon(
-                                arkBlocked
-                                    ? Icons.cloud_off
-                                    : (isArk ? Icons.account_tree : Icons.link),
-                                size: 14,
-                                color: color,
-                              ),
+                              Icon(isArk ? Icons.account_tree : Icons.error_outline,
+                                  size: 14, color: color),
                               const SizedBox(width: 6),
                               Text(
-                                arkBlocked
-                                    ? 'Ark unavailable in offline mode'
-                                    : (isArk
-                                        ? 'Ark (off-chain)'
-                                        : 'Bitcoin (on-chain)'),
-                                style: GoogleFonts.inter(
-                                    fontSize: 12, color: color),
+                                isArk ? 'Ark (off-chain)' : 'Not an Ark address',
+                                style: GoogleFonts.inter(fontSize: 12, color: color),
                               ),
                             ],
                           );
@@ -124,9 +104,7 @@ class _SendScreenState extends State<SendScreen> {
                       ),
                       const SizedBox(height: 16),
                       Text(
-                        offline
-                            ? 'On-chain: $formattedOnChain Sats'
-                            : 'On-chain: $formattedOnChain Sats  |  Ark: $formattedArk Sats',
+                        'Balance: $formattedArk Sats',
                         style: GoogleFonts.inter(
                             color: Colors.white54, fontSize: 12),
                       ),
@@ -157,18 +135,9 @@ class _SendScreenState extends State<SendScreen> {
       return;
     }
 
-    final isArk = _isArkAddress(address);
-
-    if (isArk && context.read<MpcService>().offlineMode) {
+    if (!_isArkAddress(address)) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text(
-              'Ark unavailable in offline mode — send on-chain (bc1q…) only')));
-      return;
-    }
-
-    if (!isArk && !_isBitcoinAddress(address)) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Invalid address format')));
+          content: Text('That is not an Ark address — it starts with tark1 or ark1')));
       return;
     }
 
@@ -191,7 +160,7 @@ class _SendScreenState extends State<SendScreen> {
         'address': address,
         'amount': amountDouble.toInt().toString(),
         'isBtc': true,
-        'isArk': isArk,
+        'isArk': true,
       });
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(

@@ -79,44 +79,25 @@ class WalletReadyPage {
       _tapKey(tester, 'walletReadyBtn');
 }
 
-class HomePage {
-  static Future<void> tapSend(WidgetTester tester) =>
-      _tapKey(tester, 'homeSendBtn');
-  static Future<void> tapReceive(WidgetTester tester) =>
-      _tapKey(tester, 'homeReceiveBtn');
-  static Future<void> tapArkTab(WidgetTester tester) async {
-    await tester.tap(find.descendant(
-      of: find.byType(BottomNavigationBar),
-      matching: find.text('Ark'),
-    ));
-    await tester.pump();
+/// Where the money goes if the service disappears — asked once, after the key exists.
+class ExitAddressPage {
+  static Future<void> enter(WidgetTester tester, String address) async {
+    await _enterText(tester, 'exitAddressField', address);
+    await _dismissKeyboard(tester);
+    await _tapKey(tester, 'exitAddressSaveBtn');
   }
+}
 
-  /// Tap the 'Home' bottom-nav item. No-op on the Home screen itself; from
-  /// the Ark screen it `context.go('/')` (replacing the stack).
-  static Future<void> tapHomeTab(WidgetTester tester) async {
+class ExitPage {
+  static Future<void> open(WidgetTester tester) async {
     await tester.tap(find.descendant(
       of: find.byType(BottomNavigationBar),
-      matching: find.text('Home'),
+      matching: find.text('Exit'),
     ));
     await tester.pumpAndSettle();
   }
-}
 
-class SendPage {
-  static Future<void> enterAddress(WidgetTester tester, String address) =>
-      _enterText(tester, 'sendAddressField', address);
-  static Future<void> enterAmount(WidgetTester tester, String sats) =>
-      _enterText(tester, 'sendAmountField', sats);
-  static Future<void> tapReview(WidgetTester tester) async {
-    await _dismissKeyboard(tester);
-    await _tapKey(tester, 'sendReviewBtn');
-  }
-}
-
-class ReviewPage {
-  static Future<void> tapSign(WidgetTester tester) =>
-      _tapKey(tester, 'reviewSignBtn');
+  static Future<void> signExits(WidgetTester tester) => _tapKey(tester, 'exitProtectBtn');
 }
 
 class ArkPage {

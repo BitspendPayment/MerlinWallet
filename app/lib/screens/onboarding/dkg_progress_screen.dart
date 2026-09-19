@@ -51,7 +51,8 @@ class _DkgProgressScreenState extends State<DkgProgressScreen> {
       await Future.delayed(const Duration(seconds: 1));
 
       if (mounted) {
-        context.push('/onboarding/ready');
+        // The key exists; now the one thing it cannot be given later — somewhere to exit to.
+        context.push('/onboarding/exit-address');
       }
     } catch (e) {
       await _addLog('Error: $e');

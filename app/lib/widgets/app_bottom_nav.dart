@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
-import 'package:provider/provider.dart';
-import 'package:app/services/mpc_service.dart';
 
-/// Bottom navigation shared by the Home and Ark screens. Items are built by
-/// route (indices are derived, never hardcoded), and in offline mode the Ark and
-/// Services tabs — both Ark-layer — are hidden, leaving only Home + Send.
+/// Bottom navigation, built by route so indices are derived rather than hardcoded.
+///
+/// Three destinations, because this wallet does three things: hold money in Ark, get it out
+/// without anyone's help, and be configured. The Home tab was the on-chain wallet's, Services was
+/// a tab with nothing behind it, and Send lives on the Ark screen with Receive and Board.
 class AppBottomNav extends StatelessWidget {
   /// Route of the current screen, e.g. '/' or '/ark'.
   final String current;
@@ -13,19 +13,11 @@ class AppBottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final offline = context.watch<MpcService>().offlineMode;
-
-    final items = <_NavItem>[
-      const _NavItem('/', Icons.account_balance_wallet_outlined,
-          Icons.account_balance_wallet, 'Home'),
-      if (!offline)
-        const _NavItem(
-            '/ark', Icons.account_tree_outlined, Icons.account_tree, 'Ark'),
-      const _NavItem(
-          '/spending/send', Icons.send_outlined, Icons.send, 'Send'),
-      if (!offline)
-        const _NavItem('/services', Icons.storefront_outlined,
-            Icons.storefront, 'Services'),
+    const items = <_NavItem>[
+      _NavItem('/', Icons.account_balance_wallet_outlined,
+          Icons.account_balance_wallet, 'Wallet'),
+      _NavItem('/exit', Icons.exit_to_app_outlined, Icons.exit_to_app, 'Exit'),
+      _NavItem('/settings', Icons.settings_outlined, Icons.settings, 'Settings'),
     ];
 
     int currentIndex = items.indexWhere((i) => i.route == current);
@@ -41,13 +33,7 @@ class AppBottomNav extends StatelessWidget {
       currentIndex: currentIndex,
       onTap: (index) {
         final route = items[index].route;
-        if (route == current) return;
-        // Send is a pushed modal flow; the other tabs are go() destinations.
-        if (route == '/spending/send') {
-          context.push(route);
-        } else {
-          context.go(route);
-        }
+        if (route != current) context.go(route);
       },
       items: [
         for (final i in items)

@@ -464,7 +464,9 @@ fn sealing_without_a_known_expiry_is_refused() {
                 expires_at: 0,
             }],
             &ark_info(),
+            &[],
         )
+        .map(|_| ())
         .expect_err("nothing to schedule against");
     assert!(err.contains("known expiry"), "unhelpful error: {err}");
 }

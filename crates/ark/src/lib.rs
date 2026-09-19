@@ -5,6 +5,9 @@ extern crate alloc;
 #[cfg(feature = "signing")]
 pub mod client;
 
+#[cfg(feature = "exit")]
+pub mod exit;
+
 use alloc::vec::Vec;
 use threshold::taptree::{ControlBlock, TapLeaf, TapNode, UNSPENDABLE_KEY_X_ONLY};
 

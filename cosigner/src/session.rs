@@ -553,17 +553,26 @@ async fn send(
             _ => return Err(Status::invalid_argument("after SendComplete only a seal may follow")),
         };
         let device_token = std::mem::take(&mut seal.device_token);
-        let (round, sighashes, commitments) = seal_open(&cosigner, seal)?;
+        let seal_round = seal_open(&cosigner, seal)?;
+        let mut sighashes =
+            sighashes_msg(seal_round.delegate_sighashes, seal_round.commitments);
+        sighashes.exit_messages = seal_round.exit_sighashes;
         duplex.send(proto::SendServerMsg {
             session_id: session_id.clone(),
             seq: 5,
-            body: Some(proto::send_server_msg::Body::Sighashes(sighashes_msg(sighashes, commitments))),
+            body: Some(proto::send_server_msg::Body::Sighashes(sighashes)),
         });
         let signed = match next_body(&duplex, "the delegate's signatures").await? {
             proto::send_client_msg::Body::Signed(s) => s,
             _ => return Err(Status::invalid_argument("expected the delegate's signatures")),
         };
-        let sealed = seal_finish(&cosigner, round, signed.rounds, &device_token)?;
+        let sealed = seal_finish(
+            &cosigner,
+            seal_round.round,
+            seal_round.exits,
+            signed.rounds,
+            &device_token,
+        )?;
         duplex.send(proto::SendServerMsg {
             session_id,
             seq: 6,
@@ -602,6 +611,7 @@ async fn settle(
             vtxos: open.vtxos,
             ark_info: Some(info_to_proto(&info)),
             device_token: open.device_token,
+            exit_script_pubkey: open.exit_script_pubkey,
         };
         return settle_seal(&cosigner, &duplex, seal, &session_id, 1).await;
     }
@@ -792,6 +802,7 @@ fn sighashes_msg(
         script_path_spend: true,
         cosigner_identifier: cosigner_identifier(&commitments),
         cosigner_commitments: wire_commitments(commitments),
+        exit_messages: Vec::new(),
     }
 }
 
@@ -804,6 +815,7 @@ fn settle_sighashes_msg(
         script_path_spend: true,
         cosigner_identifier: cosigner_identifier(&commitments),
         cosigner_commitments: wire_commitments(commitments),
+        exit_messages: Vec::new(),
     }
 }
 
@@ -820,20 +832,37 @@ fn vtxos_from_proto(v: Vec<proto::VtxoInput>) -> Vec<crate::types::VtxoInput> {
 }
 
 /// Build the delegate over the set the caller reports, and open the FROST round that signs it.
+/// What a seal's round is signing: the delegate's messages, then the exits'.
+struct SealRound {
+    round: crate::cosigner::InBandRound,
+    delegate_sighashes: Vec<Vec<u8>>,
+    exit_sighashes: Vec<Vec<u8>>,
+    exits: crate::handlers::delegate::PendingExits,
+    commitments: Vec<crate::types::Commitment>,
+}
+
 fn seal_open(
     cosigner: &Arc<Mutex<Cosigner>>,
     seal: proto::SealDelegate,
-) -> Result<(crate::cosigner::InBandRound, Vec<Vec<u8>>, Vec<crate::types::Commitment>), Status> {
+) -> Result<SealRound, Status> {
     let info = seal
         .ark_info
         .map(ark_info_from_proto)
         .ok_or_else(|| Status::invalid_argument("SealDelegate carried no ark_info"))?;
     let mut c = lock(cosigner);
-    let sighashes = c
-        .seal_delegate_open(vtxos_from_proto(seal.vtxos), &info)
+    let (delegate_sighashes, exits) = c
+        .seal_delegate_open(vtxos_from_proto(seal.vtxos), &info, &seal.exit_script_pubkey)
         .map_err(Status::failed_precondition)?;
-    let (round, commitments) = c.sign_in_band_begin(&sighashes).map_err(Status::internal)?;
-    Ok((round, sighashes, commitments))
+    // One round over both halves, in that order: the wallet answers them as one list, and the
+    // signatures come back the same way.
+    let exit_sighashes = exits.sighashes();
+    let all: Vec<Vec<u8>> = delegate_sighashes
+        .iter()
+        .chain(exit_sighashes.iter())
+        .cloned()
+        .collect();
+    let (round, commitments) = c.sign_in_band_begin(&all).map_err(Status::internal)?;
+    Ok(SealRound { round, delegate_sighashes, exit_sighashes, exits, commitments })
 }
 
 /// Finish the round, seal the delegate, and arm the watch — and enrol [device_token] for the wakes
@@ -841,6 +870,7 @@ fn seal_open(
 fn seal_finish(
     cosigner: &Arc<Mutex<Cosigner>>,
     round: crate::cosigner::InBandRound,
+    exits: crate::handlers::delegate::PendingExits,
     rounds: Vec<proto::WalletRound>,
     device_token: &str,
 ) -> Result<proto::DelegateSealed, Status> {
@@ -850,13 +880,25 @@ fn seal_finish(
     let signatures = c
         .sign_in_band_finish(round, wallet_halves(rounds))
         .map_err(Status::invalid_argument)?;
-    let sealed = c.seal_delegate_finish(signatures).map_err(Status::internal)?;
+    let sealed = c
+        .seal_delegate_finish(signatures, exits)
+        .map_err(Status::internal)?;
     c.seal();
     Ok(proto::DelegateSealed {
         valid_at_secs: sealed.valid_at,
         margin_secs: sealed.margin,
         covered: sealed.covered,
         device_enrolled,
+        exit_txs: sealed
+            .exits
+            .into_iter()
+            .map(|e| proto::ExitTx {
+                outpoint: e.outpoint,
+                raw_tx: e.raw_tx,
+                sequence: e.sequence,
+                amount_sats: e.amount_sats,
+            })
+            .collect(),
     })
 }
 
@@ -879,20 +921,25 @@ async fn settle_seal(
     seq: u64,
 ) -> Result<(), Status> {
     let device_token = std::mem::take(&mut seal.device_token);
-    let (round, sighashes, commitments) = seal_open(cosigner, seal)?;
+    let seal_round = seal_open(cosigner, seal)?;
+    let mut sighashes = settle_sighashes_msg(seal_round.delegate_sighashes, seal_round.commitments);
+    sighashes.exit_messages = seal_round.exit_sighashes;
     duplex.send(proto::SettleServerMsg {
         session_id: session_id.to_string(),
         seq,
-        body: Some(proto::settle_server_msg::Body::Sighashes(settle_sighashes_msg(
-            sighashes,
-            commitments,
-        ))),
+        body: Some(proto::settle_server_msg::Body::Sighashes(sighashes)),
     });
     let signed = match duplex.expect("the delegate's signatures").await?.body {
         Some(proto::settle_client_msg::Body::Signed(s)) => s,
         _ => return Err(Status::invalid_argument("expected the delegate's signatures")),
     };
-    let sealed = seal_finish(cosigner, round, signed.rounds, &device_token)?;
+    let sealed = seal_finish(
+        cosigner,
+        seal_round.round,
+        seal_round.exits,
+        signed.rounds,
+        &device_token,
+    )?;
     duplex.send(proto::SettleServerMsg {
         session_id: session_id.to_string(),
         seq: seq + 1,

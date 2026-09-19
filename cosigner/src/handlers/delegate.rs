@@ -19,6 +19,7 @@ use crate::cosigner::Cosigner;
 use crate::handlers::settle::{AspCall, InFlight, Phase, SettleStep};
 use crate::types::{VtxoEntry, VtxoInput};
 use ark::client::types::ArkInfo;
+use ark::exit::{self, ExitInput, ExitSpend};
 
 /// What a sealed delegate covers, as reported back to the wallet.
 pub struct Sealed {
@@ -27,6 +28,38 @@ pub struct Sealed {
     pub margin: u64,
     /// `txid:vout` of each VTXO it refreshes.
     pub covered: Vec<String>,
+    /// One signed unilateral exit per VTXO, when the seal carried an exit script.
+    pub exits: Vec<SignedExit>,
+}
+
+/// A unilateral exit the wallet keeps: a spend of one VTXO through its own exit leaf, paying an
+/// address the wallet named. It needs this cosigner's signature, which is why it is made while the
+/// cosigner is here, and nothing afterwards — not the ASP, not us.
+pub struct SignedExit {
+    pub outpoint: String,
+    pub raw_tx: Vec<u8>,
+    pub sequence: u32,
+    pub amount_sats: u64,
+}
+
+/// The exits a seal is signing, waiting for the wallet's half of the round.
+pub struct PendingExits {
+    spends: Vec<(String, ExitSpend)>,
+}
+
+impl PendingExits {
+    pub fn is_empty(&self) -> bool {
+        self.spends.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.spends.len()
+    }
+
+    /// The sighashes, in the order the signatures must come back in.
+    pub fn sighashes(&self) -> Vec<Vec<u8>> {
+        self.spends.iter().map(|(_, s)| s.sighash.to_vec()).collect()
+    }
 }
 
 impl Cosigner {
@@ -37,7 +70,8 @@ impl Cosigner {
         &mut self,
         vtxos: Vec<VtxoInput>,
         info: &ArkInfo,
-    ) -> Result<Vec<Vec<u8>>, String> {
+        exit_script_pubkey: &[u8],
+    ) -> Result<(Vec<Vec<u8>>, PendingExits), String> {
         self.accept_vtxos(vtxos, info)?;
         if self.owned_vtxos.is_empty() {
             return Err("nothing is held, so there is nothing to delegate".into());
@@ -49,14 +83,75 @@ impl Cosigner {
             );
         }
         self.delegate_intent_id = None;
-        self.generate_delegate_for(info, true)
+        let delegate = self.generate_delegate_for(info, true)?;
+        let exits = self.build_exits(info, exit_script_pubkey)?;
+        Ok((delegate, exits))
+    }
+
+    /// One exit transaction per held VTXO, paying `exit_script_pubkey`.
+    ///
+    /// Built here rather than by the wallet because signing something this cosigner did not build
+    /// would make it a signing oracle. The wallet builds the same transactions from the same
+    /// inputs and refuses the round unless the sighashes match, so neither side has to trust the
+    /// other's arithmetic.
+    ///
+    /// A VTXO too small to leave a non-dust output gets no exit rather than failing the seal: the
+    /// delegate still protects it, and the wallet shows it as uncovered.
+    fn build_exits(
+        &self,
+        info: &ArkInfo,
+        exit_script_pubkey: &[u8],
+    ) -> Result<PendingExits, String> {
+        if exit_script_pubkey.is_empty() {
+            return Ok(PendingExits { spends: Vec::new() });
+        }
+        let owner = parse_xonly(&self.owner_pk_hex()?)?;
+        let asp = parse_xonly(&info.signer_pubkey)?;
+        let network = parse_network(&info.network)?;
+        let destination = bitcoin::ScriptBuf::from_bytes(exit_script_pubkey.to_vec());
+
+        let mut spends = Vec::new();
+        for v in &self.owned_vtxos {
+            let input = ExitInput {
+                txid: v
+                    .txid
+                    .parse()
+                    .map_err(|e| format!("a held VTXO has an unparseable txid {}: {e}", v.txid))?,
+                vout: v.vout,
+                amount_sats: v.amount,
+                exit_delay: v.exit_delay,
+            };
+            match exit::build_exit_tx(asp, owner, network, &input, &destination) {
+                Ok(spend) => spends.push((format!("{}:{}", v.txid, v.vout), spend)),
+                Err(e) => {
+                    tracing::debug!(outpoint = %format!("{}:{}", v.txid, v.vout), "no exit: {e}")
+                }
+            }
+        }
+        Ok(PendingExits { spends })
     }
 
     /// Take the wallet's signatures, seal the delegate, and arm the watch for when it becomes valid.
     /// The caller seals the snapshot.
-    pub fn seal_delegate_finish(&mut self, signatures: Vec<Vec<u8>>) -> Result<Sealed, String> {
+    pub fn seal_delegate_finish(
+        &mut self,
+        signatures: Vec<Vec<u8>>,
+        exits: PendingExits,
+    ) -> Result<Sealed, String> {
+        // The round signed the delegate's messages and then the exits', in that order.
+        if signatures.len() < exits.len() {
+            return Err(format!(
+                "the round returned {} signatures, fewer than the {} exits it was given",
+                signatures.len(),
+                exits.len()
+            ));
+        }
+        let split = signatures.len() - exits.len();
+        let (delegate_sigs, exit_sigs) = signatures.split_at(split);
+        let exits = finalize_exits(exits, exit_sigs)?;
+
         self.apply_delegate_sigs(crate::types::ApplyDelegateSigs {
-            signed_messages: signatures,
+            signed_messages: delegate_sigs.to_vec(),
         })?;
         let valid_at = self
             .settle_deadline()
@@ -70,6 +165,7 @@ impl Cosigner {
                 .iter()
                 .map(|v| format!("{}:{}", v.txid, v.vout))
                 .collect(),
+            exits,
         })
     }
 
@@ -163,5 +259,46 @@ async fn submit<A: AspApi>(asp: &mut A, call: AspCall) -> Result<(), String> {
         AspCall::ForfeitTxs { signed_txs, signed_commitment_b64 } => {
             asp.submit_forfeits(&signed_txs, &signed_commitment_b64).await
         }
+    }
+}
+
+/// Put each signature into its exit's witness. The transactions are complete after this — no ASP
+/// leg, no second round, nothing left to add.
+fn finalize_exits(exits: PendingExits, signatures: &[Vec<u8>]) -> Result<Vec<SignedExit>, String> {
+    exits
+        .spends
+        .into_iter()
+        .zip(signatures)
+        .map(|((outpoint, spend), sig)| {
+            let raw_tx = exit::finalize_exit_tx(&spend, sig)
+                .map_err(|e| format!("finalizing the exit of {outpoint}: {e}"))?;
+            Ok(SignedExit {
+                outpoint,
+                raw_tx,
+                sequence: spend.sequence,
+                amount_sats: spend.tx.output[0].value.to_sat(),
+            })
+        })
+        .collect()
+}
+
+fn parse_xonly(hex_str: &str) -> Result<bitcoin::XOnlyPublicKey, String> {
+    let hex_str = if hex_str.len() == 66 && (hex_str.starts_with("02") || hex_str.starts_with("03"))
+    {
+        &hex_str[2..]
+    } else {
+        hex_str
+    };
+    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid pubkey hex: {e}"))?;
+    bitcoin::XOnlyPublicKey::from_slice(&bytes).map_err(|e| format!("invalid x-only pubkey: {e}"))
+}
+
+fn parse_network(name: &str) -> Result<bitcoin::Network, String> {
+    match name {
+        "bitcoin" | "mainnet" => Ok(bitcoin::Network::Bitcoin),
+        "testnet" | "testnet3" => Ok(bitcoin::Network::Testnet),
+        "signet" | "mutinynet" => Ok(bitcoin::Network::Signet),
+        "regtest" => Ok(bitcoin::Network::Regtest),
+        _ => Err(format!("unknown network: {name}")),
     }
 }
