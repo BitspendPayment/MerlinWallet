@@ -9,6 +9,7 @@ import 'package:app_core/client.dart';
 import 'package:app_core/electrum.dart';
 import 'package:app_core/enclave/dev_enclave.dart';
 import 'package:app_core/enclave/gate.dart';
+import 'package:app_core/persistence/wallet_store.dart' show IncompatibleWalletStateException;
 import 'package:bitcoin_base/bitcoin_base.dart';
 import 'package:blockchain_utils/blockchain_utils.dart' hide hex;
 import 'package:fixnum/fixnum.dart';
@@ -45,6 +46,9 @@ accept-request <base64>          take a request someone wrote into this wallet's
 requests                         this wallet's inbox
 approve <id>                     pay a pending request
 decline <id>
+
+reset <name>                     delete this machine's stored state for a wallet and rebuild it
+                                 from its passkey — for state an older build wrote
 
 help, quit''';
 
@@ -100,6 +104,8 @@ class Cli {
         }
       case 'new':
         await _new(_arg(rest, 0, 'name'));
+      case 'reset':
+        await _reset(_arg(rest, 0, 'name'));
       case 'use':
         final name = _arg(rest, 0, 'name');
         _record(name);
@@ -231,6 +237,28 @@ class Cli {
     print('$name: ${w.client.groupKeyHex}');
   }
 
+  /// Throw away what this machine stores about [name] and rebuild it from the passkey.
+  ///
+  /// What `IncompatibleWalletStateException` asks for: state from before shares were rebuilt per
+  /// operation holds a blinded share in an append-only file, and there is no migration — the file
+  /// goes. Nothing is lost by it. The wallet is its passkey and the cosigner's seal, and `recover`
+  /// needs only those; if the cosigner answers that the wallet "was created before recovery
+  /// existed", it is older than that too, and the enclave's store needs resetting with it.
+  Future<void> _reset(String name) async {
+    _record(name);
+    await _open.remove(name)?.client.close();
+    final gate = enclave.gate(home.passkey(name));
+    final client =
+        enclave.client(gate, aspHost: aspHost, aspPort: aspPort, storageId: home.storageId(name));
+    await client.resetLocalState();
+    print('deleted the stored state for $name; rebuilding it from the passkey…');
+    await client.recover();
+    home.wallets[name]!.groupKey = client.groupKeyHex;
+    home.save();
+    _open[name] = (client: client, gate: gate);
+    print('$name: ${client.groupKeyHex}');
+  }
+
   Future<void> _board(MpcClient client, {int minSats = 1}) async {
     final deposits = await _scanBoarding(await client.getBoardingAddress(), minSats);
     if (deposits.isEmpty) {
@@ -306,7 +334,13 @@ class Cli {
     _record(name);
     final gate = enclave.gate(home.passkey(name));
     final client = enclave.client(gate, aspHost: aspHost, aspPort: aspPort, storageId: home.storageId(name));
-    await client.restoreState();
+    try {
+      await client.restoreState();
+    } on IncompatibleWalletStateException {
+      await client.close();
+      print('the stored state for $name is from an older build — run `reset $name`');
+      rethrow;
+    }
     return _open[name] = (client: client, gate: gate);
   }
 

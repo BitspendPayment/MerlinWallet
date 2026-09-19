@@ -115,8 +115,9 @@ void main() {
       await store.init();
 
       final testState = {
+        'stateVersion': walletStateVersion,
         'userId': 'abcd1234' * 8, // 64 hex chars
-        'signingSecret': 'ef567890' * 8, // 64 hex chars
+        'exitScriptPubkey': 'ef567890' * 8,
       };
 
       await store.saveClientState(testState);
@@ -124,7 +125,7 @@ void main() {
 
       expect(retrieved, isNotNull);
       expect(retrieved!['userId'], equals(testState['userId']));
-      expect(retrieved['signingSecret'], equals(testState['signingSecret']));
+      expect(retrieved['exitScriptPubkey'], equals(testState['exitScriptPubkey']));
 
       await store.close();
     });
@@ -138,8 +139,8 @@ void main() {
       await store.init();
 
       final testState = {
+        'stateVersion': walletStateVersion,
         'userId': 'abcd1234' * 8,
-        'signingSecret': 'ef567890' * 8,
       };
 
       await store.saveClientState(testState);
@@ -151,46 +152,128 @@ void main() {
       await store.close();
     });
 
-    test('validates userId format on retrieval', () async {
-      final store = WalletStore(boxName: 'test_validation');
-      await store.init();
-
-      // Save invalid state directly to box (bypassing validation)
-      final box = await Hive.openBox('test_validation_raw');
-      await box.put('client_state', {'userId': ''}); // Invalid empty userId
+    /// Put [state] in a box behind the store's back, and read it through the store.
+    Future<Map<String, dynamic>?> readBack(String boxName, Map<String, dynamic> state) async {
+      final box = await Hive.openBox(boxName);
+      await box.put('client_state', state);
       await box.close();
+      final store = WalletStore(boxName: boxName);
+      await store.init();
+      try {
+        return await store.getClientState();
+      } finally {
+        await store.close();
+      }
+    }
 
-      // Create new store pointing to same data
-      final store2 = WalletStore(boxName: 'test_validation_raw');
-      await store2.init();
-      final retrieved = await store2.getClientState();
-
-      expect(retrieved, isNull); // Should fail validation
-
+    test('an empty store holds no wallet, and says so with null', () async {
+      final store = WalletStore(boxName: 'test_empty');
+      await store.init();
+      expect(await store.getClientState(), isNull);
       await store.close();
-      await store2.close();
     });
 
-    test('validates signingSecret hex format', () async {
-      final store = WalletStore(boxName: 'test_secret_validation');
+    // Anything else used to be null as well, which sent the app back to onboarding over a wallet
+    // that exists. Now it is an error with the way out in it.
+    test('state with no version is refused by name, not read as absent', () async {
+      await expectLater(
+        readBack('test_unversioned', {'userId': 'abcd1234' * 8}),
+        throwsA(isA<IncompatibleWalletStateException>()
+            .having((e) => e.toString(), 'message', contains('reset'))),
+      );
+    });
+
+    test('state of another version is refused', () async {
+      await expectLater(
+        readBack('test_future', {'stateVersion': 3, 'userId': 'abcd1234' * 8}),
+        throwsA(isA<IncompatibleWalletStateException>()),
+      );
+    });
+
+    test('state that names no wallet is refused', () async {
+      await expectLater(
+        readBack('test_validation', {'stateVersion': walletStateVersion, 'userId': ''}),
+        throwsA(isA<IncompatibleWalletStateException>()),
+      );
+    });
+
+    test('state holding a share is refused even under the right version', () async {
+      for (final key in forbiddenStateKeys) {
+        await expectLater(
+          readBack('test_forbidden_$key', {
+            'stateVersion': walletStateVersion,
+            'userId': 'abcd1234' * 8,
+            'spendingPolicies': {
+              'keyPackage': {key: 'ef567890' * 8},
+            },
+          }),
+          throwsA(isA<IncompatibleWalletStateException>()),
+          reason: key,
+        );
+      }
+    });
+
+    test('refuses to write private-key material, under any name it has had', () async {
+      final store = WalletStore(boxName: 'test_refuses_secrets');
       await store.init();
-
-      // Save state with invalid hex in signingSecret
-      final box = await Hive.openBox('test_secret_validation_raw');
-      await box.put('client_state', {
-        'userId': 'abcd1234' * 8,
-        'signingSecret': 'not-valid-hex!',
-      });
-      await box.close();
-
-      final store2 = WalletStore(boxName: 'test_secret_validation_raw');
-      await store2.init();
-      final retrieved = await store2.getClientState();
-
-      expect(retrieved, isNull); // Should fail validation
-
+      final shapes = <Map<String, dynamic>>[
+        {'onchainSecret': '11' * 32},
+        {'signingSecret': '11' * 32},
+        {'shareBlinded': true},
+        {
+          'spendingPolicies': {
+            'keyPackage': {'secretShare': '11' * 32}
+          }
+        },
+        {
+          'delegate': {
+            'exits': [
+              {'secretShare': '11' * 32}
+            ]
+          }
+        },
+      ];
+      for (final shape in shapes) {
+        await expectLater(
+          store.saveClientState(
+              {'stateVersion': walletStateVersion, 'userId': 'abcd1234' * 8, ...shape}),
+          throwsArgumentError,
+          reason: '$shape',
+        );
+      }
+      expect(await store.getClientState(), isNull, reason: 'a refused write writes nothing');
       await store.close();
-      await store2.close();
+    });
+
+    test('refuses to write state without the current version', () async {
+      final store = WalletStore(boxName: 'test_refuses_unversioned');
+      await store.init();
+      await expectLater(store.saveClientState({'userId': 'abcd1234' * 8}), throwsArgumentError);
+      await store.close();
+    });
+
+    test('destroy removes the file, and with it everything ever appended to it', () async {
+      final store = WalletStore(boxName: 'test_destroy');
+      await store.init();
+      await store.saveClientState({'stateVersion': walletStateVersion, 'userId': 'abcd1234' * 8});
+      final file = File('${tempDir.path}/test_destroy.hive');
+      expect(file.existsSync(), isTrue);
+
+      await store.destroy();
+      expect(file.existsSync(), isFalse);
+      expect(store.isInitialized, isFalse);
+
+      await store.init();
+      expect(await store.getClientState(), isNull);
+      await store.close();
+    });
+
+    test('destroy works on a store that was never opened', () async {
+      final box = await Hive.openBox('test_destroy_cold');
+      await box.put('client_state', {'userId': 'aa', 'onchainSecret': '11' * 32});
+      await box.close();
+      await WalletStore(boxName: 'test_destroy_cold').destroy();
+      expect(File('${tempDir.path}/test_destroy_cold.hive').existsSync(), isFalse);
     });
 
     test('throws when not initialized', () async {
@@ -222,8 +305,8 @@ void main() {
       );
       await store1.init();
       await store1.saveClientState({
+        'stateVersion': walletStateVersion,
         'userId': 'abcd1234' * 8,
-        'signingSecret': 'ef567890' * 8,
       });
       await store1.close();
 

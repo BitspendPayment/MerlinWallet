@@ -55,7 +55,7 @@ class WelcomeScreen extends StatelessWidget {
                 key: const Key('welcomeCreateBtn'),
                 onPressed: () {
                   // Software signer is the only path (hardware signer dropped).
-                  // Spending is gated by a passkey (created after DKG), not a PIN.
+                  // Spending is gated by a passkey (created before DKG), not a PIN.
                   context.push('/onboarding/server', extra: {
                     'isRestore': false,
                   });

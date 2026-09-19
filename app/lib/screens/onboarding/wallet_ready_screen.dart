@@ -32,7 +32,7 @@ class WalletReadyScreen extends StatelessWidget {
               ),
               const SizedBox(height: 16),
               Text(
-                'Your MPC Bitcoin Wallet has been created.\nYour key share is secured by a passkey on this device.',
+                'Your MPC Bitcoin Wallet has been created.\nYour key is rebuilt from your passkey each time you pay — none of it is stored on this device.',
                 style: GoogleFonts.inter(color: Colors.white70, fontSize: 16),
                 textAlign: TextAlign.center,
               ),

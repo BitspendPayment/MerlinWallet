@@ -185,27 +185,6 @@ pub struct ApplyDelegateSigs {
     pub signed_messages: Vec<Vec<u8>>,
 }
 
-/// FROST sign round-1 request (mirrors the gRPC `SignStep1Request` fields the guest needs).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignStep1 {
-    pub hiding_commitment: Vec<u8>,
-    pub binding_commitment: Vec<u8>,
-    pub message_to_sign: Vec<u8>,
-    pub full_transaction: Vec<u8>,
-    /// True ⇒ raw FROST (no taproot tweak).
-    pub script_path_spend: bool,
-    /// Service spend THROUGH arkd — the second leg's `ark_tx` PSBT. When set (and the actor is a
-    /// pairing actor), the guest accepts `message_to_sign` if it equals leg 1 OR leg 2; empty ⇒
-    /// single-leg, the guest OVERRIDES `message_to_sign` with the rebuilt cooperative-leaf sighash.
-    pub ark_tx: Vec<u8>,
-}
-
-/// FROST sign round-2 request (mirrors the gRPC `SignStep2Request`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignStep2 {
-    pub signature_share: Vec<u8>,
-}
-
 /// One participant's signing commitments, keyed by FROST identifier (hex).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commitment {
@@ -222,20 +201,6 @@ pub struct Commitment {
 
 
 
-
-/// Output of `sign_step1`: the combined commitments to sign over.
-#[derive(Debug)]
-pub struct SignStep1Out {
-    pub commitments: Vec<Commitment>,
-    pub message_to_sign: Vec<u8>,
-}
-
-/// Output of `sign_step2`: the aggregated signature (R, Z).
-#[derive(Debug)]
-pub struct SignStep2Out {
-    pub r_point: Vec<u8>,
-    pub z_scalar: Vec<u8>,
-}
 
 /// Output of `settle_delegate`: the finalized commitment txid, the settled VTXO outpoint if
 /// produced, and the `unilateral_exit_delay` the output was built with.

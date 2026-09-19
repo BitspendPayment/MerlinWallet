@@ -155,6 +155,11 @@ cd app && flutter run
 make threshold-test               # threshold library unit tests
 make ffi-test                     # merged FFI tests
 make e2e                          # Ark E2E (regtest + arkd + cosigner runtime + Dart harness)
+make cosigner-check               # the cosigner: build + `cargo test` (needs ~/enclave-runtime for the WIT check;
+                                  #   `cd cosigner && cargo test` runs the tests without it)
+make ffi-build && (cd app-core && dart test)
+                                  # the wallet core, headless: share reconstruction, the operation lifecycle
+                                  #   against an in-process cosigner, the store's no-secrets guard
 make crypto-bench                 # cryptography benchmarks (Criterion)
 make stress-test                  # multi-user E2E stress test
 ```
@@ -163,18 +168,97 @@ make stress-test                  # multi-user E2E stress test
 
 - **The full private key never exists on any single device.** The Ark owner key is a 2-of-2 FROST split between the phone and the cosigner.
 - **The cosigner cannot unilaterally sign.** It always needs cooperation from the phone.
-- **The phone's FROST share is passkey-gated.** It is stored blinded and reconstructed transiently, only for a sign, from a passkey PRF gesture.
-- **The passkey *is* the wallet.** The phone's dealer polynomial is derived from the passkey's PRF (`app-core/lib/passkey/key_derivation.dart`), not drawn at random, and the cosigner seals the half it dealt back. So the same passkey on a new phone reproduces its half and asks the cosigner (`Recover`) for the other — no seed phrase, no export, nothing to back up separately. The flip side is stated plainly: the passkey alone is now enough to reconstruct the share, so the platform's passkey security is the wallet's security.
+- **The phone stores no private-key material.** Not the FROST share, not a blinded form of it, not the DKG dealer secret, not the passkey's PRF output. What is on disk is public: the wallet's identifier, its verifying share, the group key, the delegate and the pre-signed exits. The share is **rebuilt for each operation** — half derived from the passkey's PRF, half returned by the cosigner on the stream that operation already approved — checked against the stored verifying share, used for that stream's rounds, and let go. See [No key at rest](#no-key-at-rest) for how, and for what it does not promise.
+- **The passkey *is* the wallet.** The phone's dealer polynomial is derived from the passkey's PRF (`app-core/lib/passkey/key_derivation.dart`), not drawn at random, and the cosigner seals the half it dealt back. So the same passkey on a new phone does what the old phone did on every payment — derives its half, and is handed the other — with no seed phrase, no export, nothing to back up separately. A recovered wallet and a freshly made one are the same thing. The flip side is stated plainly: the passkey plus an approved call to the enclave is enough to reconstruct the share, so the platform's passkey security is the wallet's security.
 - **The cosigner runs in a Nitro Enclave with attested boot.** Clients refuse to send DKG packets to a runtime whose `PCR0` doesn't match a known build, and bind its response-signing key to the attestation.
 - **KMS secrets are PCR0-locked.** A modified runtime can't decrypt them even with the same IAM role.
 - **FROST keys are held by an isolated per-user native actor** — no shared mutable state, serial per-user processing, panic-recovered from a sealed snapshot.
 - **MPC requests are authenticated** with Schnorr signatures (or a passkey-minted session token) over timestamped messages, within a replay window.
-- **The on-chain single-key path is wallet-alone.** It works without the cosigner or ASP (offline mode); it is not part of the 2-of-2.
+- **There is no wallet-alone signing path today.** An earlier on-chain single-key wallet is gone, and the key it used — the DKG dealer secret `a0` — is no longer stored; it remains derivable from the passkey, which is what the [recovery leaf](#the-better-answer-still-to-come) would spend with. What works with the cosigner gone is the [pre-signed exits](#emergency-exit), which need no key at all.
 
 The same 2-of-2 that stops the cosigner signing alone also stops *you* signing alone, which is
 why Ark balances depend on the cosigner being reachable. See
 [Trust assumptions & failure modes](#trust-assumptions--failure-modes) and
 [Emergency exit](#emergency-exit) before relying on this with real money.
+
+## No key at rest
+
+**Status: implemented, in a development build. Not production-ready.**
+
+A share is the sum of both dealers' polynomials at the wallet's identifier:
+
+```text
+  s = f_wallet(id) + f_cosigner(id)
+```
+
+`f_wallet` is derived from the passkey's PRF output by a labelled HKDF
+(`app-core/lib/passkey/key_derivation.dart`). `f_cosigner(id)` is one scalar, which the cosigner
+sealed at DKG. Neither is the key. An operation that signs goes like this
+(`MpcClient._withOperation`):
+
+1. **Wait for a turn.** Operations that sign are serialized — one operation's secrets are never in
+   memory beside another's, and the runtime runs one stream per tenant anyway.
+2. **Read what is slow and not secret** (the ASP's parameters, the indexer's set) — before the
+   approval, which is good for under a minute.
+3. **One fingerprint.** The assertion that approves the call also evaluates the PRF
+   (`SeedSource.seedDuring`). The seed becomes the polynomial and is overwritten at once. A passkey
+   that does not derive this wallet's identifier is refused here, before anything is opened.
+4. **Open the stream.** Its open names the wallet's identifier; the cosigner's first answer carries
+   `wallet_dealt_share`, on `Sign`, `Send` and `Settle` alike — once per stream, and never the
+   cosigner's own share (`cosigner/src/handlers/recover.rs`, `dealt_share_for`). No second call, so
+   no second approval.
+5. **Add, fix the sign, check.** The sum is accepted only if `s·G` is the verifying share this
+   device stored when the wallet was made — not one that arrived with the contribution
+   (`app-core/lib/passkey/share_reconstruction.dart`). The share signs every round of that stream:
+   a settle's intent proof, its commitment, the trailing seal.
+6. **Let go**, in a `finally`: on success, on failure, and on cancellation
+   (`MpcClient.cancelOperation`).
+
+`Sign` had to change shape for this. The wallet used to commit first, and its nonce is hedged with
+its share — which it no longer has until the cosigner answers. So the cosigner commits first, as it
+always did on `Send` and `Settle`; FROST's binding factor covers every commitment whoever sent
+theirs last. `Sign` is also now script-path only by name: it always was in effect, since the
+cosigner signs untweaked and checks every share.
+
+**Who may have the contribution.** Tenants are isolated by the runtime — one instance and one store
+per passkey — so an instance can only ever answer for its own wallet; the cosigner has no table of
+tenants to get wrong. Within an instance it answers only the identifier the ceremony recorded.
+That identifier is public, so the check authenticates nobody; it tells a wallet that is not this
+one — a wrong passkey, a PRF that answers differently — so, instead of handing it a scalar that
+would not add up.
+
+**What this changes in the threat model.** A stolen or imaged phone now yields nothing secret:
+before, it yielded a blinded share whose blinding the same passkey could remove, and a dealer secret
+in the clear. What it does *not* change is what `Recover` already made true: a passkey's PRF output
+plus an approved call is the wallet's half of the key. Releasing the contribution on every approved
+operation gives an attacker who has both nothing they could not already ask for.
+
+**What it does not promise.**
+
+- **Not guaranteed zeroization.** The seed is bytes and is overwritten. Everything after it is a
+  Dart `BigInt` — the coefficients, the share — which cannot be overwritten: references are dropped
+  and the garbage collector reclaims the memory when it chooses, without clearing it. The FFI takes
+  a key package as JSON, so signing makes short-lived string copies of the share. The PRF output
+  reaches Dart as base64 inside a JSON string from the platform channel, and strings are immutable.
+  This is reference hygiene with a checkable lifetime, not memory scrubbing.
+- **No migration.** State written by an older build is refused by name
+  (`IncompatibleWalletStateException`) and must be reset — the app offers it on launch, the CLI has
+  `reset <name>` — after which the wallet is restored from its passkey. Hive is append-only, so
+  only deleting the file removes what an older build wrote. A cosigner seal from before the dealt
+  share was kept cannot serve any of this ("created before recovery existed"); that tenant has to
+  be reset too.
+- **No new offline capability, and none lost.** Signing always needed the cosigner — it is a 2-of-2
+  — so rebuilding the share from it adds no dependency that was not there. The pre-signed exits
+  hold no secret and need none to broadcast; the cosigner's unattended renewals use no wallet
+  share. Both are unaffected.
+- **PRF stability across devices is still assumed, not proved** — see `SECURITY_FINDINGS.md` RC-2.
+  It now matters for every payment rather than only for recovery, which also means a PRF that
+  drifted would be noticed on the first payment rather than on the day the phone is lost.
+
+Tests: `app-core/test/share_reconstruction_test.dart`, `app-core/test/operation_lifecycle_test.dart`
+(a cosigner in-process; reads the box file back as raw bytes),
+`cosigner/tests/stream_contribution_test.rs`, and the `nothing secret at rest` and
+`a wallet on a new phone` groups of `e2e/test/enclave_ark_test.dart`.
 
 ## Trust assumptions & failure modes
 
@@ -284,10 +368,13 @@ recovery leaf:  <recov_delay>  OP_CSV OP_DROP    <recovery_pk> OP_CHECKSIG   # n
 Three things make this cheap rather than speculative, and all three already exist in this
 repository:
 
-**The recovery key already exists and needs no new custody.** `recovery_pk` is the wallet's
-on-chain single key — the DKG dealer secret, which the phone already holds and already backs up
-because it secures the on-chain balance ([`client.dart:93-98`](app-core/lib/client.dart#L93-L98)).
-No new secret, no new backup surface, no extra thing to lose.
+**The recovery key already exists and needs no new custody.** `recovery_pk` is the DKG dealer
+secret `a0` — `walletPolynomial(seed).a0`, derived from the passkey's PRF
+([`key_derivation.dart`](app-core/lib/passkey/key_derivation.dart)). It is no longer stored on the
+phone, and does not need to be: the passkey that derives it is what the platform already syncs.
+Spending through this leaf would need the passkey and nothing else — no cosigner, no enclave — which
+is exactly the property the leaf is for. No new secret, no new backup surface, no extra thing to
+lose.
 
 **The cosigner already knows it.** That key's public point *is* the DKG `walletVk`, which the
 wallet sends during onboarding and the cosigner already persists as `wallet_vk`

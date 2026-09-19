@@ -20,8 +20,7 @@ use crate::handlers;
 use crate::types::{
     ApplyDelegateSigs, BoardingSettleSubmitted, Commitment,
     Contact, IntentStatus, PaymentIntent,
-    SendVtxoStep1, SendVtxoSubmitted, SignStep1, SignStep1Out, SignStep2,
-    SignStep2Out, SnapshotState, VtxoEntry, VtxoInput,
+    SendVtxoStep1, SendVtxoSubmitted, SnapshotState, VtxoEntry, VtxoInput,
 };
 
 use ark::client::batch::{DelegateSettleSession, PersistedDelegate};
@@ -33,12 +32,10 @@ use threshold::identifier::Identifier;
 use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::nonce::{self, SigningCommitments, SigningNonce};
 use threshold::point;
-use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};
+use threshold::scalar::scalar_from_bytes;
 use threshold::signing::{self, SignatureShare};
 
 use crate::store::Store;
-
-const THRESHOLD_COUNT: usize = 2;
 
 // Request-to-pay bounds. Contacts + intents live in the sealed snapshot, which is re-serialized
 // in full on every mutation — so an allowlisted peer must not be able to grow it without limit.
@@ -76,14 +73,8 @@ pub struct Ceremony {
     message: Vec<u8>,
     commitments: BTreeMap<Identifier, SigningCommitments>,
     shares: BTreeMap<Identifier, SignatureShare>,
-    /// The cosigner's single-use nonce for this round (set in step1, consumed in step2).
+    /// The cosigner's single-use nonce for this round (set at begin, consumed at finish).
     nonce: Option<SigningNonce>,
-    /// The full transaction being signed, carried from the open. NOTHING READS IT. It fed the
-    /// contract gate in `sign_finish`, which went with the contract layer, and it is kept because
-    /// it is exactly what a policy has to see: the bytes the signature will authorize, rather than
-    /// the sighash alone. The policy IR is what makes it live again.
-    #[allow(dead_code)]
-    full_transaction: Vec<u8>,
 }
 
 /// A FROST round the cosigner is halfway through, for every sighash in one batch.
@@ -719,127 +710,6 @@ impl Cosigner {
         }
         Ok(())
     }
-
-    /// Open a ceremony and hand it back. Nothing about it is stored here.
-    pub fn sign_open(&mut self, req: SignStep1) -> Result<(Ceremony, SignStep1Out), String> {
-        let policy = self.policy.as_ref().ok_or("no policy installed")?;
-        let user_identifier = policy
-            .user_signing_identifier
-            .clone()
-            .ok_or("policy has no user_signing_identifier")?;
-        let server_identifier = policy.key_package.identifier.clone();
-
-        let key_package = policy.key_package.clone();
-
-        // The requested message, as asked. A `{service, cosigner}` pairing actor used to rebuild
-        // a contract eVTXO's cooperative-leaf sighash here and sign only that; there are no
-        // pairing actors now, and a normal wallet always took this branch anyway.
-        let message = req.message_to_sign.clone();
-
-        let mut new_signing_ceremony = Ceremony {
-            message,
-            full_transaction: req.full_transaction.clone(),
-            ..Default::default()
-        };
-
-        let user_comm = commitments_from_bytes(&req.hiding_commitment, &req.binding_commitment)?;
-        let mut rng = OsRng;
-        let server_nonce = nonce::new_nonce(&mut rng, &key_package.secret_share);
-        new_signing_ceremony
-            .commitments
-            .insert(server_identifier.clone(), server_nonce.commitments.clone());
-        new_signing_ceremony.commitments.insert(user_identifier, user_comm);
-        new_signing_ceremony.nonce = Some(server_nonce);
-
-        let commitments = new_signing_ceremony
-            .commitments
-            .iter()
-            .map(|(id, c)| Commitment {
-                identifier_hex: hex::encode(id.serialize()),
-                hiding: point::serialize_compressed(&c.hiding).to_vec(),
-                binding: point::serialize_compressed(&c.binding).to_vec(),
-            })
-            .collect();
-        let message_to_sign = new_signing_ceremony.message.clone();
-        Ok((
-            new_signing_ceremony,
-            SignStep1Out {
-                commitments,
-                message_to_sign,
-            },
-        ))
-    }
-
-    /// Finish a ceremony the caller owns. Takes it by value: the nonce is single-use, so consuming
-    /// the ceremony is what makes reuse unrepresentable rather than merely discouraged.
-    pub fn sign_finish(
-        &mut self,
-        ceremony: Ceremony,
-        req: SignStep2,
-    ) -> Result<SignStep2Out, String> {
-        let mut ceremony = ceremony;
-        // NOTHING IS CHECKED HERE. The contract gate that stood in this spot was the only thing
-        // between an authorized caller and a signature over arbitrary bytes, and the WASM contract
-        // layer it enforced is no longer planned. The policy IR is what has to take its place
-        // before this is exposed for real signing.
-
-        let policy = self.policy.as_ref().ok_or("no policy installed")?;
-        let user_identifier = policy
-            .user_signing_identifier
-            .clone()
-            .ok_or("policy has no user_signing_identifier")?;
-        let server_identifier = policy.key_package.identifier.clone();
-
-        let key_package = policy.key_package.clone();
-        let public_key_package = policy.public_key_package.clone();
-
-        // Insert the client's signature share.
-        let user_s_bytes: [u8; 32] = req
-            .signature_share
-            .as_slice()
-            .try_into()
-            .map_err(|_| "signature_share must be 32 bytes")?;
-        let user_s =
-            scalar_from_bytes(&user_s_bytes).map_err(|e| format!("bad share scalar: {e}"))?;
-        ceremony
-            .shares
-            .insert(user_identifier, SignatureShare { s: user_s });
-
-        // Compute the cosigner's share once (consumes the single-use nonce).
-        if !ceremony.shares.contains_key(&server_identifier) {
-            let nonce = ceremony
-                .nonce
-                .take()
-                .ok_or("no signing nonce; call FrostSignStep1 first")?;
-            let package = SigningPackage::new(
-                ceremony.commitments.clone(),
-                ceremony.message.clone(),
-            );
-            let share = signing::sign(&package, &nonce, &key_package)
-                .map_err(|e| format!("frost sign: {e}"))?;
-            ceremony.shares.insert(server_identifier, share);
-        }
-
-        if ceremony.shares.len() < THRESHOLD_COUNT {
-            return Err("share count below threshold".into());
-        }
-
-        // Aggregate.
-        let package = SigningPackage::new(
-            ceremony.commitments.clone(),
-            ceremony.message.clone(),
-        );
-        let signature = signing::aggregate(&package, &ceremony.shares, &public_key_package)
-            .map_err(|e| format!("frost aggregate: {e}"))?;
-        let r_point = point::serialize_compressed(&signature.r).to_vec();
-        let z_scalar = scalar_to_bytes(&signature.z).to_vec();
-
-        // No clearing step. This was `self.ceremony = Ceremony::default()` when the actor parked
-        // the ceremony — erasing a spent nonce that would otherwise sit there. Taken by value, it
-        // drops here whatever happens, including on every error path above.
-        Ok(SignStep2Out { r_point, z_scalar })
-    }
-
 
     // -------------------------------------------------------------------------------------------
     // In-band signing: FROST carried inside the Send and Settle streams

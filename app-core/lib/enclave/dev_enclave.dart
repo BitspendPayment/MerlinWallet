@@ -144,9 +144,9 @@ class DevEnclave {
       storageId: storageId,
     );
     // The same wiring the app does with a platform passkey: the wallet's key is derived from the
-    // credential's PRF, and its share is blinded under it. A software passkey has one too — see
-    // `SoftwareAuthenticator.seedSource` — so a test wallet behaves exactly like a real one, down
-    // to being recoverable from its state file alone.
+    // credential's PRF, again for every operation, and no share is kept. A software passkey has a
+    // PRF too — see `SoftwareAuthenticator.seedSource` — so a test wallet behaves exactly like a
+    // real one, down to being recoverable from its passkey file alone.
     final authenticator = gate.authenticator;
     if (authenticator is SoftwareAuthenticator) {
       client.setSeedSource(authenticator.seedSource);

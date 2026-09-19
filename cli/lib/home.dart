@@ -1,13 +1,15 @@
 /// Where the CLI keeps wallets: `~/.merlin-cli/`, or `MERLIN_CLI_HOME`.
 ///
 /// **Regtest only, and plaintext.** A wallet here is two files: a software passkey (a P-256 private
-/// key in JSON, as `passkey-client` writes it) and a Hive box with the wallet's FROST share. Either
-/// alone is enough to act as that wallet against its enclave.
+/// key in JSON, as `passkey-client` writes it) and a Hive box with the wallet's public state — who
+/// it is, its delegate, its exits. The box holds no key: the share is rebuilt for each operation
+/// from the passkey and the cosigner. **The passkey file is the wallet**, in the clear: it approves
+/// every call and its PRF derives the key, so it alone is enough to act as that wallet.
 ///
 /// Wallets are kept **per enclave store**. A kept store (`make up-enclave`) has an id that survives
 /// restarts, so its wallets do too. An enclave booted without one starts from nothing, so its
 /// wallets are kept under that boot's trust root instead: a passkey from an earlier boot would name
-/// a tenant that no longer exists, and a share would be paired with a cosigner that never heard of
+/// a tenant that no longer exists, and a wallet would be paired with a cosigner that never heard of
 /// it. Either way a new store is a clean slate rather than a confusing one.
 library;
 
@@ -47,7 +49,7 @@ class CliHome {
 
   File passkey(String name) => File('${dir.path}/passkeys/$name.json');
 
-  /// The Hive box a wallet's share lives in.
+  /// The Hive box a wallet's public state lives in.
   String storageId(String name) => 'cli_$name';
 
   Map<String, WalletRecord> wallets = {};

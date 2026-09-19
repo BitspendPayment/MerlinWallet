@@ -191,6 +191,13 @@ message SettleOpen {
   string device_token = 8;
   // With `seal_only`: where a unilateral exit pays, as `SealDelegate.exit_script_pubkey`.
   bytes exit_script_pubkey = 9;
+  // The wallet's FROST identifier, 32 bytes big-endian — what `RecoverRequest.identifier` is.
+  //
+  // The cosigner answers the first round with the half of the wallet's share it dealt at DKG (see
+  // `wallet_dealt_share`), and only to the identifier the ceremony recorded. The identifier is
+  // public, so this authenticates nobody — the runtime did that, per tenant. What it catches is a
+  // wallet that is not this one: a wrong passkey, or a PRF that answers differently.
+  bytes identifier = 10;
 }
 
 
@@ -333,6 +340,13 @@ message SettleSighashes {
   // `cosigner_commitments` runs over `messages_to_sign` first and these after, in order, and the
   // wallet's `rounds` come back in that same order.
   repeated bytes exit_messages = 5;
+  // `f_cosigner(wallet identifier)`, 32 bytes big-endian: what the cosigner dealt this wallet at
+  // DKG, and half of the wallet's signing share — the wallet adds the half it re-derives from its
+  // passkey and keeps neither. NOT the cosigner's own share, which never leaves it.
+  //
+  // On the FIRST sighashes of a stream only, and empty on every one after: one approved stream is
+  // one reconstruction, and the rounds that follow reuse it.
+  bytes wallet_dealt_share = 6;
 }
 
 // What the caller must send the ASP as `RegisterIntent`, followed by `GetEventStream(topics)`.
@@ -415,6 +429,13 @@ message SendOpen {
   // The set to spend from. The cosigner still selects WHICH of these to use and checks the
   // balance itself; it validates every one against its own derived scriptPubKey first.
   repeated VtxoInput vtxos = 7;
+  // The wallet's FROST identifier, 32 bytes big-endian — what `RecoverRequest.identifier` is.
+  //
+  // The cosigner answers the first round with the half of the wallet's share it dealt at DKG (see
+  // `wallet_dealt_share`), and only to the identifier the ceremony recorded. The identifier is
+  // public, so this authenticates nobody — the runtime did that, per tenant. What it catches is a
+  // wallet that is not this one: a wrong passkey, or a PRF that answers differently.
+  bytes identifier = 8;
 }
 
 message SendSigned {
@@ -471,6 +492,13 @@ message SendSighashes {
   string cosigner_identifier = 4;
   // As `SettleSighashes.exit_messages`.
   repeated bytes exit_messages = 5;
+  // `f_cosigner(wallet identifier)`, 32 bytes big-endian: what the cosigner dealt this wallet at
+  // DKG, and half of the wallet's signing share — the wallet adds the half it re-derives from its
+  // passkey and keeps neither. NOT the cosigner's own share, which never leaves it.
+  //
+  // On the FIRST sighashes of a stream only, and empty on every one after: one approved stream is
+  // one reconstruction, and the rounds that follow reuse it.
+  bytes wallet_dealt_share = 6;
 }
 
 message SendComplete {
@@ -511,17 +539,34 @@ message SignOpen {
   // Authentication is the runtime's — see the note at the top of this file.
   reserved 1, 2, 3;
   reserved "user_id", "signature", "timestamp_ms";
-  bytes hiding_commitment = 4;
-  bytes binding_commitment = 5;
+  // The wallet's commitments rode here once. They cannot any more: its nonce is hedged with its
+  // share, and the share does not exist until the cosigner's first answer brings the half it
+  // dealt. So the cosigner commits first, as it already did in-band, and the wallet's commitments
+  // travel with its share — see `SignShare`.
+  reserved 4, 5;
+  reserved "hiding_commitment", "binding_commitment";
   bytes message_to_sign = 6;
   // The transaction the policy inspects. Bound to `message_to_sign` by the cosigner before any
   // policy runs, so a compliant transaction cannot front a signature over something else.
   bytes full_transaction = 7;
+  // Must be true. The cosigner signs untweaked and verifies every share before aggregating, so a
+  // key-path (tweaked) share could never have aggregated here; it is refused by name instead.
   bool script_path_spend = 8;
+  // The wallet's FROST identifier, 32 bytes big-endian — what `RecoverRequest.identifier` is.
+  //
+  // The cosigner answers the first round with the half of the wallet's share it dealt at DKG (see
+  // `wallet_dealt_share`), and only to the identifier the ceremony recorded. The identifier is
+  // public, so this authenticates nobody — the runtime did that, per tenant. What it catches is a
+  // wallet that is not this one: a wrong passkey, or a PRF that answers differently.
+  bytes identifier = 9;
 }
 
+// The wallet's whole half of the round: its commitments, and its share computed over both its own
+// and the cosigner's.
 message SignShare {
   bytes signature_share = 1;
+  bytes hiding_commitment = 2;
+  bytes binding_commitment = 3;
 }
 
 message SignServerMsg {
@@ -548,10 +593,13 @@ message WalletRound {
 }
 
 message SignCommitments {
+  // The cosigner's commitment, keyed by its FROST identifier, hex. One entry.
   map<string, Commitment> commitments = 1;
   // Echoed back because the cosigner is authoritative about what it will sign: if this differs from
   // what was asked for, the caller is told rather than silently signing something else.
   bytes message_to_sign = 2;
+  // `f_cosigner(wallet identifier)`, 32 bytes big-endian — see `SendSighashes.wallet_dealt_share`.
+  bytes wallet_dealt_share = 3;
 }
 
 message SignComplete {

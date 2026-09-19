@@ -38,8 +38,11 @@ class DkgSession {
   /// sign. No hardware signer, and no recovery share — the passkey is the recovery, because the
   /// wallet's own dealer is derived from it and the cosigner seals the half it deals back.
   ///
-  /// The wallet's own dealer secret is returned alongside, because it doubles as the single-key
-  /// on-chain key.
+  /// `dealtShare` is what the cosigner dealt this wallet in round 2 — `f_cosigner(id)`, the scalar
+  /// it seals and hands back on every later operation. It is returned so the caller can prove, now,
+  /// that the share those operations will rebuild is this ceremony's share; it is not kept. The
+  /// wallet's dealer secret used to be returned here too, to be stored as an on-chain key nothing
+  /// used. It is `polynomial.a0`, and derivable whenever something does.
   ///
   /// [deviceToken], when not empty, is enrolled for wakes once the key exists; `deviceEnrolled` says
   /// whether it was.
@@ -48,7 +51,7 @@ class DkgSession {
   /// passkey re-derives the same polynomial, and so the same identifier and the same half of the
   /// share. Nothing else in the ceremony needs to be deterministic; `dkgPart1`'s own randomness is
   /// the proof-of-knowledge nonce, which no key material depends on.
-  Future<({DkgResult dkg, threshold.SecretKey onchainSecret, bool deviceEnrolled})> run({
+  Future<({DkgResult dkg, List<int> dealtShare, bool deviceEnrolled})> run({
     required int maxSigners,
     required int minSigners,
     required WalletPolynomial polynomial,
@@ -144,9 +147,15 @@ class DkgSession {
         );
       }
 
+      // A 2-of-2 has one other dealer, so one package: the cosigner's.
+      if (sharesForWallet.length != 1) {
+        throw CosignerException(
+            'expected one round-2 package, from the cosigner; got ${sharesForWallet.length}');
+      }
+
       return (
         dkg: DkgResult(keyPkg, pubKeyPkg, derived),
-        onchainSecret: secret,
+        dealtShare: threshold.bigIntToBytes(sharesForWallet.values.single.secretShare),
         deviceEnrolled: complete.complete.deviceEnrolled,
       );
     } finally {

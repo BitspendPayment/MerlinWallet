@@ -22,6 +22,8 @@ import 'package:app_core/cosigner/connection.dart' show CosignerException;
 import 'package:app_core/enclave/attestation.dart';
 import 'package:app_core/enclave/gate.dart';
 import 'package:app_core/enclave/manifest.dart' as manifest;
+import 'package:app_core/persistence/wallet_store.dart'
+    show IncompatibleWalletStateException, WalletStore;
 
 import '../passkey/passkey_channel.dart';
 import '../passkey/platform_passkey.dart';
@@ -38,7 +40,8 @@ class MpcService extends ChangeNotifier {
   String? _storageId;
 
   /// The wallet's passkey. It approves every cosigner call — enclave-runtime gates each request on
-  /// a fresh assertion — and its PRF output blinds the FROST share. Null until onboarding registers
+  /// a fresh assertion — and its PRF output is what the wallet's key is derived from, each time it
+  /// signs. Null until onboarding registers
   /// one, and nothing reaches the cosigner before that.
   PlatformPasskey? _passkey;
 
@@ -306,8 +309,8 @@ class MpcService extends ChangeNotifier {
       aspSecure: asp.secure,
       storageId: storageId,
     );
-    // Before anything that might sign: the share is blinded under the passkey's PRF at DKG, and
-    // reconstructed from it at every spend.
+    // Before anything that might sign: the wallet's half of its share is derived from the passkey's
+    // PRF for every operation, and nothing of it is kept between them.
     client.setSeedSource(_passkey!.seedSource);
     // Before the DKG, so the ceremony carries the push token and no enrolment call follows it.
     client.onDeviceEnrolled = (token) {
@@ -322,8 +325,7 @@ class MpcService extends ChangeNotifier {
   ///
   /// The first onboarding step after choosing a host, and before DKG: enclave-runtime gates every
   /// request on a passkey, so without one there is no cosigner to run a ceremony with. The DKG that
-  /// follows blinds the share under this passkey's PRF from the start — the raw share is never
-  /// stored.
+  /// follows derives the wallet's key from this passkey's PRF — no share is ever stored.
   ///
   /// Idempotent: a passkey already registered for this host is kept.
   Future<void> enablePasskey() async {
@@ -335,7 +337,7 @@ class MpcService extends ChangeNotifier {
       // (see PlatformPasskey.createCredential) — start over with a new one. Nothing is lost: no key
       // exists yet, and its tenant in the enclave is simply never used again.
       try {
-        if (!_passkey!.hasFreshSeed) await _passkey!.waitUntilUsable(timeout: const Duration(seconds: 10));
+        await _passkey!.waitUntilUsable(timeout: const Duration(seconds: 10));
         return;
       } on PlatformException catch (e) {
         if (e.code != PasskeyChannel.noCredential) rethrow;
@@ -359,12 +361,12 @@ class MpcService extends ChangeNotifier {
   }
 
   /// Run initial DKG: a pure 2-of-2 {wallet, cosigner}. The wallet derives its own dealer
-  /// polynomial from the passkey's PRF (see [MpcClient.doDkg]), and its share is blinded under the
-  /// same PRF as it is finalized.
+  /// polynomial from the passkey's PRF (see [MpcClient.doDkg]), and keeps only the ceremony's
+  /// public half.
   ///
-  /// The share on this device is a cache, not the only copy: it is derived, and the passkey that
-  /// derives it is synced by the platform. A new phone with the same passkey rebuilds it — see
-  /// [restoreWallet].
+  /// There is no share on this device to lose: it is rebuilt for each operation from the passkey,
+  /// which the platform syncs, and the half the cosigner sealed. A new phone with the same passkey
+  /// does exactly the same — see [restoreWallet].
   Future<void> doDkg() async {
     if (!_isInitialized) throw StateError("MPC Service not initialized");
 
@@ -390,11 +392,11 @@ class MpcService extends ChangeNotifier {
   /// the passkey rather than drawn at random. Three steps, one fingerprint each at most:
   ///
   ///  1. **Find the passkey.** Nothing is stored yet, so the phone is asked which of its passkeys
-  ///     for this relying party to use ([PlatformPasskey.discover]). Its id is what the gate needs,
-  ///     and the same gesture yields the PRF seed.
-  ///  2. **Ask the cosigner** for the half of the key it dealt at DKG, and rebuild the share — see
-  ///     [MpcClient.recover], which refuses anything that does not match what the ceremony
-  ///     recorded.
+  ///     for this relying party to use ([PlatformPasskey.discover]). Its id is what the gate needs;
+  ///     the PRF is not evaluated yet.
+  ///  2. **Ask the cosigner** for the half of the key it dealt at DKG — the gesture that approves
+  ///     that call is the one that yields the seed — and check the two halves make this wallet's
+  ///     share. See [MpcClient.recover]: what is saved is the public half, never the share.
   ///  3. **Open the wallet.** Its VTXOs, delegate and contacts were never on the old phone in the
   ///     first place: they come back from the cosigner's seal as they always do.
   ///
@@ -425,9 +427,13 @@ class MpcService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Restores a previously completed session without re-running DKG.
-  /// Creates gRPC channel + MpcClient + MpcBitcoinWallet, then calls
-  /// wallet.init() which restores keys from Hive persistence.
+  /// Restores a previously completed session without re-running DKG: the gate, the client, and
+  /// the wallet's public state from Hive. No key is restored because none is stored — the share
+  /// is rebuilt from the passkey when something first needs to sign, which is also the first
+  /// fingerprint this asks for.
+  ///
+  /// Throws [IncompatibleWalletStateException] when what is stored is from before shares were
+  /// rebuilt per operation. It is not read and not replaced; see [resetLocalWallet].
   Future<void> restoreSession() async {
     if (!_isInitialized) throw StateError("MPC Service not initialized");
     if (!_dkgComplete) throw StateError("DKG not completed. Cannot restore.");
@@ -442,6 +448,57 @@ class MpcService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Stop the operation in flight — a board, a send, a renewal — if there is one.
+  ///
+  /// It fails where it stands, lets go of the key it rebuilt, and frees the queue behind it. For an
+  /// owner who has decided to stop waiting: a settle waits on the ASP for minutes by design, so
+  /// nothing but the owner can tell a slow batch from an ASP that has gone. Not something to call
+  /// on a timer, or because the app went to the background — a round abandoned after its intent is
+  /// registered is one the ASP was counting on. See [MpcClient.cancelOperation].
+  Future<void> cancelOperation() async => _client?.cancelOperation();
+
+  /// Whether an operation that signs is running. Another started now waits behind it.
+  bool get operationInProgress => _client?.operationInProgress ?? false;
+
+  /// Hang up on the cosigner and the ASP, without waiting on an operation that may never finish.
+  ///
+  /// `close` is graceful — it waits for calls in flight — so behind a settle parked on a silent
+  /// ASP it would wait for ever, and so would the reconnect that was meant to fix exactly that.
+  /// The operation is cancelled first: it fails, and lets go of what it held.
+  Future<void> _hangUp() async {
+    final client = _client;
+    if (client == null) return;
+    try {
+      await client.cancelOperation();
+      await client.close();
+    } catch (_) {
+      // Hanging up on a connection that may never have opened.
+    }
+  }
+
+  /// Delete what this device stores about the wallet, so it can be restored from its passkey.
+  ///
+  /// The way out of an [IncompatibleWalletStateException], and deliberately the only one: this is
+  /// a development build with no migration, and the old state holds a blinded share and a plaintext
+  /// dealer secret in an append-only file that only deleting removes. **No key is lost** — none
+  /// that matters is in it: the wallet is its passkey plus the cosigner's seal, and
+  /// [restoreWallet] rebuilds it from those. What goes is this device's exit address and its
+  /// pre-signed exits, which the next seal reissues.
+  ///
+  /// The passkey's credential id is kept, since the passkey is still the wallet.
+  Future<void> resetLocalWallet() async {
+    if (!_isInitialized) throw StateError("MPC Service not initialized");
+    await _hangUp();
+    _client = null;
+    // Straight at the store: a client needs a gate and a passkey, and deleting a file needs neither.
+    await WalletStore(boxName: _storageId ?? 'mpc_wallet_state_default').destroy();
+    _dkgComplete = false;
+    _isConnected = false;
+    await _identityBox!.put('dkgComplete', false);
+    await _identityBox!.delete('exitAddress');
+    notifyListeners();
+  }
+
   /// Reconnects to the server by tearing down the existing channel
   /// and restoring the session fresh.
   Future<void> reconnect() async {
@@ -450,9 +507,7 @@ class MpcService extends ChangeNotifier {
     _isConnected = false;
     notifyListeners();
 
-    try {
-      await _client?.close();
-    } catch (_) {}
+    await _hangUp();
     _client = null;
     _boarding?.close();
     _boarding = null;

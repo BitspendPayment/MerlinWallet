@@ -15,6 +15,7 @@ import 'package:protocol/cosigner_v1.dart' as cs;
 
 import '../asp/ark_info.dart';
 import '../cosigner/connection.dart';
+import '../passkey/operation_secrets.dart';
 import '../threshold_types.dart' as threshold;
 import 'exit_plan.dart';
 import 'in_band_round.dart';
@@ -123,9 +124,13 @@ List<int> hexBytes(String hex) => [
 /// The in-band seal exchange: sighashes in, the wallet's half of the round out, the sealed delegate
 /// in. The caller has already sent whatever opens it — `SealDelegate` after a `Complete`, or a
 /// `SettleOpen` with `sealOnly`.
+///
+/// [resolve] is the operation's key: handed whatever dealt share these sighashes carried. For a
+/// `sealOnly` open that is the stream's first round and brings the share; after a `Complete` it
+/// brings nothing, and the share the send or settle already rebuilt is reused — see `KeyResolver`.
 Future<DelegateStatus> answerSeal<Q, R>({
   required Duplex<Q, R> duplex,
-  required threshold.KeyPackage keyPkg,
+  required KeyResolver resolve,
   required threshold.PublicKeyPackage groupPubKey,
   required ({
     List<List<int>> sighashes,
@@ -133,6 +138,7 @@ Future<DelegateStatus> answerSeal<Q, R>({
     List<cs.Commitment> commitments,
     String identifier,
     bool scriptPathSpend,
+    List<int> dealtShare,
   })? Function(R) sighashesOf,
   required Q Function(List<cs.WalletRound>) signed,
   required cs.DelegateSealed? Function(R) sealedOf,
@@ -144,6 +150,7 @@ Future<DelegateStatus> answerSeal<Q, R>({
   // this wallet independently built, or nothing here is signed.
   final plan = exits ?? ExitPlan.none;
   plan.checkAsked(h.exitMessages);
+  final keyPkg = resolve(h.dealtShare);
   duplex.send(signed(answerRound(
     sighashes: [...h.sighashes, ...h.exitMessages],
     cosignerCommitments: h.commitments,
@@ -164,7 +171,7 @@ Future<DelegateStatus?> sealAfter<Q, R>({
   required Duplex<Q, R> duplex,
   required Future<List<IndexerVtxo>?> held,
   required ArkInfo info,
-  required threshold.KeyPackage keyPkg,
+  required KeyResolver resolve,
   required threshold.PublicKeyPackage groupPubKey,
   required Q Function(cs.SealDelegate) seal,
   String deviceToken = '',
@@ -175,6 +182,7 @@ Future<DelegateStatus?> sealAfter<Q, R>({
     List<cs.Commitment> commitments,
     String identifier,
     bool scriptPathSpend,
+    List<int> dealtShare,
   })? Function(R) sighashesOf,
   required Q Function(List<cs.WalletRound>) signed,
   required cs.DelegateSealed? Function(R) sealedOf,
@@ -191,7 +199,7 @@ Future<DelegateStatus?> sealAfter<Q, R>({
     )));
     return await answerSeal(
       duplex: duplex,
-      keyPkg: keyPkg,
+      resolve: resolve,
       groupPubKey: groupPubKey,
       sighashesOf: sighashesOf,
       signed: signed,
@@ -205,6 +213,11 @@ Future<DelegateStatus?> sealAfter<Q, R>({
               vtxos: set,
             ),
     );
+  } on ContributionProtocolException {
+    // Not an unlucky seal: the cosigner sent a second dealt share on one stream. The send or
+    // settle before this did happen, but a cosigner that breaks the one rule about when half a key
+    // travels is not something to carry on past quietly.
+    rethrow;
   } catch (_) {
     return null;
   }

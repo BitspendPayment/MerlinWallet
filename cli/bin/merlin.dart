@@ -3,7 +3,8 @@
 ///   dart run bin/merlin.dart                 the REPL
 ///   dart run bin/merlin.dart <command> ...   one command, then exit
 ///
-/// **Regtest only.** Passkeys and shares are kept in plaintext under ~/.merlin-cli.
+/// **Regtest only.** Passkeys are kept in plaintext under ~/.merlin-cli — and a passkey is the
+/// whole wallet: no share is stored, because the key is rebuilt from the passkey for each operation.
 library;
 
 import 'dart:convert';
@@ -30,7 +31,7 @@ Future<void> main(List<String> args) async {
       return;
     }
     print('merlin — enclave ${cli.home.enclaveId}, wallets in ${cli.home.dir.path}');
-    print('regtest only: passkeys and shares are plaintext. `help` for commands.');
+    print('regtest only: passkeys are plaintext, and a passkey is the wallet. `help` for commands.');
     final lines = stdin.transform(utf8.decoder).transform(const LineSplitter());
     stdout.write('${cli.home.active ?? ''}> ');
     await for (final line in lines) {

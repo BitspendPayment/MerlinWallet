@@ -23,7 +23,7 @@ Do NOT fix yet — just record. Fix pass happens once, after this list is comple
 ## ★ CONSOLIDATED MASTER LIST (fix-pass checklist, deduped + severity-ranked)
 
 ### HIGH — fix first
-- [x] **CL-1** ✓ FIXED — strip `clientExtensionResults.prf` before the `assert/finish` POST (passkey_authenticator.dart). analyze clean; server confirmed not to use PRF.
+- [x] **CL-1** ✓ FIXED — strip `clientExtensionResults.prf` before the assertion is sent (now `app/lib/passkey/platform_passkey.dart`, `_stripPrf`; the PRF is also no longer *evaluated* except for an assertion that a signing operation asked a seed from). analyze clean; server confirmed not to use PRF.
 - [x] **TH-1** ✓ FIXED — single-use FROST nonce via atomic spent-flag wrapper (ffi/src/threshold: mod.rs + ffi_signing.rs). ffi builds; full 2-party sign still to be verified on device/e2e.
 - [ ] **CR-3** `verify_auth` (bound to group_key) on `contract/create` before dispatch (rest_api.rs). DEFERRED per user (contract work parked) — was implemented + verified (cargo check + dart analyze clean) then REVERTED; revisit alongside the contract/eVTXO feature.
 - [ ] **IN-1** `is_kms_key_locked: true` + scope/remove host-role `kms:Decrypt` (enclave.yaml:11, main.tf:379-392). *Makes the enclave boundary real (the C1 rationale).* — INFRA/Terraform; needs a deploy.
@@ -40,9 +40,11 @@ Do NOT fix yet — just record. Fix pass happens once, after this list is comple
 - [~] **TH-5** PARTIAL — ✓ fixed the worst offenders: both ark hex decoders (`ark/send.rs`, `ark/mod.rs`) now use `hex::decode` (no panic on odd-length / multi-byte-UTF-8 ASP input). ffi builds. REMAINING (lower priority, all have odd-length guards): threshold-ffi str-slice decoders (ffi_signing/ffi_utils/ffi_auth/ffi_dkg) UTF-8-boundary edge; identity-point panics (point.rs:32/60, low reachability); `min_signers` underflow (ffi_dkg); a `catch_unwind` backstop on all `extern "C"` bodies.
 - [ ] **TH-8** tag FFI handles by type (kill `free_handle` type-confusion / double-free / secret-leak). NOTE: FFI's only caller is the trusted Dart wrapper (correct type_ids + lifecycle), so this is defense-in-depth hardening, not a live exploit. Proper fix = enum-tagged handle across ~13 box/borrow/free sites (cargo-verifiable; handle lifecycle not e2e-testable here).
 - [x] **TH-3** ✓ FIXED (Debug part) — redacting `Debug` on all 5 secret structs (KeyPackage, SigningNonce, Round1/2 secret pkgs, Round2Package); ffi builds + 38 threshold tests pass. Zeroize-on-drop DEFERRED: `Drop` fights Rust move-semantics on the `Copy` scalars (forces `.clone()` churn in the tweak/sign hot path) for marginal gain — needs a non-Copy secret-wrapper refactor.
-- [~] **TH-6** PARTIAL — the wallet no longer uses the improvised seeded derivation: share blinding and
-  the DKG polynomial both come from one labelled HKDF (`app-core/lib/passkey/key_derivation.dart`),
-  so the Dart/Rust disagreement in `dkgRefreshPart1(seed:)` is no longer on any wallet path.
+- [~] **TH-6** PARTIAL — the wallet no longer uses the improvised seeded derivation: the DKG
+  polynomial comes from one labelled HKDF (`app-core/lib/passkey/key_derivation.dart`), so the
+  Dart/Rust disagreement in `dkgRefreshPart1(seed:)` is no longer on any wallet path. Share blinding
+  is gone altogether — no share is kept to blind — and its label, `merlin/frost/blind/v1`, is
+  retired and must not be reused.
   REMAINING: `dkgRefreshPart1`/`modNRandomSeeded` and `dkg_refresh_part1` still exist and still
   disagree — drop the seeded path, or make the two definitions one.
 - [ ] **CL-3** attestation from build-flavor/allowlist (not host-string); treat persisted serverHost untrusted; sign/pin manifest.
@@ -50,9 +52,37 @@ Do NOT fix yet — just record. Fix pass happens once, after this list is comple
 - [ ] **IN-6** [UNCERTAIN] verify an ASP tree leaf pays owner_pk+amount before signing (batch.rs:920-982) — confirm ark_core doesn't already.
 - [x] **IN-4** ✓ FIXED — pinned `verify.yml` enclave CLI `@latest`→`@v0.0.79` (matches release-eif.yml). Also de-staled workflows: deleted dead `cosigner.yml` (built the removed `cosigner/` WASM guest, triggered on crates/threshold+ark → failing CI), and stripped the `cosigner.wasm` build + `--wasm` flag from `e2e.yml` + `flutter-integration.yml` (cosigner-runtime is native, CLI only takes `--port`).
 
+- [x] **NK-1** ✓ DONE 2026-09-19 — enclave e2e re-run over the cancellation work (RC-4): `make
+  e2e-enclave`, 22/22, no skips, against the staged tree. The earlier 22/22 predated the three
+  rounds of cancellation fixes, which sit on the happy paths of `Send`, `Settle` and `Recover`
+  (`CancelSignal.guard` around every ASP wait, a tracked `Recover` call, `_stillRunning` before
+  every state change); this run is over them. Cancellation *itself* is still proved only in
+  `app-core/test/operation_lifecycle_test.dart` — the e2e never cancels anything.
+- [ ] **NK-2** let a stale fingerprint prompt be withdrawn: plumb a `CancellationSignal` through
+  `app/android/.../PasskeyPlugin.kt` and `PasskeyChannel`. Today a prompt cannot be taken off the
+  screen from Dart, so an operation queued behind a cancelled one waits for the owner to answer or
+  dismiss a prompt for something they already cancelled — or for its 5-minute timeout. Safe (the
+  late seed is overwritten, the late approval dropped — RC-4), but poor. Not written: Kotlin that
+  cannot be device-tested from a dev box.
+- [ ] **NK-3** a Flutter-side test of the queued-prompt fix against the real `PlatformPasskey` with a
+  mocked platform channel — how the reviewer reproduced it. The app-core test uses a stand-in seed
+  source that enforces the same one-capture-at-a-time rule; the fix lives in `MpcClient`, so it
+  covers both, but the real class's capture/cleanup ordering is asserted nowhere.
+- [ ] **NK-4** manual two-device PRF test (RC-2) — promoted from "before relying on recovery" to
+  "before relying on payments": since RC-3 a PRF that answers differently stops every signing
+  operation, not only a restore.
+
 ### LOW / hygiene
+- [ ] NK-5 decide when the app cancels an operation. Wired today: the boarding screen's "Stop
+  waiting", and `reconnect()` / `resetLocalWallet()` (which would otherwise hang behind a stuck
+  operation on a graceful close). Deliberately NOT wired: app backgrounding, or any timer — a round
+  abandoned after its intent is registered is one the ASP was counting on, and arkd may penalize it.
+  Product/ASP-policy call. Also: send, protect and renew have no "Stop waiting" of their own.
+- [ ] NK-6 CI does not run what proves RC-3/RC-4: `app-core` tests have no Makefile target and no CI
+  job, and `.github/workflows/e2e.yml` still points at the deleted `e2e/test/ark_e2e_test.dart`.
+  (`AGENTS.md` also still describes the old `client/` + `server/` layout.)
 - [ ] TH-7 reject non-canonical signature `s ≥ n`; TH-4 constant-time ECIES MAC compare; TH-9 PoK domain tag / seeded-zero / into_even_y.
-- [ ] CL-2 encrypted store + shorter TTL for the session token; CR-6 bounds-check compose.rs:80-87; CR-7 tighten CORS / remove unauth redeem; EC-2/EC-4 doc-timestamp recency + attestation catch_unwind.
+- [ ] CL-2 encrypted store + shorter TTL for the session token (the store no longer holds key material — see RC-3 — so this is now about privacy of outpoints and the exit address; the two-minute PRF seed cache is gone); CR-6 bounds-check compose.rs:80-87; CR-7 tighten CORS / remove unauth redeem; EC-2/EC-4 doc-timestamp recency + attestation catch_unwind.
 - [ ] IN-5 SHA-pin CI actions; ignore committed empty terraform.tfstate; Firebase API-key restrictions; docker-compose 0.0.0.0 bind comment.
 
 ### DO NOT TOUCH (verified correct / invalid) — avoid churn
@@ -99,9 +129,101 @@ Do NOT fix yet — just record. Fix pass happens once, after this list is comple
 - **[RC-2] PRF stability across devices is assumed, not guaranteed.** WebAuthn does not promise a
   synced passkey yields the same PRF output on another device; it holds in practice for the two
   platform providers and not at all for a hardware key. The design fails *loudly* — the rebuilt
-  share is checked against the sealed verifying share and refused if it does not match — rather
+  share is checked against the verifying share and refused if it does not match — rather
   than producing a wallet that cannot sign. A two-device manual test is the only real check;
-  see the plan's verification notes.
+  see the plan's verification notes. Since RC-3 this is exercised by **every** signing operation,
+  not only by recovery: a PRF that drifted on the *same* device would now stop payments there,
+  loudly (`WrongPasskey`), where it used to stop only the unblinding.
+- **[RC-3] The device stores no private-key material; the share is rebuilt per operation.**
+  `app-core/lib/client.dart` (`_withOperation`), `app-core/lib/passkey/operation_secrets.dart`,
+  `app-core/lib/passkey/share_reconstruction.dart`, `cosigner/src/handlers/recover.rs`
+  (`dealt_share_for`), `cosigner/src/session.rs`. Development architecture; not production-ready.
+  - *What changed.* The phone used to persist a blinded share (δ) and — in the clear — the DKG
+    dealer secret `a0` as `onchainSecret`, in an unencrypted append-only Hive box, and kept the PRF
+    output in memory for two minutes after any assertion. It now persists public state only
+    (`WalletStore` refuses the old keys by name, at any depth), and `f_cosigner(wallet_id)` comes
+    back on the first round of `Sign`, `Send` and `Settle` — under that stream's own approval, so
+    still one fingerprint per operation — as well as from `Recover`.
+  - *Why it is not a new exposure.* RC-1 already made `passkey PRF + an approved call` sufficient
+    for the wallet's half. The contribution is released more *often*, to exactly the party that
+    could already ask for it. It is never the cosigner's own share (tested:
+    `cosigner/tests/stream_contribution_test.rs`). What is strictly better: a stolen, imaged or
+    backed-up phone yields nothing secret, where it used to yield δ and `a0`.
+  - *What binds it.* Tenant isolation is the runtime's (an instance can read one tenant's seal).
+    In-guest, the stream's open names the wallet identifier and a mismatch is `permission_denied`
+    before anything is answered. **The identifier is public** — this is a wrong-wallet check, not
+    authentication, and must not be leaned on as one. The wallet, for its part, accepts a rebuilt
+    share only against the verifying share *it* stored, not one that arrived with the contribution.
+    The exception is `Recover` on a new device, which has nothing of its own to compare with and so
+    trusts the enclave for the public key package; a substituted package yields a wallet whose
+    addresses are not the owner's.
+  - *What it does not do.* It does not zeroize: the seed buffer is overwritten, but coefficients and
+    the share are Dart `BigInt`s (uncollectable on demand, never cleared), the FFI takes the key
+    package as a JSON string, and the PRF output arrives from the platform channel inside an
+    immutable string. The lifetime is bounded by reference — one serialized operation, disposed in
+    a `finally`, cancellable (`MpcClient.cancelOperation`) — not by scrubbing.
+  - *Availability.* Unchanged. Signing always required the cosigner (2-of-2). Pre-signed exits hold
+    no secret and need none to broadcast; the cosigner's unattended renewals use no wallet share.
+  - *No migration.* Old client state is refused (`IncompatibleWalletStateException`) and reset; a
+    seal with no dealt share refuses every signing stream. Acceptable only because all existing
+    wallets are development data.
+  - *Known limits — accepted, recorded so they are not re-raised as findings.*
+    - **No zeroization** (above): bounded by reference, not by scrubbing. Would need secrets held
+      outside the Dart heap — the share living behind an FFI handle, as nonces already do.
+    - **One rule is proved only end to end.** The second-and-later sighashes of a `Settle` carry an
+      empty share — enforced on both sides (`dealt.take()` in `session.rs`; the memoized resolver in
+      `operation_secrets.dart`, which throws `ContributionProtocolException` on a second share) —
+      but the in-process cosigner tests cannot answer a round, so they cover the first message of
+      each stream and the e2e suite covers the rest.
+    - **`Recover` on a new device trusts the enclave for the public key package** (above). Every
+      later operation checks against what the device itself stored; only the first has nothing to
+      check against. Closing it needs something out of band — e.g. the owner confirming a known
+      address — not more protocol.
+    - **The client store is still unencrypted** (`PRODUCTION_READINESS.md` #10). It no longer holds
+      key material, so this is privacy (group key, outpoints, exit address, pre-signed exits), not
+      custody.
+    - **The seal is now read on every signing operation**, not only on recovery: a lost seal stops
+      payments the same day (`PRODUCTION_READINESS.md` #7). Not a new dependency — signing already
+      needed the cosigner's own share out of the same blob — but nothing on the phone can stand in.
+  - *Follow-ups:* NK-4, NK-6 in the master list (NK-1 done).
+- **[RC-4] Cancelling an operation: what it guarantees, and what it cannot.**
+  `app-core/lib/client.dart` (`_withOperation`, `_runOperation`, `_takeSeed`, `_stillRunning`,
+  `cancelOperation`), `app-core/lib/passkey/operation_secrets.dart` (`CancelSignal`),
+  `app-core/lib/cosigner/connection.dart` (`cancelOpenStreams`). Three review rounds; each finding
+  below was reproduced, fixed, and its test mutation-checked
+  (`app-core/test/operation_lifecycle_test.dart`).
+  - *Why it exists.* An operation holds the rebuilt share for as long as it runs, and operations
+    that sign are serialized behind one lock (RC-3). So an operation that cannot be stopped is a
+    share that cannot be released **and** a wallet that cannot do anything else. `close()` is a
+    graceful gRPC shutdown and waits for calls in flight — it was never a cancel.
+  - *What is guaranteed.* `cancelOperation()` ends the running turn at once, wherever it is parked:
+    the operation is disposed, its approval dropped and the lock released in the **outer** frame,
+    before the next operation can start. Specifically:
+    - a `Settle` waiting on a silent ASP (or a `Send` on `SubmitTx`/`FinalizeTx`) unwinds — every
+      wait on a party other than the cosigner goes through `CancelSignal.guard`, so the driver's
+      frame, and the share in it, go too;
+    - a cancelled `Recover` stays cancelled: the gRPC call itself is cancelled, and `_stillRunning`
+      refuses every state change (adopt, save, record delegate) on behalf of a turn that is over —
+      a late reply adopts and saves nothing;
+    - a cancel while a fingerprint prompt is showing starts nothing when the prompt is later
+      answered: the late seed is overwritten and the late approval token discarded (also when the
+      passkey fails after approving), so no later stream can ride a gesture made for a cancelled
+      operation; and that cleanup cannot take a newer operation's approval with it, because the
+      next operation waits for it (`_promptInFlight`) before asking for a gesture of its own;
+    - operations still waiting their turn are untouched, and an operation waiting behind a stale
+      prompt can itself be cancelled.
+  - *Known limits — accepted.*
+    - **A prompt cannot be withdrawn** from Dart; the platform plugin takes no cancellation signal.
+      The queue behind a stale prompt waits for it (NK-2).
+    - **`guard` stops the waiting, not the work.** `Recover` is really cancelled; the ASP's unary
+      calls are not. A send cancelled during `SubmitTx`/`FinalizeTx` may still have happened — the
+      wallet learns of it from the indexer, and its local delegate record is stale until the next
+      seal. Inherent to cancelling a request already on the wire.
+    - **What an abandoned round costs is the ASP's to say.** After an intent is registered arkd is
+      counting on the wallet; hence no cancel-on-background and no timer (NK-5).
+    - **Cancellation is owner-initiated only.** Nothing detects a dead ASP by itself — a settle
+      legitimately waits minutes, so nothing but the owner can tell slow from gone.
+  - *Follow-ups:* NK-2, NK-3, NK-5 (NK-1 done).
 
 ## REFUTED (checked — NOT a bug)
 

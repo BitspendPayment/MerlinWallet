@@ -28,7 +28,11 @@ import 'package:app_core/enclave/attestation.dart';
 import 'package:app_core/enclave/authenticator.dart';
 import 'package:app_core/enclave/gate.dart';
 import 'package:crypto/crypto.dart' as crypto;
+import 'package:app_core/passkey/key_derivation.dart' show walletPolynomial;
 import 'package:app_core/passkey/seed_source.dart';
+import 'package:app_core/passkey/share_reconstruction.dart' show WrongPasskey;
+import 'package:app_core/persistence/wallet_store.dart' show forbiddenStateKeys;
+import 'package:app_core/threshold_types.dart' as threshold;
 import 'package:protocol/protocol.dart' show PaymentIntent, PaymentRequestCreateRequest;
 import 'package:e2e/boarding_poll.dart';
 import 'package:e2e/enclave_harness.dart';
@@ -753,31 +757,52 @@ void main() {
     }, timeout: const Timeout(Duration(minutes: 15)));
   });
 
-  group('a gated share', () {
-    /// The share stored blinded, reconstructed from a seed for each signature. A right seed signs a
-    /// settle the ASP accepts; a wrong one cannot spend.
-    test('the right seed signs; a wrong seed cannot spend', () async {
+  group('nothing secret at rest', () {
+    /// No share is stored: each operation rebuilds one from the passkey's seed and the half the
+    /// cosigner returns on the stream it approved. A right seed signs a settle the ASP accepts —
+    /// every round of it, off one reconstruction — and leaves nothing of itself on disk; a wrong
+    /// one is refused on the device, before anything is opened.
+    test('the right seed signs and leaves nothing behind; a wrong seed cannot spend', () async {
       final seed = Uint8List.fromList(List<int>.generate(32, (i) => (i * 7 + 3) & 0xff));
       final wrong = Uint8List.fromList(List<int>.generate(32, (i) => (i * 7 + 4) & 0xff));
 
-      final alice = await wallet('gated_alice');
-      final bob = await wallet('gated_bob');
+      final alice = await wallet('atrest_alice');
+      final bob = await wallet('atrest_bob');
       try {
-        // Wired before DKG, so the share is never stored in the clear.
+        // Wired before DKG: the wallet's polynomial is derived from this.
         alice.client.setSeedSource(FixedSeedSource(seed));
         await alice.client.doDkg();
         await bob.client.doDkg();
-        expect(alice.client.isShareGated, isTrue);
 
         final held = await boardAndSettle(alice, 0.01);
         expect(held, hasLength(1),
-            reason: 'a VTXO means the reconstructed share signed validly, twice, in-band');
+            reason: 'a VTXO means the rebuilt share signed validly, twice, in-band — the intent '
+                'proof and the commitment — and then the seal, all off one contribution');
+
+        // What is on disk after a DKG, a settle and a seal. The file, not the live value: Hive
+        // appends, so anything ever written is still in it.
+        final polynomial = await walletPolynomial(Uint8List.fromList(seed));
+        final raw = await harness!.stateFileOf(alice).readAsBytes();
+        final rawText = String.fromCharCodes(raw).toLowerCase();
+        for (final key in forbiddenStateKeys) {
+          expect(rawText.contains(key.toLowerCase()), isFalse, reason: '"$key" is on disk');
+        }
+        for (final secret in {
+          'the seed': seed,
+          'a0': threshold.bigIntToBytes(polynomial.a0.scalar),
+          'a1': threshold.bigIntToBytes(polynomial.a1),
+        }.entries) {
+          expect(rawText.contains(_hex(secret.value)), isFalse,
+              reason: '${secret.key} is on disk, as hex');
+          expect(_containsBytes(raw, secret.value), isFalse,
+              reason: '${secret.key} is on disk, as bytes');
+        }
 
         alice.client.setSeedSource(FixedSeedSource(wrong));
         await expectLater(
           alice.client.sendVtxo(await bob.client.getArkAddress(), 1000),
-          throwsA(anything),
-          reason: 'a wrong seed reconstructs the wrong share, which the cosigner refuses',
+          throwsA(isA<WrongPasskey>()),
+          reason: 'a wrong seed derives another wallet, and is refused before a stream is opened',
         );
       } finally {
         await alice.close();
@@ -830,10 +855,11 @@ void main() {
   group('a wallet reopened from storage', () {
     /// A client restored from its own storage can still spend.
     ///
-    /// Both halves of the key have to survive: the wallet's share out of its Hive box, and the
-    /// cosigner's out of its seal. The cosigner half is proven by every request here — it reopens
-    /// from the seal each time, with nothing kept between requests — and this proves the client
-    /// half with a fresh object that has never seen DKG.
+    /// What has to survive is public on the wallet's side — who it is, out of its Hive box — and
+    /// secret only on the cosigner's, out of its seal. The cosigner half is proven by every request
+    /// here: it reopens from the seal each time, with nothing kept between requests. This proves
+    /// the client half with a fresh object that has never seen DKG and holds no share: it spends
+    /// from its stored public state, its passkey and the enclave, and nothing else.
     test('can still spend after the client is rebuilt', () async {
       final first = await wallet('restore_carol');
       final dave = await wallet('restore_dave');
@@ -929,10 +955,59 @@ void main() {
         await newPhone.close();
       }
     }, timeout: const Timeout(Duration(minutes: 10)));
+
+    /// One tenant cannot have another wallet's half — not even knowing that wallet's seed.
+    ///
+    /// The worst case for the identifier check: Mallory is a real, authenticated tenant, and has
+    /// somehow learnt Heidi's PRF output, so she derives Heidi's identifier exactly. What she cannot
+    /// do is ask Heidi's cosigner. Her passkey resolves to her own tenant and her own instance,
+    /// whose seal holds her wallet and never Heidi's — so the identifier she sends matches nothing
+    /// there, and she is refused. The contribution is bound to the tenant by the runtime, and to
+    /// the wallet by the cosigner; this is both, against a real enclave.
+    test("an authenticated tenant cannot retrieve another wallet's contribution", () async {
+      final heidiSeed = Uint8List.fromList(List<int>.generate(32, (i) => (i * 11 + 5) & 0xff));
+      final heidi = await wallet('tenant_heidi');
+      final mallory = await wallet('tenant_mallory');
+      try {
+        heidi.client.setSeedSource(FixedSeedSource(heidiSeed));
+        await heidi.client.doDkg();
+        await mallory.client.doDkg();
+      } finally {
+        await heidi.close();
+        await mallory.close();
+      }
+
+      // Mallory's passkey — her tenant — on a device with nothing stored, deriving as Heidi.
+      final asHeidi =
+          await harness!.newDeviceFor('tenant_mallory', aspHost: aspHost, aspPort: aspPort);
+      try {
+        asHeidi.client.setSeedSource(FixedSeedSource(heidiSeed));
+        await expectLater(
+          asHeidi.client.recover(),
+          throwsA(predicate((e) => '$e'.contains('does not derive this wallet'))),
+        );
+        expect(asHeidi.client.isInitialized, isFalse);
+        expect(await asHeidi.client.restoreState(), isFalse,
+            reason: 'a refused recovery writes nothing');
+      } finally {
+        await asHeidi.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 10)));
   });
 }
 
 String _hex(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+bool _containsBytes(List<int> haystack, List<int> needle) {
+  outer:
+  for (var i = 0; i + needle.length <= haystack.length; i++) {
+    for (var j = 0; j < needle.length; j++) {
+      if (haystack[i + j] != needle[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
 
 /// A gate whose approvals are real but whose pin names some other certificate — what an intercepted
 /// channel looks like from the client's side.

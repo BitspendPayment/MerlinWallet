@@ -43,19 +43,12 @@ void main() {
     expect(mine.a1, isNot(theirs.a1));
   });
 
-  /// One seed, three purposes: each must be independent of the others. A blinding factor that
-  /// equalled the secret it blinds would hide nothing.
+  /// One seed, a label per purpose: each must be independent of the others. There were three — the
+  /// third blinded a share at rest, and went when shares stopped being kept. Its label is retired,
+  /// not freed: see `key_derivation.dart`.
   test('the labels give independent scalars', () async {
     final polynomial = await walletPolynomial(seed(7));
-    final blind = await blindingScalar(seed(7));
     expect(polynomial.a0.scalar, isNot(polynomial.a1));
-    expect(polynomial.a0.scalar, isNot(blind));
-    expect(polynomial.a1, isNot(blind));
-  });
-
-  test('the blinding scalar reproduces, or nothing could be unblinded', () async {
-    expect(await blindingScalar(seed(3)), await blindingScalar(seed(3)));
-    expect(await blindingScalar(seed(3)), isNot(await blindingScalar(seed(4))));
   });
 
   /// Scalars have to be in range and usable: zero is not a key, and anything at or above the curve
@@ -63,7 +56,7 @@ void main() {
   test('every derived scalar is a usable one', () async {
     for (var fill = 0; fill < 8; fill++) {
       final polynomial = await walletPolynomial(seed(fill));
-      for (final scalar in [polynomial.a0.scalar, polynomial.a1, await blindingScalar(seed(fill))]) {
+      for (final scalar in [polynomial.a0.scalar, polynomial.a1]) {
         expect(scalar, greaterThan(BigInt.zero));
         expect(scalar, lessThan(threshold.secp256k1Curve.n));
       }

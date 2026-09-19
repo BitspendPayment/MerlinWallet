@@ -15,27 +15,14 @@
 
 mod common;
 
-use std::future::Future;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
-
-use bytes::Bytes;
-use http_body_util::BodyExt;
-
-use cosigner::grpc::framing::{frame, Deframer};
 use cosigner::grpc::Code;
 use cosigner::session::proto;
-use cosigner::session::{CosignerService, TENANT_HEADER};
 use cosigner::wallet_proto::{GetServerInfoRequest, GetServerInfoResponse};
 use cosigner::Cosigner;
-use wstd::http::{Body, Request, Response};
 
 use threshold::keys::KeyPackage;
-use threshold::nonce;
-use threshold::point;
 
-/// What the runtime puts on an approved request: sixteen bytes, lowercase hex.
-const TENANT: &str = "0123456789abcdef0123456789abcdef";
+use common::wire::{block_on, collect, request, service, TENANT};
 
 /// Every RPC the service answers. Kept as a list so a new method is refused-by-default here the day
 /// it is added, rather than whenever somebody remembers to write a test for it.
@@ -43,97 +30,20 @@ const METHODS: &[&str] = &[
     "Sign", "Dkg", "Send", "Settle",
     "ContactAdd", "ContactRemove", "ContactList",
     "PaymentRequestCreate", "PaymentRequestList", "PaymentRequestDecline",
-    "GetServerInfo", "RegisterDevice", "ForgetDevice", "DeviceCount", "Watch",
+    "GetServerInfo", "RegisterDevice", "ForgetDevice", "DeviceCount", "Recover",
 ];
 
-/// Drive a future to completion on this thread.
-///
-/// Every body here is already in memory, so nothing genuinely parks and a busy poll is enough. The
-/// cap is what turns "this future never finishes" into a failed test rather than a hung one — which
-/// matters, because a duplex that stops making progress is exactly the bug this file would catch.
-fn block_on<F: Future>(fut: F) -> F::Output {
-    let mut fut = Box::pin(fut);
-    let mut cx = Context::from_waker(Waker::noop());
-    for _ in 0..100_000 {
-        if let Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
-            return value;
-        }
-    }
-    panic!("the future never completed");
-}
-
-/// A gRPC request carrying `messages`, addressed at `method`, as the runtime would deliver it — or,
-/// with `tenant: None`, as it would never deliver it.
-fn request<M: prost::Message>(method: &str, messages: &[M], tenant: Option<&str>) -> Request<Body> {
-    let mut buf = Vec::new();
-    for message in messages {
-        buf.extend_from_slice(&frame(&message.encode_to_vec()));
-    }
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri(format!("http://cosigner/cosigner.v1.Cosigner/{method}"))
-        .header("content-type", "application/grpc+proto");
-    if let Some(tenant) = tenant {
-        builder = builder.header(TENANT_HEADER, tenant);
-    }
-    builder
-        .body(Body::from_http_body(
-            http_body_util::Full::new(Bytes::from(buf))
-                .map_err(|e: std::convert::Infallible| -> wstd::http::Error { match e {} }),
-        ))
-        .expect("request is well formed")
-}
-
-/// What came back: the decoded messages, and the status a client reads from the trailers.
-struct Answer<M> {
-    messages: Vec<M>,
-    code: u32,
-    message: String,
-}
-
-fn collect<M: prost::Message + Default>(resp: Response<Body>) -> Answer<M> {
-    let collected = block_on(resp.into_body().into_boxed_body().collect()).expect("collect body");
-    let trailers = collected.trailers().cloned().unwrap_or_default();
-    let code = trailers
-        .get("grpc-status")
-        .expect("every gRPC response carries a grpc-status trailer")
-        .to_str()
-        .unwrap()
-        .parse()
-        .unwrap();
-    let message = trailers
-        .get("grpc-message")
-        .map(|v| v.to_str().unwrap().to_string())
-        .unwrap_or_default();
-
-    let mut deframer = Deframer::default();
-    deframer.push(&collected.to_bytes());
-    let mut messages = Vec::new();
-    while let Some(bytes) = deframer.next().expect("well-framed response") {
-        messages.push(M::decode(bytes).expect("decodable response"));
-    }
-    Answer { messages, code, message }
-}
-
-fn service(cosigner: Cosigner) -> CosignerService {
-    CosignerService::new(
-        Arc::new(Mutex::new(cosigner)),
-        GetServerInfoResponse { bitcoin_network: "regtest".into() },
-    )
-}
-
-/// A `SignOpen` with a real commitment from the wallet's share.
+/// A `SignOpen` from the wallet that owns [kp_user]. No commitments: the wallet has no share to
+/// hedge a nonce with until the cosigner's first answer brings the half it dealt.
 fn sign_open(kp_user: &KeyPackage) -> proto::SignClientMsg {
-    let nonce = nonce::new_nonce(&mut rand::rngs::OsRng, &kp_user.secret_share);
     proto::SignClientMsg {
         session_id: "s1".into(),
         seq: 0,
         body: Some(proto::sign_client_msg::Body::Open(proto::SignOpen {
-            hiding_commitment: point::serialize_compressed(&nonce.commitments.hiding).to_vec(),
-            binding_commitment: point::serialize_compressed(&nonce.commitments.binding).to_vec(),
             message_to_sign: vec![0x42; 32],
             full_transaction: Vec::new(),
             script_path_spend: true,
+            identifier: kp_user.identifier.serialize().to_vec(),
         })),
     }
 }
@@ -144,7 +54,15 @@ fn seeded() -> Option<(Cosigner, Vec<KeyPackage>)> {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    common::seed_policy_with_dealt_share(
+        &cosigner,
+        &group_key,
+        &kps[1],
+        &kps[0],
+        &pkp,
+        None,
+        Some(hex::encode([7u8; 32])),
+    );
     Some((cosigner.into_inner().unwrap(), kps))
 }
 

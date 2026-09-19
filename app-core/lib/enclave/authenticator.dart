@@ -256,6 +256,12 @@ class _SoftwarePrf implements SeedSource {
   _SoftwarePrf(this._passkey);
   final SoftwareAuthenticator _passkey;
 
+  /// Nothing to arm: a software passkey's PRF is a function of key material this process already
+  /// holds, so it is simply evaluated once the approval is through. Each call returns fresh bytes
+  /// for the caller to overwrite.
   @override
-  Future<Uint8List> deriveSeed() async => _passkey._prf();
+  Future<Uint8List> seedDuring(Future<void> Function() approve) async {
+    await approve();
+    return _passkey._prf();
+  }
 }

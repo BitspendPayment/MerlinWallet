@@ -1,45 +1,20 @@
-//! The 2-of-2 cooperative sign, driven the way a streaming session drives it: `open` returns the
-//! ceremony, the client's round-trip happens, `finish` consumes it. The user/client half is
-//! simulated host-side.
+//! The 2-of-2 cooperative sign, driven the way the `Sign` stream drives it: the cosigner commits
+//! first, the wallet answers with its commitments and its share together, the cosigner aggregates.
+//! It is the in-band round `Send` and `Settle` run, over one message — the wallet cannot commit
+//! first any more, because it holds no share until the stream's first answer brings the half the
+//! cosigner dealt it. The user/client half is simulated host-side.
 //!
-//! There is no warm path here any more. A cosigner is opened for a request and its state comes from
-//! the seal every time, so what used to be the "cold-spawn" case is the only case: seed on one
-//! `Cosigner`, drop it, open a fresh one, sign.
+//! There is no warm path here. A cosigner is opened for a request and its state comes from the seal
+//! every time, so what used to be the "cold-spawn" case is the only case: seed on one `Cosigner`,
+//! drop it, open a fresh one, sign.
 //!
 //! Persistence is in-process SQLite. The ASP channel is lazy and never used on the signing path.
 
 mod common;
 
-use std::collections::BTreeMap;
-
-use rand::rngs::OsRng;
-
-use cosigner::types::{SignStep1, SignStep2};
-
-use threshold::commitment::SigningPackage;
-use threshold::identifier::Identifier;
-use threshold::keys::KeyPackage;
-use threshold::nonce::{self, SigningCommitments};
 use threshold::point;
-use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};
+use threshold::scalar::scalar_from_bytes;
 use threshold::signature::Signature;
-use threshold::signing;
-
-
-/// The client's half of round 1: a fresh nonce and the request carrying its commitments.
-fn client_round1(kp_user: &KeyPackage, message: &[u8; 32]) -> (nonce::SigningNonce, SignStep1) {
-    let mut rng = OsRng;
-    let user_nonce = nonce::new_nonce(&mut rng, &kp_user.secret_share);
-    let req = SignStep1 {
-        hiding_commitment: point::serialize_compressed(&user_nonce.commitments.hiding).to_vec(),
-        binding_commitment: point::serialize_compressed(&user_nonce.commitments.binding).to_vec(),
-        message_to_sign: message.to_vec(),
-        full_transaction: vec![],
-        script_path_spend: true, // raw FROST (no taproot tweak)
-        ark_tx: vec![],
-    };
-    (user_nonce, req)
-}
 
 /// Seed, drop, reopen, and run a full ceremony against the reopened cosigner.
 #[test]
@@ -52,7 +27,7 @@ fn sign_session_restores_seal_and_verifies() {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let (kp_user, kp_cosigner) = (&kps[0], &kps[1]);
-    let message = [0x42u8; 32];
+    let message = vec![0x42u8; 32];
 
     let seeder = common::open_cosigner(&store, &group_key);
     common::seed_policy(&seeder, &group_key, kp_cosigner, kp_user, &pkp, None);
@@ -60,63 +35,47 @@ fn sign_session_restores_seal_and_verifies() {
 
     // A fresh instance holds nothing in memory: the seal is where its keys come from.
     let cosigner = common::open_cosigner(&store, &group_key);
-    let (user_nonce, req1) = client_round1(kp_user, &message);
 
-    // Round 1. The ceremony leaves the cosigner with the reply; nothing is parked behind it.
-    let (ceremony, resp1) = {
-        let mut actor = cosigner.lock().unwrap();
-        actor.sign_open(req1).expect("sign_open")
-    };
+    // Round 1. The round leaves the cosigner with the reply; nothing is parked behind it.
+    let (round, theirs) = cosigner
+        .lock()
+        .unwrap()
+        .sign_in_band_begin(std::slice::from_ref(&message))
+        .expect("begin");
+    assert_eq!(theirs.len(), 1, "one message, one commitment");
 
     // The client's round-trip, with no lock held on the cosigner.
-    let mut commitments: BTreeMap<Identifier, SigningCommitments> = BTreeMap::new();
-    for c in &resp1.commitments {
-        let id_arr: [u8; 32] = hex::decode(&c.identifier_hex).unwrap().try_into().unwrap();
-        let h: [u8; 33] = c.hiding.clone().try_into().unwrap();
-        let b: [u8; 33] = c.binding.clone().try_into().unwrap();
-        commitments.insert(
-            Identifier::deserialize(&id_arr).unwrap(),
-            SigningCommitments {
-                hiding: point::deserialize_compressed(&h).unwrap(),
-                binding: point::deserialize_compressed(&b).unwrap(),
-            },
-        );
-    }
-    let signing_pkg = SigningPackage::new(commitments, message.to_vec());
-    let user_share = signing::sign(&signing_pkg, &user_nonce, kp_user).expect("user share");
+    let ours = common::wallet_answers(kp_user, std::slice::from_ref(&message), &theirs);
 
-    // Round 2. The ceremony goes back in by value and is consumed.
-    let resp2 = {
-        let mut actor = cosigner.lock().unwrap();
-        actor
-            .sign_finish(
-                ceremony,
-                SignStep2 {
-                    signature_share: scalar_to_bytes(&user_share.s).to_vec(),
-                },
-            )
-            .expect("sign_finish")
-    };
+    // Round 2. The round goes back in by value and is consumed.
+    let signature = cosigner
+        .lock()
+        .unwrap()
+        .sign_in_band_finish(round, ours)
+        .expect("finish")
+        .pop()
+        .expect("one signature");
 
-    let r_arr: [u8; 33] = resp2.r_point.try_into().expect("R is 33 bytes");
-    let z_arr: [u8; 32] = resp2.z_scalar.try_into().expect("Z is 32 bytes");
-    let signature = Signature::new(
-        point::deserialize_compressed(&r_arr).unwrap(),
-        scalar_from_bytes(&z_arr).unwrap(),
-    );
-    signature
-        .verify(&pkp.verifying_key, &message)
-        .expect("aggregated 2-of-2 signature must verify under the group key");
+    // As the `Sign` stream reports it, and as the wallet's `frostFinish` reads it: R compressed
+    // under an even prefix — `aggregate` normalizes it — and z.
+    let mut r = [0x02u8; 33];
+    r[1..].copy_from_slice(&signature[..32]);
+    let z: [u8; 32] = signature[32..].try_into().expect("z is 32 bytes");
+    Signature::new(
+        point::deserialize_compressed(&r).unwrap(),
+        scalar_from_bytes(&z).unwrap(),
+    )
+    .verify(&pkp.verifying_key, &message)
+    .expect("aggregated 2-of-2 signature must verify under the group key");
 
     let _ = store.delete("sealed_state", &group_key);
 }
 
-/// The property the redesign rests on: an abandoned ceremony leaves nothing reusable behind.
+/// The property the design rests on: an abandoned ceremony leaves nothing reusable behind.
 ///
-/// A FROST nonce may be used once — signing twice under one nonce leaks the secret share. The old
-/// model parked the ceremony on the actor between two requests, so an abandoned round 1 left a live
-/// nonce sitting in memory addressable by whoever sent round 2. Here the ceremony is a value: drop
-/// it and the nonce is gone, and a second ceremony on the same cosigner gets fresh commitments.
+/// A FROST nonce may be used once — signing twice under one nonce leaks the secret share. The round
+/// is a value: drop it and the nonce is gone, and a second round on the same cosigner gets fresh
+/// commitments.
 #[test]
 fn abandoned_ceremony_leaves_no_reusable_nonce() {
     let Some(store) = common::try_store() else {
@@ -125,35 +84,26 @@ fn abandoned_ceremony_leaves_no_reusable_nonce() {
 
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
-    let (kp_user, kp_cosigner) = (&kps[0], &kps[1]);
-    let message = [0x42u8; 32];
+    let message = vec![0x42u8; 32];
 
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, kp_cosigner, kp_user, &pkp, None);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
 
-    // Open a ceremony and abandon it, as an interrupted stream does.
-    let (_, first) = {
-        let mut actor = cosigner.lock().unwrap();
-        actor.sign_open(client_round1(kp_user, &message).1).expect("first open")
-    };
+    // Open a round and abandon it, as an interrupted stream does.
+    let (_, first) = cosigner
+        .lock()
+        .unwrap()
+        .sign_in_band_begin(std::slice::from_ref(&message))
+        .expect("first open");
+    // Same cosigner, same message: a second round must not reuse the first one's nonce.
+    let (_, second) = cosigner
+        .lock()
+        .unwrap()
+        .sign_in_band_begin(std::slice::from_ref(&message))
+        .expect("second open");
 
-    // Same cosigner, same message: a second ceremony must not reuse the first one's nonce.
-    let (_, second) = {
-        let mut actor = cosigner.lock().unwrap();
-        actor.sign_open(client_round1(kp_user, &message).1).expect("second open")
-    };
-
-    let cosigner_id = hex::encode(kp_cosigner.identifier.serialize());
-    let find = |out: &cosigner::types::SignStep1Out| {
-        out.commitments
-            .iter()
-            .find(|c| c.identifier_hex == cosigner_id)
-            .expect("cosigner's own commitments")
-            .clone()
-    };
-    let (a, b) = (find(&first), find(&second));
-    assert_ne!(a.hiding, b.hiding, "hiding commitment must not repeat across ceremonies");
-    assert_ne!(a.binding, b.binding, "binding commitment must not repeat across ceremonies");
+    assert_ne!(first[0].hiding, second[0].hiding, "hiding commitment must not repeat");
+    assert_ne!(first[0].binding, second[0].binding, "binding commitment must not repeat");
 
     let _ = store.delete("sealed_state", &group_key);
 }

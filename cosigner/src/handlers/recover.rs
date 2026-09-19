@@ -39,25 +39,54 @@ use crate::session::proto::{RecoverRequest, RecoverResponse};
 use threshold::identifier::Identifier;
 
 pub fn recover(c: &Cosigner, req: RecoverRequest) -> Result<RecoverResponse, Status> {
-    // The mirror of `refuse_if_onboarded`: there is nothing to recover before a ceremony.
+    let dealt_share = dealt_share_for(c, &req.identifier)?;
+    // `dealt_share_for` has already refused a wallet with no key, so these are there.
     let (group_key, public_key_package_json) = match (
         c.policy_group_key(),
         c.policy_public_key_package_json(),
     ) {
         (Some(g), Some(p)) => (g, p),
-        _ => {
-            return Err(Status::failed_precondition(
-                "this wallet has no key yet: there is nothing to recover, create one instead",
-            ))
-        }
+        _ => return Err(Status::internal("the wallet has a dealt share and no key package")),
     };
+
+    tracing::info!("Recover: returning the dealt share to the wallet's own identifier");
+    Ok(RecoverResponse {
+        dealt_share,
+        public_key_package_json,
+        group_key,
+    })
+}
+
+/// The half of the wallet's share the cosigner dealt at DKG, for the wallet that is [identifier].
+///
+/// `Recover` hands it to a device that has nothing. `Sign`, `Send` and `Settle` hand it back on
+/// their first round, every time, because the wallet keeps no share between operations any more:
+/// it re-derives its own half from the passkey and adds this one, under the approval the stream
+/// already has. One rule for all four, so there is one place it can be wrong.
+///
+/// What this guards, and what it does not. The caller was authenticated by the runtime as this
+/// tenant before any of this ran, and a tenant's seal is the only one this instance can read — that
+/// is what keeps one tenant's half from another, and it is not re-implemented here. The identifier
+/// is public (it is in the key package and on the wire), so matching it proves nothing about who
+/// is asking. It proves the wallet asking is *this* wallet: a wrong passkey, or a PRF that answers
+/// differently, derives another identifier and is told so instead of being handed a share that
+/// would not add up.
+///
+/// Never the cosigner's own share — that is `key_package.secret_share`, and nothing returns it.
+pub(crate) fn dealt_share_for(c: &Cosigner, identifier: &[u8]) -> Result<Vec<u8>, Status> {
+    // The mirror of `refuse_if_onboarded`: there is nothing to hand back before a ceremony.
+    if c.policy_group_key().is_none() {
+        return Err(Status::failed_precondition(
+            "this wallet has no key yet: there is nothing to recover, create one instead",
+        ));
+    }
 
     let expected = c.user_signing_identifier().ok_or_else(|| {
         Status::failed_precondition("this wallet's ceremony recorded no owner identifier")
     })?;
-    let asked: [u8; 32] = req.identifier.as_slice().try_into().map_err(|_| {
-        Status::invalid_argument("identifier must be 32 bytes")
-    })?;
+    let asked: [u8; 32] = identifier
+        .try_into()
+        .map_err(|_| Status::invalid_argument("identifier must be 32 bytes"))?;
     let asked = Identifier::deserialize(&asked)
         .map_err(|e| Status::invalid_argument(format!("bad identifier: {e}")))?;
     if asked != expected {
@@ -69,8 +98,7 @@ pub fn recover(c: &Cosigner, req: RecoverRequest) -> Result<RecoverResponse, Sta
         ));
     }
 
-    let dealt_share = c
-        .wallet_dealt_share_hex()
+    c.wallet_dealt_share_hex()
         .ok_or_else(|| {
             Status::failed_precondition(
                 "this wallet was created before recovery existed: the cosigner did not keep the \
@@ -79,12 +107,5 @@ pub fn recover(c: &Cosigner, req: RecoverRequest) -> Result<RecoverResponse, Sta
         })
         .and_then(|h| {
             hex::decode(h).map_err(|e| Status::internal(format!("sealed share is not hex: {e}")))
-        })?;
-
-    tracing::info!("Recover: returning the dealt share to the wallet's own identifier");
-    Ok(RecoverResponse {
-        dealt_share,
-        public_key_package_json,
-        group_key,
-    })
+        })
 }

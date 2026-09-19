@@ -1,14 +1,31 @@
-/// The phone's passkey, as the enclave gate's authenticator and as the share's blinding seed.
+/// The phone's passkey, as the enclave gate's authenticator and as the wallet's seed.
 ///
-/// One credential does two jobs, and usually in one gesture:
+/// One credential does two jobs, and for an operation that signs, in one gesture:
 ///
 ///  * **Approval.** enclave-runtime gates every request on an assertion bound to that request, so
 ///    this implements app-core's [Authenticator] and [PasskeyRegistrar] over Credential Manager
 ///    ([PasskeyChannel]).
-///  * **The seed.** Every assertion also evaluates the credential's PRF extension at a fixed salt.
-///    The 32-byte output blinds the wallet's FROST share, so the share is only usable after a
-///    gesture. Because the PRF rides on the approval's own assertion, a spend — approved, then
-///    signed — asks for the fingerprint once, not twice.
+///  * **The seed.** The credential's PRF extension, evaluated at a fixed salt, gives 32 bytes the
+///    wallet's half of its FROST share is derived from — again for every operation, because no
+///    share is kept on the device. The PRF rides on the approval's own assertion, so a spend asks
+///    for the fingerprint once, not twice.
+///
+/// ## The seed is handed over, not kept
+///
+/// The PRF is evaluated **only** for an assertion made inside [SeedSource.seedDuring], and its
+/// output goes to the one caller that asked and nowhere else. Approving a contact list, finding a
+/// passkey, checking one still works: none of those evaluates the PRF at all.
+///
+/// It used to be evaluated on every assertion and kept for two minutes, so that the several FROST
+/// rounds of one send would not each prompt. That made a clock the only limit on the seed's life,
+/// and let any approval leave one behind. The rounds of an operation now share the *share* it
+/// rebuilt, inside the operation (`app_core/passkey/operation_secrets.dart`); nothing here outlives
+/// the call that asked for it.
+///
+/// What this cannot do is scrub the platform's own copies: the output crosses the platform channel
+/// as base64 inside a JSON string, and Dart strings are immutable. The bytes this class decodes
+/// are handed to a caller that overwrites them; the string they came from is the garbage
+/// collector's.
 ///
 /// **The PRF output never leaves the device.** The runtime neither asks for nor reads extension
 /// outputs, and it is stripped from the credential before it is sent.
@@ -76,30 +93,15 @@ class PlatformPasskey implements Authenticator, PasskeyRegistrar {
   bool _justRegistered = false;
 
   /// The PRF salt: a fixed context tag. A constant so the same passkey always yields the same seed,
-  /// which is what makes the blinded share reconstructable.
+  /// which is what makes the wallet's key derivable again — tomorrow, and on another phone.
   static final Uint8List _prfSalt =
       Uint8List.fromList(sha256.convert(utf8.encode('mpcwallet-prf-v1')).bytes);
 
-  /// How long one gesture's seed stays usable. An Ark operation is a burst — the approval, then a
-  /// stream of FROST rounds — and without this each round would prompt. Short, so the seed does not
-  /// idle in memory.
-  static const Duration _seedTtl = Duration(minutes: 2);
+  /// The [SeedSource.seedDuring] in progress, if there is one: where the next assertion's PRF
+  /// output goes. Null almost always, and while it is, no assertion evaluates the PRF.
+  _SeedCapture? _capture;
 
-  Uint8List? _seed;
-  DateTime? _seedExpiry;
-
-  /// A local assertion in flight, shared, so concurrent seed requests make one prompt, not several.
-  Future<Uint8List>? _inflight;
-
-  /// Whether an operation started now would ride the cached seed with no prompt. Requires it to stay
-  /// valid a while longer: a signing round takes seconds, and a seed expiring mid-round would pop
-  /// the very prompt the caller checked this to avoid.
-  bool get hasFreshSeed =>
-      _seed != null &&
-      _seedExpiry != null &&
-      DateTime.now().add(const Duration(seconds: 30)).isBefore(_seedExpiry!);
-
-  /// The share's blinding seed. See [PlatformPasskey].
+  /// The wallet's seed. See [PlatformPasskey].
   SeedSource get seedSource => _PrfSeedSource(this);
 
   @override
@@ -167,9 +169,9 @@ class PlatformPasskey implements Authenticator, PasskeyRegistrar {
   /// (`residentKey: required` — see [createCredential]).
   ///
   /// The assertion goes nowhere: the challenge is made here and the signature is thrown away. What
-  /// is kept is the credential id and, because [_get] evaluates the PRF in the same gesture, the
-  /// seed — so a recovery is one fingerprint for both, and the wallet's own half of its key is
-  /// already in hand when the cosigner is asked for the other.
+  /// is kept is the credential id, and only that — the PRF is not evaluated. The seed is taken by
+  /// the `Recover` call that follows, from the gesture that approves it, so nothing secret sits in
+  /// memory between the two.
   ///
   /// Throws [PasskeyChannel.noCredential] when the device holds none, which is the honest answer to
   /// "restore my wallet" on a phone the passkey never synced to.
@@ -208,39 +210,55 @@ class PlatformPasskey implements Authenticator, PasskeyRegistrar {
         'timeout': 300000,
       };
 
-  /// Assert against [publicKey] with the PRF evaluated, keep the seed, and return the credential
-  /// with the PRF output removed.
+  /// Assert against [publicKey] and return the credential, with any PRF output removed.
+  ///
+  /// The PRF is evaluated only while a [seedDuring] is waiting for one, and its output goes to
+  /// that capture. Any other assertion does not ask for it, so there is nothing to keep.
   Future<Map<String, dynamic>> _get(Map<String, dynamic> publicKey, {bool immediate = false}) async {
+    final capture = _capture;
+    final wantSeed = capture != null && !capture.filled;
     final options = Map<String, dynamic>.from(publicKey);
-    options['extensions'] = {
-      ...?(options['extensions'] as Map?)?.cast<String, dynamic>(),
-      'prf': {
-        'eval': {'first': _b64u(_prfSalt)},
-      },
-    };
+    if (wantSeed) {
+      options['extensions'] = {
+        ...?(options['extensions'] as Map?)?.cast<String, dynamic>(),
+        'prf': {
+          'eval': {'first': _b64u(_prfSalt)},
+        },
+      };
+    }
     final credential =
         jsonDecode(await PasskeyChannel.get(jsonEncode(options), immediate: immediate)) as Map<String, dynamic>;
-    _seed = _extractPrf(credential);
-    _seedExpiry = DateTime.now().add(_seedTtl);
-    _stripPrf(credential);
+    try {
+      // Still the capture that asked: one that gave up while the prompt was showing gets nothing.
+      if (wantSeed && identical(_capture, capture)) capture.fill(_extractPrf(credential));
+    } finally {
+      _stripPrf(credential);
+    }
     return credential;
   }
 
-  /// A seed without asking the enclave for anything: an assertion over a challenge made here, which
-  /// goes nowhere. Only when no recent approval left one behind.
-  Future<Uint8List> _deriveSeed() {
-    final cached = _seed;
-    if (cached != null && _seedExpiry != null && DateTime.now().isBefore(_seedExpiry!)) {
-      return Future.value(cached);
+  /// The seed for one operation, taken from the gesture that approves it.
+  ///
+  /// [approve] is the gate minting the operation's token, which asserts — and that assertion, made
+  /// while the capture is armed, evaluates the PRF. If [approve] asserted nothing (no gate in
+  /// front of this cosigner), one local assertion that goes nowhere asks for the seed by itself.
+  ///
+  /// One at a time: `MpcClient` serializes the operations that sign, and a second capture while
+  /// one is armed would be two callers expecting the same gesture's output.
+  Future<Uint8List> _seedDuring(Future<void> Function() approve) async {
+    if (_capture != null) {
+      throw StateError('a seed is already being taken for another operation');
     }
-    return _inflight ??= () async {
-      try {
-        await _get(_localRequest());
-        return _seed!;
-      } finally {
-        _inflight = null;
-      }
-    }();
+    final capture = _capture = _SeedCapture();
+    try {
+      await approve();
+      if (!capture.filled) await _get(_localRequest());
+      return capture.take();
+    } finally {
+      _capture = null;
+      // Whatever was captured and not taken — the approval succeeded and something after it threw.
+      capture.discard();
+    }
   }
 
   /// `clientExtensionResults.prf.results.first`, base64url, 32 bytes.
@@ -265,8 +283,9 @@ class PlatformPasskey implements Authenticator, PasskeyRegistrar {
     return Uint8List.fromList(seed);
   }
 
-  /// The PRF output is the secret that unblinds the share. It must never be sent anywhere; the
-  /// assertion's signature covers authenticator data and the client data hash, not this.
+  /// The PRF output is the secret the wallet's key is derived from. It must never be sent
+  /// anywhere; the assertion's signature covers authenticator data and the client data hash, not
+  /// this.
   static void _stripPrf(Map<String, dynamic> credential) {
     for (final key in ['clientExtensionResults', 'extensions']) {
       final results = credential[key];
@@ -278,10 +297,32 @@ class PlatformPasskey implements Authenticator, PasskeyRegistrar {
   static String _b64u(List<int> bytes) => base64Url.encode(bytes).replaceAll('=', '');
 }
 
+/// One seed on its way from an assertion to the operation that asked for it.
+class _SeedCapture {
+  Uint8List? _seed;
+
+  bool get filled => _seed != null;
+
+  void fill(Uint8List seed) => _seed = seed;
+
+  /// The seed, handed over: this holds it no longer, and the caller overwrites it when done.
+  Uint8List take() {
+    final seed = _seed;
+    if (seed == null) throw StateError('the passkey returned no seed');
+    _seed = null;
+    return seed;
+  }
+
+  void discard() {
+    _seed?.fillRange(0, 32, 0);
+    _seed = null;
+  }
+}
+
 class _PrfSeedSource implements SeedSource {
   _PrfSeedSource(this._passkey);
   final PlatformPasskey _passkey;
 
   @override
-  Future<Uint8List> deriveSeed() => _passkey._deriveSeed();
+  Future<Uint8List> seedDuring(Future<void> Function() approve) => _passkey._seedDuring(approve);
 }

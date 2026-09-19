@@ -28,7 +28,7 @@ use wstd::http::{Body, Request, Response};
 
 use crate::cosigner::Cosigner;
 use crate::grpc::{self, Duplex, SessionBody, Status};
-use crate::types::{SignStep1, SignStep2};
+use crate::handlers::recover::dealt_share_for;
 use crate::wallet_proto as wp;
 
 pub mod proto {
@@ -261,6 +261,16 @@ fn lock(cosigner: &Arc<Mutex<Cosigner>>) -> MutexGuard<'_, Cosigner> {
 // The ceremonies
 // ===============================================================================================
 
+/// One signature, as one in-band round.
+///
+/// The wallet used to commit first, in `SignOpen`. It cannot: its nonce is hedged with its share,
+/// and it holds no share until this stream's first answer brings the half the cosigner dealt it.
+/// So this is the round `Send` and `Settle` already run — the cosigner commits first, the wallet
+/// answers with its commitments and its share together — over a single message.
+///
+/// Script-path only, like every in-band round: the cosigner signs untweaked and `aggregate` checks
+/// each share, so a key-path share could never have aggregated here. It is refused by name rather
+/// than left to fail as a bad share.
 async fn sign(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<SignClientMsg, SignServerMsg>,
@@ -275,56 +285,80 @@ async fn sign(
     // Authenticated before it got here: the runtime approved this stream with a passkey assertion,
     // once, at open, and `route` refuses anything that arrives without the tenant it resolved.
 
-    let step1 = SignStep1 {
-        hiding_commitment: open.hiding_commitment,
-        binding_commitment: open.binding_commitment,
-        message_to_sign: open.message_to_sign,
-        full_transaction: open.full_transaction,
-        script_path_spend: open.script_path_spend,
-        ark_tx: Vec::new(),
-    };
+    if !open.script_path_spend {
+        return Err(Status::invalid_argument(
+            "Sign is script-path only: the cosigner signs untweaked, so a key-path share cannot \
+             aggregate",
+        ));
+    }
 
-    // The ceremony is OURS, as an ordinary local. The actor never held it, and the lock is released
-    // before we wait on the client — a slow client blocks nobody.
-    let (ceremony, opened) = lock(&cosigner).sign_open(step1).map_err(Status::internal)?;
+    // NOTHING ABOUT THE MESSAGE IS CHECKED HERE. The contract gate that once stood between an
+    // authorized caller and a signature over arbitrary bytes went with the contract layer; the
+    // policy IR is what has to take its place before this is exposed for real signing.
+    // `full_transaction` is what that policy will read, and is why it still travels.
 
+    // The wallet's half of its own share, before any nonce exists: a caller that is not this
+    // wallet is refused with nothing to abandon.
+    let dealt = dealt_share_for(&lock(&cosigner), &open.identifier)?;
+
+    // The round is OURS, as an ordinary local. The lock is released before we wait on the client —
+    // a slow client blocks nobody.
+    let messages = vec![open.message_to_sign.clone()];
+    let (round, commitments) = lock(&cosigner)
+        .sign_in_band_begin(&messages)
+        .map_err(Status::internal)?;
+
+    tracing::info!("Sign: returned the dealt share to the wallet's own identifier");
     duplex.send(SignServerMsg {
         session_id: session_id.clone(),
         seq: 1,
         body: Some(sign_server_msg::Body::Commitments(SignCommitments {
-            commitments: opened
-                .commitments
+            commitments: commitments
                 .into_iter()
                 .map(|c| (c.identifier_hex, Commitment { hiding: c.hiding, binding: c.binding }))
                 .collect(),
-            message_to_sign: opened.message_to_sign,
+            message_to_sign: open.message_to_sign,
+            wallet_dealt_share: dealt,
         })),
     });
 
-    // --- Round 2: the client's share ------------------------------------------------------
+    // --- Round 2: the wallet's commitments and share ----------------------------------------
     //
-    // If the client never sends it, or the stream dies here, `ceremony` drops with this task and
-    // the nonce is gone. That is the safe failure: an abandoned round leaves nothing reusable.
+    // If the client never sends it, or the stream dies here, `round` drops with this task and the
+    // nonce is gone. That is the safe failure: an abandoned round leaves nothing reusable.
     let second = duplex.expect("the share arrived").await?;
     let share = match second.body {
         Some(sign_client_msg::Body::Share(s)) => s,
         _ => return Err(Status::invalid_argument("expected SignShare")),
     };
 
-    let step2 = SignStep2 {
-        signature_share: share.signature_share,
-    };
+    // A bad share is the caller's fault, and is reported as such rather than as ours.
+    let signature = lock(&cosigner)
+        .sign_in_band_finish(
+            round,
+            vec![crate::cosigner::WalletHalf {
+                hiding: share.hiding_commitment,
+                binding: share.binding_commitment,
+                share: share.signature_share,
+            }],
+        )
+        .map_err(Status::invalid_argument)?
+        .pop()
+        .ok_or_else(|| Status::internal("the round produced no signature"))?;
+    if signature.len() != 64 {
+        return Err(Status::internal("the round produced a signature that is not 64 bytes"));
+    }
 
-    let done = lock(&cosigner)
-        .sign_finish(ceremony, step2)
-        .map_err(Status::internal)?;
-
+    // BIP-340: `R.x ‖ z`, and `aggregate` normalizes R to even Y — so the compressed point the
+    // wallet verifies against is that x under an even prefix.
+    let mut r_point = vec![0x02];
+    r_point.extend_from_slice(&signature[..32]);
     duplex.send(SignServerMsg {
         session_id,
         seq: 2,
         body: Some(sign_server_msg::Body::Complete(SignComplete {
-            r_point: done.r_point,
-            z_scalar: done.z_scalar,
+            r_point,
+            z_scalar: signature[32..].to_vec(),
         })),
     });
     Ok(())
@@ -447,6 +481,10 @@ async fn send(
     };
     // Authenticated by the runtime at open — see `sign` above.
 
+    // The wallet's half of its own share, before anything is built — see `dealt_share_for`. It
+    // rides the first sighashes and nothing after: the trailing seal reuses what the wallet rebuilt.
+    let dealt = dealt_share_for(&lock(&cosigner), &open.identifier)?;
+
     let info = open
         .ark_info
         .map(ark_info_from_proto)
@@ -473,11 +511,12 @@ async fn send(
     duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
         seq: 1,
-        body: Some(proto::send_server_msg::Body::Sighashes(sighashes_msg(
-            sighashes,
-            commitments,
-        ))),
+        body: Some(proto::send_server_msg::Body::Sighashes(proto::SendSighashes {
+            wallet_dealt_share: dealt,
+            ..sighashes_msg(sighashes, commitments)
+        })),
     });
+    tracing::info!("Send: returned the dealt share to the wallet's own identifier");
 
     // --- The wallet's half of the round, then what it must submit --------------------------
     let signed = match next_body(&duplex, "mid-send").await? {
@@ -609,6 +648,12 @@ async fn settle(
     };
     // Authenticated by the runtime at open — see `sign` above.
 
+    // The wallet's half of its own share — see `dealt_share_for`. Taken by the FIRST sighashes this
+    // stream sends, whichever path sends them, and gone after: a settle signs two or three rounds
+    // and the wallet rebuilds its share once.
+    let mut dealt = Some(dealt_share_for(&lock(&cosigner), &open.identifier)?);
+    tracing::info!("Settle: returning the dealt share to the wallet's own identifier");
+
     let info = open
         .ark_info
         .map(ark_info_from_proto)
@@ -621,7 +666,7 @@ async fn settle(
             device_token: open.device_token,
             exit_script_pubkey: open.exit_script_pubkey,
         };
-        return settle_seal(&cosigner, &duplex, seal, &session_id, 1).await;
+        return settle_seal(&cosigner, &duplex, seal, &session_id, 1, dealt.take()).await;
     }
     let boarding_utxo = open.boarding_utxo.map(|u| (u.txid, u.vout, u.amount_sats));
     let vtxos = vtxos_from_proto(open.vtxos);
@@ -650,10 +695,10 @@ async fn settle(
                     .sign_in_band_begin(&messages_to_sign)
                     .map_err(Status::internal)?;
                 pending_round = Some(round);
-                Some(proto::settle_server_msg::Body::Sighashes(settle_sighashes_msg(
-                    messages_to_sign,
-                    commitments,
-                )))
+                Some(proto::settle_server_msg::Body::Sighashes(proto::SettleSighashes {
+                    wallet_dealt_share: dealt.take().unwrap_or_default(),
+                    ..settle_sighashes_msg(messages_to_sign, commitments)
+                }))
             }
             SettleStep::Register { proof, message, topics } => Some(
                 proto::settle_server_msg::Body::Register(proto::RegisterIntent {
@@ -695,7 +740,8 @@ async fn settle(
                             ))
                         }
                     };
-                    settle_seal(&cosigner, &duplex, seal, &session_id, seq + 1).await?;
+                    // No share with it: the settle's first round already carried one.
+                    settle_seal(&cosigner, &duplex, seal, &session_id, seq + 1, None).await?;
                 }
                 return Ok(());
             }
@@ -811,6 +857,7 @@ fn sighashes_msg(
         cosigner_identifier: cosigner_identifier(&commitments),
         cosigner_commitments: wire_commitments(commitments),
         exit_messages: Vec::new(),
+        wallet_dealt_share: Vec::new(),
     }
 }
 
@@ -824,6 +871,7 @@ fn settle_sighashes_msg(
         cosigner_identifier: cosigner_identifier(&commitments),
         cosigner_commitments: wire_commitments(commitments),
         exit_messages: Vec::new(),
+        wallet_dealt_share: Vec::new(),
     }
 }
 
@@ -921,17 +969,22 @@ fn enrol_device(cosigner: &Arc<Mutex<Cosigner>>, token: &str) -> bool {
 }
 
 /// The seal exchange on a `Settle` stream: sighashes out, signatures in, sealed out.
+///
+/// [dealt_share] is the wallet's half of its share when this seal is the stream's first round — a
+/// `seal_only` open — and `None` when a settle ran before it and already handed it over.
 async fn settle_seal(
     cosigner: &Arc<Mutex<Cosigner>>,
     duplex: &Duplex<proto::SettleClientMsg, proto::SettleServerMsg>,
     mut seal: proto::SealDelegate,
     session_id: &str,
     seq: u64,
+    dealt_share: Option<Vec<u8>>,
 ) -> Result<(), Status> {
     let device_token = std::mem::take(&mut seal.device_token);
     let seal_round = seal_open(cosigner, seal)?;
     let mut sighashes = settle_sighashes_msg(seal_round.delegate_sighashes, seal_round.commitments);
     sighashes.exit_messages = seal_round.exit_sighashes;
+    sighashes.wallet_dealt_share = dealt_share.unwrap_or_default();
     duplex.send(proto::SettleServerMsg {
         session_id: session_id.to_string(),
         seq,

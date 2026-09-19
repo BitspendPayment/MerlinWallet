@@ -18,6 +18,7 @@ import 'package:protocol/protocol.dart' as pb;
 
 import '../asp/asp_client.dart';
 import '../cosigner/connection.dart';
+import '../passkey/operation_secrets.dart';
 import 'in_band_round.dart';
 import 'delegate.dart';
 import '../threshold_types.dart' as threshold;
@@ -50,13 +51,19 @@ class SendSession {
     required int amountSats,
     required List<IndexerVtxo> vtxos,
     required ArkInfo info,
-    required threshold.KeyPackage keyPkg,
+    required List<int> identifier,
+    required KeyResolver resolve,
     required threshold.PublicKeyPackage groupPubKey,
+    CancelSignal? cancel,
     Future<List<IndexerVtxo>> Function()? readHeld,
     String deviceToken = '',
     String exitScriptPubkeyHex = '',
     String ownerXOnlyHex = '',
   }) async {
+    // Every wait on the ASP or the indexer goes through this: the share is a local of this frame
+    // from the first sighashes on, and a cancel has to be able to unwind it — see `CancelSignal`.
+    Future<T> guarded<T>(Future<T> work) => cancel?.guard(work) ?? work;
+
     final duplex = _conn.openSend();
     try {
       duplex.send(cs.SendClientMsg(
@@ -67,6 +74,7 @@ class SendSession {
           amount: Int64(amountSats),
           arkInfo: arkInfoToProto(info),
           vtxos: vtxosToProto(vtxos),
+          identifier: identifier,
         ),
       ));
 
@@ -79,6 +87,9 @@ class SendSession {
         throw CosignerException('expected the sighashes, got ${sighashes.whichBody()}');
       }
       final h = sighashes.sighashes;
+      // The first sighashes of the stream: they bring the half of the share the cosigner dealt,
+      // and this is where the share comes to exist. The trailing seal reuses it.
+      final keyPkg = resolve(h.walletDealtShare);
       duplex.send(cs.SendClientMsg(
         sessionId: '',
         seq: Int64(1),
@@ -99,10 +110,10 @@ class SendSession {
       if (!submit.hasSubmit()) {
         throw CosignerException('expected what to submit, got ${submit.whichBody()}');
       }
-      final submitted = await _asp.submitTx(
+      final submitted = await guarded(_asp.submitTx(
         submit.submit.arkTxB64,
         submit.submit.checkpointTxs,
-      );
+      ));
       duplex.send(cs.SendClientMsg(
         sessionId: '',
         seq: Int64(2),
@@ -117,10 +128,10 @@ class SendSession {
       if (!finalize.hasFinalize()) {
         throw CosignerException('expected what to finalize, got ${finalize.whichBody()}');
       }
-      await _asp.finalizeTx(
+      await guarded(_asp.finalizeTx(
         finalize.finalize.arkTxid,
         finalize.finalize.finalCheckpointTxs,
-      );
+      ));
       duplex.send(cs.SendClientMsg(
         sessionId: '',
         seq: Int64(3),
@@ -140,9 +151,10 @@ class SendSession {
               duplex: duplex,
               // A send spends every input it was given; what remains is its change, and whatever
               // arrived meanwhile.
-              held: heldOnceIndexed(readHeld, gone: {for (final v in vtxos) '${v.txid}:${v.vout}'}),
+              held: guarded(
+                  heldOnceIndexed(readHeld, gone: {for (final v in vtxos) '${v.txid}:${v.vout}'})),
               info: info,
-              keyPkg: keyPkg,
+              resolve: resolve,
               groupPubKey: groupPubKey,
               seal: (s) => cs.SendClientMsg(sessionId: '', seq: Int64(4), seal: s),
               deviceToken: deviceToken,
@@ -155,6 +167,7 @@ class SendSession {
                       commitments: r.sighashes.cosignerCommitments,
                       identifier: r.sighashes.cosignerIdentifier,
                       scriptPathSpend: r.sighashes.scriptPathSpend,
+                      dealtShare: r.sighashes.walletDealtShare,
                     )
                   : null,
               signed: (rounds) =>

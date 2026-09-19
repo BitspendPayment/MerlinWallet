@@ -22,6 +22,7 @@ import 'package:protocol/cosigner_v1.dart' as cs;
 
 import '../asp/asp_client.dart';
 import '../cosigner/connection.dart';
+import '../passkey/operation_secrets.dart';
 import '../threshold_types.dart' as threshold;
 import 'in_band_round.dart';
 import 'send_session.dart';
@@ -62,7 +63,8 @@ class SettleSession {
   /// now. For funds that arrived by a receive; a send or a settle seals on its way out.
   Future<DelegateStatus> seal({
     required ArkInfo info,
-    required threshold.KeyPackage keyPkg,
+    required List<int> identifier,
+    required KeyResolver resolve,
     required threshold.PublicKeyPackage groupPubKey,
     required List<IndexerVtxo> vtxos,
     String deviceToken = '',
@@ -80,11 +82,12 @@ class SettleSession {
           sealOnly: true,
           deviceToken: deviceToken,
           exitScriptPubkey: hexBytes(exitScriptPubkeyHex),
+          identifier: identifier,
         ),
       ));
       return await answerSeal<cs.SettleClientMsg, cs.SettleServerMsg>(
         duplex: duplex,
-        keyPkg: keyPkg,
+        resolve: resolve,
         groupPubKey: groupPubKey,
         sighashesOf: _sighashesOf,
         signed: (rounds) =>
@@ -110,6 +113,7 @@ class SettleSession {
     List<cs.Commitment> commitments,
     String identifier,
     bool scriptPathSpend,
+    List<int> dealtShare,
   })? _sighashesOf(cs.SettleServerMsg r) => r.hasSighashes()
       ? (
           sighashes: r.sighashes.messagesToSign,
@@ -117,16 +121,19 @@ class SettleSession {
           commitments: r.sighashes.cosignerCommitments,
           identifier: r.sighashes.cosignerIdentifier,
           scriptPathSpend: r.sighashes.scriptPathSpend,
+          dealtShare: r.sighashes.walletDealtShare,
         )
       : null;
 
   /// Settle. Returns when the batch finalizes.
   Future<SettleResult> settle({
     required ArkInfo info,
-    required threshold.KeyPackage keyPkg,
+    required List<int> identifier,
+    required KeyResolver resolve,
     required threshold.PublicKeyPackage groupPubKey,
     cs.BoardingUtxo? boardingUtxo,
     List<IndexerVtxo> vtxos = const [],
+    CancelSignal? cancel,
     void Function(SettlePhase)? onProgress,
     Future<List<IndexerVtxo>> Function()? readHeld,
     String deviceToken = '',
@@ -139,6 +146,12 @@ class SettleSession {
 
     void report(SettlePhase p) => onProgress?.call(p);
 
+    // Most of a settle is waiting on the ASP — its batch schedule is minutes — and from the intent
+    // proof on, this operation is holding the wallet's share while it waits. Closing the cosigner's
+    // stream interrupts none of that, so every ASP and indexer wait goes through this: see
+    // `CancelSignal`. An ASP that goes quiet must not be able to keep a share in memory.
+    Future<T> guarded<T>(Future<T> work) => cancel?.guard(work) ?? work;
+
     try {
       report(SettlePhase.registering);
       duplex.send(cs.SettleClientMsg(
@@ -148,6 +161,7 @@ class SettleSession {
           boardingUtxo: boardingUtxo,
           arkInfo: arkInfoToProto(info),
           vtxos: vtxosToProto(vtxos),
+          identifier: identifier,
         ),
       ));
 
@@ -160,6 +174,9 @@ class SettleSession {
           // is holding. See `in_band_round.dart`.
           case cs.SettleServerMsg_Body.sighashes:
             final h = msg.sighashes;
+            // The first of these brings the half of the share the cosigner dealt, and the share
+            // is rebuilt then. The later ones bring nothing and sign with the same one.
+            final keyPkg = resolve(h.walletDealtShare);
             duplex.send(cs.SettleClientMsg(
               sessionId: '',
               seq: Int64(seq++),
@@ -179,10 +196,10 @@ class SettleSession {
           // proof. Subscribe BEFORE replying: a `StreamQueue` buffers from the moment it opens, so
           // everything after this point is captured even while the cosigner is still thinking.
           case cs.SettleServerMsg_Body.register:
-            final intentId = await _asp.registerIntent(
+            final intentId = await guarded(_asp.registerIntent(
               msg.register.proof,
               msg.register.message,
-            );
+            ));
             events = StreamQueue(_asp.getEventStream(msg.register.topics));
             report(SettlePhase.waitingForBatch);
             duplex.send(cs.SettleClientMsg(
@@ -193,12 +210,12 @@ class SettleSession {
 
           // One ASP call on the cosigner's behalf, then the next event.
           case cs.SettleServerMsg_Body.submit:
-            await _submit(msg.submit, report);
-            duplex.send(await _relayNext(events, seq++));
+            await guarded(_submit(msg.submit, report));
+            duplex.send(await guarded(_relayNext(events, seq++)));
 
           // The event produced nothing. Relay the next one.
           case cs.SettleServerMsg_Body.idle:
-            duplex.send(await _relayNext(events, seq++));
+            duplex.send(await guarded(_relayNext(events, seq++)));
 
           case cs.SettleServerMsg_Body.complete:
             // The round is over; stop listening to the ASP before waiting on the indexer.
@@ -211,7 +228,7 @@ class SettleSession {
                 ? null
                 : await sealAfter<cs.SettleClientMsg, cs.SettleServerMsg>(
                     duplex: duplex,
-                    held: heldOnceIndexed(
+                    held: guarded(heldOnceIndexed(
                       readHeld,
                       // A batch round's output reaches the indexer later than a send's change, and
                       // giving up early is what used to leave a refreshed wallet un-armed — the
@@ -223,9 +240,9 @@ class SettleSession {
                       arrived: boardingUtxo == null || c.vtxoTxid.isEmpty
                           ? null
                           : '${c.vtxoTxid}:${c.vtxoVout}',
-                    ),
+                    )),
                     info: info,
-                    keyPkg: keyPkg,
+                    resolve: resolve,
                     groupPubKey: groupPubKey,
                     seal: (s) => cs.SettleClientMsg(sessionId: '', seq: Int64(seq++), seal: s),
                     deviceToken: deviceToken,

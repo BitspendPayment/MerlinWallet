@@ -223,10 +223,20 @@ class EnclaveHarness {
 
   /// Hive, once per process, under a directory this run owns.
   ///
-  /// Wallet state is the client's half of the key — the FROST share, the policy, the on-chain
+  /// Wallet state is public — who the wallet is, its delegate, its exits; no share, no dealer
   /// secret — and it is per test run, not per enclave: a fresh directory each time is what stops
-  /// one run's share being reused against another run's tenant, whose seal knows nothing about it.
+  /// one run's wallet being opened against another run's tenant, whose seal knows nothing about it.
   static Directory? _hiveDir;
+
+  /// The file [wallet]'s client state is appended to. For a test that wants to read what is
+  /// actually on disk, not what the client says it wrote.
+  File stateFileOf(Wallet wallet, {bool secondDevice = false}) {
+    final dir = _hiveDir;
+    if (dir == null) throw StateError('no wallet has been opened yet');
+    final id = secondDevice ? 'e2e_${wallet.name}_device2_$runId' : 'e2e_${wallet.name}_$runId';
+    return File('${dir.path}/mpc_client/${id.toLowerCase()}.hive');
+  }
+
   static Future<void> _initPersistence() async {
     if (_hiveDir != null) return;
     final dir = Directory.systemTemp.createTempSync('merlin_e2e_');

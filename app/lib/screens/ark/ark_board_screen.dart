@@ -348,6 +348,17 @@ class _ArkBoardScreenState extends State<ArkBoardScreen> {
             textAlign: TextAlign.center,
             style: GoogleFonts.inter(color: Colors.white54, fontSize: 14),
           ),
+          const SizedBox(height: 32),
+          // A batch round is minutes, and only the owner can tell a slow one from an ASP that has
+          // gone. Stopping fails the boarding where it stands: the deposit stays at its boarding
+          // address to be boarded again, and the key rebuilt for this is let go.
+          TextButton(
+            onPressed: () => context.read<MpcService>().cancelOperation(),
+            child: Text(
+              'Stop waiting',
+              style: GoogleFonts.inter(color: Colors.white54, fontSize: 14),
+            ),
+          ),
         ],
       ),
     );

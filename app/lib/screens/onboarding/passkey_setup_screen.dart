@@ -9,8 +9,8 @@ import '../../services/mpc_service.dart';
 ///
 /// Not skippable, and before DKG rather than after: the enclave approves every request to the
 /// cosigner with a passkey assertion, so without one there is no cosigner to generate a key with.
-/// The same passkey's PRF output then blinds the FROST share as DKG finalizes it, so every payment
-/// needs a gesture. [MpcService.enablePasskey] keeps an already-registered passkey, so retrying is
+/// The same passkey's PRF output is what the wallet's half of its key is derived from — at DKG, and
+/// again for every payment, since no share is kept — so every payment needs a gesture. [MpcService.enablePasskey] keeps an already-registered passkey, so retrying is
 /// safe.
 class PasskeySetupScreen extends StatefulWidget {
   const PasskeySetupScreen({super.key});

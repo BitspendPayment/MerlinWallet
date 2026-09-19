@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dart:math' show Random;
 import 'dart:typed_data';
 
-import 'package:app_core/policy.dart';
 import 'package:app_core/ark/ark.dart' as ark_addr;
 import 'package:app_core/ark/exit.dart' as ark_exit;
 import 'package:app_core/asp/asp_client.dart';
@@ -19,9 +18,10 @@ import 'package:app_core/sessions/delegate.dart';
 import 'package:app_core/sessions/exit_plan.dart' show ExitTx;
 import 'package:app_core/requests/authorship.dart';
 import 'package:app_core/threshold/frost/ceremony.dart' show schnorr64;
-import 'package:app_core/passkey/key_derivation.dart';
 import 'package:app_core/passkey/seed_source.dart';
-import 'package:app_core/pin_blinding.dart';
+import 'package:app_core/passkey/operation_secrets.dart';
+import 'package:app_core/passkey/share_reconstruction.dart';
+import 'package:app_core/passkey/wallet_public_state.dart';
 import 'package:protocol/cosigner_v1.dart' as cs;
 import 'package:app_core/threshold/core/dkg.dart';
 import 'package:app_core/threshold/threshold.dart' as threshold;
@@ -31,6 +31,7 @@ import 'package:protocol/protocol.dart' hide ArkInfo;
 import 'package:fixnum/fixnum.dart';
 import 'package:protobuf/protobuf.dart' show GeneratedMessageGenericExtensions;
 import 'package:hive/hive.dart';
+import 'package:synchronized/synchronized.dart';
 import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:convert/convert.dart';
@@ -57,7 +58,7 @@ class MpcClient {
   /// The FROST group x-only public key (64 hex chars).
   /// This is the owner key for Ark VTXOs — NOT the same as userId.
   String? get groupXOnlyPubKey {
-    final pkp = _normalPolicy?.publicKeyPackage;
+    final pkp = _wallet?.publicKeyPackage;
     if (pkp == null) return null;
     final compressed = threshold.elemSerializeCompressed(pkp.verifyingKey.E);
     final compressedHex = hex.encode(compressed);
@@ -68,7 +69,7 @@ class MpcClient {
   /// The FROST group verifying key, COMPRESSED (66 hex) — the wallet's public IDENTITY. Neither
   /// [userId] (a share key) nor [groupXOnlyPubKey] (same key, parity stripped, for taproot).
   String? get groupKeyHex {
-    final pkp = _normalPolicy?.publicKeyPackage;
+    final pkp = _wallet?.publicKeyPackage;
     if (pkp == null) return null;
     return hex.encode(threshold.elemSerializeCompressed(pkp.verifyingKey.E));
   }
@@ -81,41 +82,23 @@ class MpcClient {
   final int _maxSigners;
   final int _minSigners;
 
-  /// PIN/passkey-PRF share gating. When a [SeedSource] is configured the wallet's FROST share is
-  /// stored BLINDED (δ = share − b(seed)) inside `_normalPolicy.keyPackage.secretShare`; the raw
-  /// share is never persisted and is reconstructed transiently only for an ARK sign / contract
-  /// op (see [_walletKeyPackage]). Nothing else needs the share: requests are approved by the enclave's
-  /// passkey gate, not by anything the share signs.
+  /// Where the wallet's seed comes from: the passkey's PRF in the app, a stand-in in tests.
+  ///
+  /// Every operation that signs asks it for the seed around its own approval, turns the seed into
+  /// the wallet's polynomial, adds the half of the share the cosigner returns on the stream, and
+  /// lets all of it go when the operation ends — see [_withOperation]. Nothing else needs a
+  /// secret: requests are approved by the enclave's passkey gate, not by anything a share signs.
   SeedSource? _seedSource;
 
-  /// Whether the stored share is blinded (a persistent property set at DKG time; loaded from state).
-  /// Kept separate from [_seedSource] so persist/load/sign agree even before a seed source is wired.
-  bool _shareBlinded = false;
-
-  /// Whether the persisted share is blinded — i.e. a passkey/PIN was provisioned
-  /// and a seed source must be wired before any ARK sign. Used on cold-start
-  /// restore to decide whether to re-attach the passkey seed/token sources.
-  bool get isShareGated => _shareBlinded;
-
-  /// Wire the blinding seed source (passkey PRF in production; a fixed seed in tests). Set before
-  /// DKG to create a gated wallet, and before signing to unlock ARK ops. Never wired ⇒ legacy
-  /// un-gated behavior.
+  /// Wire the seed source. Before DKG to create a wallet, before recovery to rebuild one, and
+  /// before anything that signs.
   void setSeedSource(SeedSource source) => _seedSource = source;
 
-  /// The wallet's DKG dealer secret — the polynomial constant term that
-  /// generated this wallet's share. It is a SINGLE secp256k1 key the wallet
-  /// controls alone (its public point is the DKG `walletVk`), distinct from the
-  /// threshold share. It is the wallet's on-chain ("utxo") signing key: on-chain
-  /// receive/spend/broadcast happen wallet-alone with NO cosigner. The FROST
-  /// group key stays the Ark owner key (boarding + VTXO).
-  threshold.SecretKey? _onchainSecret;
-
-  /// 32-byte on-chain secret, or null before DKG/restore.
-  Uint8List? get onchainSecretBytes => _onchainSecret == null
-      ? null
-      : Uint8List.fromList(threshold.bigIntToBytes(_onchainSecret!.scalar));
-
-  SpendingPolicy? _normalPolicy;
+  /// Everything this device keeps about the wallet's key, all of it public. Null before DKG,
+  /// recovery or restore. **There is no private counterpart**: no share, no blinded share, no
+  /// dealer secret is held between operations or written anywhere — see
+  /// `passkey/wallet_public_state.dart`.
+  WalletPublicState? _wallet;
 
   /// A wallet whose cosigner runs inside an enclave, reached through [gate].
   ///
@@ -124,8 +107,9 @@ class MpcClient {
   ///
   /// The ASP is a separate party and takes none of that: it is arkd, reached directly.
   ///
-  /// [storageId] names the Hive box the wallet's half of the key lives in; [encryptionCipher]
-  /// encrypts it (`HiveAesCipher`), and without one it is stored in the clear.
+  /// [storageId] names the Hive box the wallet's public state lives in; [encryptionCipher]
+  /// encrypts it (`HiveAesCipher`), and without one it is stored in the clear. Nothing in it is
+  /// key material either way.
   MpcClient.enclave({
     required EnclaveGate gate,
     required String aspHost,
@@ -147,6 +131,10 @@ class MpcClient {
         );
 
   /// A wallet over a cosigner connection built some other way.
+  ///
+  /// [asp] replaces the ASP dialled at [aspHost]:[aspPort] with one the caller built — for a test
+  /// that needs an ASP to misbehave in a way a real one will not on request, such as going quiet
+  /// in the middle of a batch.
   MpcClient.withConnection(
     CosignerConnection connection, {
     required String aspHost,
@@ -156,8 +144,9 @@ class MpcClient {
     int minSigners = 2,
     String? storageId,
     HiveCipher? encryptionCipher,
+    AspClient? asp,
   })  : _conn = connection,
-        _asp = AspClient.connect(aspHost, aspPort, secure: aspSecure),
+        _asp = asp ?? AspClient.connect(aspHost, aspPort, secure: aspSecure),
         _maxSigners = maxSigners,
         _minSigners = minSigners {
     _store = WalletStore(
@@ -205,49 +194,25 @@ class MpcClient {
   }
 
   // Real 2-of-2: a completed DKG yields the normal policy; there is no recovery policy.
-  bool get isInitialized => _normalPolicy != null;
+  bool get isInitialized => _wallet != null;
 
   /// Restores client state from persistence.
   /// [debugState] can be provided to inject state for testing (bypassing store).
   /// Returns true if state was found and restored.
+  ///
+  /// Throws [IncompatibleWalletStateException] when this device holds state from before shares
+  /// were rebuilt per operation. It is neither read nor replaced: see [resetLocalState].
   Future<bool> restoreState({Map<String, dynamic>? debugState}) async {
-    // Ensure persistence is initialized (via initPersistence or just ensure path)
-    // WalletStore relies on Hive.init being called previously.
-    // If not called, assume default? We rely on user calling initPersistence.
+    // WalletStore relies on Hive.init being called previously — see [initPersistence].
     await _store.init();
 
-    Map<String, dynamic>? state;
-    if (debugState != null) {
-      state = debugState;
-    } else {
-      state = await _store.getClientState();
-    }
-
+    final state =
+        debugState != null ? validateClientState(debugState) : await _store.getClientState();
     if (state == null) return false;
 
-    final storedUserId = state['userId'];
-    if (storedUserId is! String || storedUserId.isEmpty) {
-      return false;
-    }
-    _userId = hex.decode(storedUserId);
-
-    // `signingSecret` may still be in an older state, and is ignored. It was a second plaintext copy
-    // of the wallet's share, kept only to sign request authentication the cosigner no longer reads.
-    // Gated wallet: `_normalPolicy.keyPackage.secretShare` holds δ; reconstruct at sign time.
-    _shareBlinded = state['shareBlinded'] == true;
-
-    // Restore the single-key on-chain secret (the DKG dealer secret).
-    if (state['onchainSecret'] != null) {
-      final secretBytes =
-          Uint8List.fromList(hex.decode(state['onchainSecret'] as String));
-      _onchainSecret =
-          threshold.SecretKey(threshold.bytesToBigInt(secretBytes));
-    }
-
-    if (state['spendingPolicies'] != null) {
-      _normalPolicy = SpendingPolicy.fromJson(
-          Map<String, dynamic>.from(state['spendingPolicies']));
-    }
+    _userId = hex.decode(state['userId'] as String);
+    final wallet = state['wallet'];
+    _wallet = wallet is Map ? WalletPublicState.fromJson(Map<String, dynamic>.from(wallet)) : null;
 
     final delegate = state['delegate'];
     _delegate =
@@ -258,28 +223,227 @@ class MpcClient {
     return true;
   }
 
+  /// Everything persisted, and all of it public. `WalletStore.saveClientState` refuses a map that
+  /// holds a share by any of the names one has had, so this cannot regress quietly.
   Future<void> _saveState() async {
     final state = <String, dynamic>{
+      'stateVersion': walletStateVersion,
       'userId': hex.encode(_userId!),
     };
-    if (_onchainSecret != null) {
-      state['onchainSecret'] =
-          hex.encode(threshold.bigIntToBytes(_onchainSecret!.scalar));
-    }
-    if (_normalPolicy != null) {
-      // When gating is on, `_normalPolicy.keyPackage.secretShare` already holds δ (the raw share is
-      // never persisted); `shareBlinded` tells restore to reconstruct at sign time, not load time.
-      state['spendingPolicies'] = _normalPolicy!.toJson();
-    }
-    state['shareBlinded'] = _shareBlinded;
+    if (_wallet != null) state['wallet'] = _wallet!.toJson();
     if (_delegate != null) state['delegate'] = _delegate!.toJson();
     if (_exitScriptPubkeyHex != null) state['exitScriptPubkey'] = _exitScriptPubkeyHex;
     await _store.saveClientState(state);
   }
 
-  // Getters for testing
-  threshold.KeyPackage? get keyPackage1 => _normalPolicy?.keyPackage;
-  threshold.PublicKeyPackage? get publicKey => _normalPolicy?.publicKeyPackage;
+  /// Delete everything this device stores about the wallet, file included.
+  ///
+  /// The way out of an [IncompatibleWalletStateException], and the only one: there is no
+  /// migration. **It deletes no key** — none is stored — so a wallet with a passkey is restored
+  /// afterwards with [recover]. What does not come back is what only this device had: the exit
+  /// address, and the pre-signed exits, until the next seal reissues them.
+  Future<void> resetLocalState() async {
+    await _store.destroy();
+    _userId = null;
+    _wallet = null;
+    _delegate = null;
+    _exitScriptPubkeyHex = null;
+  }
+
+  // --- The operation ---------------------------------------------------------------------------
+
+  /// One at a time. See [_withOperation].
+  final Lock _operations = Lock();
+
+  /// Whether an operation that holds the wallet's secrets is running — a settle can be minutes. A
+  /// second one started now waits its turn, and is approved only once it has it.
+  bool get operationInProgress => _operations.locked;
+
+  /// Called with each operation as it begins. For tests, which have no other way to see that an
+  /// operation that failed or was cancelled let go of what it held.
+  void Function(WalletOperation operation)? debugOnOperation;
+
+  /// Run [run] with the wallet's secrets, and take them away again.
+  ///
+  /// The whole lifetime of a secret on this device is this method:
+  ///
+  ///  1. **Wait for a turn.** Operations that sign are serialized. The runtime runs one stream
+  ///     per tenant anyway, so a second one could only ever have burnt a fingerprint and then
+  ///     hung; and one operation's secrets are never in memory beside another's.
+  ///  2. **[prepare]** — the slow, secret-free reads (the ASP's parameters, the indexer's set) —
+  ///     *before* the approval, because an approval is good for under a minute and a turn can
+  ///     take longer than that to come.
+  ///  3. **Approve, and take the seed from the same gesture** (`SeedSource.seedDuring`). One
+  ///     fingerprint: the approval is kept for the stream [run] is about to open
+  ///     (`CosignerConnection.approveAhead`), and the PRF output becomes the polynomial.
+  ///  4. **[run]**, with a [WalletOperation] that turns the cosigner's contribution into a key
+  ///     package when the stream brings it, and holds it for that stream's rounds only.
+  ///  5. **Dispose**, in a `finally` — success, failure, cancellation alike — and drop an
+  ///     approval nothing used.
+  ///
+  /// The whole of it is cancellable, from the first read to the last round — see
+  /// [cancelOperation]. That matters most where it is least obvious: a settle spends minutes
+  /// waiting on the ASP with the share already rebuilt, and an ASP that went quiet would otherwise
+  /// hold the share in memory and this lock against every later operation, indefinitely.
+  ///
+  /// [forWallet] is false for the two operations that have no wallet to check the passkey
+  /// against yet: DKG, which makes one, and recovery, which finds one.
+  Future<T> _withOperation<P, T>(
+    String method, {
+    required Future<P> Function() prepare,
+    required Future<T> Function(WalletOperation operation, P prepared) run,
+    bool forWallet = true,
+  }) {
+    return _operations.synchronized(() async {
+      // For this turn only: a cancel is of the operation running, never of one still in line.
+      final cancel = _cancel = CancelSignal();
+      try {
+        // Raced as a whole, so the turn ends wherever the work is parked — including somewhere
+        // no driver thought to guard.
+        return await cancel.guard(_runOperation(method, cancel,
+            prepare: prepare, run: run, forWallet: forWallet));
+      } finally {
+        // Here rather than in [_runOperation], and that is the point: a cancel ends this frame
+        // at once, while the work it was racing may take a moment to unwind — or, parked on a
+        // fingerprint prompt, a long one. The secrets, the approval and the turn are given up
+        // now, before the next operation can start, not whenever that happens.
+        _operation?.dispose();
+        _operation = null;
+        // Spent if a stream opened; still there if the operation ended before one did.
+        _conn.discardApproval(method);
+        _cancel = null;
+      }
+    });
+  }
+
+  /// The running operation's cancel signal, and the operation itself once it has begun. Null
+  /// between operations.
+  CancelSignal? _cancel;
+  WalletOperation? _operation;
+
+  Future<T> _runOperation<P, T>(
+    String method,
+    CancelSignal cancel, {
+    required Future<P> Function() prepare,
+    required Future<T> Function(WalletOperation operation, P prepared) run,
+    required bool forWallet,
+  }) async {
+    final source = _seedSource;
+    if (source == null) {
+      throw StateError(
+        'a wallet is derived from its passkey — no seed source is wired, so there is nothing '
+        'to derive a key from',
+      );
+    }
+    final wallet = _wallet;
+    if (forWallet && wallet == null) throw StateError('no wallet key yet — run DKG first');
+
+    final prepared = await cancel.guard(prepare());
+
+    // A prompt an earlier, cancelled operation left on the screen — see [_takeSeed]. A passkey
+    // answers one gesture at a time, so this one's cannot be asked for until that one is over.
+    // Cancellable like any other wait: the owner is not made to answer a stale prompt to get out.
+    final stale = _promptInFlight;
+    if (stale != null) await cancel.guard(stale);
+
+    final taking = _takeSeed(source, method, cancel);
+    // Everything [_takeSeed] does, cleanup included, and never an error: it is waited on by
+    // whoever comes next, who has no interest in how it went.
+    final settled = taking.then<void>((_) {}, onError: (_) {});
+    _promptInFlight = settled;
+    settled.whenComplete(() {
+      if (identical(_promptInFlight, settled)) _promptInFlight = null;
+    });
+    final seed = await taking;
+    // Takes the seed and overwrites it; refuses a passkey that is not this wallet's before
+    // anything is opened or sent.
+    final operation =
+        await WalletOperation.begin(seed, wallet: forWallet ? wallet : null, cancel: cancel);
+    if (cancel.isCancelled) {
+      operation.dispose();
+      throw const OperationCancelled();
+    }
+    // Disposed by [_withOperation] when the turn ends, however it ends.
+    _operation = operation;
+    debugOnOperation?.call(operation);
+    return run(operation, prepared);
+  }
+
+  /// A seed being taken — a fingerprint prompt on the screen, usually — and its cleanup. Outlives
+  /// the turn that asked for it when that turn is cancelled, which is the only reason it is kept.
+  Future<void>? _promptInFlight;
+
+  /// The seed for [method]'s operation, from the gesture that approves it.
+  ///
+  /// A fingerprint prompt cannot be taken off the screen from here: the platform offers no way to
+  /// withdraw one. So a cancel while it is showing ends the turn at once and leaves this waiting,
+  /// and when the owner does answer, the turn is somebody else's — the seed is overwritten, the
+  /// approval it minted is dropped, and nothing is begun. The next operation waits for exactly
+  /// that ([_promptInFlight]) before asking for a gesture of its own, because a passkey that is
+  /// mid-gesture cannot start another.
+  ///
+  /// **The late approval is dropped here, and only here.** The turn's own cleanup ran when it was
+  /// cancelled — before this approval existed — so it cannot be what removes it; left in the cache
+  /// it would let the next stream to this method open on a gesture the owner made for something
+  /// they had already cancelled. It is dropped whether the seed arrived or the passkey failed
+  /// after approving. It cannot take a newer operation's approval with it: whoever is next waits
+  /// for this to finish ([_promptInFlight]) before asking for its own.
+  Future<Uint8List> _takeSeed(SeedSource source, String method, CancelSignal cancel) async {
+    final Uint8List seed;
+    try {
+      seed = await source.seedDuring(() => _conn.approveAhead(method));
+    } catch (_) {
+      if (cancel.isCancelled) _conn.discardApproval(method);
+      rethrow;
+    }
+    if (cancel.isCancelled) {
+      seed.fillRange(0, seed.length, 0);
+      _conn.discardApproval(method);
+      throw const OperationCancelled();
+    }
+    return seed;
+  }
+
+  /// Refuse to change anything on behalf of an operation whose turn is over.
+  ///
+  /// A cancel ends the turn at once, but the work it was racing unwinds in its own time — and a
+  /// callback that was waiting on an answer still has it delivered. Without this a cancelled
+  /// recovery would go on, when the cosigner's reply arrived, to adopt the wallet and save it:
+  /// reported as cancelled, and done anyway. Called before every change an operation makes to
+  /// this client or its store. The turn's end disposes the operation, which is what this reads.
+  void _stillRunning(WalletOperation operation) {
+    if (operation.isDisposed) throw const OperationCancelled();
+  }
+
+  /// Cancel the operation in flight, if there is one. It fails with [OperationCancelled], lets go
+  /// of the share it rebuilt, and gives up its turn — now, wherever it is waiting.
+  ///
+  /// Two things have to happen, because an operation waits on two kinds of party:
+  ///
+  ///  * **The cosigner.** Its streams are ended, so a driver parked on the cosigner's next message
+  ///    is told the stream closed. [close] alone does not do this — it is graceful, and waits.
+  ///  * **Everybody else.** A settle spends most of its life waiting on the ASP — the batch
+  ///    schedule, the event stream — and a send on `SubmitTx`; closing the cosigner interrupts
+  ///    none of it. Those waits go through the operation's `CancelSignal`, so they end here too.
+  ///    Without that an ASP that went quiet would keep the share in memory, and the lock against
+  ///    every later operation, for as long as it stayed quiet.
+  ///
+  /// Operations still waiting their turn are untouched: they hold nothing yet, and run next.
+  ///
+  /// **What cancelling a settle costs is the ASP's business, not this method's.** A round abandoned
+  /// after the intent is registered is a round the ASP was counting on; arkd may hold that against
+  /// the wallet. This is for an owner who has decided to stop, not something to call on a timer.
+  Future<void> cancelOperation() async {
+    _cancel?.cancel();
+    await _conn.cancelOpenStreams();
+  }
+
+  static Future<void> _nothingToPrepare() async {}
+
+  threshold.PublicKeyPackage? get publicKey => _wallet?.publicKeyPackage;
+
+  /// What this device knows about the wallet's key. Public, all of it.
+  WalletPublicState? get walletPublicState => _wallet;
 
   // --- SERVER METADATA ---
 
@@ -289,22 +453,56 @@ class MpcClient {
 
   // --- DKG ---
 
-  /// Run the DKG ceremony and keep the resulting share.
+  /// Run the DKG ceremony, and keep what it made public.
   ///
-  /// 2-of-2 {wallet, cosigner}: both deal, both hold a share, both are needed to sign.
+  /// 2-of-2 {wallet, cosigner}: both deal, both hold a share, both are needed to sign. The wallet
+  /// deals a polynomial derived from its passkey, and **keeps nothing of what comes back but the
+  /// public half** — not the share, not the dealer secret. Its share is rebuilt, for each operation
+  /// that signs, from that same polynomial and the scalar the cosigner dealt and sealed.
+  ///
+  /// So before anything is saved this proves that it can be: the share is rebuilt the way every
+  /// later operation will rebuild it, from the polynomial and the cosigner's round-2 package, and
+  /// compared with the one the ceremony computed. A wallet that could not sign is found out here,
+  /// while it is a failed onboarding and not an unspendable balance.
+  ///
+  /// One approval, which is also where the seed comes from.
   Future<void> doDkg() async {
     await _store.init();
-    final result = await DkgSession(_conn).run(
-      maxSigners: _maxSigners,
-      minSigners: _minSigners,
-      polynomial: await _walletPolynomial(),
-      deviceToken: _deviceToken ?? '',
-    );
-    // The wallet's dealer secret doubles as its single-key on-chain key.
-    _onchainSecret = result.onchainSecret;
-    await _finalizeWalletShare(result.dkg.keyPackage, result.dkg.publicKeyPackage);
-    await _saveState();
-    _deviceTokenCarried(result.deviceEnrolled);
+    await _withOperation('Dkg', forWallet: false, prepare: _nothingToPrepare,
+        run: (operation, _) async {
+      final polynomial = operation.takePolynomial();
+      final result = await DkgSession(_conn).run(
+        maxSigners: _maxSigners,
+        minSigners: _minSigners,
+        polynomial: polynomial,
+        deviceToken: _deviceToken ?? '',
+      );
+      final wallet = WalletPublicState.fromPublicKeyPackage(
+        result.dkg.publicKeyPackage,
+        result.dkg.keyPackage.identifier,
+        minSigners: _minSigners,
+      );
+      final rebuilt = reconstructWalletShare(
+        polynomial: polynomial,
+        dealtShare: result.dealtShare,
+        wallet: wallet,
+      );
+      _stillRunning(operation);
+      if (rebuilt.secretShare != result.dkg.keyPackage.secretShare) {
+        throw StateError(
+          'the share this passkey and the cosigner rebuild is not the one the ceremony made — '
+          'this wallet could never sign, and is not saved',
+        );
+      }
+      _adopt(wallet);
+      await _saveState();
+      _deviceTokenCarried(result.deviceEnrolled);
+    });
+  }
+
+  void _adopt(WalletPublicState wallet) {
+    _wallet = wallet;
+    _userId = threshold.elemSerializeCompressed(wallet.verifyingShare).toList();
   }
 
   // --- Recovery ---
@@ -322,78 +520,50 @@ class MpcClient {
   /// the cosigner sealed at DKG and hands back; it is half a key and nothing else. Neither side
   /// could do this alone, which is the point.
   ///
-  /// Nothing is trusted on the cosigner's word. The rebuilt share is checked against the verifying
-  /// share in the ceremony's public key package — `s·G` must be it — and a wallet that fails that
-  /// check is refused rather than saved. There is no in-between state to clean up: the share is
-  /// written only once it has been shown to be the right one.
+  /// The rebuilt share is checked against the verifying share in the ceremony's public key package
+  /// — `s·G` must be it — and a wallet that fails that check is refused rather than saved. **The
+  /// share itself is not saved either.** What recovery leaves on this device is the public half,
+  /// exactly as DKG does; every later operation rebuilds the share the same way this just did, so a
+  /// recovered wallet and a freshly made one are the same thing.
   ///
-  /// Throws if this device already holds a share: recovering over a live wallet would replace it,
-  /// and a 2-of-2 has no way back from that.
+  /// This is the one check that leans on the cosigner: a new device has nothing of its own to
+  /// compare the key package with. The group key it names is what the owner's addresses are
+  /// derived from, so a substituted package shows up as a wallet that is not theirs.
+  ///
+  /// Throws if this device already holds a wallet.
   Future<void> recover() async {
-    // Asked of the store, not of memory: a device with a share in Hive is not a device to recover
-    // onto, and a wallet replaced here could never be signed for again.
+    // Asked of the store, not of memory: a device with a wallet in Hive is not a device to recover
+    // onto. State from before this build throws here instead — see [resetLocalState].
     if (await restoreState()) {
-      throw StateError('this device already holds a share for a wallet; nothing to recover');
+      throw StateError('this device already holds a wallet; nothing to recover');
     }
 
-    final polynomial = await _walletPolynomial();
-    final coefficients = [polynomial.a0.scalar, ...polynomial.higherCoefficients];
-    final identifier = threshold.Identifier.derive(
-        threshold.elemSerializeCompressed(threshold.elemBaseMul(polynomial.a0.scalar)));
+    await _withOperation('Recover', forWallet: false, prepare: _nothingToPrepare,
+        run: (operation, _) async {
+      final polynomial = operation.takePolynomial();
+      final resp = await operation.cancel.guard(
+          _conn.recover(cs.RecoverRequest(identifier: operation.identifier.serialize())));
+      // The polynomial was taken out of the operation, so disposing it did not take it from this
+      // frame. If the turn ended while the cosigner was answering, stop here: nothing is rebuilt
+      // from a reply nobody is waiting for, and nothing is saved.
+      _stillRunning(operation);
 
-    final resp = await _conn.recover(cs.RecoverRequest(identifier: identifier.serialize()));
-
-    final pubKeyPkg = threshold.PublicKeyPackage.fromJson(
-        jsonDecode(resp.publicKeyPackageJson) as Map<String, dynamic>);
-    // Hex from two languages: compared as bytes would be, not as the strings happen to be cased.
-    final derivedGroupKey =
-        hex.encode(threshold.elemSerializeCompressed(pubKeyPkg.verifyingKey.E)).toLowerCase();
-    if (derivedGroupKey != resp.groupKey.toLowerCase()) {
-      throw StateError(
-        'the cosigner returned a key package for a different wallet: it says ${resp.groupKey}, '
-        'the package says $derivedGroupKey',
+      // The one time the public half comes from the cosigner rather than from this device, so the
+      // two things it said are checked against each other, and then the share against both.
+      final wallet = publicStateFromRecovery(
+        publicKeyPackage: threshold.PublicKeyPackage.fromJson(
+            jsonDecode(resp.publicKeyPackageJson) as Map<String, dynamic>),
+        claimedGroupKeyHex: resp.groupKey,
+        identifier: operation.identifier,
+        minSigners: _minSigners,
       );
-    }
+      // Rebuilt to be checked, not to be kept: what is saved is what it was checked against.
+      reconstructWalletShare(polynomial: polynomial, dealtShare: resp.dealtShare, wallet: wallet);
 
-    final expectedVerifyingShare = pubKeyPkg.verifyingShares[identifier]?.toLowerCase();
-    if (expectedVerifyingShare == null) {
-      throw StateError(
-        'this wallet is not a member of the ceremony the cosigner returned — its identifier is '
-        'not in the key package',
-      );
-    }
-
-    // Both halves, added. `dkg_part3` normalizes every share to an even-Y group key, which negates
-    // it when the group key came out odd — so the reconstruction is right up to a sign, and the
-    // verifying share says which. Trying both is not guesswork: exactly one can match.
-    final own = threshold.evaluatePolynomial(identifier, coefficients);
-    final dealt = threshold.bytesToBigInt(Uint8List.fromList(resp.dealtShare));
-    final n = threshold.secp256k1Curve.n;
-    final sum = (own + dealt) % n;
-    final candidates = [sum, (n - sum) % n];
-    final share = candidates.firstWhere(
-      (c) => threshold.elemBaseMul(c).toLowerCase() == expectedVerifyingShare,
-      orElse: () => throw StateError(
-        'the share this passkey rebuilds does not match the one this wallet signs with. The '
-        'passkey is the wrong one, or its PRF answers differently on this device — either way '
-        'the wallet cannot be recovered here.',
-      ),
-    );
-
-    // The wallet's dealer secret doubles as its single-key on-chain key, exactly as after DKG. It
-    // is `a0` whatever the group's parity: the normalization above is the share's, not this key's.
-    _onchainSecret = polynomial.a0;
-    await _finalizeWalletShare(
-      threshold.KeyPackage(
-        identifier,
-        share,
-        expectedVerifyingShare,
-        pubKeyPkg.verifyingKey,
-        _minSigners,
-      ),
-      pubKeyPkg,
-    );
-    await _saveState();
+      _stillRunning(operation);
+      _adopt(wallet);
+      await _saveState();
+    });
   }
 
   // --- The way out ---
@@ -486,166 +656,33 @@ class MpcClient {
   }
 
   PublicKeyPackage? getTweakedPublicKeyPackage(List<int>? merkle_root) {
-    final publicKeyPackage = _normalPolicy?.publicKeyPackage;
+    final publicKeyPackage = _wallet?.publicKeyPackage;
     return publicKeyPackage?.tweak(merkle_root);
   }
 
   PublicKeyPackage? getPublicKeyPackage() {
-    return _normalPolicy?.publicKeyPackage;
+    return _wallet?.publicKeyPackage;
   }
 
-
-  /// The wallet's key package carrying the REAL share for a single op. Gated: reconstruct
-  /// `P_full = δ + b(seed)` from `_seedSource` (throws if no seed is wired — an ARK sign needs the
-  /// PIN/passkey). Un-gated: the stored key package already holds the real share. The reconstructed
-  /// share lives only for the caller's scope (best-effort wipe = it goes out of scope after use).
-  Future<threshold.KeyPackage> _walletKeyPackage() async {
-    final kp = _normalPolicy!.keyPackage;
-    if (!_shareBlinded) return kp;
-    final src = _seedSource;
-    if (src == null) {
-      throw StateError(
-          'signing requires the wallet seed (PIN/passkey) — none configured');
-    }
-    final seed = await src.deriveSeed();
-    final pFull =
-        (await reconstructShare(threshold.bigIntToBytes(kp.secretShare), seed)).scalar;
-    // The share is public-checkable even though it is secret: `s·G` is the verifying share the
-    // ceremony recorded, and it is stored beside it. Checking costs one multiplication and turns
-    // every way this can go wrong — a different passkey, a PRF that changed, a wallet blinded
-    // under an older derivation — into one honest message here, instead of a FROST aggregation
-    // failure several calls later that names none of them.
-    if (threshold.elemBaseMul(pFull).toLowerCase() != kp.verifyingShare.toLowerCase()) {
-      throw StateError(
-        'this wallet\'s share could not be unblinded: what the passkey reconstructs is not the '
-        'share this wallet signs with. Either it is a different passkey, or its PRF answers '
-        'differently than when the wallet was made.',
-      );
-    }
-    return threshold.KeyPackage(kp.identifier, pFull, kp.verifyingShare,
-        kp.verifyingKey, kp.minSigners);
-  }
-
-  /// The share for an operation that opens [method] — with the call approved first.
-  ///
-  /// A gated share is unblinded by the passkey's PRF, and so is every call approved: one gesture
-  /// yields both, as long as the approval comes first. Unlocking the share first cost a fingerprint
-  /// of its own, then the call asked for another. See `CosignerConnection.approveAhead`.
-  Future<threshold.KeyPackage> _keyPackageFor(String method) async {
-    await _conn.approveAhead(method);
-    try {
-      return await _walletKeyPackage();
-    } catch (_) {
-      _conn.discardApproval(method);
-      rethrow;
-    }
-  }
-
-  /// What this wallet deals at DKG, derived from the passkey so it can be derived again on another
-  /// device. Without a seed source there is nothing to derive from, and a wallet made from
-  /// randomness would be one that dies with this phone — so that is refused rather than quietly
-  /// produced.
-  Future<WalletPolynomial> _walletPolynomial() async {
-    final src = _seedSource;
-    if (src == null) {
-      throw StateError(
-        'a wallet is derived from its passkey — no seed source is wired, and a key made from '
-        'randomness could never be recovered',
-      );
-    }
-    return walletPolynomial(await src.deriveSeed());
-  }
-
-  /// Finalize the wallet's freshly-DKG'd share into `_normalPolicy` + auth state. When a
-  /// [SeedSource] is configured, store the share BLINDED (δ) — the raw share is never persisted and
-  /// never lingers in memory; it's reconstructed transiently at sign time. Without one the raw share
-  /// is kept.
-  Future<void> _finalizeWalletShare(threshold.KeyPackage walletKeyPkg,
-      threshold.PublicKeyPackage pubKeyPkg) async {
-    _userId =
-        threshold.elemSerializeCompressed(walletKeyPkg.verifyingShare).toList();
-    final src = _seedSource;
-    if (src != null) {
-      final seed = await src.deriveSeed();
-      final delta = threshold.bytesToBigInt(
-          await blindShare(threshold.SecretKey(walletKeyPkg.secretShare), seed));
-      final blindedKp = threshold.KeyPackage(walletKeyPkg.identifier, delta,
-          walletKeyPkg.verifyingShare, walletKeyPkg.verifyingKey,
-          walletKeyPkg.minSigners);
-      _normalPolicy = SpendingPolicy(
-          id: "normal_policy_id",
-          keyPackage: blindedKp,
-          publicKeyPackage: pubKeyPkg);
-      _shareBlinded = true;
-    } else {
-      _normalPolicy = SpendingPolicy(
-          id: "normal_policy_id",
-          keyPackage: walletKeyPkg,
-          publicKeyPackage: pubKeyPkg);
-    }
-  }
-
-  /// Gate an already-DKG'd (raw) share retroactively: blind it to δ under [seed], persist δ, and drop
-  /// the raw share. Used when the seed only exists after DKG — a passkey's PRF
-  /// needs the post-DKG user id to register/assert. No-op if already gated.
-  Future<void> gateShare(Uint8List seed) async {
-    if (_shareBlinded) return;
-    final kp = _normalPolicy?.keyPackage;
-    if (kp == null) throw StateError('no wallet share to gate');
-    final delta = threshold.bytesToBigInt(
-        await blindShare(threshold.SecretKey(kp.secretShare), seed));
-    _normalPolicy = SpendingPolicy(
-        id: "normal_policy_id",
-        keyPackage: threshold.KeyPackage(kp.identifier, delta, kp.verifyingShare,
-            kp.verifyingKey, kp.minSigners),
-        publicKeyPackage: _normalPolicy!.publicKeyPackage);
-    _shareBlinded = true;
-    await _saveState();
-    // Hive appends; without compaction the pre-gating state (the raw share, and any `signingSecret`
-    // an older version wrote) would remain readable in the box file.
-    await _store.compact();
-  }
 
   // --- SIGNING ---
 
-  Future<threshold.Signature> sign(Uint8List message,
-      {List<int>? fullTransaction, bool applyTweak = true}) async {
-    final keyPackage = await _keyPackageFor('Sign');
-    final groupPubKey = _normalPolicy!.publicKeyPackage;
-
-    if (_userId == null) {
-      throw StateError("User ID is null, cannot proceed with signing.");
-    }
-
-    return signWithContext(
-      message,
-      keyPackage,
-      groupPubKey,
-      fullTransaction,
-      applyTweak: applyTweak,
-    );
-  }
-
-  /// Sign [message], with the ceremony carried on one stream.
+  /// A signature by the group key over [message], untweaked, made with the cosigner.
   ///
-  /// The two unary steps this replaces made the cosigner hold a single-use FROST nonce between
-  /// them; here it lives on the handler's stack and dies with the stream, so an interrupted
-  /// ceremony leaves nothing to reuse.
-  Future<threshold.Signature> signWithContext(
-    Uint8List message,
-    threshold.KeyPackage keyPkg,
-    threshold.PublicKeyPackage groupPubKey,
-    List<int>? fullTransaction, {
-    bool applyTweak = true,
-  }) async {
-    return SignSession(_conn).sign(
-      message: message,
-      keyPkg: keyPkg,
-      groupPubKey: groupPubKey,
-      fullTransaction: fullTransaction,
-      applyTweak: applyTweak,
-    );
-  }
+  /// One approval. There was an `applyTweak` here that offered a taproot key-path signature; the
+  /// cosigner signs untweaked and checks every share, so that path could never have aggregated,
+  /// and nothing called it. See `sessions/sign_session.dart`.
+  Future<threshold.Signature> sign(Uint8List message, {List<int>? fullTransaction}) =>
+      _withOperation('Sign',
+          prepare: _nothingToPrepare,
+          run: (operation, _) => SignSession(_conn).sign(
+                message: message,
+                identifier: operation.identifier.serialize(),
+                resolve: operation.keyPackage,
+                groupPubKey: _wallet!.publicKeyPackage,
+                fullTransaction: fullTransaction,
+              ));
+
   // --- ARK ---
   //
   // The cosigner answered all of this once, by relaying its own ASP connection and deriving from a
@@ -655,7 +692,7 @@ class MpcClient {
 
   /// This wallet's group key, x-only, as address derivation wants it.
   String get _ownerXOnly {
-    final pkp = _normalPolicy?.publicKeyPackage;
+    final pkp = _wallet?.publicKeyPackage;
     if (pkp == null) throw StateError('No key yet — run DKG first.');
     final hex = _hexOf(threshold.elemSerializeCompressed(pkp.verifyingKey.E));
     // Compressed is 33 bytes; x-only drops the parity prefix.
@@ -727,26 +764,31 @@ class MpcClient {
   /// The wallet no longer builds the transaction — the cosigner does, and hands back sighashes to
   /// FROST-sign. What the wallet does instead is talk to the ASP: `SubmitTx`, then `FinalizeTx`,
   /// then tell the cosigner it was accepted so the send is recorded only once it is real.
-  Future<String> sendVtxo(String recipientArkAddress, int amountSats) async {
-    final info = await _asp.getInfo();
-    final vtxos = await listVtxos();
-    final result = await SendSession(_conn, _asp).send(
-      recipientArkAddress: recipientArkAddress,
-      amountSats: amountSats,
-      vtxos: vtxos,
-      info: info,
-      keyPkg: await _keyPackageFor('Send'),
-      groupPubKey: _normalPolicy!.publicKeyPackage,
-      readHeld: listVtxos,
-      deviceToken: _deviceToken ?? '',
-      exitScriptPubkeyHex: exitScriptPubkeyHex,
-      ownerXOnlyHex: _ownerXOnly,
-    );
-    _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
-    // A send spends what the old delegate covered, so the cosigner dropped it: what is sealed now is
-    // whatever this send sealed, or nothing.
-    await _recordDelegate(result.delegate);
-    return result.arkTxid;
+  Future<String> sendVtxo(String recipientArkAddress, int amountSats) {
+    return _withOperation('Send',
+        prepare: () async => (info: await _asp.getInfo(), vtxos: await listVtxos()),
+        run: (operation, prepared) async {
+      final result = await SendSession(_conn, _asp).send(
+        recipientArkAddress: recipientArkAddress,
+        amountSats: amountSats,
+        vtxos: prepared.vtxos,
+        info: prepared.info,
+        identifier: operation.identifier.serialize(),
+        resolve: operation.keyPackage,
+        groupPubKey: _wallet!.publicKeyPackage,
+        cancel: operation.cancel,
+        readHeld: listVtxos,
+        deviceToken: _deviceToken ?? '',
+        exitScriptPubkeyHex: exitScriptPubkeyHex,
+        ownerXOnlyHex: _ownerXOnly,
+      );
+      _stillRunning(operation);
+      _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
+      // A send spends what the old delegate covered, so the cosigner dropped it: what is sealed
+      // now is whatever this send sealed, or nothing.
+      await _recordDelegate(result.delegate);
+      return result.arkTxid;
+    });
   }
 
   // --- The delegate ----------------------------------------------------------------------------
@@ -772,26 +814,33 @@ class MpcClient {
   /// doing that — it is how an exit can be proven against bitcoind, by sealing over an output that
   /// carries this wallet's VTXO script but that no ASP ever made. One approval — for funds that arrived without an operation of ours; a send or a settle
   /// seals on its way out at no extra cost.
-  Future<DelegateStatus> protectFunds({List<IndexerVtxo>? over}) async {
-    final info = await _asp.getInfo();
-    final held = over ??
-        await heldOnceIndexed(listVtxos, timeout: const Duration(seconds: 10));
-    if (held == null) {
-      throw StateError('the indexer has not reported every VTXO\'s expiry yet — try again shortly');
-    }
-    if (held.isEmpty) throw StateError('nothing is held, so there is nothing to protect');
-    final sealed = await SettleSession(_conn, _asp).seal(
-      info: info,
-      keyPkg: await _keyPackageFor('Settle'),
-      groupPubKey: _normalPolicy!.publicKeyPackage,
-      vtxos: held,
-      deviceToken: _deviceToken ?? '',
-      exitScriptPubkeyHex: exitScriptPubkeyHex,
-      ownerXOnlyHex: _ownerXOnly,
-    );
-    _deviceTokenCarried(sealed.deviceEnrolled);
-    await _recordDelegate(sealed);
-    return sealed;
+  Future<DelegateStatus> protectFunds({List<IndexerVtxo>? over}) {
+    return _withOperation('Settle', prepare: () async {
+      final info = await _asp.getInfo();
+      final held =
+          over ?? await heldOnceIndexed(listVtxos, timeout: const Duration(seconds: 10));
+      if (held == null) {
+        throw StateError(
+            'the indexer has not reported every VTXO\'s expiry yet — try again shortly');
+      }
+      if (held.isEmpty) throw StateError('nothing is held, so there is nothing to protect');
+      return (info: info, held: held);
+    }, run: (operation, prepared) async {
+      final sealed = await SettleSession(_conn, _asp).seal(
+        info: prepared.info,
+        identifier: operation.identifier.serialize(),
+        resolve: operation.keyPackage,
+        groupPubKey: _wallet!.publicKeyPackage,
+        vtxos: prepared.held,
+        deviceToken: _deviceToken ?? '',
+        exitScriptPubkeyHex: exitScriptPubkeyHex,
+        ownerXOnlyHex: _ownerXOnly,
+      );
+      _stillRunning(operation);
+      _deviceTokenCarried(sealed.deviceEnrolled);
+      await _recordDelegate(sealed);
+      return sealed;
+    });
   }
 
   Future<void> _recordDelegate(DelegateStatus? delegate) async {
@@ -814,25 +863,35 @@ class MpcClient {
         'settle them individually',
       );
     }
-    final info = await _asp.getInfo();
-    final vtxos = boardingUtxos.isEmpty ? await listVtxos() : const <IndexerVtxo>[];
-    final result = await SettleSession(_conn, _asp).settle(
-      info: info,
-      keyPkg: await _keyPackageFor('Settle'),
-      groupPubKey: _normalPolicy!.publicKeyPackage,
-      boardingUtxo: boardingUtxos.isEmpty ? null : boardingUtxos.first,
-      vtxos: vtxos,
-      onProgress: onProgress,
-      readHeld: listVtxos,
-      deviceToken: _deviceToken ?? '',
-      exitScriptPubkeyHex: exitScriptPubkeyHex,
-      ownerXOnlyHex: _ownerXOnly,
-    );
-    _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
-    // A refresh spends the old delegate's inputs; boarding leaves it standing. Either way what this
-    // settle sealed, when it sealed, supersedes it.
-    if (result.delegate != null || boardingUtxos.isEmpty) await _recordDelegate(result.delegate);
-    return result.commitmentTxid;
+    return _withOperation('Settle',
+        prepare: () async => (
+              info: await _asp.getInfo(),
+              vtxos: boardingUtxos.isEmpty ? await listVtxos() : const <IndexerVtxo>[],
+            ),
+        run: (operation, prepared) async {
+      final result = await SettleSession(_conn, _asp).settle(
+        info: prepared.info,
+        identifier: operation.identifier.serialize(),
+        resolve: operation.keyPackage,
+        groupPubKey: _wallet!.publicKeyPackage,
+        boardingUtxo: boardingUtxos.isEmpty ? null : boardingUtxos.first,
+        vtxos: prepared.vtxos,
+        cancel: operation.cancel,
+        onProgress: onProgress,
+        readHeld: listVtxos,
+        deviceToken: _deviceToken ?? '',
+        exitScriptPubkeyHex: exitScriptPubkeyHex,
+        ownerXOnlyHex: _ownerXOnly,
+      );
+      _stillRunning(operation);
+      _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
+      // A refresh spends the old delegate's inputs; boarding leaves it standing. Either way what
+      // this settle sealed, when it sealed, supersedes it.
+      if (result.delegate != null || boardingUtxos.isEmpty) {
+        await _recordDelegate(result.delegate);
+      }
+      return result.commitmentTxid;
+    });
   }
 
   /// Refresh the held VTXOs before they expire.
@@ -903,12 +962,7 @@ class MpcClient {
       memo: memo,
     );
     // Untweaked: this is a statement by the group key, not a taproot key-path spend.
-    final signature = await SignSession(_conn).sign(
-      message: digest,
-      keyPkg: await _keyPackageFor('Sign'),
-      groupPubKey: _normalPolicy!.publicKeyPackage,
-      applyTweak: false,
-    );
+    final signature = await sign(digest);
 
     return PaymentRequestCreateRequest()
       ..amountSats = Int64(amountSats)
