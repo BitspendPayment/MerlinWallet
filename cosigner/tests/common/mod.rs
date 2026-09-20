@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use rand::rngs::OsRng;
 
+use cosigner::host::Host;
 use cosigner::store::Store;
 
 use threshold::dkg::{self, Round1Package, Round2Package};
@@ -327,5 +328,160 @@ pub mod wire {
             Arc::new(Mutex::new(cosigner)),
             GetServerInfoResponse { bitcoin_network: "regtest".into() },
         )
+    }
+}
+
+/// Records what the cosigner asked of the runtime, and holds it to the runtime's rule for task ids:
+/// an id is an idempotency key, refused with different input until its record is forgotten.
+#[derive(Default)]
+pub struct Recorder {
+    pub enqueued: Mutex<Vec<(String, Vec<u8>, u64, Option<u64>)>>,
+    live: Mutex<std::collections::HashMap<String, (Vec<u8>, u64, bool)>>,
+    pub cancelled: Mutex<Vec<String>>,
+    pub woken: Mutex<Vec<(String, Option<String>)>>,
+    registered: Mutex<Vec<String>>,
+    /// Connections the cosigner asked the runtime to hold, and what it sent on them.
+    pub opened: Mutex<Vec<(String, String)>>,
+    pub sent: Mutex<Vec<(String, Vec<u8>)>>,
+    /// Whether a connection is up. Sending on one that is not fails, as it does for real.
+    pub connected: Mutex<bool>,
+    /// A far side that never answers: opening still succeeds, and no send ever does.
+    pub never_connects: Mutex<bool>,
+}
+
+impl Host for Recorder {
+    fn enqueue(
+        &self,
+        id: &str,
+        payload: &[u8],
+        run_at_ms: u64,
+        interval_ms: Option<u64>,
+    ) -> Result<(), String> {
+        let mut live = self.live.lock().unwrap();
+        if let Some((old, old_run_at, _)) = live.get(id) {
+            if old != payload || *old_run_at != run_at_ms {
+                return Err("task id already used with different input".into());
+            }
+            return Ok(());
+        }
+        live.insert(id.into(), (payload.to_vec(), run_at_ms, false));
+        self.enqueued
+            .lock()
+            .unwrap()
+            .push((id.into(), payload.to_vec(), run_at_ms, interval_ms));
+        Ok(())
+    }
+    fn status(&self, _: &str) -> Result<String, String> {
+        Ok("{}".into())
+    }
+    fn cancel(&self, id: &str) -> Result<(), String> {
+        if let Some(record) = self.live.lock().unwrap().get_mut(id) {
+            record.2 = true;
+        }
+        self.cancelled.lock().unwrap().push(id.into());
+        Ok(())
+    }
+    fn forget(&self, id: &str) -> Result<(), String> {
+        let mut live = self.live.lock().unwrap();
+        match live.get(id) {
+            Some((_, _, true)) => {
+                live.remove(id);
+                Ok(())
+            }
+            Some(_) => Err("task is still active".into()),
+            None => Err("no such task".into()),
+        }
+    }
+    fn register_device(&self, token: &str) -> Result<(), String> {
+        self.registered.lock().unwrap().push(token.into());
+        Ok(())
+    }
+    fn forget_device(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn devices(&self) -> Result<u32, String> {
+        Ok(self.registered.lock().unwrap().len() as u32)
+    }
+    fn wake(&self, category: &str, reference: Option<&str>) -> Result<(), String> {
+        self.woken
+            .lock()
+            .unwrap()
+            .push((category.into(), reference.map(Into::into)));
+        Ok(())
+    }
+    fn stream_open(&self, id: &str, origin: &str) -> Result<(), String> {
+        let mut opened = self.opened.lock().unwrap();
+        // Idempotent for the same instruction, as the runtime's is: a second escrow with the same
+        // service reuses the connection rather than making a second.
+        match opened.iter().find(|(held, _)| held == id) {
+            Some((_, held_origin)) if held_origin != origin => {
+                return Err(format!("a stream with that id is already open to {held_origin}"))
+            }
+            Some(_) => {}
+            None => opened.push((id.into(), origin.into())),
+        }
+        if !*self.never_connects.lock().unwrap() {
+            *self.connected.lock().unwrap() = true;
+        }
+        Ok(())
+    }
+
+    fn stream_close(&self, id: &str) -> Result<(), String> {
+        self.opened.lock().unwrap().retain(|(held, _)| held != id);
+        Ok(())
+    }
+
+    fn stream_send(&self, id: &str, payload: &[u8]) -> Result<(), String> {
+        if !*self.connected.lock().unwrap() {
+            return Err("that stream is not connected; the message was not sent".into());
+        }
+        self.sent.lock().unwrap().push((id.into(), payload.to_vec()));
+        Ok(())
+    }
+
+    fn stream_status(&self, _: &str) -> Result<String, String> {
+        Ok(format!(
+            r#"{{"connected":{}}}"#,
+            *self.connected.lock().unwrap()
+        ))
+    }
+
+}
+
+impl Recorder {
+    /// The connections the cosigner asked the runtime to hold, as `(id, origin)`.
+    pub fn opened(&self) -> Vec<(String, String)> {
+        self.opened.lock().unwrap().clone()
+    }
+
+    /// What went out on them, as `(id, payload)`.
+    pub fn sent(&self) -> Vec<(String, Vec<u8>)> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    /// Everything the cosigner asked to have enqueued, as `(id, payload, run_at_ms, interval_ms)`.
+    pub fn enqueued(&self) -> Vec<(String, Vec<u8>, u64, Option<u64>)> {
+        self.enqueued.lock().unwrap().clone()
+    }
+
+    pub fn woken(&self) -> Vec<(String, Option<String>)> {
+        self.woken.lock().unwrap().clone()
+    }
+
+    pub fn cancelled(&self) -> Vec<String> {
+        self.cancelled.lock().unwrap().clone()
+    }
+
+    /// Pretend the far side went away: a send now fails the way it does for real.
+    pub fn disconnect(&self) {
+        *self.connected.lock().unwrap() = false;
+    }
+
+    /// A service the runtime never manages to reach. `stream_open` still succeeds — it only
+    /// records a standing instruction — and every send afterwards fails, which is what a guest
+    /// sees while the supervisor is dialling something that is not answering.
+    pub fn disconnect_on_open(&self) {
+        *self.never_connects.lock().unwrap() = true;
+        *self.connected.lock().unwrap() = false;
     }
 }

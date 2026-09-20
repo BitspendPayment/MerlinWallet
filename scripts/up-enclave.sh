@@ -48,6 +48,25 @@ egress=(--guest-egress "$asp_origin"
         --guest-env "AUTO_SETTLE_SAFETY_MARGIN_SECS=${ENCLAVE_DELEGATE_MARGIN:-15060}"
         --background-timeout "${ENCLAVE_TASK_TIMEOUT:-600}")
 
+# Escrow services this image may pair with, as `<service id hex>=<origin>,…`. A wallet names a
+# service by id and never by URL, so the set of reachable services is decided here, in the image,
+# and is measured into PCR0 like every other choice — see cosigner/src/handlers/delivery.rs. Each
+# one needs an egress allowance too: naming a service the guest cannot dial would fail at delivery
+# rather than at configuration, which is the wrong place to find out.
+if [[ -n "${ENCLAVE_SERVICE_ORIGINS:-}" ]]; then
+    egress+=(--guest-env "SERVICE_ORIGINS=$ENCLAVE_SERVICE_ORIGINS")
+    # `dev-enclave.sh` validates a --guest-env value against [A-Za-z0-9:/._-], which admits neither
+    # `=` nor `,` — so entries are separated by `_` and an id from its origin by `:`. The cosigner's
+    # parser takes either spelling; see cosigner/src/handlers/delivery.rs.
+    IFS=_ read -ra services <<<"$ENCLAVE_SERVICE_ORIGINS"
+    for entry in "${services[@]}"; do
+        origin="${entry#*:}"
+        [[ -n "$origin" && "$origin" != "$entry" ]] || {
+            echo "ENCLAVE_SERVICE_ORIGINS entry '$entry' is not <service id>:<origin>" >&2; exit 1; }
+        egress+=(--guest-egress "$origin")
+    done
+fi
+
 webauthn=()
 if [[ -n "$rp_id" ]]; then
     webauthn+=(--rp-id "$rp_id")

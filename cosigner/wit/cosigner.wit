@@ -15,12 +15,21 @@ package merlin:cosigner@0.1.0;
 
 world cosigner {
     // `run-task`, plus the queue to arm it with. The cosigner uses this for one thing: a settle
-    // that has come due. It cannot settle from a task — a guest has no egress, so it can reach
-    // neither the ASP nor anything else — so the task reads its own sealed delegate, compares the
-    // deadline to the clock, and wakes its owner.
+    // that has come due. Where the image allowlists the ASP the task executes the sealed delegate
+    // itself; where it does not, it reads the delegate, compares the deadline to the clock, and
+    // wakes its owner instead. Egress is the image's to grant, and is not named in this world.
     include enclave:tasks/background@0.1.0;
 
     // Waking those devices. The cosigner never sees a token and never sends a message; it spends
     // an enrolment an interactive call already made.
     import enclave:notify/notify@0.1.0;
+
+    // A connection the RUNTIME holds to an escrow service, and the messages that arrive on it.
+    //
+    // The cosigner cannot hold one itself: it has no execution context between invocations, so
+    // there is nothing for a socket to belong to. And it needs one, because a service holding half
+    // of an escrow key has no passkey for its user's tenant and so can never call in. The runtime
+    // keeps the connection; each message the service sends becomes one invocation of `on-message`,
+    // exactly as a due task becomes one invocation of `run-task`.
+    include enclave:streams/streaming@0.1.0;
 }

@@ -56,3 +56,44 @@ pub trait AspApi {
 pub trait EventSource {
     async fn next(&mut self) -> Result<Option<Event>, String>;
 }
+
+/// An ASP that is not there.
+///
+/// Not a fallback so much as the truth for a build or a deployment whose image allowlists no ASP:
+/// every call fails, so a path that needed one says so instead of quietly doing less. The task
+/// watch and the escrow release both take `Option<impl AspApi>` and this is what stands in when
+/// there is none.
+pub struct NoAsp;
+
+impl AspApi for NoAsp {
+    type Events = NoEvents;
+    async fn get_info(&mut self) -> Result<ark::client::types::ArkInfo, String> {
+        Err("this deployment names no ASP".into())
+    }
+    async fn register_intent(&mut self, _: &str, _: &str) -> Result<String, String> {
+        Err("this deployment names no ASP".into())
+    }
+    async fn events(&mut self, _: &[String]) -> Result<NoEvents, String> {
+        Err("this deployment names no ASP".into())
+    }
+    async fn confirm_registration(&mut self, _: &str) -> Result<(), String> {
+        Err("this deployment names no ASP".into())
+    }
+    async fn submit_tree_nonces(&mut self, _: &str, _: &str, _: &[(String, String)]) -> Result<(), String> {
+        Err("this deployment names no ASP".into())
+    }
+    async fn submit_tree_signatures(&mut self, _: &str, _: &str, _: &[(String, String)]) -> Result<(), String> {
+        Err("this deployment names no ASP".into())
+    }
+    async fn submit_forfeits(&mut self, _: &[String], _: &str) -> Result<(), String> {
+        Err("this deployment names no ASP".into())
+    }
+}
+
+pub struct NoEvents;
+
+impl EventSource for NoEvents {
+    async fn next(&mut self) -> Result<Option<Event>, String> {
+        Ok(None)
+    }
+}

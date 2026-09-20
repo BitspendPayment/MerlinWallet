@@ -102,6 +102,8 @@ impl CosignerService {
             "Dkg" => ceremony!(dkg),
             "Send" => ceremony!(send),
             "Settle" => ceremony!(settle),
+            "Escrow" => ceremony!(escrow),
+            "PairService" => ceremony!(pair_service),
             _ => {}
         }
 
@@ -129,6 +131,10 @@ impl CosignerService {
             "ForgetDevice" => unary!(self.forget_device(body)),
             "DeviceCount" => unary!(self.device_count(body)),
             "Recover" => unary!(self.recover(body)),
+            "EscrowList" => unary!(self.escrow_list(body)),
+            "EscrowOpenSession" => unary!(self.escrow_open_session(body)),
+            "EscrowCloseSession" => unary!(self.escrow_close_session(body)),
+            "PairServiceConfirm" => unary!(self.pair_service_confirm(body)),
             other => grpc::failed(Status::unimplemented(format!("no such method: {other}"))),
         }
     }
@@ -224,6 +230,124 @@ impl CosignerService {
     async fn recover(&self, body: Body) -> Result<proto::RecoverResponse, Status> {
         let req: proto::RecoverRequest = grpc::one_message(body).await?;
         crate::handlers::recover::recover(&lock(&self.cosigner), req)
+    }
+
+    /// Mark a pairing usable: the service has both halves and its share checks out.
+    ///
+    /// The cosigner cannot establish this for itself — it never sees the wallet's half, and asking
+    /// the service would mean trusting an answer it has no way to check. What it can do is refuse
+    /// to treat a pairing as usable until the party that *would* know says so, and refuse a
+    /// confirmation that names a different attempt than the one it sealed.
+    async fn pair_service_confirm(
+        &self,
+        body: Body,
+    ) -> Result<proto::PairServiceConfirmResponse, Status> {
+        let req: proto::PairServiceConfirmRequest = grpc::one_message(body).await?;
+        let mut c = lock(&self.cosigner);
+        c.confirm_escrow_pairing(&req.escrow_key, &hex::encode(&req.attempt_id))
+            .map_err(Status::failed_precondition)?;
+        c.seal();
+        Ok(proto::PairServiceConfirmResponse {})
+    }
+
+    /// Commit an escrow to a deal: what the paired service may take, and until when.
+    async fn escrow_open_session(
+        &self,
+        body: Body,
+    ) -> Result<proto::EscrowOpenSessionResponse, Status> {
+        let req: proto::EscrowOpenSessionRequest = grpc::one_message(body).await?;
+        // An unparseable policy is `never`, not `always`: a deal nobody can take from is a bad day,
+        // and one anybody can take from is a lost escrow.
+        let policy: crate::policy::Policy = serde_json::from_str(&req.policy_json)
+            .map_err(|e| Status::invalid_argument(format!("that is not a policy: {e}")))?;
+        let now = crate::handlers::helpers::now_secs();
+        let session = crate::escrow_session::EscrowSession::open(policy, now, req.deadline_secs)
+            .map_err(Status::invalid_argument)?;
+        let description = session.policy.describe();
+        let deadline = session.deadline;
+
+        let mut c = lock(&self.cosigner);
+        c.open_escrow_session(&req.escrow_key, session, now)
+            .map_err(Status::failed_precondition)?;
+        c.seal();
+        // Nothing is scheduled for the deadline, and nothing needs to be. A deadline is a fact
+        // about the clock that every decision reads out of the seal — `may_release` and
+        // `may_reclaim` reach the same answer whether or not anything ran when it passed. What
+        // used to be here was a task that woke the owner, and it bought a notification at the cost
+        // of a scheduler; the owner learns the same thing from `EscrowList` the next time they
+        // look. See `crate::escrow_session`.
+        Ok(proto::EscrowOpenSessionResponse {
+            policy_description: description,
+            deadline_secs: deadline,
+        })
+    }
+
+    /// Close a deal early — the owner giving up on it before its deadline.
+    async fn escrow_close_session(
+        &self,
+        body: Body,
+    ) -> Result<proto::EscrowCloseSessionResponse, Status> {
+        let req: proto::EscrowCloseSessionRequest = grpc::one_message(body).await?;
+        let mut c = lock(&self.cosigner);
+        c.close_escrow_session(&req.escrow_key, crate::handlers::helpers::now_secs())
+            .map_err(Status::failed_precondition)?;
+        c.seal();
+        // The connection is NOT let go of here, and that is deliberate. A service that asks for a
+        // release after the deal ended should be told "this escrow is closed" — which is a reason
+        // it can act on — rather than finding a dead socket, which is indistinguishable from the
+        // network being down. It would also be inconsistent: a deal that simply *lapsed* keeps its
+        // connection, because nothing runs at a deadline to take it away, so closing one here
+        // would make the same end state behave two different ways. The wallet's next deal with the
+        // same service reuses the connection either way.
+        Ok(proto::EscrowCloseSessionResponse {})
+    }
+
+    /// The escrow keys this wallet holds — public projection only, so a device that keeps nothing
+    /// can ask what exists instead of remembering.
+    async fn escrow_list(&self, body: Body) -> Result<proto::EscrowListResponse, Status> {
+        let _: proto::EscrowListRequest = grpc::one_message(body).await?;
+        // One reading of the clock for the whole listing, so two escrows are never described as of
+        // two different moments.
+        let now = crate::handlers::helpers::now_secs();
+        let c = lock(&self.cosigner);
+        Ok(proto::EscrowListResponse {
+            escrows: c
+                .escrows()
+                .iter()
+                .map(|e| proto::EscrowSummary {
+                    escrow_key: e.escrow_key.clone(),
+                    wallet_identifier: hex::decode(&e.wallet_identifier_hex).unwrap_or_default(),
+                    public_key_package_json: e.public_key_package_json.clone(),
+                    created_at: e.created_at,
+                    service_identifier: e
+                        .pairing
+                        .as_ref()
+                        .map(|p| p.service_identifier_hex.clone())
+                        .unwrap_or_default(),
+                    service_ready: e
+                        .pairing
+                        .as_ref()
+                        .is_some_and(|p| p.state() == crate::types::PairingState::Ready),
+                    // Reported apart as well as together: they arrive by different routes, at
+                    // different moments, and a caller waiting on one wants to know which.
+                    service_confirmed: e
+                        .pairing
+                        .as_ref()
+                        .is_some_and(|p| p.service_confirmed),
+                    wallet_confirmed: e
+                        .pairing
+                        .as_ref()
+                        .is_some_and(|p| p.wallet_confirmed),
+                    session: e.session.as_ref().map(|s| proto::EscrowSessionSummary {
+                        open: s.is_open(now),
+                        deadline_secs: s.deadline,
+                        opened_at: s.opened_at,
+                        released_sats: s.released_sats,
+                        policy_description: s.policy.describe(),
+                    }),
+                })
+                .collect(),
+        })
     }
 }
 
@@ -371,6 +495,274 @@ async fn sign(
 /// born. Here the session is a LOCAL: created at open, dropped when the stream ends. There is no
 /// map to evict from, no TTL to tune, and an abandoned ceremony leaves nothing behind rather than
 /// key material sitting in a map until a sweep notices.
+/// Minting an escrow key: one reshare, two exchanges, nothing parked.
+///
+/// The same shape as [`dkg`] and for the same reason — the round-1 and round-2 secrets are what the
+/// key is born from, so they live on this frame and die with it. What differs is that both parties
+/// already have keys: the reshare is dealt under the identifiers they hold in the wallet key, and
+/// neither side's wallet share changes. See [`crate::handlers::escrow`].
+async fn escrow(
+    cosigner: Arc<Mutex<Cosigner>>,
+    duplex: Duplex<proto::EscrowClientMsg, proto::EscrowServerMsg>,
+) -> Result<(), Status> {
+    use crate::handlers::escrow as esc;
+
+    let first = duplex.expect("it opened").await?;
+    let session_id = first.session_id.clone();
+    let open = match first.body {
+        Some(proto::escrow_client_msg::Body::Open(o)) => o,
+        _ => return Err(Status::invalid_argument("a session must open with EscrowOpen")),
+    };
+
+    // There is nothing to reshare before there is a wallet. Taken once, up front, so the ceremony
+    // runs against one consistent view of the key it is derived from.
+    //
+    // A wallet whose ceremony kept no dealt share is refused here rather than at release: its owner
+    // cannot rebuild the wallet share an escrow share is built on top of, so the escrow would be
+    // spendable by this cosigner's half and nobody else's.
+    let (old_kp, old_pkp) = {
+        let c = lock(&cosigner);
+        if c.wallet_dealt_share_hex().is_none() {
+            return Err(Status::failed_precondition(
+                "this wallet was made before recovery existed: its owner could not rebuild a share \
+                 for an escrow, so there is no safe escrow to mint",
+            ));
+        }
+        c.wallet_key_material().ok_or_else(|| {
+            Status::failed_precondition("this wallet has no key yet; there is nothing to escrow from")
+        })?
+    };
+
+    // The wallet's half of its own share, before anything is dealt — see `dealt_share_for`. A
+    // reshare builds on the wallet share, so the wallet needs this to finalize its own side.
+    let dealt = dealt_share_for(&lock(&cosigner), &open.identifier)?;
+
+    let mut sess = esc::EscrowSession::new();
+    let our_round1 = esc::escrow_open(
+        &mut sess,
+        &old_kp,
+        &open.identifier,
+        &open.round1_package,
+        &open.context,
+    )?;
+    duplex.send(proto::EscrowServerMsg {
+        session_id: session_id.clone(),
+        seq: 1,
+        body: Some(proto::escrow_server_msg::Body::Round1(
+            proto::EscrowRound1Out {
+                round1_package: our_round1,
+                wallet_dealt_share: dealt,
+            },
+        )),
+    });
+
+    let msg = duplex.expect("round 2").await?;
+    let round2 = match msg.body {
+        Some(proto::escrow_client_msg::Body::Round2(r)) => r,
+        _ => return Err(Status::invalid_argument("expected EscrowRound2")),
+    };
+    let for_wallet = esc::escrow_finish(&mut sess, &old_kp, &old_pkp, &round2.round2_package)?;
+    let material = sess
+        .material
+        .take()
+        .ok_or_else(|| Status::internal("the reshare finished without key material"))?;
+    let escrow_key = material.escrow_key.clone();
+
+    // Sealed before it is announced. A wallet told about an escrow this cosigner cannot co-sign for
+    // would be a wallet that funds a key only half of which exists.
+    {
+        let mut c = lock(&cosigner);
+        c.install_escrow(crate::types::EscrowRecord {
+            escrow_key: material.escrow_key,
+            key_package_json: material.key_package_json,
+            public_key_package_json: material.public_key_package_json,
+            wallet_identifier_hex: material.wallet_identifier_hex,
+            context_hex: material.context_hex,
+            wallet_delta_share_hex: material.wallet_delta_share_hex,
+            created_at: crate::handlers::helpers::now_secs(),
+            pairing: None,
+            session: None,
+        })
+        .map_err(Status::failed_precondition)?;
+        c.seal();
+    }
+
+    duplex.send(proto::EscrowServerMsg {
+        session_id,
+        seq: 2,
+        body: Some(proto::escrow_server_msg::Body::Complete(
+            proto::EscrowComplete {
+                round2_package: for_wallet,
+                escrow_key,
+            },
+        )),
+    });
+    Ok(())
+}
+
+/// Pairing a service into an escrow, and handing it its half — deliver, then seal.
+///
+/// A stream because the wallet cannot deal until it has rebuilt its escrow share, and it keeps no
+/// share: the two halves it needs ride the first server message, as they do on every other stream.
+///
+/// The order at the end is deliberate and documented in [`crate::handlers::delivery`]: this
+/// cosigner never keeps the service's half, so a pairing sealed before a failed delivery could
+/// never be completed. Delivering first makes a failure harmless — nothing is sealed, and the
+/// wallet simply pairs again with a fresh half.
+async fn pair_service(
+    cosigner: Arc<Mutex<Cosigner>>,
+    duplex: Duplex<proto::PairServiceClientMsg, proto::PairServiceServerMsg>,
+) -> Result<(), Status> {
+    use crate::handlers::delivery::ServiceRegistry;
+
+    let first = duplex.expect("it opened").await?;
+    let session_id = first.session_id.clone();
+    let open = match first.body {
+        Some(proto::pair_service_client_msg::Body::Open(o)) => o,
+        _ => return Err(Status::invalid_argument("a session must open with PairServiceOpen")),
+    };
+
+    // Enough to be unrepeatable by accident. It is a label, not a secret: it ties two deliveries
+    // together and nothing rests on it being unguessable.
+    if open.attempt_id.len() != 16 {
+        return Err(Status::invalid_argument("a pairing attempt id is 16 bytes"));
+    }
+    let attempt_id_hex = hex::encode(&open.attempt_id);
+
+    // Where this service is, according to the IMAGE. Resolved before anything is dealt, so naming
+    // a service this enclave does not know costs nothing and reveals nothing.
+    let service_id_hex = hex::encode(&open.service_identifier);
+    let origin = ServiceRegistry::from_env()
+        .origin_of(&service_id_hex)?
+        .to_string();
+
+    let service_id = {
+        let b: [u8; 32] = open
+            .service_identifier
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("a service identifier is 32 bytes"))?;
+        threshold::identifier::Identifier::deserialize(&b)
+            .map_err(|e| Status::invalid_argument(format!("bad service identifier: {e}")))?
+    };
+
+    let (escrow_kp, escrow_pkp, wallet_id, dealt, delta) = {
+        let c = lock(&cosigner);
+        let escrow = c
+            .escrow(&open.escrow_key)
+            .ok_or_else(|| Status::not_found("this wallet holds no such escrow"))?;
+        // A FINISHED pairing is not replaceable: a second service in one escrow is a second way to
+        // be paid out of money committed to a single deal. A *pending* one is a different matter —
+        // it is an attempt that did not complete, and pairing again is how a wallet retries. The
+        // cosigner deals a fresh half each time, because it keeps none.
+        if escrow
+            .pairing
+            .as_ref()
+            .is_some_and(|p| p.state() == crate::types::PairingState::Ready)
+        {
+            return Err(Status::failed_precondition(
+                "this escrow already has a service paired into it",
+            ));
+        }
+        let delta = hex::decode(&escrow.wallet_delta_share_hex)
+            .map_err(|e| Status::internal(format!("sealed escrow delta is not hex: {e}")))?;
+        let wallet_id_bytes = hex::decode(&escrow.wallet_identifier_hex)
+            .map_err(|e| Status::internal(format!("sealed wallet identifier is not hex: {e}")))?;
+        // Answered only to the identifier the ceremony recorded — the same rule every other stream
+        // applies, reached through the same function.
+        let dealt = dealt_share_for(&c, &wallet_id_bytes)?;
+        let (kp, pkp, id) = c
+            .escrow_key_material(&open.escrow_key)
+            .ok_or_else(|| Status::internal("this escrow's sealed key material is unreadable"))?;
+        (kp, pkp, id, dealt, delta)
+    };
+
+    duplex.send(proto::PairServiceServerMsg {
+        session_id: session_id.clone(),
+        seq: 1,
+        body: Some(proto::pair_service_server_msg::Body::Ready(
+            proto::PairServiceReady {
+                wallet_dealt_share: dealt,
+                escrow_delta_share: delta,
+            },
+        )),
+    });
+
+    let msg = duplex.expect("the wallet's dealing").await?;
+    let deal = match msg.body {
+        Some(proto::pair_service_client_msg::Body::Deal(d)) => d,
+        _ => return Err(Status::invalid_argument("expected PairServiceDeal")),
+    };
+
+    let material = crate::handlers::pairing::pair_service(
+        &escrow_kp,
+        &escrow_pkp,
+        &wallet_id,
+        &service_id,
+        &deal.contribution_to_cosigner,
+        &deal.contribution_to_service,
+    )?;
+
+    // Over the connection the runtime will go on holding after this call ends — that is what lets
+    // the service speak first later, when it asks for a release. See `handlers::delivery`.
+    let host = lock(&cosigner).host();
+    crate::handlers::delivery::deliver_pairing_half(
+        host.as_ref(),
+        &material.service_identifier_hex,
+        &origin,
+        &crate::service_stream::ToService::PairingHalf {
+            escrow_key: open.escrow_key.clone(),
+            attempt_id: attempt_id_hex.clone(),
+            service_identifier: material.service_identifier_hex.clone(),
+            half: hex::encode(&material.service_half),
+            public_key_package_json: material.public_key_package_json.clone(),
+            service_verifying_share: material.service_verifying_share_hex.clone(),
+        },
+    )
+    .await
+    .map_err(|e| {
+        Status::unavailable(format!(
+            "the service did not take its half, so nothing was paired: {e}"
+        ))
+    })?;
+
+    let done = proto::PairServiceDone {
+        public_key_package_json: material.public_key_package_json.clone(),
+        service_verifying_share: material.service_verifying_share_hex.clone(),
+        // So the wallet delivers its own half to the same place. It does not choose an origin, and
+        // could not: the list lives in the image.
+        service_origin: origin.clone(),
+        attempt_id: open.attempt_id.clone(),
+    };
+    {
+        let mut c = lock(&cosigner);
+        c.pair_escrow_service(
+            &open.escrow_key,
+            crate::types::ServicePairing {
+                service_identifier_hex: material.service_identifier_hex,
+                key_package_json: material.key_package_json,
+                public_key_package_json: material.public_key_package_json,
+                service_verifying_share_hex: material.service_verifying_share_hex,
+                paired_at: crate::handlers::helpers::now_secs(),
+                attempt_id_hex,
+                // Delivered, not yet shown to work: the service has one half of two, and neither
+                // party has vouched for it. See `handlers::delivery`.
+                service_confirmed: false,
+                wallet_confirmed: false,
+            },
+        )
+        .map_err(Status::failed_precondition)?;
+        c.seal();
+    }
+
+    duplex.send(proto::PairServiceServerMsg {
+        session_id,
+        seq: 2,
+        body: Some(proto::pair_service_server_msg::Body::Done(done)),
+    });
+    Ok(())
+}
+
 async fn dkg(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<proto::DkgClientMsg, proto::DkgServerMsg>,

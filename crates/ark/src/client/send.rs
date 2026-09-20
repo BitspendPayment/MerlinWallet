@@ -348,6 +348,25 @@ impl SendSession {
         Ok(final_checkpoints)
     }
 
+    /// The transactions as built, before anybody has signed: the ark tx and one checkpoint per
+    /// input, base64 PSBTs.
+    ///
+    /// For a counterparty that has to submit *exactly* what was approved rather than rebuild it.
+    /// `build` is deterministic, so a party running it over the same inputs gets the same bytes —
+    /// but "the same, we checked" is a weaker thing to rest a release on than "these, verbatim",
+    /// and a signature is only valid over the transaction whose sighashes it covers anyway.
+    pub fn unsigned(&self) -> (String, Vec<String>) {
+        (
+            encode_psbt_b64(&self.ark_tx),
+            self.checkpoint_txs.iter().map(encode_psbt_b64).collect(),
+        )
+    }
+
+    /// The ark transaction's outputs — where the money actually goes — for a policy to judge.
+    pub fn outputs(&self) -> &[bitcoin::TxOut] {
+        &self.ark_tx.unsigned_tx.output
+    }
+
     /// Mark the session complete after finalization succeeds.
     pub fn mark_done(&mut self) {
         self.phase = SendPhase::Done;

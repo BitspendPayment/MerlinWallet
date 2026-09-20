@@ -623,6 +623,46 @@ PublicKeyPackage pkpFromCommitment(
 /// eVTXO reshare round 1: deal a fresh NON-zero polynomial under the dealer's
 /// EXISTING identifier. The polynomial lives in the returned FFI handle; round 2
 /// uses the regular [dkgPart2].
+/// Reshare round 1 from a polynomial the caller already has.
+///
+/// The variant below draws its own constant term and expands coefficients from a seed. This one
+/// takes both, because a wallet's escrow delta is derived from its passkey through the same HKDF as
+/// the rest of its key material — which is what lets another device reproduce it.
+(Round1SecretPackage, Round1Package) dkgResharePart1From(
+  Identifier identifier,
+  int maxSigners,
+  int minSigners,
+  SecretKey secret,
+  List<BigInt> coefficients,
+) {
+  final idHex = _bigIntToHex64(identifier.toScalar());
+  final idPtr = idHex.toNativeUtf8();
+  final secretPtr = _bigIntToHex64(secret.scalar).toNativeUtf8();
+  final coeffsPtr = _coeffsToJson(coefficients).toNativeUtf8();
+  try {
+    final (data, handle) = callFfi(
+      dkgResharePart1FromFfi(idPtr, maxSigners, minSigners, secretPtr, coeffsPtr),
+    );
+    // The package itself, not wrapped in anything — `serialize_round1_pkg` returns exactly what
+    // `dkgPart1` parses here. (The seeded sibling below unwraps a `round1Package` key that the FFI
+    // has never produced, which is one way to tell nothing has ever called it.)
+    final r1Pkg = Round1Package.fromJson(jsonDecode(data) as Map<String, dynamic>);
+    final r1Secret = Round1SecretPackage(
+      identifier,
+      const <BigInt>[], // the coefficients live in the FFI handle
+      r1Pkg.commitment,
+      minSigners,
+      maxSigners,
+      handle,
+    );
+    return (r1Secret, r1Pkg);
+  } finally {
+    calloc.free(idPtr);
+    calloc.free(secretPtr);
+    calloc.free(coeffsPtr);
+  }
+}
+
 (Round1SecretPackage, Round1Package) dkgResharePart1(
   Identifier identifier,
   int maxSigners,

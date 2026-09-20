@@ -91,7 +91,14 @@ class CancelSignal {
 }
 
 class WalletOperation {
-  WalletOperation._(this._polynomial, this.identifier, this._wallet, this.cancel);
+  WalletOperation._(
+    this._polynomial,
+    this._escrowDelta,
+    this._pairingSlope,
+    this.identifier,
+    this._wallet,
+    this.cancel,
+  );
 
   /// Begin an operation from the passkey's PRF output.
   ///
@@ -101,16 +108,33 @@ class WalletOperation {
   /// With [wallet] — every operation but DKG and recovery — the identifier the seed derives is
   /// checked against the wallet's here, so a wrong passkey is refused before a stream is opened
   /// or anything is sent. Throws [WrongPasskey].
+  ///
+  /// [escrowContext], for the one operation that mints an escrow key, derives that escrow's delta
+  /// here as well. It is done now rather than later because the seed is overwritten before this
+  /// returns and never read twice: whatever an operation will need from the passkey, it takes in
+  /// this one place.
   static Future<WalletOperation> begin(
     Uint8List seed, {
     WalletPublicState? wallet,
     CancelSignal? cancel,
+    Uint8List? escrowContext,
+    Uint8List? pairingContext,
   }) async {
     try {
       final polynomial = await walletPolynomial(seed);
       final identifier = identifierOf(polynomial);
       if (wallet != null && identifier != wallet.identifier) throw const WrongPasskey();
-      return WalletOperation._(polynomial, identifier, wallet, cancel ?? CancelSignal());
+      final escrowDelta =
+          escrowContext == null ? null : await escrowPolynomial(seed, escrowContext);
+      final slope = pairingContext == null ? null : await pairingSlope(seed, pairingContext);
+      return WalletOperation._(
+        polynomial,
+        escrowDelta,
+        slope,
+        identifier,
+        wallet,
+        cancel ?? CancelSignal(),
+      );
     } finally {
       seed.fillRange(0, seed.length, 0);
     }
@@ -125,13 +149,19 @@ class WalletOperation {
 
   final WalletPublicState? _wallet;
   WalletPolynomial? _polynomial;
+  WalletPolynomial? _escrowDelta;
+  BigInt? _pairingSlope;
   threshold.KeyPackage? _keyPackage;
   bool _disposed = false;
 
   bool get isDisposed => _disposed;
 
   /// Whether this operation currently holds anything secret. False after [dispose], always.
-  bool get holdsSecrets => _polynomial != null || _keyPackage != null;
+  bool get holdsSecrets =>
+      _polynomial != null ||
+      _escrowDelta != null ||
+      _pairingSlope != null ||
+      _keyPackage != null;
 
   /// The key package for this operation — see [KeyResolver].
   ///
@@ -168,6 +198,33 @@ class WalletOperation {
   /// The polynomial itself, for the two operations that deal with it directly: DKG deals it, and
   /// recovery rebuilds from it before there is a [WalletPublicState] to check against. The
   /// operation keeps no copy.
+  /// The escrow delta this operation was begun with, for the one operation that mints an escrow
+  /// key. The operation keeps no copy.
+  ///
+  /// Distinct from [takePolynomial]: minting an escrow needs *both* — the wallet share is rebuilt
+  /// from the wallet polynomial, and the delta is what is dealt on top of it.
+  /// The slope this operation deals a service pairing on. Derived under the escrow key and the
+  /// attempt id, so retrying one attempt's delivery reproduces the same contribution.
+  BigInt takePairingSlope() {
+    _ensureLive();
+    final slope = _pairingSlope;
+    if (slope == null) {
+      throw StateError('this operation was not begun with a pairing context');
+    }
+    _pairingSlope = null;
+    return slope;
+  }
+
+  WalletPolynomial takeEscrowDelta() {
+    _ensureLive();
+    final delta = _escrowDelta;
+    if (delta == null) {
+      throw StateError('this operation was not begun with an escrow context');
+    }
+    _escrowDelta = null;
+    return delta;
+  }
+
   WalletPolynomial takePolynomial() {
     _ensureLive();
     final polynomial = _polynomial;
@@ -180,6 +237,8 @@ class WalletOperation {
   void dispose() {
     _disposed = true;
     _polynomial = null;
+    _escrowDelta = null;
+    _pairingSlope = null;
     _keyPackage = null;
   }
 

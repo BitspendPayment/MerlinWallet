@@ -11,6 +11,9 @@ import 'package:app_core/asp/history.dart';
 import 'enclave/gate.dart';
 import 'package:app_core/cosigner/connection.dart';
 import 'package:app_core/sessions/dkg_session.dart';
+import 'package:app_core/sessions/escrow_session.dart';
+import 'package:app_core/sessions/pairing_session.dart';
+import 'package:app_core/sessions/service_delivery.dart';
 import 'package:app_core/sessions/send_session.dart';
 import 'package:app_core/sessions/settle_session.dart';
 import 'package:app_core/sessions/sign_session.dart';
@@ -18,6 +21,7 @@ import 'package:app_core/sessions/delegate.dart';
 import 'package:app_core/sessions/exit_plan.dart' show ExitTx;
 import 'package:app_core/requests/authorship.dart';
 import 'package:app_core/threshold/frost/ceremony.dart' show schnorr64;
+import 'package:app_core/passkey/escrow_public_state.dart';
 import 'package:app_core/passkey/seed_source.dart';
 import 'package:app_core/passkey/operation_secrets.dart';
 import 'package:app_core/passkey/share_reconstruction.dart';
@@ -213,6 +217,12 @@ class MpcClient {
     _userId = hex.decode(state['userId'] as String);
     final wallet = state['wallet'];
     _wallet = wallet is Map ? WalletPublicState.fromJson(Map<String, dynamic>.from(wallet)) : null;
+    _escrows
+      ..clear()
+      ..addAll([
+        for (final e in (state['escrows'] as List? ?? const []))
+          EscrowPublicState.fromJson(Map<String, dynamic>.from(e as Map)),
+      ]);
 
     final delegate = state['delegate'];
     _delegate =
@@ -231,6 +241,9 @@ class MpcClient {
       'userId': hex.encode(_userId!),
     };
     if (_wallet != null) state['wallet'] = _wallet!.toJson();
+    if (_escrows.isNotEmpty) {
+      state['escrows'] = [for (final e in _escrows) e.toJson()];
+    }
     if (_delegate != null) state['delegate'] = _delegate!.toJson();
     if (_exitScriptPubkeyHex != null) state['exitScriptPubkey'] = _exitScriptPubkeyHex;
     await _store.saveClientState(state);
@@ -293,6 +306,8 @@ class MpcClient {
     required Future<P> Function() prepare,
     required Future<T> Function(WalletOperation operation, P prepared) run,
     bool forWallet = true,
+    Uint8List? escrowContext,
+    Uint8List? pairingContext,
   }) {
     return _operations.synchronized(() async {
       // For this turn only: a cancel is of the operation running, never of one still in line.
@@ -301,7 +316,11 @@ class MpcClient {
         // Raced as a whole, so the turn ends wherever the work is parked — including somewhere
         // no driver thought to guard.
         return await cancel.guard(_runOperation(method, cancel,
-            prepare: prepare, run: run, forWallet: forWallet));
+            prepare: prepare,
+            run: run,
+            forWallet: forWallet,
+            escrowContext: escrowContext,
+            pairingContext: pairingContext));
       } finally {
         // Here rather than in [_runOperation], and that is the point: a cancel ends this frame
         // at once, while the work it was racing may take a moment to unwind — or, parked on a
@@ -327,6 +346,8 @@ class MpcClient {
     required Future<P> Function() prepare,
     required Future<T> Function(WalletOperation operation, P prepared) run,
     required bool forWallet,
+    Uint8List? escrowContext,
+    Uint8List? pairingContext,
   }) async {
     final source = _seedSource;
     if (source == null) {
@@ -357,8 +378,13 @@ class MpcClient {
     final seed = await taking;
     // Takes the seed and overwrites it; refuses a passkey that is not this wallet's before
     // anything is opened or sent.
-    final operation =
-        await WalletOperation.begin(seed, wallet: forWallet ? wallet : null, cancel: cancel);
+    final operation = await WalletOperation.begin(
+      seed,
+      wallet: forWallet ? wallet : null,
+      cancel: cancel,
+      escrowContext: escrowContext,
+      pairingContext: pairingContext,
+    );
     if (cancel.isCancelled) {
       operation.dispose();
       throw const OperationCancelled();
@@ -565,6 +591,169 @@ class MpcClient {
       await _saveState();
     });
   }
+
+  // --- Escrow ---
+  //
+  // A second 2-of-2 over a key of its own, so money can be committed to a deal without committing
+  // the wallet. See `sessions/escrow_session.dart`.
+
+  /// Mint an escrow key: one reshare with the cosigner, `V' = V + Δ_wallet + Δ_cosigner`.
+  ///
+  /// The wallet's own key is untouched, and nothing is escrowed by minting — an escrow holds money
+  /// only once money is sent to the address this returns. What the device keeps is public: the
+  /// escrow key, this wallet's place in it, and the package a rebuilt share is checked against.
+  /// The share itself is rebuilt per operation, from the passkey and one scalar the cosigner
+  /// sealed, exactly as the wallet's own share is.
+  ///
+  /// The delta is derived under a context drawn fresh here. It must never repeat for one wallet —
+  /// two escrows on one delta are two points on one line — and the cosigner refuses a repeat, so a
+  /// failure to draw properly is loud rather than silent.
+  ///
+  /// One approval, which is also where the seed comes from.
+  Future<EscrowPublicState> createEscrow() async {
+    final context = Uint8List.fromList(
+      List<int>.generate(16, (_) => _secureRandom.nextInt(256)),
+    );
+    return _withOperation<void, EscrowPublicState>(
+      'Escrow',
+      escrowContext: context,
+      prepare: _nothingToPrepare,
+      run: (operation, _) async {
+        final wallet = _wallet!;
+        final result = await EscrowSession(_conn).run(
+          walletId: operation.identifier,
+          walletPkp: wallet.publicKeyPackage,
+          resolveWallet: operation.keyPackage,
+          delta: operation.takeEscrowDelta(),
+          context: context,
+        );
+        final escrow = EscrowPublicState(
+          escrowKeyHex: result.escrowKeyHex,
+          wallet: WalletPublicState.fromPublicKeyPackage(
+            result.publicKeyPackage,
+            result.keyPackage.identifier,
+            minSigners: _minSigners,
+          ),
+          contextHex: hex.encode(context),
+        );
+        _stillRunning(operation);
+        _escrows.add(escrow);
+        await _saveState();
+        return escrow;
+      },
+    );
+  }
+
+  /// Pair a service into an escrow: a second 2-of-2 over the same key.
+  ///
+  /// Afterwards `{service, cosigner}` can sign the escrow as well as `{wallet, cosigner}` — and the
+  /// escrow key does not move, so money already in it stays reachable both ways. The wallet and the
+  /// service share no pairing, so they cannot sign together; the cosigner is in both, which is what
+  /// makes its policy the thing an escrow rests on.
+  ///
+  /// [serviceIdentifier] names a service the **image** knows. The wallet never names a URL: the
+  /// cosigner resolves one from its measured image, delivers its own half there, and returns the
+  /// origin so this wallet sends its half to the same place. A service this enclave was not built
+  /// to reach is refused before anything is dealt.
+  ///
+  /// **Not usable until the service says so.** Two halves travel by two routes, and a service
+  /// holding one of them can sign nothing — so the cosigner seals the pairing `pending` and marks
+  /// it usable only once this wallet has delivered its own half and the service has checked the
+  /// share they sum to.
+  ///
+  /// [attemptId] resumes a pairing that got as far as the cosigner's delivery and no further. The
+  /// wallet's contribution is derived from the attempt, so naming the same one reproduces the same
+  /// contribution instead of dealing a second, incompatible one. Omit it to start fresh.
+  ///
+  /// One approval, which is also where the seed comes from.
+  Future<PairingResult> pairService({
+    required String escrowKeyHex,
+    required threshold.Identifier serviceIdentifier,
+    List<int>? attemptId,
+    DeliverToService? delivery,
+  }) async {
+    final escrow = _escrows.firstWhere(
+      (e) => e.escrowKeyHex.toLowerCase() == escrowKeyHex.toLowerCase(),
+      orElse: () => throw StateError('this wallet holds no escrow $escrowKeyHex'),
+    );
+    final attempt = Uint8List.fromList(
+      attemptId ?? List<int>.generate(16, (_) => _secureRandom.nextInt(256)),
+    );
+    if (attempt.length != 16) {
+      throw ArgumentError('a pairing attempt id is 16 bytes');
+    }
+    // The escrow key and the attempt together: one attempt reproduces, and a second attempt deals a
+    // different line. Two pairings on one slope are two points on it.
+    final pairingContext = Uint8List.fromList([
+      ...hex.decode(escrow.escrowKeyHex),
+      ...attempt,
+    ]);
+
+    return _withOperation<void, PairingResult>(
+      'PairService',
+      escrowContext: Uint8List.fromList(hex.decode(escrow.contextHex)),
+      pairingContext: pairingContext,
+      prepare: _nothingToPrepare,
+      run: (operation, _) async {
+        final wallet = _wallet!;
+        final delta = operation.takeEscrowDelta();
+        final polynomial = operation.takePolynomial();
+        final slope = operation.takePairingSlope();
+        return PairingSession(_conn, delivery: delivery).run(
+          escrowKeyHex: escrow.escrowKeyHex,
+          escrowPkp: escrow.wallet.publicKeyPackage,
+          serviceIdentifier: serviceIdentifier,
+          walletIdentifier: operation.identifier,
+          attemptId: attempt,
+          slope: slope,
+          resolveEscrow: (dealtShare, deltaShare) => reconstructEscrowShare(
+            polynomial: polynomial,
+            escrowDelta: delta,
+            dealtShare: dealtShare,
+            deltaShare: deltaShare,
+            wallet: wallet,
+            escrow: escrow.wallet,
+          ),
+        );
+      },
+    );
+  }
+
+  /// Commit an escrow to a deal.
+  ///
+  /// Until [deadline] the paired service may release from it, judged against [policy], and this
+  /// wallet may **not** take it back; afterwards those swap. Nothing in Bitcoin enforces that —
+  /// both pairings sign the same key — so what holds it up is the cosigner declining to co-sign
+  /// with the wrong party at the wrong time, in attested code. See `cosigner/src/escrow_session.rs`.
+  ///
+  /// Returns the policy rendered as a sentence, which is what an owner is actually agreeing to.
+  Future<String> openEscrowSession({
+    required String escrowKeyHex,
+    required Map<String, dynamic> policy,
+    required DateTime deadline,
+  }) async {
+    final response = await _conn.escrowOpenSession(cs.EscrowOpenSessionRequest(
+      escrowKey: escrowKeyHex,
+      policyJson: jsonEncode(policy),
+      deadlineSecs: Int64(deadline.millisecondsSinceEpoch ~/ 1000),
+    ));
+    return response.policyDescription;
+  }
+
+  /// Close a deal before its deadline — giving up on it, so what is left can be taken back now.
+  Future<void> closeEscrowSession(String escrowKeyHex) async {
+    await _conn.escrowCloseSession(cs.EscrowCloseSessionRequest(escrowKey: escrowKeyHex));
+  }
+
+  /// What the cosigner holds for this wallet's escrows, including any live deal. Asked rather than
+  /// remembered: this device keeps the public shape of an escrow, never the state of its deal.
+  Future<List<cs.EscrowSummary>> escrowStatus() async =>
+      (await _conn.escrowList()).escrows;
+
+  /// The escrow keys this wallet has minted, oldest first. Public throughout.
+  List<EscrowPublicState> get escrows => List.unmodifiable(_escrows);
+
+  final List<EscrowPublicState> _escrows = [];
 
   // --- The way out ---
   //
@@ -896,9 +1085,10 @@ class MpcClient {
 
   /// Refresh the held VTXOs before they expire.
   ///
-  /// The same `Settle` stream with no boarding output. There is no `storeOnly` any more: the
-  /// cosigner cannot drive a round unattended — a guest has no egress — so what it does instead is
-  /// arm a durable watch and wake the device when the deadline arrives, and this is what runs then.
+  /// The same `Settle` stream with no boarding output. There is no `storeOnly` any more: sealing a
+  /// delegate arms a durable watch, and when its deadline arrives the cosigner either executes the
+  /// delegate itself — where its image allowlists the ASP — or wakes this device, and then this is
+  /// what runs.
   Future<String> settleDelegate({void Function(SettlePhase)? onProgress}) =>
       settle(onProgress: onProgress);
 

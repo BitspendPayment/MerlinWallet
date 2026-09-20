@@ -244,6 +244,58 @@ class FakeCosigner extends cs.CosignerServiceBase {
     }
   }
 
+  // --- Escrow ------------------------------------------------------------------------------------
+
+  /// Not implemented here. The escrow reshare is proved against the real handler in
+  /// `cosigner/tests/escrow_test.rs` and the derivation in `escrow_derivation_test.dart`; this fake
+  /// exists for the operation lifecycle — locks, cancellation, what a stream may ask for — and a
+  /// half-built reshare would test the fake rather than the wallet.
+  @override
+  Stream<cs.EscrowServerMsg> escrow(
+    ServiceCall call,
+    Stream<cs.EscrowClientMsg> request,
+  ) async* {
+    throw GrpcError.unimplemented('this fake does not mint escrow keys');
+  }
+
+  /// Not implemented here either — and for the same reason. Pairing's decisions are proved against
+  /// the real handler in `cosigner/tests/pairing_test.rs`.
+  @override
+  Stream<cs.PairServiceServerMsg> pairService(
+    ServiceCall call,
+    Stream<cs.PairServiceClientMsg> request,
+  ) async* {
+    throw GrpcError.unimplemented('this fake does not pair services');
+  }
+
+  @override
+  Future<cs.PairServiceConfirmResponse> pairServiceConfirm(
+    ServiceCall call,
+    cs.PairServiceConfirmRequest request,
+  ) async =>
+      throw GrpcError.unimplemented('this fake pairs no services to confirm');
+
+  @override
+  Future<cs.EscrowOpenSessionResponse> escrowOpenSession(
+    ServiceCall call,
+    cs.EscrowOpenSessionRequest request,
+  ) async =>
+      throw GrpcError.unimplemented('this fake mints no escrows to commit');
+
+  @override
+  Future<cs.EscrowCloseSessionResponse> escrowCloseSession(
+    ServiceCall call,
+    cs.EscrowCloseSessionRequest request,
+  ) async =>
+      throw GrpcError.unimplemented('this fake mints no escrows to commit');
+
+  @override
+  Future<cs.EscrowListResponse> escrowList(
+    ServiceCall call,
+    cs.EscrowListRequest request,
+  ) async =>
+      cs.EscrowListResponse();
+
   // --- Recover -----------------------------------------------------------------------------------
 
   @override

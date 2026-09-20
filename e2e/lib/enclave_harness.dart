@@ -102,10 +102,15 @@ class EnclaveHarness {
   /// Attach to a running enclave, or boot one.
   ///
   /// [component] defaults to the release component `make cosigner-wasm` writes.
+  /// [serviceOrigins] names the escrow services this image may pair with, as
+  /// `<service id hex>=<origin>`. It is image configuration, measured into PCR0 — a wallet names a
+  /// service *id* and never a URL — so it has to be decided before the enclave boots, which is why
+  /// a test that pairs must start its service on a known port first.
   static Future<EnclaveHarness> start({
     String name = 'merlin',
     int port = 8443,
     String? component,
+    String? serviceOrigins,
     Duration timeout = const Duration(minutes: 20),
   }) async {
     final existing = Platform.environment['MERLIN_ENCLAVE_RUN'];
@@ -140,6 +145,16 @@ class EnclaveHarness {
         '--guest-egress', 'http://192.168.127.254:7070',
         '--guest-env', 'ASP_URL=http://192.168.127.254:7070',
         '--guest-env', 'AUTO_SETTLE_SAFETY_MARGIN_SECS=15060',
+        // Each named service needs both halves of the permission: the guest has to be told the id
+        // means that origin, and the image has to allow the guest to dial it. Naming one without
+        // the other fails at delivery, which is the wrong place to find out.
+        if (serviceOrigins != null && serviceOrigins.isNotEmpty) ...[
+          '--guest-env', 'SERVICE_ORIGINS=$serviceOrigins',
+          for (final entry in serviceOrigins.split(RegExp(r'[,_]')))
+            // The origin is whatever follows the first separator; an origin's own `://` comes
+            // later. See `cosigner/src/handlers/delivery.rs` for why both spellings exist.
+            ...['--guest-egress', entry.replaceFirst(RegExp(r'^[0-9a-fA-F]+[:=]'), '')],
+        ],
         '--background-timeout', '600',
       ],
       workingDirectory: _runtimeRepo,

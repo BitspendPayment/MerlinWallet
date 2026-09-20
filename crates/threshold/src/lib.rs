@@ -19,6 +19,7 @@ pub mod polynomial;
 #[cfg(feature = "std")]
 pub mod random;
 pub mod scalar;
+pub mod service_poly;
 pub mod signature;
 pub mod signing;
 pub mod taptree;

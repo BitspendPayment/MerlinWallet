@@ -117,6 +117,68 @@ threshold.KeyPackage reconstructWalletShare({
   throw const ShareMismatch();
 }
 
+/// The wallet's key package for one ESCROW, from the same passkey and two sealed halves.
+///
+/// An escrow key is `V' = V + Δ_wallet + Δ_cosigner`, minted by a reshare, so the escrow share is
+/// built on top of the wallet share rather than beside it:
+///
+/// ```text
+///   s_wallet  = ±[ f_wallet(id) + dealtShare ]                against V's verifying share
+///   s_escrow  = ±[ s_wallet + Δ_wallet(id) + deltaShare ]     against V''s
+/// ```
+///
+/// **Two `±`, resolved separately.** Every finalizer normalises to an even-Y group key, so a
+/// normalisation sits *between* those two lines: when `V` came out with odd Y the wallet share is
+/// negated before the deltas are added. Pre-adding `dealtShare` to `deltaShare` would therefore be
+/// wrong for half of all wallets — silently, and only for those half. It is not a hypothetical; a
+/// test caught exactly that. See `cosigner/src/handlers/escrow.rs`.
+///
+/// Throws a [ShareReconstructionException], and never returns a share not shown to be the right
+/// one.
+threshold.KeyPackage reconstructEscrowShare({
+  required WalletPolynomial polynomial,
+  required WalletPolynomial escrowDelta,
+  required List<int> dealtShare,
+  required List<int> deltaShare,
+  required WalletPublicState wallet,
+  required WalletPublicState escrow,
+}) {
+  // Step one is the ordinary wallet share, checked as always.
+  final walletShare = reconstructWalletShare(
+    polynomial: polynomial,
+    dealtShare: dealtShare,
+    wallet: wallet,
+  );
+
+  if (deltaShare.length != 32) {
+    throw InvalidContribution('the escrow delta is ${deltaShare.length} bytes, not 32');
+  }
+  final n = threshold.secp256k1Curve.n;
+  final cosignerDelta = threshold.bytesToBigInt(Uint8List.fromList(deltaShare));
+  if (cosignerDelta == BigInt.zero) throw const InvalidContribution('the escrow delta is zero');
+  if (cosignerDelta >= n) {
+    throw const InvalidContribution('the escrow delta is not below the group order');
+  }
+
+  final ownDelta = threshold.evaluatePolynomial(
+      escrow.identifier, [escrowDelta.a0.scalar, ...escrowDelta.higherCoefficients]);
+  final sum = (walletShare.secretShare + ownDelta + cosignerDelta) % n;
+  final expected = escrow.verifyingShare.toLowerCase();
+  for (final candidate in [sum, (n - sum) % n]) {
+    if (candidate == BigInt.zero) continue;
+    if (threshold.elemBaseMul(candidate).toLowerCase() == expected) {
+      return threshold.KeyPackage(
+        escrow.identifier,
+        candidate,
+        escrow.verifyingShare,
+        escrow.publicKeyPackage.verifyingKey,
+        escrow.minSigners,
+      );
+    }
+  }
+  throw const ShareMismatch();
+}
+
 /// What a device with nothing stored learns from `Recover`: the ceremony's public half, checked
 /// for being one ceremony about one wallet that [identifier] took part in.
 ///

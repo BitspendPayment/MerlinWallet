@@ -2,10 +2,12 @@ use std::env;
 
 /// What the runtime passes the guest, as environment variables.
 ///
-/// Three values, and none of them is an endpoint: the cosigner has no outbound sockets, so there is
-/// no ASP URL, no Electrum host and no push channel to configure. `COSIGNER_GROUP_KEY` — which
-/// wallet this instance serves — is read in `main` rather than here, because a missing one is a
-/// refusal to serve rather than a default.
+/// Three values, and none of them is an endpoint — though not for want of anywhere to go. A guest
+/// reaches exactly the origins its image allowlists, and `ASP_URL` is one of them; it is read where
+/// it is used (`asp::rest::AspRest::from_env`) rather than here, so a deployment naming no ASP has
+/// no connection at all rather than a half-configured one. `COSIGNER_GROUP_KEY` — which wallet this
+/// instance serves — is read in `main` rather than here, because a missing one is a refusal to
+/// serve rather than a default.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Directory the KV store lives in, e.g. `/var/lib/cosigner`. Created at open, so a fresh

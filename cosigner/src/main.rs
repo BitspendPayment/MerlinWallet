@@ -122,6 +122,7 @@ mod runtime {
     }
 
     use bindings::enclave::notify::notify;
+    use bindings::enclave::streams::connection;
     use bindings::enclave::tasks::queue;
 
     /// Each method is the WIT function with the same name. Nothing is adapted, which is what the
@@ -159,6 +160,19 @@ mod runtime {
         fn wake(&self, category: &str, reference: Option<&str>) -> Result<(), String> {
             notify::wake(category, reference)
         }
+
+        fn stream_open(&self, id: &str, origin: &str) -> Result<(), String> {
+            connection::stream_open(id, origin)
+        }
+        fn stream_close(&self, id: &str) -> Result<(), String> {
+            connection::stream_close(id)
+        }
+        fn stream_send(&self, id: &str, payload: &[u8]) -> Result<(), String> {
+            connection::stream_send(id, payload)
+        }
+        fn stream_status(&self, id: &str) -> Result<String, String> {
+            connection::stream_status(id)
+        }
     }
 
     /// `run-task`, the other half of `enclave:tasks/background`.
@@ -183,6 +197,42 @@ mod runtime {
                 wstd::runtime::block_on(wallet.run_task_with(&task_id, &payload, asp.as_mut()))
             };
             run().inspect_err(|e| eprintln!("background task {task_id} failed: {e}"))
+        }
+
+        /// One message from an escrow service, as one invocation.
+        ///
+        /// The same shape as `run_task` and for the same reason: the runtime calls this with no
+        /// request in flight, so there is no instance to inherit and this opens the wallet itself.
+        /// What is different is who is on the other end — a service that could not call in, because
+        /// it has no passkey for this tenant — and that the bytes this returns are sent back to it
+        /// as the reply.
+        ///
+        /// An `Err` has the runtime redeliver the message, so a refusal is NOT an error: it comes
+        /// back as `Ok` carrying a `Refused`. See `cosigner::service_stream`.
+        ///
+        /// The runtime holds this tenant's lock for the whole call, exactly as it does for a
+        /// request — so two messages on one connection cannot interleave here, and a release
+        /// cannot race another release of the same escrow.
+        fn on_message(
+            id: String,
+            message_id: String,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>, String> {
+            let run = || {
+                let cfg = cosigner::config::ServerConfig::from_environment();
+                let mut wallet = super::open_cosigner(&cfg).map_err(|e| e.to_string())?;
+                let asp = cosigner::asp::rest::AspRest::from_env();
+                wstd::runtime::block_on(wallet.on_service_message_with(
+                    &id,
+                    &message_id,
+                    &payload,
+                    asp,
+                    &cosigner::evidence::HttpEvidence,
+                ))
+            };
+            // The body is never logged: a pairing half travels on this connection, and so does
+            // everything beside one. The id says which conversation, and nothing about it.
+            run().inspect_err(|e| eprintln!("a message on {id} could not be handled: {e}"))
         }
     }
 

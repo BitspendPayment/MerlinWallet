@@ -12,16 +12,17 @@
 //!
 //! ## What a background task can and cannot do
 //!
-//! It cannot reach the network. `wasmtime_wasi`'s `SocketAddrCheck` defaults to refusing every
-//! address and the runtime never overrides it, so a guest has no egress at all — not in a request,
-//! not in a task. That rules out the obvious shape for unattended settling: a task cannot register
-//! an intent, relay a batch round, or ask the ASP what arrived.
+//! It reaches exactly what its image allows, and nothing else. `wasmtime_wasi`'s `SocketAddrCheck`
+//! refuses every address by default; a deployment overrides it with an origin allowlist that is
+//! image configuration, measured into PCR0 — so a client learns where this guest may send traffic
+//! from the same attestation that tells it what the guest is. This deployment allows the ASP.
 //!
-//! What it can do without a socket is read its own sealed state and compare a deadline to the
-//! clock. So the cosigner does not settle in the background — it *wakes its owner* when a settle
-//! comes due, with the delegate already signed and waiting, and the app drives the round over the
-//! attested channel. `notify.wit` names this as the primary use: "a finished task telling its owner
-//! to come and look".
+//! So a settle that has come due is executed in the task itself rather than handed back to a phone;
+//! see `crate::asp`. Where the image names no ASP, the task falls back on the thing it can always
+//! do without a connection: read its own sealed state, compare a deadline to the clock, and *wake
+//! its owner*, with the delegate already signed and waiting for the app to drive over the attested
+//! channel. `notify.wit` names that as the primary use: "a finished task telling its owner to come
+//! and look".
 
 use std::fmt;
 
@@ -66,6 +67,32 @@ pub trait Host: Send + Sync {
     /// tenant's data, so it carries nothing a person reads. The app wakes and fetches the detail
     /// over the attested channel.
     fn wake(&self, category: &str, reference: Option<&str>) -> Result<(), String>;
+
+    // --- Connections the runtime holds ---------------------------------------------------------
+    //
+    // An escrow service has no passkey for its user's tenant, so it can never call in; and this
+    // cosigner has no execution context between invocations, so it cannot hold a socket open. The
+    // runtime holds it, and each message becomes one invocation — see `enclave:streams`.
+
+    /// Ask the runtime to maintain a connection, and to keep maintaining it. Durable: it survives a
+    /// restart and is re-established without this cosigner being involved.
+    ///
+    /// `origin` must be one the IMAGE allows, exactly as an outgoing request must — asking the
+    /// runtime to hold a connection reaches no further than making the request directly.
+    fn stream_open(&self, id: &str, origin: &str) -> Result<(), String>;
+
+    /// Stop maintaining it. Idempotent.
+    fn stream_close(&self, id: &str) -> Result<(), String>;
+
+    /// One message to the far side.
+    ///
+    /// Fails when the connection is down rather than queueing: only the caller knows whether a
+    /// message is still worth sending after the far side has been absent.
+    fn stream_send(&self, id: &str, payload: &[u8]) -> Result<(), String>;
+
+    /// A JSON record: whether it is connected, and enough history to tell "never worked" from
+    /// "flapping".
+    fn stream_status(&self, id: &str) -> Result<String, String>;
 }
 
 /// The runtime is not there.
@@ -101,6 +128,23 @@ impl Host for Detached {
         Err(format!(
             "no runtime to wake devices for {category}: not running as a guest"
         ))
+    }
+
+    fn stream_open(&self, id: &str, _: &str) -> Result<(), String> {
+        Err(format!("no runtime to hold a connection {id}: not running as a guest"))
+    }
+
+    fn stream_close(&self, _: &str) -> Result<(), String> {
+        // Closing what was never opened is what a caller wants either way.
+        Ok(())
+    }
+
+    fn stream_send(&self, id: &str, _: &[u8]) -> Result<(), String> {
+        Err(format!("no connection {id} to send on: not running as a guest"))
+    }
+
+    fn stream_status(&self, id: &str) -> Result<String, String> {
+        Err(format!("no connection {id}: not running as a guest"))
     }
 }
 

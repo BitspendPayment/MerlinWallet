@@ -55,6 +55,9 @@ class WalletPolynomial {
 /// The labels. Each is a distinct purpose; none may be reused for another.
 const String _a0Label = 'merlin/frost/dkg/a0/v1';
 const String _a1Label = 'merlin/frost/dkg/a1/v1';
+const String _escrowD0Label = 'merlin/frost/escrow/d0/v1';
+const String _escrowD1Label = 'merlin/frost/escrow/d1/v1';
+const String _pairingSlopeLabel = 'merlin/frost/pairing/slope/v1';
 
 /// The salt is fixed and public: HKDF's salt adds nothing when the input is already a uniform
 /// 32-byte PRF output, and a per-wallet salt would be one more thing to recover.
@@ -66,16 +69,54 @@ Future<WalletPolynomial> walletPolynomial(Uint8List seed) async => WalletPolynom
       a1: await _scalar(seed, _a1Label),
     );
 
+/// What this wallet deals to mint one escrow key: `Δ(x) = d0 + d1·x`.
+///
+/// Escrowed money must be as recoverable as ordinary money, so this delta is derived rather than
+/// drawn — the same passkey on a new device reproduces it, and with the scalar the cosigner sealed
+/// that is enough to rebuild the escrow share. A random delta would have made escrow the one thing
+/// a lost phone could not get back.
+///
+/// [context] separates one escrow from the next. **It must never repeat for the same wallet**: two
+/// escrows dealt on one delta are two points on one line, and two points determine it. The caller
+/// draws it fresh — see `MpcClient.createEscrow` — and the cosigner records which context minted
+/// which key, so a repeat is visible rather than silent.
+Future<WalletPolynomial> escrowPolynomial(Uint8List seed, Uint8List context) async =>
+    WalletPolynomial(
+      a0: threshold.SecretKey(await _scalar(seed, _escrowD0Label, context)),
+      a1: await _scalar(seed, _escrowD1Label, context),
+    );
+
+/// The slope this wallet deals when pairing a service into an escrow.
+///
+/// Derived rather than drawn, for one reason: **a delivery that failed must be retryable.** The
+/// wallet's contribution and the cosigner's reach the service by different routes, and if the
+/// wallet's does not arrive it has to be sent again — which means computing the same scalar again.
+/// A drawn slope could not be, so "retry" would mean throwing away the cosigner's half as well and
+/// pairing from scratch.
+///
+/// [context] is the escrow key and the attempt id together, so one attempt reproduces and a second
+/// attempt is a different line. Reusing a context across two *pairings* would put two of this
+/// wallet's dealings on one slope — what `crates/threshold/src/service_poly.rs` exists to warn
+/// about — which is why the attempt id is in it, and why the cosigner refuses a confirmation
+/// naming an attempt other than the one it sealed.
+Future<BigInt> pairingSlope(Uint8List seed, Uint8List context) =>
+    _scalar(seed, _pairingSlopeLabel, context);
+
 /// HKDF-SHA256 to 64 bytes, reduced mod n.
 ///
 /// Sixty-four bytes rather than thirty-two: reducing a 32-byte value biases the result towards
 /// small scalars by about 2^-128, which is negligible but free to avoid. Zero is refused — it is
 /// not a usable scalar and, for `a0`, would be a wallet with no key at all.
-Future<BigInt> _scalar(Uint8List seed, String label) async {
+/// [context], when given, is appended to the label after a zero byte, so a label with a context and
+/// the same label without one can never collide.
+Future<BigInt> _scalar(Uint8List seed, String label, [Uint8List? context]) async {
+  final info = Uint8List.fromList(
+    context == null ? label.codeUnits : [...label.codeUnits, 0, ...context],
+  );
   final bytes = await Hkdf(hmac: Hmac.sha256(), outputLength: 64).deriveKey(
     secretKey: SecretKey(seed),
     nonce: _salt,
-    info: Uint8List.fromList(label.codeUnits),
+    info: info,
   );
   final scalar = threshold.modNFromBytesBE(Uint8List.fromList(bytes.bytes));
   if (scalar == BigInt.zero) {

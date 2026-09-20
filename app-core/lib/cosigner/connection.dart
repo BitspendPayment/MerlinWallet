@@ -189,6 +189,20 @@ class CosignerConnection {
     return _track(out, _stream('Send', (o) => _stub.send(out.stream, options: o)));
   }
 
+  /// Minting an escrow key: one reshare between this wallet and its cosigner. See
+  /// `sessions/escrow_session.dart`.
+  Duplex<cs.EscrowClientMsg, cs.EscrowServerMsg> openEscrow() {
+    final out = StreamController<cs.EscrowClientMsg>();
+    return Duplex(out, _stream('Escrow', (o) => _stub.escrow(out.stream, options: o)));
+  }
+
+  /// Pairing a service into an escrow. See `sessions/pairing_session.dart`.
+  Duplex<cs.PairServiceClientMsg, cs.PairServiceServerMsg> openPairService() {
+    final out = StreamController<cs.PairServiceClientMsg>();
+    return Duplex(
+        out, _stream('PairService', (o) => _stub.pairService(out.stream, options: o)));
+  }
+
   Duplex<cs.SettleClientMsg, cs.SettleServerMsg> openSettle() {
     final out = StreamController<cs.SettleClientMsg>();
     return _track(out, _stream('Settle', (o) => _stub.settle(out.stream, options: o)));
@@ -237,6 +251,26 @@ class CosignerConnection {
       _calls.remove(call);
     }
   }
+
+  /// The escrow keys this wallet holds. Public projection only, so a device that keeps nothing can
+  /// ask what exists rather than remembering.
+  Future<cs.EscrowListResponse> escrowList() async =>
+      _stub.escrowList(cs.EscrowListRequest(), options: await _approved('EscrowList'));
+
+  /// Mark a pairing usable, once the service has both halves and its share checks out.
+  Future<cs.PairServiceConfirmResponse> pairServiceConfirm(
+          cs.PairServiceConfirmRequest r) async =>
+      _stub.pairServiceConfirm(r, options: await _approved('PairServiceConfirm'));
+
+  /// Commit an escrow to a deal: what the paired service may take, and until when.
+  Future<cs.EscrowOpenSessionResponse> escrowOpenSession(
+          cs.EscrowOpenSessionRequest r) async =>
+      _stub.escrowOpenSession(r, options: await _approved('EscrowOpenSession'));
+
+  /// Close a deal early.
+  Future<cs.EscrowCloseSessionResponse> escrowCloseSession(
+          cs.EscrowCloseSessionRequest r) async =>
+      _stub.escrowCloseSession(r, options: await _approved('EscrowCloseSession'));
 
   Future<void> shutdown() => _channel.shutdown();
 }

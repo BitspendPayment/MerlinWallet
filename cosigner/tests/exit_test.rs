@@ -52,6 +52,20 @@ impl cosigner::host::Host for Accepting {
     fn wake(&self, _: &str, _: Option<&str>) -> Result<(), String> {
         Ok(())
     }
+    // This test is about exits, not connections; accepting keeps it about exits.
+    fn stream_open(&self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn stream_close(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn stream_send(&self, _: &str, _: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+    fn stream_status(&self, _: &str) -> Result<String, String> {
+        Ok(r#"{"connected":true}"#.into())
+    }
+
 }
 
 /// A P2TR output somewhere else entirely — an exit pays a wallet this one does not control.

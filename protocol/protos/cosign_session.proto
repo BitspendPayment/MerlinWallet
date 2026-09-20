@@ -107,6 +107,44 @@ service Cosigner {
   // It reads; it never installs. A recovery that re-keyed would strand everything the seal holds.
   rpc Recover(RecoverRequest) returns (RecoverResponse);
 
+  // Minting an escrow key: one reshare between the two parties that already hold this wallet.
+  //
+  // `V' = V + delta_wallet + delta_cosigner` — a second 2-of-2 over a key of its own, held by the
+  // same pair. The wallet's key is untouched, which is the point: a service can be paired into an
+  // escrow without being paired into the wallet, and escrowed money is visibly separate from the
+  // rest. Two exchanges, the same shape as `Dkg`, and the secrets live on one handler's stack.
+  rpc Escrow(stream EscrowClientMsg) returns (stream EscrowServerMsg);
+
+  // The escrow keys this wallet holds. Public projection only — a device that keeps nothing asks
+  // what exists rather than remembering.
+  rpc EscrowList(EscrowListRequest) returns (EscrowListResponse);
+
+  // Pairing a service into an escrow: a key-preserving refresh giving the service a share of the
+  // SAME key, so `{service, cosigner}` can sign it too and the escrow key never moves.
+  //
+  // The cosigner's half of that share goes straight to the service, over an origin THIS IMAGE
+  // names — a wallet names a service id, never a URL. So the reply carries no half: a wallet
+  // holding both would hold the service's share. See `cosigner/src/handlers/delivery.rs`.
+  rpc PairService(stream PairServiceClientMsg) returns (stream PairServiceServerMsg);
+
+  // Finishing a pairing, once the service has BOTH contributions and has checked the share they
+  // sum to. Until then the pairing is `pending` and nothing may be committed to it: a service that
+  // holds one half can sign nothing, and an escrow that believed otherwise would be a deal with a
+  // party that cannot take its side of it.
+  rpc PairServiceConfirm(PairServiceConfirmRequest) returns (PairServiceConfirmResponse);
+
+  // Committing an escrow to a deal: what the paired service may take, and until when.
+  //
+  // Both pairings sign the same key, so which of them gets a signature is a DECISION this cosigner
+  // makes on sealed state — not something the key enforces. Until the deadline the service may
+  // release and the owner may not reclaim; afterwards those swap, with nothing written down in
+  // between. See `cosigner/src/escrow_session.rs`, which says plainly what that does and does not
+  // guarantee.
+  rpc EscrowOpenSession(EscrowOpenSessionRequest) returns (EscrowOpenSessionResponse);
+
+  // Closing one early. The owner giving up on the deal before its deadline.
+  rpc EscrowCloseSession(EscrowCloseSessionRequest) returns (EscrowCloseSessionResponse);
+
 }
 
 // 32-512 characters of [A-Za-z0-9_:.-], as `notify.wit` specifies.
@@ -663,4 +701,215 @@ message DkgComplete {
   string group_key = 2;
   // Whether `DkgOpen.device_token` was enrolled for wakes. Not having been is not a failed ceremony.
   bool device_enrolled = 3;
+}
+
+// --- Escrow -------------------------------------------------------------------------------------
+//
+// A reshare between the wallet and this cosigner, producing a key only they hold. Both deal a fresh
+// non-zero delta under the identifiers they already have, both finalize, and neither side's wallet
+// share changes. See `cosigner/src/handlers/escrow.rs`.
+
+message EscrowClientMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    EscrowOpen open = 3;
+    EscrowRound2 round2 = 4;
+  }
+}
+
+message EscrowOpen {
+  // The wallet's FROST identifier in its OWN key — the reshare is dealt under the identifiers both
+  // parties already have, so the deltas land on the same points as the old shares.
+  bytes identifier = 1;
+  // JSON: the wallet's delta dealing.
+  string round1_package = 2;
+  // What separates this escrow's delta from the next one's in the wallet's key derivation. Recorded
+  // so a repeat is refused: two escrows dealt on one delta are two points on one line, and two
+  // points determine it. 16 bytes, drawn fresh by the wallet.
+  bytes context = 3;
+}
+
+// JSON: the wallet's share of its own delta, addressed to the cosigner.
+message EscrowRound2 { string round2_package = 1; }
+
+message EscrowServerMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    EscrowRound1Out round1 = 3;
+    EscrowComplete complete = 4;
+  }
+}
+
+message EscrowRound1Out {
+  // JSON: the cosigner's delta dealing.
+  string round1_package = 1;
+  // `f_cosigner(wallet identifier)`, 32 bytes big-endian — see `SendSighashes.wallet_dealt_share`.
+  //
+  // A reshare adds a delta to the wallet's EXISTING share, so the wallet has to rebuild that share
+  // before it can finalize. It keeps none, so the half it cannot derive rides this stream exactly
+  // as it rides every other, once, and never the cosigner's own share.
+  bytes wallet_dealt_share = 2;
+}
+
+message EscrowComplete {
+  // JSON: the cosigner's share of its delta, addressed to the wallet. With this the wallet
+  // finalizes its own side and arrives at the same key.
+  string round2_package = 1;
+  // `V'`, compressed hex. The wallet derives the same one; this is here so a mismatch is caught now
+  // rather than when money is already in it.
+  string escrow_key = 2;
+}
+
+// A stream rather than one call, because the wallet cannot deal until it has rebuilt its escrow
+// share — and it keeps no share, so the halves it needs ride this stream as they ride every other.
+message PairServiceClientMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    PairServiceOpen open = 3;
+    PairServiceDeal deal = 4;
+  }
+}
+
+message PairServiceOpen {
+  // Which escrow, compressed hex.
+  string escrow_key = 1;
+  // The service's FROST identifier, 32 bytes. The IMAGE resolves this to an origin; the request
+  // never names one. An id this image does not know is refused here, before anything is dealt.
+  bytes service_identifier = 2;
+  // What ties the two halves together, 16 bytes, drawn fresh by the wallet for each ATTEMPT.
+  //
+  // The two contributions reach the service by different routes — the cosigner's directly from the
+  // enclave, the wallet's from the device — so the service needs to know which two belong to each
+  // other. A retry deals fresh halves on a fresh slope, and halves from two attempts do not sum to
+  // anything; this is what keeps them apart rather than relying on the verification to notice.
+  bytes attempt_id = 3;
+}
+
+message PairServiceDeal {
+  // The wallet's contribution to the cosigner: a 32-byte scalar.
+  bytes contribution_to_cosigner = 1;
+  // The wallet's contribution to the service: a 33-byte compressed POINT, and never the scalar
+  // behind it. A cosigner holding both that scalar and its own counter-share would have two points
+  // on one line; it checks this point against public data instead. See `handlers/pairing.rs`.
+  bytes contribution_to_service = 2;
+}
+
+message PairServiceServerMsg {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    PairServiceReady ready = 3;
+    PairServiceDone done = 4;
+  }
+}
+
+// What the wallet needs to rebuild its escrow share, and nothing more. Both are halves of sums
+// whose other terms come from the passkey — see `SendSighashes.wallet_dealt_share`.
+message PairServiceReady {
+  // `f_cosigner(wallet identifier)` for the WALLET key, 32 bytes.
+  bytes wallet_dealt_share = 1;
+  // `delta_cosigner(wallet identifier)` for THIS ESCROW, 32 bytes.
+  bytes escrow_delta_share = 2;
+}
+
+message PairServiceDone {
+  // The pairing's public key package, JSON. Its verifying key is the escrow key, unchanged.
+  string public_key_package_json = 1;
+  // The verifying share the service's assembled share must match, hex.
+  string service_verifying_share = 2;
+  // Where this enclave delivered its own half, resolved from the IMAGE's `SERVICE_ORIGINS`.
+  //
+  // Returned so the wallet sends its contribution to the same place rather than choosing one: the
+  // wallet has no business knowing where a service lives, and two halves delivered to two
+  // different hosts would split a share between them. The wallet trusts this because it trusts
+  // the attestation that says which image is running.
+  string service_origin = 3;
+  // Echoed so the wallet labels its own delivery with the attempt this pairing belongs to.
+  bytes attempt_id = 4;
+}
+
+message PairServiceConfirmRequest {
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
+  string escrow_key = 4;
+  // The attempt being confirmed. A confirmation for any other attempt is refused: it would mark a
+  // pairing usable on the strength of a different pairing's delivery.
+  bytes attempt_id = 5;
+}
+
+message PairServiceConfirmResponse {}
+
+message EscrowOpenSessionRequest {
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
+  string escrow_key = 4;
+  // What a release must satisfy, as the policy IR's JSON — `cosigner/src/policy.rs`. An absent or
+  // unparseable policy releases NOTHING: the IR's default is `never`.
+  string policy_json = 5;
+  // Unix seconds. After this the service may no longer take and the owner may reclaim.
+  int64 deadline_secs = 6;
+}
+
+message EscrowOpenSessionResponse {
+  // What the owner is agreeing to, rendered for consent — `Policy::describe`.
+  string policy_description = 1;
+  int64 deadline_secs = 2;
+}
+
+message EscrowCloseSessionRequest {
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
+  string escrow_key = 4;
+}
+
+message EscrowCloseSessionResponse {}
+
+message EscrowListRequest {
+  // Authentication is the runtime's — see the note at the top of this file.
+  reserved 1, 2, 3;
+  reserved "user_id", "signature", "timestamp_ms";
+}
+
+message EscrowListResponse { repeated EscrowSummary escrows = 1; }
+
+// What a wallet needs to operate an escrow, and nothing secret.
+message EscrowSummary {
+  string escrow_key = 1;
+  // This wallet's FROST identifier in that escrow.
+  bytes wallet_identifier = 2;
+  // The escrow's public key package, JSON: the group key and both verifying shares. What a rebuilt
+  // share is checked against.
+  string public_key_package_json = 3;
+  int64 created_at = 4;
+  // The service paired into this escrow, hex, or empty when none is.
+  string service_identifier = 5;
+  // Whether that pairing is finished. BOTH parties have to say so, and each can answer only for
+  // itself — so the two are reported separately as well as together. A pending pairing is not
+  // usable and nothing may be committed to it.
+  bool service_ready = 7;
+  // The service said, over the connection the cosigner's runtime holds to it, that it has both
+  // halves and that the share they sum to matches the published verifying share. Only the service
+  // can know this: it is the only party that ever holds both halves.
+  bool service_confirmed = 8;
+  // The wallet said it delivered its own half and the service took it. Only the wallet can know
+  // this: its half travels device-to-service and never through the cosigner.
+  bool wallet_confirmed = 9;
+  // The live deal, when there is one.
+  EscrowSessionSummary session = 6;
+}
+
+message EscrowSessionSummary {
+  // Whether a release would be accepted right now — the clock and the state together, so a caller
+  // need not reimplement the rule.
+  bool open = 1;
+  int64 deadline_secs = 2;
+  int64 opened_at = 3;
+  uint64 released_sats = 4;
+  string policy_description = 5;
 }

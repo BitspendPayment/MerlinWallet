@@ -64,7 +64,9 @@ impl Cosigner {
     /// The body of the guest's exported `run-task`, with no ASP to run a delegate against — so a
     /// due delegate wakes the owner instead.
     pub fn run_task(&mut self, task_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
-        futures_lite_block_on(self.run_task_with::<NoAsp>(task_id, payload, None))
+        crate::handlers::helpers::block_on_ready(
+            self.run_task_with::<crate::asp::NoAsp>(task_id, payload, None),
+        )
     }
 
     /// The body of the guest's exported `run-task`.
@@ -139,6 +141,10 @@ impl Cosigner {
     /// `deadline_secs` of 0 means the expiry was unknown — the ASP had not indexed the VTXOs yet —
     /// and arming against a made-up deadline would wake the owner for nothing. Refused rather than
     /// guessed.
+    ///
+    /// **The only thing this queue is used for.** An escrow's deadline had a task of its own once,
+    /// and does not any more: see `crate::service_stream` for what replaced it and
+    /// `crate::escrow_session` for why nothing has to run at a deadline at all.
     pub fn arm_settle_watch(&self, deadline_secs: u64) -> Result<(), String> {
         if deadline_secs == 0 {
             return Err("no deadline to watch: the VTXO expiries are not known yet".into());
@@ -165,60 +171,5 @@ impl Cosigner {
             }
             Err(e) => Err(e),
         }
-    }
-}
-
-/// The watch without an ASP.
-struct NoAsp;
-
-impl AspApi for NoAsp {
-    type Events = NoEvents;
-    async fn get_info(&mut self) -> Result<ark::client::types::ArkInfo, String> {
-        Err("no ASP".into())
-    }
-    async fn register_intent(&mut self, _: &str, _: &str) -> Result<String, String> {
-        Err("no ASP".into())
-    }
-    async fn events(&mut self, _: &[String]) -> Result<NoEvents, String> {
-        Err("no ASP".into())
-    }
-    async fn confirm_registration(&mut self, _: &str) -> Result<(), String> {
-        Err("no ASP".into())
-    }
-    async fn submit_tree_nonces(&mut self, _: &str, _: &str, _: &[(String, String)]) -> Result<(), String> {
-        Err("no ASP".into())
-    }
-    async fn submit_tree_signatures(&mut self, _: &str, _: &str, _: &[(String, String)]) -> Result<(), String> {
-        Err("no ASP".into())
-    }
-    async fn submit_forfeits(&mut self, _: &[String], _: &str) -> Result<(), String> {
-        Err("no ASP".into())
-    }
-}
-
-struct NoEvents;
-
-impl crate::asp::EventSource for NoEvents {
-    async fn next(
-        &mut self,
-    ) -> Result<Option<ark::client::proto::get_event_stream_response::Event>, String> {
-        Ok(None)
-    }
-}
-
-/// Drive a future that never actually waits — `run_task` with no ASP makes no I/O.
-fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn noop(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-    let mut cx = Context::from_waker(&waker);
-    let mut fut = std::pin::pin!(fut);
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(out) => out,
-        Poll::Pending => panic!("run_task without an ASP never waits"),
     }
 }

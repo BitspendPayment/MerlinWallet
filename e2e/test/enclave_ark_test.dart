@@ -15,6 +15,7 @@
 /// ```
 library;
 
+import 'dart:math';
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
@@ -24,6 +25,8 @@ import 'package:app_core/asp/asp_client.dart' show IndexerVtxo;
 import 'package:app_core/asp/exit_chain.dart' show ChainKind;
 import 'package:blockchain_utils/blockchain_utils.dart' show SegwitBech32Encoder;
 import 'package:app_core/client.dart';
+import 'package:app_core/threshold_types.dart' as ark_threshold;
+import 'package:e2e/escrow_service.dart';
 import 'package:app_core/enclave/attestation.dart';
 import 'package:app_core/enclave/authenticator.dart';
 import 'package:app_core/enclave/gate.dart';
@@ -92,14 +95,40 @@ Future<T> eventually<T>(
   fail('timed out after $timeout waiting for $what; last saw $last');
 }
 
+/// The escrow service these tests pair with.
+///
+/// Its identifier and its origin both go into the enclave's IMAGE, so both have to be decided
+/// before the enclave boots — a wallet names a service id and never a URL, and the image is what
+/// turns one into the other. Hence a fixed label and a fixed port.
+const servicePort = 7099;
+final serviceIdentifier =
+    ark_threshold.Identifier.derive(Uint8List.fromList('merlin-e2e-escrow-service'.codeUnits));
+
 void main() {
   EnclaveHarness? harness;
+  EscrowService? service;
 
   setUpAll(() async {
-    harness = await EnclaveHarness.start();
+    // Before the enclave: the image has to name where this service is, and it cannot be told
+    // afterwards.
+    service = EscrowService(identifier: serviceIdentifier);
+    await service!.start(port: servicePort);
+    final serviceId = _hex(serviceIdentifier.serialize());
+    // 192.168.127.254 is this host as the guest sees it — the same address the ASP is reached at.
+    // `id:origin` rather than `id=origin`: `dev-enclave.sh` validates a `--guest-env` value against
+    // `[A-Za-z0-9:/._-]`, so the natural spelling cannot reach an image built through it.
+    final origins = '$serviceId:http://192.168.127.254:$servicePort';
+
+    harness = await EnclaveHarness.start(serviceOrigins: origins);
     Log.info('enclave up: pcr16=${harness!.pcr16.substring(0, 16)}…'
         '${harness!.attached ? ' (attached)' : ''}');
+    if (harness!.attached) {
+      Log.info('attached: escrow pairing needs SERVICE_ORIGINS in that image — '
+          '$origins');
+    }
   });
+
+  tearDownAll(() async => service?.stop());
 
   tearDownAll(() async => harness?.stop());
 
@@ -307,8 +336,7 @@ void main() {
     btc = RegtestHelper(rpcUrl: 'http://127.0.0.1:18443/wallet/default');
   });
 
-  Future<Wallet> wallet(String name) =>
-      harness!.wallet(name, aspHost: aspHost, aspPort: aspPort);
+  Future<Wallet> wallet(String name) => harness!.wallet(name, aspHost: aspHost, aspPort: aspPort);
 
   /// Fund [w]'s boarding address with [btcAmount], settle it into Ark, and return what it holds.
   Future<List<IndexerVtxo>> boardAndSettle(Wallet w, double btcAmount) async {
@@ -369,8 +397,7 @@ void main() {
         expect(exit.amountSats, vtxo.amountSats,
             reason: 'an exit pays the whole VTXO — it carries an anchor instead of a fee');
         expect(exit.sequence, greaterThan(0), reason: "it waits out the VTXO's exit delay");
-        expect(exit.rawTx.length, greaterThan(200),
-            reason: 'a signed transaction, not a stub');
+        expect(exit.rawTx.length, greaterThan(200), reason: 'a signed transaction, not a stub');
 
         // The exit is the last hop. Everything above it — the batch tree, down from a commitment
         // transaction already on-chain — has to be published first, and the indexer is where those
@@ -494,8 +521,7 @@ void main() {
         final exitTxid = (await btc.decodeRawTransaction(exit.rawTx))['txid'] as String;
         await btc.generateBlock(await btc.getNewAddress(), [exit.rawTx]);
         final mined = await btc.getRawTransaction(exitTxid);
-        expect(mined['confirmations'], greaterThanOrEqualTo(1),
-            reason: 'the exit is in a block');
+        expect(mined['confirmations'], greaterThanOrEqualTo(1), reason: 'the exit is in a block');
 
         // And the money is where the owner said it should go.
         final paid = (mined['vout'] as List)
@@ -545,7 +571,8 @@ void main() {
         expect(held, hasLength(1));
         final vtxo = held.single;
         expect(vtxo.exitDelay, greaterThan(0),
-            reason: 'tagged from the script it came under — the cosigner refuses a VTXO without it');
+            reason:
+                'tagged from the script it came under — the cosigner refuses a VTXO without it');
         expect(vtxo.script, isNotEmpty);
         // Straight from the indexer, so present at once. It used to land asynchronously, backfilled
         // by a subscription the cosigner ran; nothing runs one now.
@@ -683,9 +710,8 @@ void main() {
         final bobArk = await bob.client.getArkAddress();
 
         // Travel as bytes, the way a request really would.
-        Future<PaymentIntent> deliver(PaymentRequestCreateRequest written) =>
-            alice.client.receivePaymentRequest(
-                PaymentRequestCreateRequest.fromBuffer(written.writeToBuffer()));
+        Future<PaymentIntent> deliver(PaymentRequestCreateRequest written) => alice.client
+            .receivePaymentRequest(PaymentRequestCreateRequest.fromBuffer(written.writeToBuffer()));
 
         // Not a contact yet: refused.
         await expectLater(
@@ -723,12 +749,13 @@ void main() {
         expect(inbox.map((i) => i.id), contains(intent.id));
 
         final bobBefore = (await bob.client.listVtxos()).totalSats;
-        final payTxid = await whileMining(btc,
-            () => alice.client.sendVtxo(intent.toArkAddress, intent.amountSats.toInt()));
+        final payTxid = await whileMining(
+            btc, () => alice.client.sendVtxo(intent.toArkAddress, intent.amountSats.toInt()));
         expect(payTxid, isNotEmpty);
 
         final paid = (await alice.client.paymentRequests()).firstWhere((i) => i.id == intent.id);
-        expect(paid.status, 'fulfilled', reason: 'the settled send must mark the request fulfilled');
+        expect(paid.status, 'fulfilled',
+            reason: 'the settled send must mark the request fulfilled');
         expect(paid.arkTxid, payTxid);
         await eventually('Bob to be paid', bob.client.listVtxos,
             (List<IndexerVtxo> v) => v.totalSats == bobBefore + 5000);
@@ -944,8 +971,7 @@ void main() {
       final newPhone =
           await harness!.newDeviceFor('recover_gina', aspHost: aspHost, aspPort: aspPort);
       try {
-        newPhone.client
-            .setSeedSource(FixedSeedSource(Uint8List.fromList(List.filled(32, 0xab))));
+        newPhone.client.setSeedSource(FixedSeedSource(Uint8List.fromList(List.filled(32, 0xab))));
         await expectLater(
           newPhone.client.recover(),
           throwsA(predicate((e) => '$e'.contains('does not derive this wallet'))),
@@ -994,9 +1020,345 @@ void main() {
       }
     }, timeout: const Timeout(Duration(minutes: 10)));
   });
+
+  group('pairing a service into an escrow', () {
+    // The wallet sends where the enclave sent — but the enclave's address for this host is not one
+    // the test process can route to. See `HostSideDelivery`.
+    final delivery = HostSideDelivery();
+
+    /// Wait for the cosigner to agree a pairing is finished.
+    ///
+    /// Finishing needs BOTH parties, and they speak by different routes. The wallet's word rides
+    /// the RPC it just made; the service's travels the other way — an event on the connection the
+    /// runtime holds, one `on-message` invocation, and that invocation needs the tenant lock the
+    /// pairing call was holding. So "ready" arrives shortly *after* the call that caused it
+    /// returns, which is what asynchronous agreement looks like and not a bug to design away.
+    Future<String> readyWithin(Wallet w, String escrowKeyHex,
+        {Duration limit = const Duration(seconds: 30)}) async {
+      final deadline = DateTime.now().add(limit);
+      while (true) {
+        final listed = await w.client.escrowStatus();
+        final row =
+            listed.firstWhere((e) => e.escrowKey.toLowerCase() == escrowKeyHex.toLowerCase());
+        if (row.serviceReady) return 'ready';
+        if (DateTime.now().isAfter(deadline)) {
+          // Which of the two is missing, and what the cosigner said to the service, because
+          // "not ready" alone does not say whose word never arrived.
+          return 'not ready: service_confirmed=${row.serviceConfirmed} '
+              'wallet_confirmed=${row.walletConfirmed}; '
+              'the cosigner replied ${service!.replies}';
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
+    }
+
+    /// Both deliveries, for real: the cosigner's half leaves the enclave over its allowlisted
+    /// egress, the wallet's leaves this device over HTTP, and neither party ever holds both.
+    ///
+    /// The unit tests for pairing hand the service both halves in memory, which is precisely why
+    /// they could not notice that the wallet never sent its own. This one can: the service assembles
+    /// only what actually arrived, and then signs with it.
+    test('both halves arrive by their own routes, and the pair can sign', () async {
+      final alice = await wallet('pair_alice');
+      try {
+        await alice.client.doDkg();
+        final escrow = await alice.client.createEscrow();
+
+        final pairing = await alice.client.pairService(
+          escrowKeyHex: escrow.escrowKeyHex,
+          serviceIdentifier: serviceIdentifier,
+          delivery: delivery,
+        );
+
+        // The service has both halves and checked the share they sum to. Nothing about that came
+        // from the wallet's say-so — it assembled and verified for itself.
+        expect(service!.isReady(escrow.escrowKeyHex, pairing.attemptIdHex), isTrue,
+            reason: 'the service must hold a finished share, not one half of one');
+        expect(pairing.serviceOrigin, 'http://192.168.127.254:$servicePort',
+            reason: 'the wallet delivers where the enclave delivered, not where it chose');
+
+        final share = service!.shareFor(escrow.escrowKeyHex, pairing.attemptIdHex)!;
+        expect(
+          share.keyPackage.verifyingShare.toLowerCase(),
+          pairing.serviceVerifyingShareHex.toLowerCase(),
+        );
+
+        // The pairing signs for the escrow key itself — a refresh preserves it, so money already in
+        // the escrow is reachable through this pairing too.
+        expect(
+          _hex(ark_threshold.elemSerializeCompressed(share.publicKeyPackage.verifyingKey.E))
+              .toLowerCase(),
+          escrow.escrowKeyHex.toLowerCase(),
+        );
+
+        // And the cosigner agrees it is finished, which is what makes it usable. Both parties had
+        // to say so: the wallet over the RPC, the service over the connection the runtime holds.
+        expect(await readyWithin(alice, escrow.escrowKeyHex), 'ready',
+            reason: 'the service confirms over the stream, and only then is a pairing usable');
+        final listed = await alice.client.escrowStatus();
+        final row = listed
+            .firstWhere((e) => e.escrowKey.toLowerCase() == escrow.escrowKeyHex.toLowerCase());
+        expect(
+            row.serviceIdentifier.toLowerCase(), _hex(serviceIdentifier.serialize()).toLowerCase());
+
+        // The connection outlives the call that opened it. That is the whole reason the half went
+        // on a stream rather than in a POST: the service has to be able to speak first later.
+        expect(service!.isHolding(_streamIdFor(serviceIdentifier)), isTrue);
+      } finally {
+        await alice.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 15)));
+
+    /// A pairing whose wallet half never arrives is NOT usable — and says so rather than looking
+    /// finished. This is the failure the old code had permanently and silently.
+    test('a pairing with only the cosigner half is refused as unfinished', () async {
+      final bob = await wallet('pair_bob');
+      try {
+        await bob.client.doDkg();
+        final escrow = await bob.client.createEscrow();
+
+        service!.rejectWalletDeliveries = true;
+        await expectLater(
+          bob.client.pairService(
+            escrowKeyHex: escrow.escrowKeyHex,
+            serviceIdentifier: serviceIdentifier,
+            delivery: delivery,
+          ),
+          throwsA(anything),
+          reason: 'a pairing the service cannot complete must not report success',
+        );
+        service!.rejectWalletDeliveries = false;
+
+        // The cosigner sealed it pending, not ready — so nothing may be committed to it. Given
+        // time to converge rather than checked instantly, so this cannot pass merely by being
+        // quick: neither party has anything to say, and after the wait it is still not ready.
+        expect(await readyWithin(bob, escrow.escrowKeyHex, limit: const Duration(seconds: 3)),
+            isNot('ready'),
+            reason: 'one half is not a pairing, and must not be reported as one');
+
+        await expectLater(
+          bob.client.openEscrowSession(
+            escrowKeyHex: escrow.escrowKeyHex,
+            policy: {'op': 'always'},
+            deadline: DateTime.now().add(const Duration(hours: 1)),
+          ),
+          throwsA(anything),
+          reason: 'an escrow whose service cannot sign must not be committed to a deal',
+        );
+      } finally {
+        await bob.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 15)));
+
+    /// Retrying the SAME attempt redelivers the same contribution, so the halves still sum. A
+    /// retry that dealt a fresh slope would leave the service holding two halves of two different
+    /// pairings and able to complete neither.
+    test('a failed wallet delivery is retried under the same attempt', () async {
+      final carol = await wallet('pair_carol');
+      try {
+        await carol.client.doDkg();
+        final escrow = await carol.client.createEscrow();
+
+        // A fixed attempt id, so the retry below names the one that half-finished.
+        final attempt = List<int>.generate(16, (i) => i + 1);
+
+        service!.rejectWalletDeliveries = true;
+        await expectLater(
+          carol.client.pairService(
+            escrowKeyHex: escrow.escrowKeyHex,
+            serviceIdentifier: serviceIdentifier,
+            attemptId: attempt,
+            delivery: delivery,
+          ),
+          throwsA(anything),
+        );
+        service!.rejectWalletDeliveries = false;
+        expect(service!.isReady(escrow.escrowKeyHex, _hex(attempt)), isFalse);
+
+        // The same attempt again. The cosigner deals a fresh half — its own is never retained — and
+        // the wallet's slope is derived, so what it sends is the same scalar as before.
+        final pairing = await carol.client.pairService(
+          escrowKeyHex: escrow.escrowKeyHex,
+          serviceIdentifier: serviceIdentifier,
+          attemptId: attempt,
+          delivery: delivery,
+        );
+        expect(pairing.attemptIdHex, _hex(attempt));
+        expect(service!.isReady(escrow.escrowKeyHex, _hex(attempt)), isTrue);
+        expect(service!.refusals, isEmpty,
+            reason: 'no assembled share should ever have failed its check');
+
+        expect(await readyWithin(carol, escrow.escrowKeyHex), 'ready');
+      } finally {
+        await carol.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 15)));
+
+    /// A release, the whole way round: the service asks over the connection the runtime holds, the
+    /// cosigner judges it against sealed policy and sealed accounting, signs, and answers on the
+    /// same connection.
+    ///
+    /// What this proves is the PATH and the DECISIONS — that a service which cannot call in can
+    /// still be paid, that one payment reference buys one release, and that a lost reply can be
+    /// asked for again without being charged twice. That the signature itself is a valid BIP-340
+    /// signature over the escrow key is proved where it can be checked properly, in
+    /// `cosigner/tests/release_test.rs`, which combines both halves and verifies.
+    test('a service is paid over the connection, and one payment pays once', () async {
+      final erin = await wallet('release_erin');
+      try {
+        await erin.client.doDkg();
+        final escrow = await erin.client.createEscrow();
+        final pairing = await erin.client.pairService(
+          escrowKeyHex: escrow.escrowKeyHex,
+          serviceIdentifier: serviceIdentifier,
+          delivery: delivery,
+        );
+        expect(await readyWithin(erin, escrow.escrowKeyHex), 'ready');
+        final share = service!.shareFor(escrow.escrowKeyHex, pairing.attemptIdHex)!;
+
+        // Several wallets have now paired with this one service, and the enclave derives its
+        // stream id from the SERVICE — so every one of them opened a connection under the same
+        // local name. They must still be separate connections here, or one wallet's answer goes
+        // down another's socket. What keeps them apart is the tenant the runtime puts on the wire;
+        // see `StreamRecord::wire_id`.
+        expect(service!.heldUnder(_streamIdFor(serviceIdentifier)), greaterThan(1),
+            reason: 'one connection per wallet, all announcing the same local id');
+        expect(share.streamId, endsWith('-${_streamIdFor(serviceIdentifier)}'),
+            reason: 'the wire name is the tenant and then the id the guest chose');
+
+        // The deal: what the service may take, and until when.
+        await erin.client.openEscrowSession(
+          escrowKeyHex: escrow.escrowKeyHex,
+          policy: {'op': 'always'},
+          deadline: DateTime.now().add(const Duration(hours: 1)),
+        );
+
+        // One VTXO in, one payout and change out — so two things to sign, and two commitments.
+        final inputs = [
+          {
+            'txid': '11' * 32,
+            'vout': 0,
+            'amount_sats': 200000,
+            'exit_delay': 512,
+          }
+        ];
+        final commitments = List.generate(2, (_) => _commitment());
+
+        final signed = await service!.requestRelease(
+          share: share,
+          requestId: 'e2e-release-1',
+          toArkAddress: await erin.client.getArkAddress(),
+          amountSats: 50000,
+          inputs: inputs,
+          paymentReference: 'e2e_payment_1',
+          commitments: commitments,
+        );
+        expect(signed['kind'], 'release-signed',
+            reason: 'an allowed release must be signed: $signed');
+        expect((signed['halves'] as List), hasLength(2),
+            reason: 'one half per sighash — the ark tx input and its checkpoint');
+        expect(signed['ark_tx'], isNotEmpty,
+            reason: 'the service submits what was approved, not a rebuild of it');
+        expect((signed['checkpoint_txs'] as List), hasLength(1));
+        expect(signed['already_counted'], isFalse);
+
+        // The same request again — what a service whose reply was lost does. Signed afresh, with
+        // fresh commitments, and NOT charged a second time.
+        final retry = await service!.requestRelease(
+          share: share,
+          requestId: 'e2e-release-1',
+          toArkAddress: await erin.client.getArkAddress(),
+          amountSats: 50000,
+          inputs: inputs,
+          paymentReference: 'e2e_payment_1',
+          commitments: List.generate(2, (_) => _commitment()),
+        );
+        expect(retry['kind'], 'release-signed');
+        expect(retry['already_counted'], isTrue,
+            reason: 'a retry is answered again and counted once');
+
+        // The same PAYMENT under a new request id. A replayed authorization verifies every time,
+        // because it really did succeed — so what stops it paying twice is the sealed record.
+        final replay = await service!.requestRelease(
+          share: share,
+          requestId: 'e2e-release-2',
+          toArkAddress: await erin.client.getArkAddress(),
+          amountSats: 50000,
+          inputs: inputs,
+          paymentReference: 'e2e_payment_1',
+          commitments: List.generate(2, (_) => _commitment()),
+        );
+        expect(replay['kind'], 'release-refused');
+        expect(replay['reason'], contains('already been released against'));
+
+        // And once the owner closes the deal, nothing more comes out of it.
+        await erin.client.closeEscrowSession(escrow.escrowKeyHex);
+        final afterwards = await service!.requestRelease(
+          share: share,
+          requestId: 'e2e-release-3',
+          toArkAddress: await erin.client.getArkAddress(),
+          amountSats: 50000,
+          inputs: inputs,
+          paymentReference: 'e2e_payment_2',
+          commitments: List.generate(2, (_) => _commitment()),
+        );
+        expect(afterwards['kind'], 'release-refused');
+        expect(afterwards['reason'], contains('escrow is closed'));
+      } finally {
+        await erin.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 15)));
+
+    /// A service this image was not built to reach is refused before anything is dealt.
+    test('a service the image does not name is refused before anything is dealt', () async {
+      final dave = await wallet('pair_dave');
+      try {
+        await dave.client.doDkg();
+        final escrow = await dave.client.createEscrow();
+        final stranger =
+            ark_threshold.Identifier.derive(Uint8List.fromList('nobody-the-image-knows'.codeUnits));
+
+        await expectLater(
+          dave.client.pairService(
+            escrowKeyHex: escrow.escrowKeyHex,
+            serviceIdentifier: stranger,
+            delivery: delivery,
+          ),
+          throwsA(predicate((e) => '$e'.contains('does not know that service'))),
+        );
+      } finally {
+        await dave.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 10)));
+  });
 }
 
 String _hex(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+/// One party's FROST commitments for one message: two points, each from a one-time nonce.
+///
+/// The service commits first, so these go out with the request — which is what lets the cosigner
+/// make its own nonce and its share inside a single invocation, and never write a nonce down.
+Map<String, String> _commitment() {
+  final n = ark_threshold.secp256k1Curve.n;
+  String point() {
+    final k = ark_threshold.bytesToBigInt(
+            Uint8List.fromList(List<int>.generate(32, (_) => _random.nextInt(256)))) %
+        n;
+    return ark_threshold.elemBaseMul(k == BigInt.zero ? BigInt.one : k);
+  }
+
+  return {'hiding': point(), 'binding': point()};
+}
+
+final _random = Random.secure();
+
+/// The id the enclave opens its connection to a service under.
+///
+/// Derived the same way `cosigner::service_stream::service_stream_id` derives it, and duplicated
+/// here on purpose: a test that computed it by asking the thing it is testing would prove nothing.
+String _streamIdFor(ark_threshold.Identifier identifier) =>
+    'svc-${_hex(identifier.serialize()).toLowerCase().substring(0, 40)}';
 
 bool _containsBytes(List<int> haystack, List<int> needle) {
   outer:

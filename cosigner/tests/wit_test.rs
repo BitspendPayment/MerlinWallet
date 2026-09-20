@@ -104,11 +104,19 @@ fn the_host_trait_mirrors_the_vendored_wit() {
     let mut exports = Vec::new();
     let mut wit = wit_funcs("wit/deps/tasks/tasks.wit", &mut exports);
     wit.extend(wit_funcs("wit/deps/notify/notify.wit", &mut exports));
+    wit.extend(wit_funcs("wit/deps/stream/stream.wit", &mut exports));
     let host = host_trait_methods();
 
     // What the guest EXPORTS is implemented on `Cosigner`, not asked of the runtime. `run-task` is
     // the only one, and the trait is right not to carry it.
-    assert_eq!(exports, vec!["run-task"], "the WIT's exports changed");
+    // `on-message` joins `run-task`: both are things the guest implements when the runtime calls
+    // in, not things it asks the runtime for.
+    exports.sort();
+    assert_eq!(
+        exports,
+        vec!["on-message", "run-task"],
+        "the WIT's exports changed"
+    );
     for e in &exports {
         wit.remove(e);
         assert!(
@@ -141,13 +149,17 @@ fn the_host_trait_mirrors_the_vendored_wit() {
     }
 
     // Guard the guard: if the readers stop finding anything, say so rather than pass.
-    assert!(wit.len() >= 6, "expected at least the six imports, found {}", wit.len());
+    assert!(
+        wit.len() >= 10,
+        "expected at least the ten imports, found {}",
+        wit.len()
+    );
 }
 
 /// The world composes both capabilities, so a single `wit_bindgen::generate!` over it is all the
 /// guest port needs.
 #[test]
-fn the_world_includes_both_capabilities() {
+fn the_world_includes_every_capability_it_uses() {
     let world = fs::read_to_string("wit/cosigner.wit").expect("read wit/cosigner.wit");
     assert!(
         world.contains("include enclave:tasks/background@0.1.0;"),
@@ -156,5 +168,11 @@ fn the_world_includes_both_capabilities() {
     assert!(
         world.contains("import enclave:notify/notify@0.1.0;"),
         "the world must import notify — that is what wake comes from"
+    );
+    assert!(
+        world.contains("include enclave:streams/streaming@0.1.0;"),
+        "the world must INCLUDE the streaming world, not merely import its interface — an import \
+         would give the guest the connection calls without the on-message export the runtime needs \
+         to hand it what arrives"
     );
 }

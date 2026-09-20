@@ -1,91 +1,19 @@
-//! The settle watch: what the cosigner can do in the background, and what it deliberately cannot.
+//! The settle watch: what the cosigner does in the background, with an ASP and without one.
 //!
-//! A guest has no egress — `wasmtime_wasi`'s `SocketAddrCheck` refuses every address and the
-//! runtime never overrides it — so a background task cannot reach the ASP. It cannot register an
-//! intent, relay a batch round, or ask what arrived. What it can do without a socket is read its
-//! own sealed delegate and compare the deadline to the clock, then wake its owner's devices.
+//! A guest reaches only the origins its image allowlists. Where that includes the ASP, a due
+//! delegate is executed in the task itself. Where it does not — as here, since these tests pass no
+//! ASP — the task does what it can always do without a connection: read its own sealed delegate,
+//! compare the deadline to the clock, and wake its owner's devices.
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ark::client::types::ArkInfo;
 use cosigner::handlers::watch::{Outcome, Task, CATEGORY_SETTLE_DUE, WATCH_TASK_ID};
-use cosigner::host::{valid_label, Host};
+use common::Recorder;
+use cosigner::host::valid_label;
 use cosigner::types::VtxoInput;
-
-/// Records what the cosigner asked of the runtime, and holds it to the runtime's rule for task ids:
-/// an id is an idempotency key, refused with different input until its record is forgotten.
-#[derive(Default)]
-struct Recorder {
-    enqueued: Mutex<Vec<(String, Vec<u8>, u64, Option<u64>)>>,
-    live: Mutex<std::collections::HashMap<String, (Vec<u8>, u64, bool)>>,
-    cancelled: Mutex<Vec<String>>,
-    woken: Mutex<Vec<(String, Option<String>)>>,
-    registered: Mutex<Vec<String>>,
-}
-
-impl Host for Recorder {
-    fn enqueue(
-        &self,
-        id: &str,
-        payload: &[u8],
-        run_at_ms: u64,
-        interval_ms: Option<u64>,
-    ) -> Result<(), String> {
-        let mut live = self.live.lock().unwrap();
-        if let Some((old, old_run_at, _)) = live.get(id) {
-            if old != payload || *old_run_at != run_at_ms {
-                return Err("task id already used with different input".into());
-            }
-            return Ok(());
-        }
-        live.insert(id.into(), (payload.to_vec(), run_at_ms, false));
-        self.enqueued
-            .lock()
-            .unwrap()
-            .push((id.into(), payload.to_vec(), run_at_ms, interval_ms));
-        Ok(())
-    }
-    fn status(&self, _: &str) -> Result<String, String> {
-        Ok("{}".into())
-    }
-    fn cancel(&self, id: &str) -> Result<(), String> {
-        if let Some(record) = self.live.lock().unwrap().get_mut(id) {
-            record.2 = true;
-        }
-        self.cancelled.lock().unwrap().push(id.into());
-        Ok(())
-    }
-    fn forget(&self, id: &str) -> Result<(), String> {
-        let mut live = self.live.lock().unwrap();
-        match live.get(id) {
-            Some((_, _, true)) => {
-                live.remove(id);
-                Ok(())
-            }
-            Some(_) => Err("task is still active".into()),
-            None => Err("no such task".into()),
-        }
-    }
-    fn register_device(&self, token: &str) -> Result<(), String> {
-        self.registered.lock().unwrap().push(token.into());
-        Ok(())
-    }
-    fn forget_device(&self, _: &str) -> Result<(), String> {
-        Ok(())
-    }
-    fn devices(&self) -> Result<u32, String> {
-        Ok(self.registered.lock().unwrap().len() as u32)
-    }
-    fn wake(&self, category: &str, reference: Option<&str>) -> Result<(), String> {
-        self.woken
-            .lock()
-            .unwrap()
-            .push((category.into(), reference.map(Into::into)));
-        Ok(())
-    }
-}
 
 fn payload(deadline_secs: u64) -> Vec<u8> {
     serde_json::to_vec(&Task::SettleDue { deadline_secs }).unwrap()
