@@ -18,4 +18,5 @@ pub mod escrow;
 pub mod delivery;
 pub mod pairing;
 pub mod recover;
+pub mod reclaim;
 pub mod release;

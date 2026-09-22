@@ -527,18 +527,31 @@ fn a_release_asked_for_on_another_services_connection_is_refused() {
 // 2. the escrow permits a release now
 // ---------------------------------------------------------------------------------------------
 
+/// A deal ends one way: its deadline passes. There is no other, and there is deliberately no way
+/// for the owner to cut it short — see `cosigner::escrow_session`.
+///
+/// The clock is let run for real rather than a flag being set, because a flag is not what happens.
+/// Nothing is written when a deal lapses, so the only honest way to test it is to let it lapse.
 #[test]
-fn a_release_after_the_owner_closed_the_escrow_is_refused() {
+fn a_release_after_the_deadline_is_refused() {
     let Some(store) = common::try_store() else { return };
-    let mut p = paired(&store, permissive());
-    p.cosigner
-        .close_escrow_session(&p.escrow_key.clone(), now())
-        .unwrap();
-
+    // A deal with one second left.
+    let mut p = paired_for(&store, permissive(), 1);
     let (_, commitments) = service_commits(2);
     let req = request(&p, commitments);
-    let reply = ask(&mut p, &req, &Provider::default());
-    assert!(refusal(&reply).contains("escrow is closed"), "{reply:?}");
+    assert!(
+        matches!(ask(&mut p, &req, &Provider::default()), ToService::ReleaseSigned(_)),
+        "while it is running, a release is signed"
+    );
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let (_, commitments) = service_commits(2);
+    let mut after = request(&p, commitments);
+    after.request_id = "req-after".into();
+    after.payment_reference = "tx_later".into();
+    let reply = ask(&mut p, &after, &Provider::default());
+    assert!(refusal(&reply).contains("deal is over"), "{reply:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -919,16 +932,17 @@ fn a_release_against_an_unfinished_pairing_is_refused() {
 #[test]
 fn reopening_an_escrow_does_not_hand_back_the_payments_it_already_spent() {
     let Some(store) = common::try_store() else { return };
-    let mut p = paired(&store, permissive());
+    let mut p = paired_for(&store, permissive(), 1);
 
     let (_, commitments) = service_commits(2);
     let first = request(&p, commitments);
     assert!(matches!(ask(&mut p, &first, &Provider::default()), ToService::ReleaseSigned(_)));
 
-    // The owner ends the deal and strikes a new one over the same escrow.
+    // The deal runs out and a new one is struck over the same escrow. Waiting it out rather than
+    // ending it: a deal has no ending but its deadline.
+    std::thread::sleep(std::time::Duration::from_secs(2));
     let key = p.escrow_key.clone();
     let now = now();
-    p.cosigner.close_escrow_session(&key, now).expect("close it");
     p.cosigner
         .open_escrow_session(
             &key,
@@ -1034,7 +1048,7 @@ fn a_deadline_that_passes_during_the_fetch_still_refuses() {
         .expect("a decision, not a fault");
 
     assert!(
-        refusal(&reply).contains("escrow is closed"),
+        refusal(&reply).contains("deal is over"),
         "the deadline passed while the provider was answering: {reply:?}"
     );
     assert!(

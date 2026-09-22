@@ -1,0 +1,43 @@
+[package]
+name = "card-escrow"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A worked example: a card programme's settlement service reimbursed from a Bitcoin escrow."
+
+[[bin]]
+name = "mock-provider"
+path = "src/bin/mock_provider.rs"
+
+[[bin]]
+name = "card-service"
+path = "src/bin/card_service.rs"
+
+[dependencies]
+# The escrow itself: the policy vocabulary, the evidence types and the release shapes are the
+# cosigner's, imported rather than restated. An example that defined its own copy of the wire would
+# prove that the copy works.
+cosigner = { path = "../../cosigner" }
+ark = { path = "../../crates/ark", features = ["signing", "client"] }
+threshold = { path = "../../crates/threshold", features = ["std"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "signal"] }
+axum = "0.8"
+tokio-stream = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+rand = "0.8"
+k256 = { version = "0.13", features = ["arithmetic"] }
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+# Reading a held SSE stream in a test, the way the runtime reads one.
+futures-util = "0.3"

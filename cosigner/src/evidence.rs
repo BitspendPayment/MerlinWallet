@@ -118,6 +118,31 @@ pub enum Predicate {
     /// The other half of the binding: evidence for the right payment, of the wrong size, is
     /// evidence for a different release.
     MatchesAmount { at: String },
+    /// The fiat amount at `at`, converted at a FIXED rate, is exactly the sats this release pays.
+    ///
+    /// The binding for a release denominated in one currency against a payment denominated in
+    /// another. Evidence that a $20 purchase cleared says nothing about how many sats are owed for
+    /// it until something says what a dollar is worth, and whoever supplies that number decides how
+    /// much leaves the escrow — verify a $5 coffee, release $500. So the rate is not supplied: it
+    /// is written into the sealed policy, which the owner agreed to.
+    ///
+    /// **This is a demonstration setting, not a market quote.** A fixed rate means the escrow bears
+    /// the whole of the price move between committing and clearing, which is a thing to decide
+    /// deliberately rather than inherit.
+    ///
+    /// # Exact, or refused
+    ///
+    /// Money, so no floating point reaches the arithmetic. The amount is read as a decimal string
+    /// and turned into whole minor units — cents — and the conversion is integer throughout. A
+    /// conversion that does not come out whole is **refused rather than rounded**: rounding is
+    /// where money goes missing, and a release is not the place to decide in whose favour.
+    AmountAtFixedRate {
+        at: String,
+        /// Minor units in one whole unit of the fiat currency: 100 for dollars and cents.
+        minor_units_per_unit: u32,
+        /// Sats per one whole fiat unit.
+        sats_per_unit: u64,
+    },
 }
 
 impl Predicate {
@@ -128,7 +153,8 @@ impl Predicate {
             | Predicate::AtLeast { at, .. }
             | Predicate::AtMost { at, .. }
             | Predicate::MatchesReference { at }
-            | Predicate::MatchesAmount { at } => at,
+            | Predicate::MatchesAmount { at }
+            | Predicate::AmountAtFixedRate { at, .. } => at,
         }
     }
 
@@ -142,6 +168,12 @@ impl Predicate {
                 format!("{at} is the payment this release claims")
             }
             Predicate::MatchesAmount { at } => format!("{at} is the amount this release pays"),
+            Predicate::AmountAtFixedRate {
+                at, sats_per_unit, ..
+            } => format!(
+                "{at}, at the agreed {sats_per_unit} sats per unit, is exactly what this release \
+                 pays"
+            ),
         }
     }
 
@@ -152,6 +184,19 @@ impl Predicate {
         if let Predicate::OneOf { values, .. } = self {
             if values.is_empty() {
                 return Err("an empty one_of admits nothing; say never instead".into());
+            }
+        }
+        if let Predicate::AmountAtFixedRate {
+            minor_units_per_unit,
+            sats_per_unit,
+            ..
+        } = self
+        {
+            if *minor_units_per_unit == 0 {
+                return Err("a currency with no minor units cannot be converted exactly".into());
+            }
+            if *sats_per_unit == 0 {
+                return Err("a rate of 0 sats makes every release pay nothing".into());
             }
         }
         Ok(())
@@ -197,8 +242,94 @@ impl Predicate {
                 )),
                 None => Err(format!("{at} is not a whole number")),
             },
+            Predicate::AmountAtFixedRate {
+                minor_units_per_unit,
+                sats_per_unit,
+                ..
+            } => {
+                let minor = minor_units(found, *minor_units_per_unit)
+                    .ok_or_else(|| format!("{at} is not an amount of money"))?;
+                if minor < 0 {
+                    return Err(format!("{at} is negative, and a refund is not a release"));
+                }
+                let owed = i128::from(*sats_per_unit)
+                    .checked_mul(minor)
+                    .ok_or_else(|| format!("{at} converts to more sats than there are"))?;
+                let per_unit = i128::from(*minor_units_per_unit);
+                if owed % per_unit != 0 {
+                    return Err(format!(
+                        "{at} does not convert to a whole number of sats at {sats_per_unit} per \
+                         unit, and a release is not the place to decide who keeps the remainder"
+                    ));
+                }
+                let owed = owed / per_unit;
+                if owed == i128::from(release.sats) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{at} is worth {owed} sats at the agreed rate, and this release pays {}",
+                        release.sats
+                    ))
+                }
+            }
         }
     }
+}
+
+/// A JSON amount of money, as whole minor units. `None` if it is not one.
+///
+/// # Why this is not `as_f64`
+///
+/// Because money. `0.1 + 0.2` is famously not `0.3` in binary, and an amount that arrives as a
+/// float and leaves as a float can disagree with itself by a cent — which, converted, is a
+/// disagreement about sats. So the value is read as **text** and parsed into integers.
+///
+/// A JSON number is turned into text by `serde_json`'s own formatting, which prints the shortest
+/// decimal that round-trips to the same double. For any amount a payment system states — a few
+/// digits, two decimal places — that string is the amount exactly as written. A string is taken as
+/// written, which is what a provider that knows better than to send money as a float will send.
+///
+/// More decimal places than the currency has is refused rather than truncated: a payment of
+/// `20.005` dollars is not a payment this can reason about, and picking a direction to round it is
+/// deciding something that is not ours to decide.
+fn minor_units(found: &serde_json::Value, minor_units_per_unit: u32) -> Option<i128> {
+    let text = match found {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(&text)),
+    };
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (digits, ""),
+    };
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // How many decimal places this currency has: 100 minor units is two, 1000 is three.
+    let places = (minor_units_per_unit as f64).log10().round() as u32;
+    if 10u32.checked_pow(places) != Some(minor_units_per_unit) {
+        return None; // not a power of ten, so "decimal places" is not a question with an answer
+    }
+    if fraction.len() > places as usize {
+        return None; // more precision than the currency has
+    }
+    let whole: i128 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let fraction: i128 = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<i128>().ok()? * 10i128.pow(places - fraction.len() as u32)
+    };
+    let total = whole
+        .checked_mul(i128::from(minor_units_per_unit))?
+        .checked_add(fraction)?;
+    Some(if negative { -total } else { total })
 }
 
 /// What the release being judged claims. The half of the binding that does not come from the
@@ -808,6 +939,108 @@ mod tests {
             credential("DIVATEST", "https://diva.example").unwrap_err(),
             NoCredential::Unknown
         );
+    }
+
+    /// Money is read as text and converted with integers. A float on this path can disagree with
+    /// itself by a cent, and a cent, converted, is a disagreement about sats.
+    #[test]
+    fn an_amount_becomes_whole_minor_units_or_nothing() {
+        use serde_json::json;
+        let cents = |v: serde_json::Value| minor_units(&v, 100);
+
+        assert_eq!(cents(json!(20.00)), Some(2_000));
+        assert_eq!(cents(json!("20.00")), Some(2_000));
+        assert_eq!(cents(json!(19.99)), Some(1_999));
+        assert_eq!(cents(json!("0.07")), Some(7));
+        assert_eq!(cents(json!(20)), Some(2_000));
+        assert_eq!(cents(json!("20.5")), Some(2_050), "one place is two places' worth");
+        assert_eq!(cents(json!("-5.00")), Some(-500));
+
+        // The classic one: a value no double holds exactly still reads as the cents it was written
+        // as, because the text is what is parsed.
+        assert_eq!(cents(json!(0.1)), Some(10));
+        assert_eq!(cents(json!(0.3)), Some(30));
+
+        // More precision than dollars have. Truncating would decide something that is not ours.
+        assert_eq!(cents(json!("20.005")), None);
+        assert_eq!(cents(json!("not money")), None);
+        assert_eq!(cents(json!(true)), None);
+        assert_eq!(cents(json!("")), None);
+    }
+
+    fn at_rate(sats_per_unit: u64) -> Predicate {
+        Predicate::AmountAtFixedRate {
+            at: "amount".into(),
+            minor_units_per_unit: 100,
+            sats_per_unit,
+        }
+    }
+
+    fn paying(sats: u64) -> ReleaseFacts {
+        ReleaseFacts {
+            reference: "tx_1".into(),
+            sats,
+            fee_sats: 0,
+            already_released_sats: 0,
+        }
+    }
+
+    /// The scenario the example demonstrates: $20.00 at 1,000 sats per dollar is 20,000 sats.
+    #[test]
+    fn a_purchase_converts_at_the_agreed_rate_and_must_match_exactly() {
+        use serde_json::json;
+        let p = at_rate(1_000);
+        assert!(p.check(&json!({"amount": 20.00}), &paying(20_000)).is_ok());
+        assert!(p.check(&json!({"amount": "20.00"}), &paying(20_000)).is_ok());
+
+        // A release for more than the purchase was worth. This is the whole point of the term:
+        // without it, "a $20 purchase cleared" says nothing about how many sats are owed.
+        let err = p.check(&json!({"amount": 20.00}), &paying(500_000)).unwrap_err();
+        assert!(err.contains("worth 20000 sats"), "{err}");
+        assert!(err.contains("pays 500000"), "{err}");
+
+        // And a purchase for more than the release, which is the service short-changing itself.
+        assert!(p.check(&json!({"amount": 25.00}), &paying(20_000)).is_err());
+    }
+
+    /// A conversion that does not come out whole is refused, not rounded. Rounding is where money
+    /// goes missing, and a release is not the place to decide in whose favour.
+    #[test]
+    fn an_inexact_conversion_is_refused_rather_than_rounded() {
+        use serde_json::json;
+        // 3 sats per dollar: one cent is 3/100 of a sat.
+        let p = at_rate(3);
+        let err = p.check(&json!({"amount": "0.01"}), &paying(0)).unwrap_err();
+        assert!(err.contains("whole number of sats"), "{err}");
+        // A dollar exactly does divide, and is allowed.
+        assert!(p.check(&json!({"amount": "1.00"}), &paying(3)).is_ok());
+    }
+
+    #[test]
+    fn a_refund_is_not_a_release_and_a_rate_of_zero_is_not_a_rate() {
+        use serde_json::json;
+        let err = at_rate(1_000)
+            .check(&json!({"amount": "-20.00"}), &paying(20_000))
+            .unwrap_err();
+        assert!(err.contains("negative"), "{err}");
+
+        assert!(at_rate(0).validate().is_err());
+        assert!(Predicate::AmountAtFixedRate {
+            at: "amount".into(),
+            minor_units_per_unit: 0,
+            sats_per_unit: 1_000,
+        }
+        .validate()
+        .is_err());
+        assert!(at_rate(1_000).validate().is_ok());
+    }
+
+    /// A currency whose minor unit is not a power of ten has no "decimal places" to speak of, so
+    /// there is no exact reading and none is guessed.
+    #[test]
+    fn a_currency_that_is_not_decimal_is_refused() {
+        use serde_json::json;
+        assert_eq!(minor_units(&json!("1.00"), 60), None);
     }
 
 }

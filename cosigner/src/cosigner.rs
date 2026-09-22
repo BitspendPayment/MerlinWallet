@@ -901,8 +901,13 @@ impl Cosigner {
             }
             Some(crate::types::PairingState::Ready) => {}
         }
+        // A deal can be struck again once the last one's deadline has passed, and not before.
+        // There is no other way for one to end — see `crate::escrow_session`.
         if record.session.as_ref().is_some_and(|s| s.is_open(now)) {
-            return Err("this escrow is already committed to a deal".into());
+            return Err(
+                "this escrow is already committed to a deal, and a deal runs until its deadline"
+                    .into(),
+            );
         }
         record.session = Some(session);
         Ok(())
@@ -1013,23 +1018,6 @@ impl Cosigner {
         &self.released_references
     }
 
-    /// Close a live session early.
-    pub fn close_escrow_session(&mut self, escrow_key: &str, now: i64) -> Result<(), String> {
-        let want = x_only(escrow_key);
-        let record = self
-            .escrows
-            .iter_mut()
-            .find(|e| x_only(&e.escrow_key) == want)
-            .ok_or("this wallet holds no such escrow")?;
-        match record.session.as_mut() {
-            Some(session) => {
-                session.close(now);
-                Ok(())
-            }
-            None => Err("this escrow is not committed to anything".into()),
-        }
-    }
-
     /// Record a freshly minted escrow. Refuses a duplicate key and refuses past the cap.
     ///
     /// The cap is not ceremony: every escrow is a standing obligation — a key to co-sign for, a
@@ -1124,30 +1112,19 @@ impl Cosigner {
         messages: &[Vec<u8>],
     ) -> Result<(InBandRound, Vec<Commitment>), String> {
         let policy = self.policy.as_ref().ok_or("no policy installed")?;
-        let server_identifier = policy.key_package.identifier.clone();
-        let identifier_hex = hex::encode(server_identifier.serialize());
+        Ok(in_band_begin(&policy.key_package, messages))
+    }
 
-        let mut rng = OsRng;
-        let mut ceremonies = Vec::with_capacity(messages.len());
-        let mut commitments = Vec::with_capacity(messages.len());
-        for message in messages {
-            let nonce = nonce::new_nonce(&mut rng, &policy.key_package.secret_share);
-            commitments.push(Commitment {
-                identifier_hex: identifier_hex.clone(),
-                hiding: point::serialize_compressed(&nonce.commitments.hiding).to_vec(),
-                binding: point::serialize_compressed(&nonce.commitments.binding).to_vec(),
-            });
-            let mut ceremony = Ceremony {
-                message: message.clone(),
-                ..Default::default()
-            };
-            ceremony
-                .commitments
-                .insert(server_identifier.clone(), nonce.commitments.clone());
-            ceremony.nonce = Some(nonce);
-            ceremonies.push(ceremony);
-        }
-        Ok((InBandRound { ceremonies }, commitments))
+    /// The same round one, for a key this cosigner holds that is NOT the wallet's.
+    ///
+    /// An escrow is a second 2-of-2 over a key of its own, and reclaiming from it is that key's
+    /// pair signing — so the ceremony is identical and only the share differs.
+    pub fn sign_in_band_begin_as(
+        &self,
+        key_package: &KeyPackage,
+        messages: &[Vec<u8>],
+    ) -> (InBandRound, Vec<Commitment>) {
+        in_band_begin(key_package, messages)
     }
 
     /// Round two: the wallet's commitment and share for each message in, BIP-340 signatures out.
@@ -1163,6 +1140,73 @@ impl Cosigner {
         round: InBandRound,
         wallet: Vec<WalletHalf>,
     ) -> Result<Vec<Vec<u8>>, String> {
+        let policy = self.policy.as_ref().ok_or("no policy installed")?;
+        let user_identifier = policy
+            .user_signing_identifier
+            .clone()
+            .ok_or("policy has no user_signing_identifier")?;
+        in_band_finish(
+            &policy.key_package,
+            &policy.public_key_package,
+            &user_identifier,
+            round,
+            wallet,
+        )
+    }
+
+    /// Round two for a key that is not the wallet's. See [`Self::sign_in_band_begin_as`].
+    pub fn sign_in_band_finish_as(
+        &self,
+        key_package: &KeyPackage,
+        public_key_package: &PublicKeyPackage,
+        counterparty: &Identifier,
+        round: InBandRound,
+        halves: Vec<WalletHalf>,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        in_band_finish(key_package, public_key_package, counterparty, round, halves)
+    }
+}
+
+/// Round one: a fresh nonce for each message, and the commitment to it.
+///
+/// Free of the wallet on purpose. The cosigner signs for more than one key — its own, and every
+/// escrow it co-holds — and the ceremony does not differ between them, only the share does.
+fn in_band_begin(key_package: &KeyPackage, messages: &[Vec<u8>]) -> (InBandRound, Vec<Commitment>) {
+    let server_identifier = key_package.identifier.clone();
+    let identifier_hex = hex::encode(server_identifier.serialize());
+
+    let mut rng = OsRng;
+    let mut ceremonies = Vec::with_capacity(messages.len());
+    let mut commitments = Vec::with_capacity(messages.len());
+    for message in messages {
+        let nonce = nonce::new_nonce(&mut rng, &key_package.secret_share);
+        commitments.push(Commitment {
+            identifier_hex: identifier_hex.clone(),
+            hiding: point::serialize_compressed(&nonce.commitments.hiding).to_vec(),
+            binding: point::serialize_compressed(&nonce.commitments.binding).to_vec(),
+        });
+        let mut ceremony = Ceremony {
+            message: message.clone(),
+            ..Default::default()
+        };
+        ceremony
+            .commitments
+            .insert(server_identifier.clone(), nonce.commitments.clone());
+        ceremony.nonce = Some(nonce);
+        ceremonies.push(ceremony);
+    }
+    (InBandRound { ceremonies }, commitments)
+}
+
+/// Round two: the counterparty's commitment and share for each message in, signatures out.
+fn in_band_finish(
+    key_package: &KeyPackage,
+    public_key_package: &PublicKeyPackage,
+    counterparty: &Identifier,
+    round: InBandRound,
+    wallet: Vec<WalletHalf>,
+) -> Result<Vec<Vec<u8>>, String> {
+    {
         if wallet.len() != round.ceremonies.len() {
             return Err(format!(
                 "the wallet answered {} of {} messages",
@@ -1170,12 +1214,12 @@ impl Cosigner {
                 round.ceremonies.len()
             ));
         }
-        let policy = self.policy.as_ref().ok_or("no policy installed")?;
-        let user_identifier = policy
-            .user_signing_identifier
-            .clone()
-            .ok_or("policy has no user_signing_identifier")?;
-        let server_identifier = policy.key_package.identifier.clone();
+        let user_identifier = counterparty.clone();
+        let server_identifier = key_package.identifier.clone();
+        let policy = Shares {
+            key_package,
+            public_key_package,
+        };
 
         round
             .ceremonies
@@ -1209,7 +1253,7 @@ impl Cosigner {
                     .nonce
                     .take()
                     .ok_or_else(|| at("the nonce was already spent".into()))?;
-                let server_share = signing::sign(&package, &nonce, &policy.key_package)
+                let server_share = signing::sign(&package, &nonce, policy.key_package)
                     .map_err(|e| at(format!("frost sign: {e}")))?;
                 ceremony.shares.insert(server_identifier.clone(), server_share);
 
@@ -1217,12 +1261,22 @@ impl Cosigner {
                 // wallet share that does not belong to this message and these commitments stops
                 // here, with the index attached, instead of at the ASP with nothing to say.
                 let signature =
-                    signing::aggregate(&package, &ceremony.shares, &policy.public_key_package)
+                    signing::aggregate(&package, &ceremony.shares, policy.public_key_package)
                         .map_err(|e| at(format!("frost aggregate: {e}")))?;
                 Ok(signature.serialize().to_vec())
             })
             .collect()
     }
+}
+
+/// The two halves of a key this cosigner signs with, so the body above reads the same whether it
+/// is the wallet's key or an escrow's.
+struct Shares<'a> {
+    key_package: &'a KeyPackage,
+    public_key_package: &'a PublicKeyPackage,
+}
+
+impl Cosigner {
 
     /// Boarding settle START: derive the owner key (from the installed policy), the ASP info, and
     /// the boarding address ourselves, then build the session from the wallet-scanned `boarding_utxo`

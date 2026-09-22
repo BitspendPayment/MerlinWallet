@@ -1226,11 +1226,13 @@ void main() {
         expect(share.streamId, endsWith('-${_streamIdFor(serviceIdentifier)}'),
             reason: 'the wire name is the tenant and then the id the guest chose');
 
-        // The deal: what the service may take, and until when.
+        // The deal: what the service may take, and until when. Short, because this test waits it
+        // out — the only way a deal ends.
+        final deadline = DateTime.now().add(const Duration(seconds: 20));
         await erin.client.openEscrowSession(
           escrowKeyHex: escrow.escrowKeyHex,
           policy: {'op': 'always'},
-          deadline: DateTime.now().add(const Duration(hours: 1)),
+          deadline: deadline,
         );
 
         // One VTXO in, one payout and change out — so two things to sign, and two commitments.
@@ -1291,8 +1293,15 @@ void main() {
         expect(replay['kind'], 'release-refused');
         expect(replay['reason'], contains('already been released against'));
 
-        // And once the owner closes the deal, nothing more comes out of it.
-        await erin.client.closeEscrowSession(escrow.escrowKeyHex);
+        // And once the deal runs out, nothing more comes out of it.
+        //
+        // Waited for rather than ended: a deal has no ending but its deadline. There is no way for
+        // the owner to cut one short, deliberately — a commitment she could revoke would leave a
+        // service that had already paid a merchant holding the loss.
+        //
+        // Nothing is written when a deal lapses, so this is the only honest way to test it: the
+        // seal is identical either side of the deadline, and only the clock moved.
+        await _untilPast(deadline);
         final afterwards = await service!.requestRelease(
           share: share,
           requestId: 'e2e-release-3',
@@ -1303,7 +1312,11 @@ void main() {
           commitments: List.generate(2, (_) => _commitment()),
         );
         expect(afterwards['kind'], 'release-refused');
-        expect(afterwards['reason'], contains('escrow is closed'));
+        expect(afterwards['reason'], contains('deal is over'));
+
+        // The other half of the same swap — the owner being able to take it back — needs an escrow
+        // that actually holds something. This one spends synthetic inputs, so reclaim is proved
+        // where the money is real: `bin/card_walkthrough.dart`, which funds, lapses and reclaims.
       } finally {
         await erin.close();
       }
@@ -1331,6 +1344,13 @@ void main() {
       }
     }, timeout: const Timeout(Duration(minutes: 10)));
   });
+}
+
+/// Wait until the clock is past [deadline], with a second to spare.
+Future<void> _untilPast(DateTime deadline) async {
+  final remaining = deadline.difference(DateTime.now());
+  if (remaining.isNegative) return;
+  await Future<void>.delayed(remaining + const Duration(seconds: 1));
 }
 
 String _hex(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();

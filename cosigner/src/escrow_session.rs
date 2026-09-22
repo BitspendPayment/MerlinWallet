@@ -9,14 +9,31 @@
 //!     │                                           │
 //!     │  service + cosigner may release           │  wallet + cosigner may reclaim
 //!     │  wallet  + cosigner may NOT reclaim       │  service may no longer release
-//!     │                                           │
-//!     └── closed early by the owner ──────────────┘
 //! ```
+//!
+//! # The clock, and nothing else
+//!
+//! There is no state here, and no way to end a deal early — not for the owner, not for anybody.
+//! A session is a policy and a date, and which side of that date `now` falls on is the whole
+//! decision.
+//!
+//! **The owner especially cannot end it.** She is the one who committed, and a commitment she can
+//! revoke at will is not one: a service that has already paid a merchant against it would be left
+//! holding the loss, which is exactly the thing this is supposed to prevent. Her control is in
+//! choosing the deadline, not in taking it back afterwards — short sessions, struck again as
+//! needed, which costs nothing because a session is just a policy and a date over an escrow that
+//! already exists.
+//!
+//! What that buys is worth saying plainly: there is now exactly **one** way a deal ends, it leaves
+//! no record because there is nothing to record, and every decision reaches it the same way — by
+//! reading the seal and asking the clock. A second way to end would be a second thing to get
+//! wrong, and the one that was here could be got wrong silently, because it wrote a flag that a
+//! lapse never writes.
 //!
 //! **Say plainly what holds this up.** Nothing in Bitcoin enforces the line above. Both pairings
 //! sign the same key, so what stops an owner emptying a live escrow is this cosigner declining to
-//! co-sign with them until it closes — and what stops a service taking after the deadline is the
-//! same refusal pointed the other way. The escrow is enclave-enforced, not script-enforced. That is
+//! co-sign with them before the deadline — and what stops a service taking after it is the same
+//! refusal pointed the other way. The escrow is enclave-enforced, not script-enforced. That is
 //! defensible because the refusal lives in attested, measured code that a client verifies before it
 //! sends anything; it is *not* the same guarantee as an output that cannot be spent, and nothing
 //! here should be written as though it were.
@@ -59,23 +76,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::policy::Policy;
 
-/// Whether an escrow is still live.
-///
-/// Deliberately two states and not four. "Released" and "expired" are things that *happened*, and a
-/// session that recorded them as states would have to answer what a second release after an expiry
-/// means. What matters to a decision is only whether the owner has taken it back yet, and what the
-/// clock says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EscrowState {
-    /// Accepting releases until the deadline.
-    Open,
-    /// Finished: the owner closed it, or reclaimed what was left. Nothing more is released.
-    Closed,
-}
-
 /// One escrow's session: what the service may take, and until when.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscrowSession {
     /// What a release must satisfy. [`Policy::Never`] by default, so an escrow whose policy failed
     /// to deserialize releases nothing rather than everything.
@@ -85,10 +87,6 @@ pub struct EscrowSession {
     pub opened_at: i64,
     /// Unix seconds. After this the service may no longer release and the owner may reclaim.
     pub deadline: i64,
-    pub state: EscrowState,
-    /// Unix seconds, once closed.
-    #[serde(default)]
-    pub closed_at: Option<i64>,
     /// What has been released so far **in this deal**. Accumulates across releases — a cumulative
     /// cap is checked against this, not against one transaction.
     ///
@@ -103,8 +101,8 @@ pub struct EscrowSession {
 /// Why a party may not sign right now. Each is a different thing to tell somebody.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// The service asked after the deadline, or after the owner closed it.
-    EscrowClosed,
+    /// The service asked after the deadline.
+    DealEnded,
     /// The owner asked while the escrow is still live and the service may still take.
     StillOpen,
 }
@@ -112,40 +110,43 @@ pub enum Refusal {
 impl Refusal {
     pub fn message(self) -> &'static str {
         match self {
-            Refusal::EscrowClosed => {
-                "this escrow is closed: it passed its deadline or its owner took it back, and \
-                 nothing more is released from it"
+            Refusal::DealEnded => {
+                "this escrow's deal is over: it passed its deadline, and nothing more is released \
+                 from it"
             }
             Refusal::StillOpen => {
-                "this escrow is still open: it can be taken back once it closes, and until then \
-                 the money is committed to the deal"
+                "this escrow's deal is still running: it can be taken back once the deadline \
+                 passes, and until then the money is committed to it"
             }
         }
     }
 }
 
 impl EscrowSession {
-    /// Open a session that closes at [`deadline`](Self::deadline).
+    /// Strike a deal that runs until [`deadline`](Self::deadline).
+    ///
+    /// There is no matching `close`. See the module note: a commitment the owner can revoke is not
+    /// one, and the deadline she chooses here is the whole of her control over it.
     pub fn open(policy: Policy, now: i64, deadline: i64) -> Result<Self, String> {
         if deadline <= now {
-            return Err("an escrow that is already closed commits nothing to anybody".into());
+            return Err("a deal that is already over commits nothing to anybody".into());
         }
         policy.validate()?;
         Ok(Self {
             policy,
             opened_at: now,
             deadline,
-            state: EscrowState::Open,
-            closed_at: None,
             released_sats: 0,
         })
     }
 
-    /// Whether the clock alone has closed it. Separate from [`state`](Self::state) because time
-    /// passes without anybody writing anything down — a restart must reach the same conclusion as
-    /// the instance that armed it, from the seal and the clock and nothing else.
+    /// Whether the deal is still live.
+    ///
+    /// The clock, and nothing else. Time passes without anybody writing anything down, so a
+    /// restart reaches the same conclusion as the instance that struck the deal — from the seal
+    /// and the clock, which is all there is.
     pub fn is_open(&self, now: i64) -> bool {
-        self.state == EscrowState::Open && now < self.deadline
+        now < self.deadline
     }
 
     /// May `{service, cosigner}` sign? The *timing* question only — what a release pays and how
@@ -154,7 +155,7 @@ impl EscrowSession {
         if self.is_open(now) {
             Ok(())
         } else {
-            Err(Refusal::EscrowClosed)
+            Err(Refusal::DealEnded)
         }
     }
 
@@ -168,21 +169,13 @@ impl EscrowSession {
         }
     }
 
-    /// Count a release against this deal's allowance. Does not close the session: an escrow is
-    /// spent against, not spent once.
+    /// Count a release against this deal's allowance. Does not end the deal: an escrow is spent
+    /// against, not spent once, and only the deadline ends it.
     ///
     /// Only ever called for a release that was not counted before — a second signature over an
     /// already-answered request adds nothing, because it spends the inputs the first one did.
     pub fn record_release(&mut self, sats: u64) {
         self.released_sats = self.released_sats.saturating_add(sats);
-    }
-
-    /// Close it early. Idempotent — an owner closing twice has got what they asked for.
-    pub fn close(&mut self, now: i64) {
-        if self.state == EscrowState::Open {
-            self.state = EscrowState::Closed;
-            self.closed_at = Some(now);
-        }
     }
 }
 
@@ -198,49 +191,55 @@ mod tests {
     }
 
     #[test]
-    fn while_it_is_open_the_service_may_take_and_the_owner_may_not() {
+    fn while_it_is_running_the_service_may_take_and_the_owner_may_not() {
         let s = session();
         assert!(s.may_release(NOW).is_ok());
         assert!(s.may_release(NOW + HOUR - 1).is_ok());
         assert_eq!(s.may_reclaim(NOW), Err(Refusal::StillOpen));
     }
 
-    /// The moment the clock passes, both answers swap — with nothing written down in between.
+    /// The moment the clock passes, both answers swap — with nothing written down in between, and
+    /// nothing to write. That is the whole of the design: one way for a deal to end, and it leaves
+    /// no record because there is no record to leave.
     #[test]
     fn at_the_deadline_the_answers_swap_without_anybody_writing_anything() {
         let s = session();
         assert!(s.may_release(NOW + HOUR - 1).is_ok());
         assert_eq!(s.may_reclaim(NOW + HOUR - 1), Err(Refusal::StillOpen));
 
-        assert_eq!(s.may_release(NOW + HOUR), Err(Refusal::EscrowClosed));
+        assert_eq!(s.may_release(NOW + HOUR), Err(Refusal::DealEnded));
         assert!(s.may_reclaim(NOW + HOUR).is_ok());
 
-        // And the state is untouched: a reseated instance reads the same seal and agrees.
-        assert_eq!(s.state, EscrowState::Open);
+        // And a reseated instance reads the same seal and agrees, because the seal never changed.
+        let round_tripped: EscrowSession =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(round_tripped.may_release(NOW + HOUR), Err(Refusal::DealEnded));
+        assert!(round_tripped.may_reclaim(NOW + HOUR).is_ok());
     }
 
+    /// There is no way to end a deal early, and that is the point rather than an omission.
+    ///
+    /// A commitment the owner can revoke is not a commitment: a service that had already paid a
+    /// merchant against it would be left holding the loss. Her control is the deadline she chose.
     #[test]
-    fn closing_early_ends_it_before_the_deadline() {
-        let mut s = session();
-        s.close(NOW + 60);
-        assert_eq!(s.state, EscrowState::Closed);
-        assert_eq!(s.closed_at, Some(NOW + 60));
-        assert_eq!(s.may_release(NOW + 120), Err(Refusal::EscrowClosed));
-        assert!(s.may_reclaim(NOW + 120).is_ok());
-    }
-
-    #[test]
-    fn closing_twice_keeps_the_first_answer() {
-        let mut s = session();
-        s.close(NOW + 60);
-        s.close(NOW + 600);
-        assert_eq!(s.closed_at, Some(NOW + 60), "the first close is when it closed");
+    fn a_deal_has_no_ending_but_its_deadline() {
+        let s = session();
+        // The whole of a session's mutable surface. If something that ends a deal early is ever
+        // added, this stops compiling — which is the point of writing it down.
+        let EscrowSession {
+            policy: _,
+            opened_at: _,
+            deadline,
+            released_sats: _,
+        } = s.clone();
+        assert_eq!(deadline, NOW + HOUR);
+        assert!(s.may_release(NOW + HOUR - 1).is_ok(), "nothing can cut this short");
     }
 
     /// One escrow, many releases: a card is tapped more than once. This is the ALLOWANCE only —
     /// which payments have been spent is the wallet's ledger, tested in `release_test.rs`.
     #[test]
-    fn releases_accumulate_and_do_not_close_the_escrow() {
+    fn releases_accumulate_and_do_not_end_the_deal() {
         let mut s = session();
         s.record_release(1_000);
         s.record_release(2_500);
@@ -257,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn an_escrow_that_closes_in_the_past_is_refused() {
+    fn a_deal_that_is_already_over_is_refused() {
         assert!(EscrowSession::open(Policy::Always, NOW, NOW).is_err());
         assert!(EscrowSession::open(Policy::Always, NOW, NOW - 1).is_err());
     }
@@ -273,14 +272,13 @@ mod tests {
     #[test]
     fn a_seal_missing_its_policy_releases_nothing() {
         let json = format!(
-            r#"{{"opened_at":{NOW},"deadline":{},"state":"open"}}"#,
+            r#"{{"opened_at":{NOW},"deadline":{}}}"#,
             NOW + HOUR
         );
         let restored: EscrowSession = serde_json::from_str(&json).expect("an older seal");
         assert_eq!(restored.policy, Policy::Never);
         assert_eq!(restored.released_sats, 0);
-        assert!(restored.closed_at.is_none());
-        // Still open by the clock — the refusal it gives a release comes from the policy, not here.
+        // Still running by the clock — the refusal it gives a release comes from the policy.
         assert!(restored.may_release(NOW).is_ok());
     }
 
@@ -288,11 +286,9 @@ mod tests {
     fn a_session_survives_a_seal_round_trip() {
         let mut s = session();
         s.record_release(42);
-        s.close(NOW + 10);
         let round_tripped: EscrowSession =
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(round_tripped.released_sats, 42);
-        assert_eq!(round_tripped.state, EscrowState::Closed);
-        assert_eq!(round_tripped.closed_at, Some(NOW + 10));
+        assert_eq!(round_tripped.deadline, NOW + HOUR);
     }
 }

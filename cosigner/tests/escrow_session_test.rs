@@ -8,7 +8,7 @@
 
 mod common;
 
-use cosigner::escrow_session::{EscrowSession, EscrowState, Refusal};
+use cosigner::escrow_session::{EscrowSession, Refusal};
 use cosigner::policy::Policy;
 use cosigner::types::{EscrowRecord, ServicePairing};
 
@@ -168,7 +168,6 @@ fn a_deal_survives_the_seal_and_a_restored_instance_agrees_with_the_clock() {
     let escrow = guard.escrow(&key).expect("the escrow came back");
     let session = escrow.session.as_ref().expect("and so did its deal");
 
-    assert_eq!(session.state, EscrowState::Open);
     assert_eq!(session.deadline, NOW + HOUR);
     assert_eq!(session.policy, Policy::TotalOutMax { sats: 50_000 });
 
@@ -176,23 +175,46 @@ fn a_deal_survives_the_seal_and_a_restored_instance_agrees_with_the_clock() {
     // nothing written down at the deadline.
     assert!(session.may_release(NOW + 60).is_ok());
     assert_eq!(session.may_reclaim(NOW + 60), Err(Refusal::StillOpen));
-    assert_eq!(session.may_release(NOW + HOUR), Err(Refusal::EscrowClosed));
+    assert_eq!(session.may_release(NOW + HOUR), Err(Refusal::DealEnded));
     assert!(session.may_reclaim(NOW + HOUR).is_ok());
 }
 
+/// A deal runs until its deadline, and a second one cannot be struck over a running one.
+///
+/// This is the only guard there is, because it is the only one there needs to be: there is no way
+/// to end a deal early, so "already committed" can only be answered by the clock.
 #[test]
-fn closing_a_deal_that_was_never_opened_says_so() {
+fn a_second_deal_waits_for_the_first_ones_deadline() {
     let Some(store) = common::try_store() else { return };
     let (c, _) = wallet(&store);
     let key = "02".to_string() + &"ab".repeat(32);
     seed_escrow(&c, &key, true);
 
+    let first = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
+    c.lock().unwrap().open_escrow_session(&key, first, NOW).expect("the first deal");
+
+    // While it runs, no.
     let err = c
         .lock()
         .unwrap()
-        .close_escrow_session(&key, NOW)
-        .expect_err("there is nothing to close");
-    assert!(err.contains("not committed"), "unexpected: {err}");
+        .open_escrow_session(
+            &key,
+            EscrowSession::open(Policy::Always, NOW + 60, NOW + 60 + HOUR).unwrap(),
+            NOW + 60,
+        )
+        .expect_err("a running deal cannot be replaced");
+    assert!(err.contains("already committed"), "unexpected: {err}");
+
+    // Once it has run out, yes — and nothing had to happen at the deadline for that to be true.
+    let later = NOW + HOUR;
+    c.lock()
+        .unwrap()
+        .open_escrow_session(
+            &key,
+            EscrowSession::open(Policy::Always, later, later + HOUR).unwrap(),
+            later,
+        )
+        .expect("a new deal once the last one is over");
 }
 
 #[test]
@@ -260,10 +282,15 @@ fn the_deadline_decides_with_nothing_having_run_at_it() {
     assert!(session.may_release(NOW + HOUR - 1).is_ok());
     assert!(session.may_reclaim(NOW + HOUR - 1).is_err());
 
-    // Nobody wrote anything down in between.
+    // Nobody wrote anything down in between, and there is nothing that could have been: a deal is
+    // a policy and a date, and the date is the whole of the decision.
     assert!(session.may_release(NOW + HOUR).is_err());
     assert!(session.may_reclaim(NOW + HOUR).is_ok());
-    assert_eq!(session.state, cosigner::escrow_session::EscrowState::Open);
+    assert_eq!(
+        session,
+        EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap(),
+        "the session is byte-identical either side of its deadline"
+    );
 }
 
 /// A pairing the service has not finished is not a pairing you can deal against.
@@ -470,4 +497,125 @@ fn an_unfinished_pairing_may_be_replaced_but_a_finished_one_may_not() {
             "and the record that survives is the retry's, not the abandoned attempt's"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reclaim
+// ---------------------------------------------------------------------------
+
+/// A reclaim derives its inputs' exit delay rather than accepting one.
+///
+/// The delay is part of a VTXO's taproot tree, so it decides the scriptPubKey the sighash commits
+/// to. An indexer does not report it at all — so a caller reading what an escrow holds has nothing
+/// to put there, and a zero produces `OP_0 OP_CSV`, a script the ASP refuses outright with
+/// "CSV block type not allowed". Found by running the walkthrough, which is the only place a real
+/// ASP sees the script.
+#[test]
+fn a_reclaim_ignores_the_exit_delay_it_is_given() {
+    let Some(store) = common::try_store() else { return };
+    // Built here rather than through `seed_escrow`, because a reclaim answers only to the
+    // identifier the ceremony recorded — so the escrow's must be this wallet's real one.
+    let (kps, pkp) = common::dkg_2of2();
+    let group_key = hex::encode(pkp.verifying_key.serialize());
+    let c = std::sync::Mutex::new(
+        cosigner::Cosigner::open_with_host(
+            store.clone(),
+            group_key.clone(),
+            std::sync::Arc::new(common::Recorder::default()),
+        )
+        .expect("open"),
+    );
+    common::seed_policy_with_dealt_share(
+        &c,
+        &group_key,
+        &kps[1],
+        &kps[0],
+        &pkp,
+        Some(hex::encode([9u8; 32])),
+        Some(hex::encode([7u8; 32])),
+    );
+    let key = group_key.clone();
+    c.lock()
+        .unwrap()
+        .install_escrow(EscrowRecord {
+            escrow_key: key.clone(),
+            key_package_json: kps[1].to_json(),
+            public_key_package_json: pkp.to_json(),
+            wallet_identifier_hex: hex::encode(kps[0].identifier.serialize()),
+            context_hex: "44".repeat(16),
+            wallet_delta_share_hex: "33".repeat(32),
+            created_at: NOW,
+            pairing: None,
+            session: None,
+        })
+        .expect("install escrow");
+
+    let info = ark::client::types::ArkInfo {
+        signer_pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+        forfeit_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+        forfeit_address: "bcrt1qq5rjlmqartxjyh6vnmjrhrqnc58q2hqr5asln0".into(),
+        checkpoint_tapscript: String::new(),
+        network: "regtest".into(),
+        session_duration: 0,
+        unilateral_exit_delay: 512,
+        boarding_exit_delay: 144,
+        vtxo_min_amount: 0,
+        dust: 330,
+    };
+    // What an indexer gives a caller: no delay at all.
+    let vtxos = vec![cosigner::types::VtxoInput {
+        txid: "11".repeat(32),
+        vout: 0,
+        amount_sats: 80_000,
+        exit_delay: 0,
+        expires_at: 0,
+    }];
+
+    let guard = c.lock().unwrap();
+    // The escrow has no session here, so nothing is holding it and a reclaim is permitted; what is
+    // being checked is that it BUILDS, which it cannot at a zero delay.
+    let reclaim = guard
+        .reclaim_open(&key, vtxos, &info, NOW)
+        .expect("a reclaim must build from what an indexer actually reports");
+    assert_eq!(reclaim.amount_sats, 80_000);
+    drop(guard);
+
+    // The delay it actually used, read off the sighashes: they commit to the prevout's script, so
+    // a build at one delay cannot produce a build at another's. Compare against both candidates.
+    let sighashes_at = |delay: u32| {
+        let owner = &key[2..];
+        ark::client::send::SendSession::build(
+            owner,
+            &[ark::client::send::SendVtxoInput {
+                txid: "11".repeat(32),
+                vout: 0,
+                amount_sats: 80_000,
+                exit_delay: delay,
+            }],
+            &reclaim.to_ark_address,
+            80_000,
+            None,
+            &info,
+        )
+        .expect("it builds")
+        .1
+        .iter()
+        .map(|s| s.to_vec())
+        .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        reclaim.sighashes,
+        sighashes_at(512),
+        "a reclaim must build at the ASP's unilateral exit delay"
+    );
+    assert_ne!(
+        reclaim.sighashes,
+        sighashes_at(0),
+        "and NOT at the zero an indexer's silence leaves behind — that is `OP_0 OP_CSV`, which no \
+         ASP will take"
+    );
+
+    // And where it goes was derived, not asked for.
+    assert!(reclaim.to_ark_address.starts_with("tark1"), "{}", reclaim.to_ark_address);
 }

@@ -140,10 +140,22 @@ service Cosigner {
   // release and the owner may not reclaim; afterwards those swap, with nothing written down in
   // between. See `cosigner/src/escrow_session.rs`, which says plainly what that does and does not
   // guarantee.
+  // There is deliberately no way to END one. A commitment the owner can revoke is not a
+  // commitment: a service that had already paid a merchant against it would be left holding the
+  // loss. Her control is the deadline she chooses here.
   rpc EscrowOpenSession(EscrowOpenSessionRequest) returns (EscrowOpenSessionResponse);
 
-  // Closing one early. The owner giving up on the deal before its deadline.
-  rpc EscrowCloseSession(EscrowCloseSessionRequest) returns (EscrowCloseSessionResponse);
+  // Taking back what is left of an escrow, once its deal is over.
+  //
+  // The OTHER pairing over the same key — `{wallet, cosigner}`, the one the service is not in — so
+  // reclaiming needs the owner present and needs this cosigner to agree. It agrees only once the
+  // deal is over: until then the money is committed, and an escrow an owner can empty at will
+  // commits nothing to anybody.
+  //
+  // The destination is NOT on the wire. It is the wallet's own Ark address, derived here from the
+  // key this cosigner already holds, so a reclaim cannot be pointed anywhere else — not by a
+  // caller, and not by anything that reached a caller.
+  rpc EscrowReclaim(stream EscrowReclaimClientMsg) returns (stream EscrowReclaimServerMsg);
 
 }
 
@@ -860,16 +872,6 @@ message EscrowOpenSessionResponse {
   string policy_description = 1;
   int64 deadline_secs = 2;
 }
-
-message EscrowCloseSessionRequest {
-  // Authentication is the runtime's — see the note at the top of this file.
-  reserved 1, 2, 3;
-  reserved "user_id", "signature", "timestamp_ms";
-  string escrow_key = 4;
-}
-
-message EscrowCloseSessionResponse {}
-
 message EscrowListRequest {
   // Authentication is the runtime's — see the note at the top of this file.
   reserved 1, 2, 3;
@@ -905,11 +907,88 @@ message EscrowSummary {
 }
 
 message EscrowSessionSummary {
-  // Whether a release would be accepted right now — the clock and the state together, so a caller
-  // need not reimplement the rule.
+  // Whether a release would be accepted right now. The clock against the deadline, and nothing
+  // else — there is no state, and no way to end a deal early. Projected so a caller need not
+  // reimplement the rule.
   bool open = 1;
   int64 deadline_secs = 2;
   int64 opened_at = 3;
   uint64 released_sats = 4;
   string policy_description = 5;
+}
+
+// ===========================================================================
+// Reclaiming an escrow
+//
+// The same four steps a send takes, because it IS a send — of the escrow's key rather than the
+// wallet's. The cosigner builds it, signs its half, and hands over transactions to submit; the
+// wallet drives the ASP, as it does for its own sends.
+// ===========================================================================
+
+message EscrowReclaimClientMsg {
+  string session_id = 1;
+  uint32 seq = 2;
+  oneof body {
+    EscrowReclaimOpen open = 3;
+    // The wallet's half of the FROST round, one entry per sighash and in the same order.
+    EscrowReclaimSigned signed = 4;
+    SendSubmitted submitted = 5;
+    SendFinalized finalized = 6;
+  }
+}
+
+message EscrowReclaimOpen {
+  // Which escrow. Compared x-only, so either parity resolves.
+  string escrow_key = 1;
+  // Reserved: the wallet's identifier used to be sent here. It is not, because the cosigner
+  // already has it — the ceremony recorded it — and reading it off the wire would be asking the
+  // caller to tell us something we know.
+  reserved 2;
+  reserved "identifier";
+  // The escrow's VTXOs, as the wallet's indexer resolved them.
+  //
+  // Named by the caller because this cosigner does not index the escrow's funds. That is safe for
+  // the same reason it is safe on a release: a taproot sighash commits to every prevout, so an
+  // input claimed wrongly produces a signature that verifies against nothing. The only claim that
+  // yields a usable signature is the true one.
+  repeated VtxoInput vtxos = 3;
+  mpc_wallet.ArkInfo ark_info = 4;
+}
+
+message EscrowReclaimSigned {
+  repeated WalletRound rounds = 1;
+}
+
+message EscrowReclaimServerMsg {
+  string session_id = 1;
+  uint32 seq = 2;
+  oneof body {
+    EscrowReclaimSighashes sighashes = 3;
+    SendSubmit submit = 4;
+    SendFinalize finalize = 5;
+    EscrowReclaimComplete complete = 6;
+  }
+}
+
+message EscrowReclaimSighashes {
+  repeated bytes messages_to_sign = 1;
+  // Round one, the cosigner's half: its commitment for each message, in the same order. It commits
+  // first here, as it does for a send — the wallet is present, holding the stream.
+  repeated Commitment cosigner_commitments = 2;
+  // Which identifier those commitments are the ESCROW key's, hex. A commitment carries no
+  // identifier of its own, so it is said once for the batch.
+  string cosigner_identifier = 7;
+  // The two halves the wallet needs to rebuild its share of the ESCROW key: what this cosigner
+  // dealt it at DKG, and this cosigner's delta share for it. The third term comes from the passkey
+  // and never leaves the device.
+  bytes wallet_dealt_share = 3;
+  bytes escrow_delta_share = 4;
+  // Where the money is going, and how much. Derived here, reported so the owner sees what they are
+  // signing rather than being told it worked.
+  string to_ark_address = 5;
+  uint64 amount_sats = 6;
+}
+
+message EscrowReclaimComplete {
+  string ark_txid = 1;
 }

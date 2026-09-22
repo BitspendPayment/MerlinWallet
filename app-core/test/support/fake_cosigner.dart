@@ -268,6 +268,16 @@ class FakeCosigner extends cs.CosignerServiceBase {
     throw GrpcError.unimplemented('this fake does not pair services');
   }
 
+  /// Nor this: a reclaim is `{wallet, cosigner}` signing the escrow key, and what it decides — that
+  /// the deal is over, and where the money goes — is proved against the real handler.
+  @override
+  Stream<cs.EscrowReclaimServerMsg> escrowReclaim(
+    ServiceCall call,
+    Stream<cs.EscrowReclaimClientMsg> request,
+  ) async* {
+    throw GrpcError.unimplemented('this fake does not reclaim escrows');
+  }
+
   @override
   Future<cs.PairServiceConfirmResponse> pairServiceConfirm(
     ServiceCall call,
@@ -279,13 +289,6 @@ class FakeCosigner extends cs.CosignerServiceBase {
   Future<cs.EscrowOpenSessionResponse> escrowOpenSession(
     ServiceCall call,
     cs.EscrowOpenSessionRequest request,
-  ) async =>
-      throw GrpcError.unimplemented('this fake mints no escrows to commit');
-
-  @override
-  Future<cs.EscrowCloseSessionResponse> escrowCloseSession(
-    ServiceCall call,
-    cs.EscrowCloseSessionRequest request,
   ) async =>
       throw GrpcError.unimplemented('this fake mints no escrows to commit');
 

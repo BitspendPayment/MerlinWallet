@@ -13,6 +13,7 @@ import 'package:app_core/cosigner/connection.dart';
 import 'package:app_core/sessions/dkg_session.dart';
 import 'package:app_core/sessions/escrow_session.dart';
 import 'package:app_core/sessions/pairing_session.dart';
+import 'package:app_core/sessions/reclaim_session.dart';
 import 'package:app_core/sessions/service_delivery.dart';
 import 'package:app_core/sessions/send_session.dart';
 import 'package:app_core/sessions/settle_session.dart';
@@ -719,10 +720,91 @@ class MpcClient {
     );
   }
 
+  /// Take back what is left of an escrow, once its deal is over.
+  ///
+  /// `{wallet, cosigner}` signing the escrow key — the pairing the service is not in. Refused while
+  /// the deal is live: until it closes, the money is committed, and an escrow its owner can empty
+  /// at will commits nothing to anybody.
+  ///
+  /// [vtxos] is what the escrow's address holds, from the indexer. Where the money goes is **not**
+  /// sent: the cosigner derives this wallet's own address from the key it already holds, and
+  /// reports it back so the owner sees where it went.
+  Future<ReclaimResult> reclaimEscrow({
+    required String escrowKeyHex,
+    required List<IndexerVtxo> vtxos,
+    ArkInfo? info,
+  }) async {
+    final escrow = _escrows.firstWhere(
+      (e) => e.escrowKeyHex.toLowerCase() == escrowKeyHex.toLowerCase(),
+      orElse: () => throw StateError('this wallet holds no escrow $escrowKeyHex'),
+    );
+    final arkInfo = info ?? await _asp.getInfo();
+
+    return _withOperation<void, ReclaimResult>(
+      'EscrowReclaim',
+      escrowContext: Uint8List.fromList(hex.decode(escrow.contextHex)),
+      prepare: _nothingToPrepare,
+      run: (operation, _) async {
+        final wallet = _wallet!;
+        final delta = operation.takeEscrowDelta();
+        final polynomial = operation.takePolynomial();
+        return ReclaimSession(_conn, _asp).run(
+          escrowKeyHex: escrow.escrowKeyHex,
+          vtxos: vtxos,
+          info: arkInfo,
+          escrowPubKey: escrow.wallet.publicKeyPackage,
+          resolveEscrow: (dealtShare, deltaShare) => reconstructEscrowShare(
+            polynomial: polynomial,
+            escrowDelta: delta,
+            dealtShare: dealtShare,
+            deltaShare: deltaShare,
+            wallet: wallet,
+            escrow: escrow.wallet,
+          ),
+        );
+      },
+    );
+  }
+
+  /// What a key's Ark address holds, from the indexer.
+  ///
+  /// For a key this wallet does not spend from alone — an escrow's, say. Reading rather than
+  /// remembering: this device keeps the public shape of an escrow, never a view of the chain.
+  Future<List<IndexerVtxo>> vtxosAtArkAddress(String ownerXOnlyHex, {ArkInfo? info}) async {
+    final arkInfo = info ?? await _asp.getInfo();
+    final script = ark_addr.vtxoScriptPubkeyHex(
+      ownerXOnlyHex: ownerXOnlyHex,
+      aspPubkeyHex: arkInfo.signerPubkey,
+      exitDelay: arkInfo.unilateralExitDelay,
+      network: arkInfo.network,
+    );
+    return _asp.getVtxosByScripts([script]);
+  }
+
+  /// The Ark address an escrow is paid at — where its funding goes, and what the indexer is asked
+  /// about to find what it holds.
+  ///
+  /// Derived from the escrow's own key, exactly as the cosigner derives it.
+  Future<String> escrowArkAddress(String escrowKeyHex, {ArkInfo? info}) async {
+    final escrow = _escrows.firstWhere(
+      (e) => e.escrowKeyHex.toLowerCase() == escrowKeyHex.toLowerCase(),
+      orElse: () => throw StateError('this wallet holds no escrow $escrowKeyHex'),
+    );
+    final arkInfo = info ?? await _asp.getInfo();
+    final key = escrow.escrowKeyHex.toLowerCase();
+    return ark_addr.arkAddress(
+      ownerXOnlyHex: key.length == 66 ? key.substring(2) : key,
+      aspPubkeyHex: arkInfo.signerPubkey,
+      exitDelay: arkInfo.unilateralExitDelay,
+      network: arkInfo.network,
+    );
+  }
+
   /// Commit an escrow to a deal.
   ///
   /// Until [deadline] the paired service may release from it, judged against [policy], and this
-  /// wallet may **not** take it back; afterwards those swap. Nothing in Bitcoin enforces that —
+  /// wallet may **not** take it back; afterwards those swap. There is no way to end it early:
+  /// a commitment the owner can revoke is not one, and [deadline] is the whole of her control. Nothing in Bitcoin enforces that —
   /// both pairings sign the same key — so what holds it up is the cosigner declining to co-sign
   /// with the wrong party at the wrong time, in attested code. See `cosigner/src/escrow_session.rs`.
   ///
@@ -738,11 +820,6 @@ class MpcClient {
       deadlineSecs: Int64(deadline.millisecondsSinceEpoch ~/ 1000),
     ));
     return response.policyDescription;
-  }
-
-  /// Close a deal before its deadline — giving up on it, so what is left can be taken back now.
-  Future<void> closeEscrowSession(String escrowKeyHex) async {
-    await _conn.escrowCloseSession(cs.EscrowCloseSessionRequest(escrowKey: escrowKeyHex));
   }
 
   /// What the cosigner holds for this wallet's escrows, including any live deal. Asked rather than

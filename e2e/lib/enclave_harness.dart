@@ -111,6 +111,13 @@ class EnclaveHarness {
     int port = 8443,
     String? component,
     String? serviceOrigins,
+    /// Origins the guest may dial that are not services — a payment provider, say. A service needs
+    /// both halves (a name and an egress allowance); anything the cosigner only *fetches* from
+    /// needs the allowance alone.
+    List<String> extraEgress = const [],
+    /// Extra image environment. Measured into PCR0 like everything else here, which is the point:
+    /// a credential the cosigner uses is part of what the image is.
+    Map<String, String> extraEnv = const {},
     Duration timeout = const Duration(minutes: 20),
   }) async {
     final existing = Platform.environment['MERLIN_ENCLAVE_RUN'];
@@ -155,6 +162,9 @@ class EnclaveHarness {
             // later. See `cosigner/src/handlers/delivery.rs` for why both spellings exist.
             ...['--guest-egress', entry.replaceFirst(RegExp(r'^[0-9a-fA-F]+[:=]'), '')],
         ],
+        for (final origin in extraEgress) ...['--guest-egress', origin],
+        for (final entry in extraEnv.entries)
+          ...['--guest-env', '${entry.key}=${entry.value}'],
         '--background-timeout', '600',
       ],
       workingDirectory: _runtimeRepo,

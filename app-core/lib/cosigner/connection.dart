@@ -203,6 +203,13 @@ class CosignerConnection {
         out, _stream('PairService', (o) => _stub.pairService(out.stream, options: o)));
   }
 
+  /// Taking back what is left of an escrow. See `sessions/reclaim_session.dart`.
+  Duplex<cs.EscrowReclaimClientMsg, cs.EscrowReclaimServerMsg> openEscrowReclaim() {
+    final out = StreamController<cs.EscrowReclaimClientMsg>();
+    return Duplex(
+        out, _stream('EscrowReclaim', (o) => _stub.escrowReclaim(out.stream, options: o)));
+  }
+
   Duplex<cs.SettleClientMsg, cs.SettleServerMsg> openSettle() {
     final out = StreamController<cs.SettleClientMsg>();
     return _track(out, _stream('Settle', (o) => _stub.settle(out.stream, options: o)));
@@ -268,9 +275,6 @@ class CosignerConnection {
       _stub.escrowOpenSession(r, options: await _approved('EscrowOpenSession'));
 
   /// Close a deal early.
-  Future<cs.EscrowCloseSessionResponse> escrowCloseSession(
-          cs.EscrowCloseSessionRequest r) async =>
-      _stub.escrowCloseSession(r, options: await _approved('EscrowCloseSession'));
 
   Future<void> shutdown() => _channel.shutdown();
 }

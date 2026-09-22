@@ -83,6 +83,12 @@ use crate::types::{Admission, ReleaseRecord};
 use crate::evidence::{FetchEvidence, ReleaseFacts};
 use crate::service_stream::{StreamRefusal, ToService};
 
+/// The pay-to-anchor script every Ark transaction carries: `OP_1 <0x4e73>`.
+///
+/// Zero-value by construction, spendable by anyone, and there so a transaction can be fee-bumped.
+/// It is not a party to the payment and must not be judged as one.
+pub const ANCHOR_SCRIPT_HEX: &str = "51024e73";
+
 /// How many VTXOs one release may spend. Each costs a checkpoint transaction and two sighashes, and
 /// a proposal is a message on a connection with a ceiling of its own.
 pub const MAX_RELEASE_INPUTS: usize = 64;
@@ -328,9 +334,29 @@ impl Cosigner {
 
         // What leaves the escrow, and what it costs. Change back to the escrow's own scripts is not
         // a payment to anybody, so it is not egress — the policy is told which scripts are ours.
-        let owned = owned_scripts(&owner_pk_hex, &info, &request.inputs)
+        let mut owned = owned_scripts(&owner_pk_hex, &info, &request.inputs)
             .map_err(|e| Denial::Faulted(format!("working out this escrow's own scripts: {e}")))?;
         let outputs = crate::policy::outputs_of_txouts(send.outputs());
+
+        // The anchor is not a destination. Every Ark transaction carries a zero-value pay-to-anchor
+        // output so the transaction can be fee-bumped; it pays nobody, and a policy that counted it
+        // as egress would refuse every release ever made.
+        //
+        // Only at zero, and that matters: anyone can spend a P2A output, so one carrying value
+        // would be money leaving the escrow to whoever claimed it first. If one ever does, that is
+        // not an anchor and it is not waved through.
+        if outputs.iter().any(|o| o.script_pubkey_hex == ANCHOR_SCRIPT_HEX) {
+            if let Some(bearing) = outputs
+                .iter()
+                .find(|o| o.script_pubkey_hex == ANCHOR_SCRIPT_HEX && o.sats > 0)
+            {
+                return Err(Denial::Refused(format!(
+                    "this release puts {} sats in a pay-to-anchor output, which anybody may spend",
+                    bearing.sats
+                )));
+            }
+            owned.insert(ANCHOR_SCRIPT_HEX.to_string());
+        }
         let paid_in: u64 = request.inputs.iter().map(|i| i.amount_sats).sum();
         let paid_out: u64 = outputs.iter().map(|o| o.sats).sum();
         let fee_sats = paid_in.checked_sub(paid_out).ok_or_else(|| {

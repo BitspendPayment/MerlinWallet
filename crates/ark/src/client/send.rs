@@ -32,6 +32,7 @@ use crate::client::types::ArkInfo;
 // ---------------------------------------------------------------------------
 
 /// VTXO input descriptor for off-chain send.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendVtxoInput {
     pub txid: String,
     pub vout: u32,
@@ -360,6 +361,15 @@ impl SendSession {
             encode_psbt_b64(&self.ark_tx),
             self.checkpoint_txs.iter().map(encode_psbt_b64).collect(),
         )
+    }
+
+    /// The ark transaction's id, known as soon as it is built.
+    ///
+    /// Fixed before anything is signed: these are taproot script-path spends, so the signatures go
+    /// in the witness and the txid does not move. That is what lets a caller write down what it is
+    /// about to submit, and afterwards ask the chain whether it landed.
+    pub fn ark_txid(&self) -> String {
+        self.ark_tx.unsigned_tx.compute_txid().to_string()
     }
 
     /// The ark transaction's outputs — where the money actually goes — for a policy to judge.

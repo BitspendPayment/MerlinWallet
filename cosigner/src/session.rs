@@ -104,6 +104,7 @@ impl CosignerService {
             "Settle" => ceremony!(settle),
             "Escrow" => ceremony!(escrow),
             "PairService" => ceremony!(pair_service),
+            "EscrowReclaim" => ceremony!(escrow_reclaim),
             _ => {}
         }
 
@@ -133,7 +134,6 @@ impl CosignerService {
             "Recover" => unary!(self.recover(body)),
             "EscrowList" => unary!(self.escrow_list(body)),
             "EscrowOpenSession" => unary!(self.escrow_open_session(body)),
-            "EscrowCloseSession" => unary!(self.escrow_close_session(body)),
             "PairServiceConfirm" => unary!(self.pair_service_confirm(body)),
             other => grpc::failed(Status::unimplemented(format!("no such method: {other}"))),
         }
@@ -280,26 +280,6 @@ impl CosignerService {
             policy_description: description,
             deadline_secs: deadline,
         })
-    }
-
-    /// Close a deal early — the owner giving up on it before its deadline.
-    async fn escrow_close_session(
-        &self,
-        body: Body,
-    ) -> Result<proto::EscrowCloseSessionResponse, Status> {
-        let req: proto::EscrowCloseSessionRequest = grpc::one_message(body).await?;
-        let mut c = lock(&self.cosigner);
-        c.close_escrow_session(&req.escrow_key, crate::handlers::helpers::now_secs())
-            .map_err(Status::failed_precondition)?;
-        c.seal();
-        // The connection is NOT let go of here, and that is deliberate. A service that asks for a
-        // release after the deal ended should be told "this escrow is closed" — which is a reason
-        // it can act on — rather than finding a dead socket, which is indistinguishable from the
-        // network being down. It would also be inconsistent: a deal that simply *lapsed* keeps its
-        // connection, because nothing runs at a deadline to take it away, so closing one here
-        // would make the same end state behave two different ways. The wallet's next deal with the
-        // same service reuses the connection either way.
-        Ok(proto::EscrowCloseSessionResponse {})
     }
 
     /// The escrow keys this wallet holds — public projection only, so a device that keeps nothing
@@ -861,6 +841,135 @@ async fn dkg(
 /// on this handler and the caller makes those two calls: the cosigner hands over what to send and
 /// seals only once the ASP has accepted it, so an interrupted send leaves neither a half-signed
 /// transaction addressable by the next request nor a recorded spend that never happened.
+/// Taking back what is left of an escrow, once its deal is over.
+///
+/// The same four steps a send takes, because it is one — of the escrow's key rather than the
+/// wallet's. See [`crate::handlers::reclaim`] for what is checked and what is derived rather than
+/// accepted.
+async fn escrow_reclaim(
+    cosigner: Arc<Mutex<Cosigner>>,
+    duplex: Duplex<proto::EscrowReclaimClientMsg, proto::EscrowReclaimServerMsg>,
+) -> Result<(), Status> {
+    let first = duplex.expect("it opened").await?;
+    let session_id = first.session_id.clone();
+    let open = match first.body {
+        Some(proto::escrow_reclaim_client_msg::Body::Open(o)) => o,
+        _ => {
+            return Err(Status::invalid_argument(
+                "a session must open with EscrowReclaimOpen",
+            ))
+        }
+    };
+    let info = open
+        .ark_info
+        .map(ark_info_from_proto)
+        .ok_or_else(|| Status::invalid_argument("EscrowReclaimOpen carried no ark_info"))?;
+
+    let mut reclaim = lock(&cosigner).reclaim_open(
+        &open.escrow_key,
+        vtxos_from_proto(open.vtxos.clone()),
+        &info,
+        crate::handlers::helpers::now_secs(),
+    )?;
+
+    // Round one, on this stream, as a send does it: the cosigner commits first so the whole batch
+    // costs one round trip — but with the ESCROW's share, not the wallet's.
+    let (round, commitments) = lock(&cosigner)
+        .sign_in_band_begin_as(&reclaim.key_package, &reclaim.sighashes);
+
+    duplex.send(proto::EscrowReclaimServerMsg {
+        session_id: session_id.clone(),
+        seq: 1,
+        body: Some(proto::escrow_reclaim_server_msg::Body::Sighashes(
+            proto::EscrowReclaimSighashes {
+                messages_to_sign: reclaim.sighashes.clone(),
+                cosigner_identifier: cosigner_identifier(&commitments),
+                cosigner_commitments: wire_commitments(commitments),
+                wallet_dealt_share: reclaim.wallet_dealt_share.clone(),
+                escrow_delta_share: reclaim.escrow_delta_share.clone(),
+                to_ark_address: reclaim.to_ark_address.clone(),
+                amount_sats: reclaim.amount_sats,
+            },
+        )),
+    });
+
+    // --- The wallet's half of the round, then what it must submit --------------------------
+    let signed = match reclaim_body(&duplex, "mid-reclaim").await? {
+        proto::escrow_reclaim_client_msg::Body::Signed(s) => s,
+        _ => return Err(Status::invalid_argument("expected EscrowReclaimSigned")),
+    };
+    let signatures = lock(&cosigner)
+        .sign_in_band_finish_as(
+            &reclaim.key_package,
+            &reclaim.public_key_package,
+            &reclaim.wallet_identifier,
+            round,
+            wallet_halves(signed.rounds),
+        )
+        .map_err(Status::invalid_argument)?;
+    let (ark_tx_b64, checkpoint_txs) = {
+        let sigs = crate::cosigner::sigs_from_wire(&signatures).map_err(Status::internal)?;
+        reclaim.session.sign_with_frost(sigs).map_err(Status::internal)?;
+        reclaim
+            .session
+            .prepare_submit()
+            .map_err(|e| Status::internal(format!("prepare submit: {e}")))?
+    };
+
+    duplex.send(proto::EscrowReclaimServerMsg {
+        session_id: session_id.clone(),
+        seq: 2,
+        body: Some(proto::escrow_reclaim_server_msg::Body::Submit(
+            proto::SendSubmit {
+                ark_tx_b64,
+                checkpoint_txs,
+            },
+        )),
+    });
+
+    // --- What the ASP returned, turned into the finalize call ------------------------------
+    let submitted = match reclaim_body(&duplex, "mid-reclaim").await? {
+        proto::escrow_reclaim_client_msg::Body::Submitted(s) => s,
+        _ => return Err(Status::invalid_argument("expected SendSubmitted")),
+    };
+    let final_checkpoint_txs = reclaim
+        .session
+        .finalize_checkpoints(&submitted.signed_checkpoint_txs)
+        .map_err(|e| Status::internal(format!("finalize checkpoints: {e}")))?;
+
+    duplex.send(proto::EscrowReclaimServerMsg {
+        session_id: session_id.clone(),
+        seq: 3,
+        body: Some(proto::escrow_reclaim_server_msg::Body::Finalize(
+            proto::SendFinalize {
+                ark_txid: submitted.ark_txid.clone(),
+                final_checkpoint_txs,
+            },
+        )),
+    });
+
+    // --- Accepted. Only now is the escrow closed for good ----------------------------------
+    match reclaim_body(&duplex, "mid-reclaim").await? {
+        proto::escrow_reclaim_client_msg::Body::Finalized(_) => {}
+        _ => return Err(Status::invalid_argument("expected SendFinalized")),
+    }
+    reclaim.session.mark_done();
+    // Nothing to close. A reclaim is only permitted once the deadline has passed, so by the time
+    // this runs the deal is already over — by the clock, which is the only way a deal ends.
+    lock(&cosigner).seal();
+
+    duplex.send(proto::EscrowReclaimServerMsg {
+        session_id,
+        seq: 4,
+        body: Some(proto::escrow_reclaim_server_msg::Body::Complete(
+            proto::EscrowReclaimComplete {
+                ark_txid: submitted.ark_txid,
+            },
+        )),
+    });
+    Ok(())
+}
+
 async fn send(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<proto::SendClientMsg, proto::SendServerMsg>,
@@ -1183,6 +1292,17 @@ async fn settle(
         };
         drop(c);
     }
+}
+
+async fn reclaim_body(
+    duplex: &Duplex<proto::EscrowReclaimClientMsg, proto::EscrowReclaimServerMsg>,
+    what: &str,
+) -> Result<proto::escrow_reclaim_client_msg::Body, Status> {
+    duplex
+        .expect(what)
+        .await?
+        .body
+        .ok_or_else(|| Status::invalid_argument("empty EscrowReclaimClientMsg"))
 }
 
 async fn next_body(
