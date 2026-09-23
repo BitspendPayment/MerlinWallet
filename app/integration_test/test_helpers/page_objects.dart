@@ -103,10 +103,10 @@ class ExitPage {
 class ArkPage {
   static Future<void> tapSend(WidgetTester tester) =>
       _tapKey(tester, 'arkSendBtn');
+  /// Receiving IS boarding: on-chain to the boarding address, then settle.
   static Future<void> tapReceive(WidgetTester tester) =>
       _tapKey(tester, 'arkReceiveBtn');
-  static Future<void> tapBoard(WidgetTester tester) =>
-      _tapKey(tester, 'arkBoardBtn');
+  static Future<void> tapBoard(WidgetTester tester) => tapReceive(tester);
 }
 
 class ArkBoardPage {

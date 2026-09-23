@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:app/services/mpc_service.dart';
 
 class ArkBoardScreen extends StatefulWidget {
@@ -17,6 +18,7 @@ class ArkBoardScreen extends StatefulWidget {
 class _ArkBoardScreenState extends State<ArkBoardScreen> {
   _BoardState _state = _BoardState.ready;
   String? _commitmentTxid;
+  int _boardedSats = 0;
   String? _error;
   Timer? _pollTimer;
 
@@ -49,6 +51,9 @@ class _ArkBoardScreenState extends State<ArkBoardScreen> {
     setState(() {
       _state = _BoardState.settling;
       _error = null;
+      // What is being settled, read before it moves — afterwards the boarding
+      // balance is zero and there is nothing left to name.
+      _boardedSats = mpcService.boardingBalance;
     });
 
     try {
@@ -77,7 +82,7 @@ class _ArkBoardScreenState extends State<ArkBoardScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          'Board Funds',
+          'Receive',
           style: GoogleFonts.inter(fontWeight: FontWeight.w600),
         ),
         centerTitle: true,
@@ -135,7 +140,7 @@ class _ArkBoardScreenState extends State<ArkBoardScreen> {
                               color: Colors.blueAccent, size: 20),
                           const SizedBox(width: 8),
                           Text(
-                            'How Boarding Works',
+                            'How Receiving Works',
                             style: GoogleFonts.inter(
                               fontWeight: FontWeight.w600,
                               color: Colors.white,
@@ -145,7 +150,7 @@ class _ArkBoardScreenState extends State<ArkBoardScreen> {
                         ],
                       ),
                       const SizedBox(height: 12),
-                      _buildStep('1', 'Send BTC to your boarding address'),
+                      _buildStep('1', 'Send BTC to the address below'),
                       const SizedBox(height: 8),
                       _buildStep('2', 'Wait for on-chain confirmation'),
                       const SizedBox(height: 8),
@@ -216,6 +221,14 @@ class _ArkBoardScreenState extends State<ArkBoardScreen> {
                                   fontSize: 11,
                                 ),
                               ),
+                            Text(
+                              'Already in Ark: '
+                              '${NumberFormat("#,##0").format(mpcService.arkBalance.toInt())} sats',
+                              style: GoogleFonts.inter(
+                                color: Colors.white38,
+                                fontSize: 11,
+                              ),
+                            ),
                           ],
                         ),
                       ),
@@ -224,6 +237,22 @@ class _ArkBoardScreenState extends State<ArkBoardScreen> {
                 ),
                 const SizedBox(height: 16),
                 if (boardingAddress != null) ...[
+                  Center(
+                    child: Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: QrImageView(
+                        data: boardingAddress,
+                        version: QrVersions.auto,
+                        size: 200.0,
+                        backgroundColor: Colors.white,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
                   Text(
                     'Your Boarding Address',
                     style: GoogleFonts.inter(
@@ -393,9 +422,17 @@ class _ArkBoardScreenState extends State<ArkBoardScreen> {
           ),
           const SizedBox(height: 12),
           Text(
-            'Your funds have been settled into Ark VTXOs.',
+            _boardedSats > 0
+                ? '${NumberFormat("#,##0").format(_boardedSats)} sats settled into Ark VTXOs.'
+                : 'Your funds have been settled into Ark VTXOs.',
             textAlign: TextAlign.center,
             style: GoogleFonts.inter(color: Colors.white54, fontSize: 14),
+          ),
+          Text(
+            'Now in Ark: '
+            '${NumberFormat("#,##0").format(context.watch<MpcService>().arkBalance.toInt())} sats',
+            textAlign: TextAlign.center,
+            style: GoogleFonts.inter(color: Colors.white38, fontSize: 12),
           ),
           if (_commitmentTxid != null) ...[
             const SizedBox(height: 16),

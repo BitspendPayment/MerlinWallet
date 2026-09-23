@@ -17,7 +17,6 @@ import 'screens/exit/exit_screen.dart';
 import 'screens/onboarding/exit_address_screen.dart';
 import 'screens/splash_screen.dart';
 import 'screens/ark/ark_screen.dart';
-import 'screens/ark/ark_receive_screen.dart';
 import 'screens/ark/ark_send_screen.dart';
 import 'screens/ark/ark_board_screen.dart';
 
@@ -158,15 +157,11 @@ GoRoute(
     ),
     GoRoute(
       path: '/ark/receive',
-      builder: (context, state) => const ArkReceiveScreen(),
+      builder: (context, state) => const ArkBoardScreen(),
     ),
     GoRoute(
       path: '/ark/send',
       builder: (context, state) => const ArkSendScreen(),
-    ),
-    GoRoute(
-      path: '/ark/board',
-      builder: (context, state) => const ArkBoardScreen(),
     ),
     GoRoute(
       path: '/settings',

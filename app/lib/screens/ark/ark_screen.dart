@@ -359,17 +359,6 @@ class ArkScreen extends StatelessWidget {
                   isPrimary: false,
                 ),
               ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: _buildActionButton(
-                  context,
-                  widgetKey: const Key('arkBoardBtn'),
-                  icon: Icons.login,
-                  label: 'Board',
-                  onTap: () => context.push('/ark/board'),
-                  isPrimary: false,
-                ),
-              ),
             ],
           ),
         ],
