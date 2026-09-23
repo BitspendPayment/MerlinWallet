@@ -68,8 +68,7 @@ class _MerlinWalletAppState extends State<MerlinWalletApp> {
 
   @override
   Widget build(BuildContext context) {
-    // Build once, wiring the router to MpcService so the offline-mode guard can
-    // re-evaluate (refreshListenable) and redirect off Ark routes.
+    // Keep one router instance across app rebuilds.
     _router ??= _buildRouter(context.read<MpcService>());
     return MaterialApp.router(
       title: 'Merlin Wallet',
@@ -81,91 +80,91 @@ class _MerlinWalletAppState extends State<MerlinWalletApp> {
 }
 
 GoRouter _buildRouter(MpcService mpc) => GoRouter(
-  initialLocation: '/splash',
-  refreshListenable: mpc,
-  routes: [
-    GoRoute(
-      path: '/splash',
-      builder: (context, state) => const SplashScreen(),
-    ),
-    // The wallet is the Ark wallet now; there is no other.
-    GoRoute(
-      path: '/',
-      builder: (context, state) => const ArkScreen(),
-    ),
-    GoRoute(
-      path: '/exit',
-      builder: (context, state) => const ExitScreen(),
-    ),
-    GoRoute(
-      path: '/onboarding/welcome',
-      builder: (context, state) => const WelcomeScreen(),
-    ),
-    GoRoute(
-      path: '/onboarding/server',
-      builder: (context, state) => const ServerConnectionScreen(),
-    ),
-    GoRoute(
-      path: '/onboarding/dkg',
-      builder: (context, state) => const DkgProgressScreen(),
-    ),
-    GoRoute(
-      path: '/onboarding/passkey',
-      builder: (context, state) => const PasskeySetupScreen(),
-    ),
-    GoRoute(
-      path: '/onboarding/restore',
-      builder: (context, state) => const RestoreWalletScreen(),
-    ),
-GoRoute(
-      path: '/onboarding/ready',
-      builder: (context, state) => const WalletReadyScreen(),
-    ),
-    GoRoute(
-      path: '/spending/send',
-      builder: (context, state) => const SendScreen(),
-    ),
-    GoRoute(
-      path: '/onboarding/exit-address',
-      builder: (context, state) => const ExitAddressScreen(),
-    ),
-    GoRoute(
-      path: '/contacts',
-      builder: (context, state) => const ContactsScreen(),
-    ),
-    GoRoute(
-      path: '/requests',
-      builder: (context, state) => const RequestsScreen(),
-    ),
-    GoRoute(
-      path: '/spending/review',
-      builder: (context, state) {
-        final extras = state.extra as Map<String, dynamic>? ?? {};
-        return ReviewScreen(extras: extras);
-      },
-    ),
-    GoRoute(
-      path: '/spending/signing',
-      builder: (context, state) {
-        final extras = state.extra as Map<String, dynamic>? ?? {};
-        return SigningScreen(extras: extras);
-      },
-    ),
-    GoRoute(
-      path: '/ark',
-      builder: (context, state) => const ArkScreen(),
-    ),
-    GoRoute(
-      path: '/ark/receive',
-      builder: (context, state) => const ArkBoardScreen(),
-    ),
-    GoRoute(
-      path: '/ark/send',
-      builder: (context, state) => const ArkSendScreen(),
-    ),
-    GoRoute(
-      path: '/settings',
-      builder: (context, state) => const SettingsScreen(),
-    ),
-  ],
-);
+      initialLocation: '/splash',
+      refreshListenable: mpc,
+      routes: [
+        GoRoute(
+          path: '/splash',
+          builder: (context, state) => const SplashScreen(),
+        ),
+        // The wallet is the Ark wallet now; there is no other.
+        GoRoute(
+          path: '/',
+          builder: (context, state) => const ArkScreen(),
+        ),
+        GoRoute(
+          path: '/exit',
+          builder: (context, state) => const ExitScreen(),
+        ),
+        GoRoute(
+          path: '/onboarding/welcome',
+          builder: (context, state) => const WelcomeScreen(),
+        ),
+        GoRoute(
+          path: '/onboarding/server',
+          builder: (context, state) => const ServerConnectionScreen(),
+        ),
+        GoRoute(
+          path: '/onboarding/dkg',
+          builder: (context, state) => const DkgProgressScreen(),
+        ),
+        GoRoute(
+          path: '/onboarding/passkey',
+          builder: (context, state) => const PasskeySetupScreen(),
+        ),
+        GoRoute(
+          path: '/onboarding/restore',
+          builder: (context, state) => const RestoreWalletScreen(),
+        ),
+        GoRoute(
+          path: '/onboarding/ready',
+          builder: (context, state) => const WalletReadyScreen(),
+        ),
+        GoRoute(
+          path: '/spending/send',
+          builder: (context, state) => const SendScreen(),
+        ),
+        GoRoute(
+          path: '/onboarding/exit-address',
+          builder: (context, state) => const ExitAddressScreen(),
+        ),
+        GoRoute(
+          path: '/contacts',
+          builder: (context, state) => const ContactsScreen(),
+        ),
+        GoRoute(
+          path: '/requests',
+          builder: (context, state) => const RequestsScreen(),
+        ),
+        GoRoute(
+          path: '/spending/review',
+          builder: (context, state) {
+            final extras = state.extra as Map<String, dynamic>? ?? {};
+            return ReviewScreen(extras: extras);
+          },
+        ),
+        GoRoute(
+          path: '/spending/signing',
+          builder: (context, state) {
+            final extras = state.extra as Map<String, dynamic>? ?? {};
+            return SigningScreen(extras: extras);
+          },
+        ),
+        GoRoute(
+          path: '/ark',
+          builder: (context, state) => const ArkScreen(),
+        ),
+        GoRoute(
+          path: '/ark/receive',
+          builder: (context, state) => const ArkBoardScreen(),
+        ),
+        GoRoute(
+          path: '/ark/send',
+          builder: (context, state) => const ArkSendScreen(),
+        ),
+        GoRoute(
+          path: '/settings',
+          builder: (context, state) => const SettingsScreen(),
+        ),
+      ],
+    );

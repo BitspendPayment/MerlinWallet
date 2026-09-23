@@ -42,7 +42,7 @@ class WelcomeScreen extends StatelessWidget {
               ),
               const SizedBox(height: 16),
               Text(
-                'Secure 2-of-2 Multi-Party Computation Bitcoin Wallet.\n\nYou hold one key share on this device.\nThe co-signing server holds the other.\nNeither can move your funds alone.',
+                'Secure 2-of-2 Multi-Party Computation Bitcoin Wallet.\n\nYour passkey rebuilds your wallet’s key share when needed.\nThe co-signing server holds the other.\nNeither can move your funds alone.',
                 style: GoogleFonts.inter(
                   fontSize: 16,
                   color: Colors.white70,

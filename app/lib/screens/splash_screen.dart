@@ -3,7 +3,8 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:go_router/go_router.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
-import 'package:app_core/persistence/wallet_store.dart' show IncompatibleWalletStateException;
+import 'package:app_core/persistence/wallet_store.dart'
+    show IncompatibleWalletStateException;
 import '../services/mpc_service.dart';
 
 class SplashScreen extends StatefulWidget {
@@ -42,7 +43,8 @@ class _SplashScreenState extends State<SplashScreen> {
         return;
       } catch (e) {
         // Session restore failed — will start in disconnected state
-        print("Session restore failed: $e — falling back to onboarding");
+        print(
+            "Session restore failed: $e — opening wallet in disconnected state");
       }
       if (mounted) context.go('/');
     } else {
@@ -59,7 +61,8 @@ class _SplashScreenState extends State<SplashScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _resetting = false);
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Reset failed: $e')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Reset failed: $e')));
     }
   }
 
@@ -74,22 +77,29 @@ class _SplashScreenState extends State<SplashScreen> {
             children: [
               Text(
                 'This wallet data is from an older development build',
-                style: GoogleFonts.inter(fontSize: 22, fontWeight: FontWeight.bold),
+                style: GoogleFonts.inter(
+                    fontSize: 22, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 16),
               Text(
                 'Older builds kept part of the wallet\'s key on this phone. This build keeps none '
                 'of it — the key is rebuilt from your passkey each time you sign — and it cannot '
                 'use the old data. There is no migration.\n\n'
-                'Resetting deletes the old data from this phone. Your wallet is not deleted: '
-                'afterwards choose "Restore wallet" and it is rebuilt from your passkey. You will '
-                'be asked for your exit address again.',
+                'Resetting permanently deletes this phone’s wallet data, including any saved '
+                'exit transactions. Recovery requires your original passkey and a reachable '
+                'cosigner that supports recovery for this wallet. Wallets created before '
+                'recovery support cannot be restored this way. Do not reset if you still need '
+                'the old data to recover funds.\n\n'
+                'For a recoverable wallet, choose "I already have a wallet" after resetting. '
+                'You will be asked for your exit address again.',
                 style: GoogleFonts.inter(fontSize: 15, height: 1.4),
               ),
               const SizedBox(height: 28),
               FilledButton(
                 onPressed: _resetting ? null : _reset,
-                child: Text(_resetting ? 'Resetting…' : 'Reset wallet data on this phone'),
+                child: Text(_resetting
+                    ? 'Resetting…'
+                    : 'Reset wallet data on this phone'),
               ),
             ],
           ),

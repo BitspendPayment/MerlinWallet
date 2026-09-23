@@ -37,7 +37,8 @@ class ExitScreen extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('Exit', style: GoogleFonts.inter(fontWeight: FontWeight.w600)),
+        title:
+            Text('Exit', style: GoogleFonts.inter(fontWeight: FontWeight.w600)),
         centerTitle: true,
       ),
       body: SafeArea(
@@ -59,7 +60,9 @@ class ExitScreen extends StatelessWidget {
               const SizedBox(height: 20),
               Text('Signed and yours',
                   style: GoogleFonts.inter(
-                      fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white)),
               const SizedBox(height: 8),
               for (final exit in exits) _exitTile(context, exit),
             ],
@@ -74,9 +77,10 @@ class ExitScreen extends StatelessWidget {
 
   Widget _explainer() => Text(
         'If this service stops answering, these transactions are how you get your money out. '
-        'Each one pays your balance to your own address after a waiting period, and needs nobody '
+        'Each one pays the funds it covers to its exit address after a waiting period, and needs nobody '
         'else to sign it.',
-        style: GoogleFonts.inter(color: Colors.white60, fontSize: 13, height: 1.5),
+        style:
+            GoogleFonts.inter(color: Colors.white60, fontSize: 13, height: 1.5),
       );
 
   Widget _addressCard(BuildContext context, MpcService service) {
@@ -89,19 +93,23 @@ class ExitScreen extends StatelessWidget {
       ),
       child: Row(
         children: [
-          Icon(Icons.north_east, size: 20, color: Colors.tealAccent.withOpacity(0.9)),
+          Icon(Icons.north_east,
+              size: 20, color: Colors.tealAccent.withOpacity(0.9)),
           const SizedBox(width: 12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text('Your exit address',
-                    style: GoogleFonts.inter(color: Colors.white54, fontSize: 12)),
+                    style:
+                        GoogleFonts.inter(color: Colors.white54, fontSize: 12)),
                 const SizedBox(height: 4),
                 Text(
                   address ?? 'Not set — nothing can be pre-signed',
                   style: GoogleFonts.robotoMono(
-                      color: address == null ? Colors.orangeAccent : Colors.white, fontSize: 12),
+                      color:
+                          address == null ? Colors.orangeAccent : Colors.white,
+                      fontSize: 12),
                 ),
               ],
             ),
@@ -133,7 +141,8 @@ class ExitScreen extends StatelessWidget {
     return Row(
       children: [
         Expanded(
-          child: _stat('Covered', '${format.format(coveredSats)} sats', Colors.tealAccent),
+          child: _stat('Covered', '${format.format(coveredSats)} sats',
+              Colors.tealAccent),
         ),
         const SizedBox(width: 12),
         Expanded(
@@ -156,7 +165,8 @@ class ExitScreen extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(label, style: GoogleFonts.inter(color: Colors.white54, fontSize: 12)),
+            Text(label,
+                style: GoogleFonts.inter(color: Colors.white54, fontSize: 12)),
             const SizedBox(height: 6),
             Text(value,
                 style: GoogleFonts.inter(
@@ -167,7 +177,9 @@ class ExitScreen extends StatelessWidget {
 
   /// Funds arrive, and the cosigner renews funds on its own — both leave money no exit covers until
   /// the next seal. One approval fixes it, and only the owner can give it.
-  Widget _protectPrompt(BuildContext context, MpcService service, int uncoveredSats) => Container(
+  Widget _protectPrompt(
+          BuildContext context, MpcService service, int uncoveredSats) =>
+      Container(
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
           color: Colors.orange.withOpacity(0.08),
@@ -181,7 +193,8 @@ class ExitScreen extends StatelessWidget {
               'Some of your money has no exit yet. This happens when funds arrive, and after the '
               'service renews them for you — a renewal makes a new output, and only you can sign '
               'its exit.',
-              style: GoogleFonts.inter(color: Colors.white70, fontSize: 13, height: 1.4),
+              style: GoogleFonts.inter(
+                  color: Colors.white70, fontSize: 13, height: 1.4),
             ),
             const SizedBox(height: 12),
             SizedBox(
@@ -193,10 +206,12 @@ class ExitScreen extends StatelessWidget {
                         final messenger = ScaffoldMessenger.of(context);
                         try {
                           await service.protectFunds();
-                          messenger.showSnackBar(
-                              const SnackBar(content: Text('Exits signed for all your funds')));
+                          messenger.showSnackBar(const SnackBar(
+                              content:
+                                  Text('Exits signed for all your funds')));
                         } catch (e) {
-                          messenger.showSnackBar(SnackBar(content: Text('Could not sign: $e')));
+                          messenger.showSnackBar(
+                              SnackBar(content: Text('Could not sign: $e')));
                         }
                       }
                     : null,
@@ -225,7 +240,9 @@ class ExitScreen extends StatelessWidget {
               Expanded(
                 child: Text('${format.format(exit.amountSats)} sats',
                     style: GoogleFonts.inter(
-                        color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold)),
               ),
               IconButton(
                 key: const Key('exitCopyBtn'),
@@ -246,7 +263,8 @@ class ExitScreen extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           Text('from ${_short(exit.outpoint)}',
-              style: GoogleFonts.robotoMono(color: Colors.white38, fontSize: 11)),
+              style:
+                  GoogleFonts.robotoMono(color: Colors.white38, fontSize: 11)),
           const SizedBox(height: 8),
           Row(
             children: [
@@ -272,7 +290,8 @@ class ExitScreen extends StatelessWidget {
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: const Color(0xFF1E1E1E),
-        title: Text('Exit transaction', style: GoogleFonts.inter(color: Colors.white)),
+        title: Text('Exit transaction',
+            style: GoogleFonts.inter(color: Colors.white)),
         content: SizedBox(
           width: 280,
           child: Column(
@@ -292,7 +311,9 @@ class ExitScreen extends StatelessWidget {
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Close')),
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close')),
         ],
       ),
     );
@@ -311,7 +332,9 @@ class ExitScreen extends StatelessWidget {
           children: [
             Text('What these do not do yet',
                 style: GoogleFonts.inter(
-                    color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600)),
+                    color: Colors.white70,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
             Text(
               'Your money lives off-chain, so before an exit can be mined, the transactions that '
@@ -320,7 +343,8 @@ class ExitScreen extends StatelessWidget {
               'An exit also pays no fee — it carries a tiny output anyone can spend to pay for it. '
               'Whoever broadcasts it attaches that fee, which is why it never becomes too cheap to '
               'confirm, however long it sits here.',
-              style: GoogleFonts.inter(color: Colors.white38, fontSize: 12, height: 1.5),
+              style: GoogleFonts.inter(
+                  color: Colors.white38, fontSize: 12, height: 1.5),
             ),
           ],
         ),
@@ -349,7 +373,6 @@ String describeDelay(int sequence) {
   }
   return '$value block${value == 1 ? '' : 's'}';
 }
-
 
 /// The whole path this exit has to take, fetched when the user asks for it.
 ///
@@ -383,7 +406,8 @@ class _ExitPathState extends State<_ExitPath> {
         // nobody needs it.
         onExpansionChanged: (open) {
           if (open && _chain == null) {
-            setState(() => _chain = context.read<MpcService>().exitChain(widget.exit));
+            setState(() =>
+                _chain = context.read<MpcService>().exitChain(widget.exit));
           }
         },
         children: [
@@ -394,12 +418,15 @@ class _ExitPathState extends State<_ExitPath> {
                 return const Padding(
                   padding: EdgeInsets.all(12),
                   child: SizedBox(
-                      height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                      height: 18,
+                      width: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2)),
                 );
               }
               if (snapshot.hasError) {
                 return Text('Could not read the path: ${snapshot.error}',
-                    style: GoogleFonts.inter(color: Colors.orangeAccent, fontSize: 11));
+                    style: GoogleFonts.inter(
+                        color: Colors.orangeAccent, fontSize: 11));
               }
               return _path(context, snapshot.data!);
             },
@@ -413,14 +440,16 @@ class _ExitPathState extends State<_ExitPath> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        for (final hop in chain.hops) _hop(hop, chain.hops.indexOf(hop) == chain.hops.length - 1),
+        for (final hop in chain.hops)
+          _hop(hop, chain.hops.indexOf(hop) == chain.hops.length - 1),
         if (chain.missing.isNotEmpty) ...[
           const SizedBox(height: 8),
           Text(
             'The server did not return ${chain.missing.length} transaction'
             '${chain.missing.length == 1 ? '' : 's'} this path needs. Without them the exit cannot '
             'be published — try again later, or while the server is reachable.',
-            style: GoogleFonts.inter(color: Colors.orangeAccent, fontSize: 11, height: 1.4),
+            style: GoogleFonts.inter(
+                color: Colors.orangeAccent, fontSize: 11, height: 1.4),
           ),
         ],
         const SizedBox(height: 8),
@@ -443,8 +472,8 @@ class _ExitPathState extends State<_ExitPath> {
                           if (hop.rawTx != null) hop.rawTx!,
                       ].join('\n');
                       Clipboard.setData(ClipboardData(text: all));
-                      ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('Whole path copied, in order')));
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                          content: Text('Whole path copied, in order')));
                     }
                   : null,
               icon: const Icon(Icons.copy_all, size: 16),
@@ -475,7 +504,9 @@ class _ExitPathState extends State<_ExitPath> {
               Icon(
                 hop.kind == ChainKind.commitment
                     ? Icons.check_circle
-                    : (hop.kind == ChainKind.exit ? Icons.exit_to_app : Icons.arrow_downward),
+                    : (hop.kind == ChainKind.exit
+                        ? Icons.exit_to_app
+                        : Icons.arrow_downward),
                 size: 14,
                 color: colour,
               ),
@@ -487,21 +518,26 @@ class _ExitPathState extends State<_ExitPath> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(label, style: GoogleFonts.inter(color: colour, fontSize: 12)),
+                Text(label,
+                    style: GoogleFonts.inter(color: colour, fontSize: 12)),
                 Text(
                   hop.txid.isEmpty ? '(txid unknown)' : _shortTxid(hop.txid),
-                  style: GoogleFonts.robotoMono(color: Colors.white38, fontSize: 10),
+                  style: GoogleFonts.robotoMono(
+                      color: Colors.white38, fontSize: 10),
                 ),
               ],
             ),
           ),
           if (hop.kind != ChainKind.commitment && hop.rawTx == null)
-            Text('missing', style: GoogleFonts.inter(color: Colors.orangeAccent, fontSize: 10)),
+            Text('missing',
+                style: GoogleFonts.inter(
+                    color: Colors.orangeAccent, fontSize: 10)),
         ],
       ),
     );
   }
 
-  static String _shortTxid(String txid) =>
-      txid.length <= 20 ? txid : '${txid.substring(0, 10)}…${txid.substring(txid.length - 8)}';
+  static String _shortTxid(String txid) => txid.length <= 20
+      ? txid
+      : '${txid.substring(0, 10)}…${txid.substring(txid.length - 8)}';
 }

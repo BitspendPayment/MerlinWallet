@@ -56,11 +56,13 @@ class _RestoreWalletScreenState extends State<RestoreWalletScreen> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const Spacer(),
-              const Center(child: Icon(Icons.restore, size: 80, color: Colors.white)),
+              const Center(
+                  child: Icon(Icons.restore, size: 80, color: Colors.white)),
               const SizedBox(height: 32),
               Text(
                 'Use your passkey',
-                style: GoogleFonts.inter(fontSize: 32, fontWeight: FontWeight.bold),
+                style: GoogleFonts.inter(
+                    fontSize: 32, fontWeight: FontWeight.bold),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 16),
@@ -68,8 +70,10 @@ class _RestoreWalletScreenState extends State<RestoreWalletScreen> {
                 'Your wallet is not a file on your old phone — it is derived from the passkey '
                 'you made it with. Pick that passkey and this device works out its half of the '
                 'key again, then asks the co-signing enclave for the other half.\n\n'
-                'Your balance, your contacts and your pending payments come back with it.',
-                style: GoogleFonts.inter(color: Colors.white70, fontSize: 16, height: 1.5),
+                'Your balance is loaded when Ark is available. After restoring, pull down on the '
+                'Contacts and Requests screens to load your contacts and pending payments.',
+                style: GoogleFonts.inter(
+                    color: Colors.white70, fontSize: 16, height: 1.5),
                 textAlign: TextAlign.center,
               ),
               if (_error != null) ...[
@@ -82,7 +86,8 @@ class _RestoreWalletScreenState extends State<RestoreWalletScreen> {
                   ),
                   child: Text(
                     'Could not restore: $_error',
-                    style: GoogleFonts.inter(color: Colors.redAccent, fontSize: 13),
+                    style: GoogleFonts.inter(
+                        color: Colors.redAccent, fontSize: 13),
                   ),
                 ),
               ],
@@ -100,7 +105,9 @@ class _RestoreWalletScreenState extends State<RestoreWalletScreen> {
                 onPressed: _busy ? null : _restore,
                 child: _busy
                     ? const SizedBox(
-                        height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                        height: 20,
+                        width: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2))
                     : Text(_error == null ? 'Restore my wallet' : 'Try again'),
               ),
               const SizedBox(height: 12),

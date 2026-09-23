@@ -17,9 +17,6 @@ class ArkScreen extends StatelessWidget {
     final arkBalance = mpcService.arkBalance;
     final arkAvailable = mpcService.arkAvailable;
 
-    final balanceBtc = arkBalance.toDouble() / 100000000;
-    final balanceUsd = balanceBtc * 65000;
-
     return Scaffold(
       appBar: AppBar(
         title: Text(
@@ -74,8 +71,7 @@ class ArkScreen extends StatelessWidget {
             : Column(
                 children: [
                   const SizedBox(height: 24),
-                  _buildArkBalanceCard(
-                      context, mpcService, arkBalance, balanceUsd),
+                  _buildArkBalanceCard(context, mpcService, arkBalance),
                   const SizedBox(height: 32),
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 24.0),
@@ -100,10 +96,12 @@ class ArkScreen extends StatelessWidget {
                         : RefreshIndicator(
                             onRefresh: mpcService.refreshVtxos,
                             child: ListView.builder(
-                              padding: const EdgeInsets.symmetric(horizontal: 24),
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 24),
                               itemCount: mpcService.arkHistory.length,
                               itemBuilder: (context, i) =>
-                                  _buildTransactionItem(mpcService.arkHistory[i]),
+                                  _buildTransactionItem(
+                                      mpcService.arkHistory[i]),
                             ),
                           ),
                   ),
@@ -200,7 +198,9 @@ class ArkScreen extends StatelessWidget {
             '$sign$amount Sats',
             style: GoogleFonts.inter(
               fontWeight: FontWeight.bold,
-              color: tx.kind == ArkTransactionKind.renewed ? Colors.white54 : accent,
+              color: tx.kind == ArkTransactionKind.renewed
+                  ? Colors.white54
+                  : accent,
             ),
           ),
         ],
@@ -227,7 +227,7 @@ class ArkScreen extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             Text(
-              'The server is not connected to an ASP.\nArk features require an ASP connection.',
+              'Ark is currently unavailable.\nCould not connect to the Ark service.',
               textAlign: TextAlign.center,
               style: GoogleFonts.inter(color: Colors.white38, fontSize: 14),
             ),
@@ -237,10 +237,9 @@ class ArkScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildArkBalanceCard(BuildContext context, MpcService mpcService,
-      BigInt balance, double usdValue) {
+  Widget _buildArkBalanceCard(
+      BuildContext context, MpcService mpcService, BigInt balance) {
     final balanceFormatter = NumberFormat("#,##0", "en_US");
-    final usdFormatter = NumberFormat.currency(symbol: "\$");
 
     // Wallet-wide auto-renew state. Auto-settle consolidates every VTXO into one
     // renewed VTXO, so the soonest-expiring VTXO is the whole wallet's next
@@ -320,15 +319,6 @@ class ArkScreen extends StatelessWidget {
               color: Colors.white,
             ),
           ),
-          const SizedBox(height: 4),
-          Text(
-            usdFormatter.format(usdValue),
-            style: GoogleFonts.inter(
-              fontSize: 16,
-              color: Colors.white38,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
           if (hasFunds) ...[
             const SizedBox(height: 12),
             delegated
@@ -376,11 +366,7 @@ class ArkScreen extends StatelessWidget {
     if (soonest == null) {
       label = 'Auto-renew active';
     } else {
-      // Counted to expiry, not to a refresh time. The refresh threshold was
-      // `expires_at - GetArkInfo.auto_settle_safety_margin_secs`, a cosigner
-      // setting it published so the app could show when it would settle on our
-      // behalf. It does not settle on our behalf any more, and there is no RPC
-      // for that margin — so the honest number is the one the ASP told us.
+      // Show the ASP-reported expiry, not the delegate's scheduled renewal time.
       final s = soonest;
       final nowSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       final secsUntil = s.expiresAt - nowSecs;
@@ -444,11 +430,14 @@ class ArkScreen extends StatelessWidget {
                 } else {
                   await mpcService.protectFunds();
                   messenger.showSnackBar(const SnackBar(
-                      content: Text('These funds will renew themselves before they expire')));
+                      content: Text(
+                          'These funds will renew themselves before they expire')));
                 }
               } catch (e) {
                 messenger.showSnackBar(SnackBar(
-                    content: Text(due ? 'Refresh failed: $e' : 'Could not protect these funds: $e')));
+                    content: Text(due
+                        ? 'Refresh failed: $e'
+                        : 'Could not protect these funds: $e')));
               }
             },
             icon: Icon(Icons.shield_outlined,
@@ -565,13 +554,8 @@ class ArkScreen extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 8),
-            // This used to read "delegated to the server, which automatically
-            // refreshes your funds — no action needed". That is no longer true,
-            // and it is the kind of untrue that costs someone their VTXOs: the
-            // cosigner runs as a sandboxed guest with no network access at all,
-            // so it can reach neither the ASP nor anything else and cannot
-            // settle on our behalf. What it does is hold the signed renewal and
-            // watch the clock, waking this device when the deadline nears.
+            // A sealed delegate can renew these outputs without the phone. The resulting
+            // outputs need a new owner-approved seal for another renewal and signed exits.
             Text(
               delegated
                   ? 'You signed a renewal for these funds, and the secure enclave '

@@ -2,10 +2,10 @@
 
 A **2-of-2 FROST threshold Bitcoin wallet**. The full private key never exists on any single device: two independent identities — your phone and a remote cosigning service running inside an AWS Nitro Enclave — jointly control your funds. Neither can move funds alone.
 
-The wallet spends across two value layers:
-
-- **Ark (off-chain VTXOs).** The primary path. The FROST group key (phone + cosigner, 2-of-2) owns the VTXOs; boarding, sending, and settling go through an **Ark Service Provider (arkd)**.
-- **On-chain Bitcoin.** A single key the wallet controls **alone** (the DKG dealer secret), for direct on-chain send/receive. It needs neither the cosigner nor the ASP, so it keeps working when they're unavailable — the app calls this **offline mode**.
+The wallet holds Bitcoin as **Ark off-chain VTXOs**. The FROST group key owns the
+VTXOs; boarding, sending, and settling use an Ark Service Provider (ASP). On-chain
+addresses are used for boarding deposits and exits to another wallet. Direct
+on-chain spending and the former on-chain-only offline mode have been removed.
 
 Both parties are required to produce a valid Taproot (BIP-340) Schnorr signature on the Ark path. The server alone cannot move funds; the phone alone cannot move Ark funds.
 
@@ -24,13 +24,13 @@ Both parties are required to produce a valid Taproot (BIP-340) Schnorr signature
    +-----------+---------------------------------+-----------+
    |   Android Phone — Flutter app — Identity 1/2            |
    |   in-app FROST signing (FFI) · passkey-gated share      |
-   |   on-chain single-key path (wallet-alone / offline)     |
+   |   boarding deposits + pre-signed exits to another wallet     |
    +--------------------------------------------------------+
 ```
 
 | Identity | Held by | Role |
 |---|---|---|
-| **Wallet share** | Phone (local, passkey-gated FROST share) | One half of the 2-of-2; signs in-app |
+| **Wallet share** | Phone (share rebuilt from the passkey for each operation) | One half of the 2-of-2; signs in-app |
 | **Cosigner share** | Cosigner runtime in the enclave | The other half; co-signs, never sees the full key |
 
 ## The Cosigner Runtime
@@ -98,11 +98,11 @@ MPCWallet/
 
 ### Flutter app ([app/](app/))
 
-Android wallet UI built with Provider + GoRouter. Onboarding guides server connection, passkey setup, and DKG. Supports on-chain + Ark (VTXO) send/receive, an **offline mode** that falls back to on-chain-only when the ASP is unavailable, and passkey-gated signing.
+Android wallet UI built with Provider + GoRouter. Onboarding guides server connection, passkey setup, and DKG. Supports Ark (VTXO) payments, on-chain boarding deposits, passkey-approved signing, and export of pre-signed exits. Ark operations are unavailable during an ASP outage; there is no on-chain spending fallback.
 
 ### Dart client ([app-core/](app-core/))
 
-High-level Dart API that orchestrates the full protocol: drives DKG, FROST signing, key refresh, Ark boarding/send/settle, and the on-chain single-key path. Talks to the cosigner over **attested transport** (verifies the enclave's `PCR0` and response signatures), and handles Taproot address derivation, UTXO/VTXO tracking, and PSBT construction.
+High-level Dart API that orchestrates the full protocol: drives DKG, FROST signing, key refresh, Ark boarding/send/settle, and pre-signed exits. Talks to the cosigner over **attested transport** (verifies the enclave's `PCR0` and response signatures), and handles Taproot address derivation, UTXO/VTXO tracking, and PSBT construction.
 
 ### Threshold library ([crates/threshold/](crates/threshold/))
 
@@ -278,16 +278,13 @@ exit leaf:     <delay>  OP_CSV OP_DROP    <owner_pk> OP_CHECKSIG
 
 (`Vtxo::new_default` → `multisig_script` + `csv_sig_script`, `ark-core/src/{vtxo,script}.rs`.)
 
-Both name `owner_pk`, and here `owner_pk` is the group key. **The exit leaf's timelock controls
-*when* you may leave, not *who* may leave.** So if the cosigner is permanently gone, the phone
-holds one of two required shares and cannot produce a group-key signature at all — the unilateral
-exit path that normally protects Ark users does not protect you. Ark funds and in-flight boarding
-outputs are frozen, permanently. Waiting does not fix it.
-
-**What survives regardless:** the on-chain single-key layer. Its key is the phone's own DKG dealer
-secret, spending a plain BIP-341 key-path taproot address, and the cosigner is never involved.
-Offline mode already routes there when Ark is unreachable. On-chain balance is genuinely
-self-custodial today; Ark balance is not.
+Both name `owner_pk`, and here it is the group key. The exit timelock controls
+when funds can be spent; it does not remove the need for a group-key signature.
+If the cosigner disappears, the wallet cannot create new signatures. Funds with
+saved pre-signed exits can still be exited after publishing the required ancestor
+transactions and satisfying the delay. Uncovered funds have no such fallback.
+The app can export saved exits and display their ancestry, but does not broadcast
+the full exit path. There is no separate on-chain wallet or offline spending mode.
 
 ### AWS
 

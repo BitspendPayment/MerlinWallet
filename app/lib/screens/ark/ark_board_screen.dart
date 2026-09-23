@@ -45,9 +45,7 @@ class _ArkBoardScreenState extends State<ArkBoardScreen> {
   Future<void> _startBoarding() async {
     final mpcService = context.read<MpcService>();
 
-    // Boarding never prompts for PIN: spending policies gate fund egress
-    // (sends + redeems), not settling. Server-side `SignStep1` forces the
-    // normal key package whenever a settle session is in flight.
+    // Each confirmed deposit is settled with a passkey-approved operation.
     setState(() {
       _state = _BoardState.settling;
       _error = null;
@@ -208,8 +206,8 @@ class _ArkBoardScreenState extends State<ArkBoardScreen> {
                               Text(
                                 '${NumberFormat("#,##0").format(pending)} sats seen, not yet mined',
                                 style: GoogleFonts.inter(
-                                  color: Colors.orangeAccent.withValues(
-                                      alpha: 0.7),
+                                  color: Colors.orangeAccent
+                                      .withValues(alpha: 0.7),
                                   fontSize: 11,
                                 ),
                               ),

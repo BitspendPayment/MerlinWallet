@@ -65,7 +65,6 @@ class MpcService extends ChangeNotifier {
   /// Deposits only: this wallet holds no on-chain coins and spends none. See `app_core/boarding`.
   BoardingScanner? _boarding;
 
-
   ArkInfo? _arkInfo;
   ArkInfo? get arkInfo => _arkInfo;
   String? _arkAddress;
@@ -120,7 +119,8 @@ class MpcService extends ChangeNotifier {
         : await manifest.fetchManifest(_manifestRepo, tag: _manifestTag);
     final measurement = RegExp(r'^[a-f0-9]{96}$');
     if (!measurement.hasMatch(m.pcr0) || !measurement.hasMatch(m.pcr16)) {
-      throw StateError('the deployment manifest does not carry a valid PCR0 and PCR16');
+      throw StateError(
+          'the deployment manifest does not carry a valid PCR0 and PCR16');
     }
     // A manifest that names its host must name this one, and the relying party it was built with
     // must be the one passkeys are made for — otherwise every approval would be refused, later and
@@ -130,14 +130,16 @@ class MpcService extends ChangeNotifier {
     }
     final rpId = server_host.relyingPartyId(host);
     if (m.rpId.isNotEmpty && m.rpId != rpId) {
-      throw StateError('the enclave at $host accepts passkeys for ${m.rpId}, not $rpId');
+      throw StateError(
+          'the enclave at $host accepts passkeys for ${m.rpId}, not $rpId');
     }
     final trustRoot = m.trustRoot;
     final pins = trustRoot == null
         ? EnclavePins.aws(pcr0: m.pcr0, pcr16: m.pcr16)
         : EnclavePins(trustRoot: trustRoot, pcr0: m.pcr0, pcr16: m.pcr16);
     if (host == _host) _remotePins = pins;
-    debugPrint('Fetched manifest: pcr0=${m.pcr0.substring(0, 16)}… pcr16=${m.pcr16.substring(0, 16)}…'
+    debugPrint(
+        'Fetched manifest: pcr0=${m.pcr0.substring(0, 16)}… pcr16=${m.pcr16.substring(0, 16)}…'
         '${trustRoot == null ? '' : ' (emulated enclave root)'}');
     return pins;
   }
@@ -145,7 +147,8 @@ class MpcService extends ChangeNotifier {
   /// What this host's enclave must attest to. Throws when there is nothing to pin — talking to an
   /// enclave that has not proved what it is would be the one thing all of this exists to prevent.
   Future<EnclavePins> _pins() async {
-    if (server_host.isLocalHost(_host)) return server_host.DevEnclaveConfig.fromDefines.pins();
+    if (server_host.isLocalHost(_host))
+      return server_host.DevEnclaveConfig.fromDefines.pins();
     return _remotePins ?? await fetchManifest();
   }
 
@@ -235,7 +238,8 @@ class MpcService extends ChangeNotifier {
       try {
         final network = (await _client!.getArkInfo()).network;
         if (network.isEmpty) {
-          throw StateError('the ASP reported no network; refusing to build a wallet without one');
+          throw StateError(
+              'the ASP reported no network; refusing to build a wallet without one');
         }
         await _identityBox!.put('bitcoinNetwork', network);
         return network;
@@ -245,7 +249,8 @@ class MpcService extends ChangeNotifier {
         if (attempt < 3) await Future.delayed(Duration(seconds: attempt));
       }
     }
-    throw StateError("ASP unreachable: getInfo failed after 3 attempts. Last error: $lastError. "
+    throw StateError(
+        "ASP unreachable: getInfo failed after 3 attempts. Last error: $lastError. "
         "Check that it is running and reachable from $_host.");
   }
 
@@ -284,7 +289,8 @@ class MpcService extends ChangeNotifier {
       refreshPins: server_host.isLocalHost(_host) ? null : fetchManifest,
     );
     final credentialId = _identityBox!.get('passkeyCredentialId') as String?;
-    _passkey = PlatformPasskey(rpId: server_host.relyingPartyId(_host), credentialId: credentialId);
+    _passkey = PlatformPasskey(
+        rpId: server_host.relyingPartyId(_host), credentialId: credentialId);
     if (credentialId != null) gate.authenticator = _passkey;
     return _gate = gate;
   }
@@ -299,7 +305,8 @@ class MpcService extends ChangeNotifier {
   Future<MpcClient> _createMpcClient({String? storageId}) async {
     final gate = await _ensureGate();
     if (gate.authenticator == null) {
-      throw StateError('no passkey yet — every cosigner call needs one; register it first');
+      throw StateError(
+          'no passkey yet — every cosigner call needs one; register it first');
     }
     final asp = server_host.aspEndpoint(_host);
     final client = MpcClient.enclave(
@@ -341,7 +348,8 @@ class MpcService extends ChangeNotifier {
         return;
       } on PlatformException catch (e) {
         if (e.code != PasskeyChannel.noCredential) rethrow;
-        debugPrint('Stored passkey is not usable on this device (${e.message}); registering a new one');
+        debugPrint(
+            'Stored passkey is not usable on this device (${e.message}); registering a new one');
         await _identityBox!.delete('passkeyCredentialId');
         await _identityBox!.delete('tenantId');
         _passkey = PlatformPasskey(rpId: server_host.relyingPartyId(_host));
@@ -374,7 +382,8 @@ class MpcService extends ChangeNotifier {
       throw StateError("DKG already completed for this user.");
     }
 
-    _client = await _createMpcClient(storageId: _storageId ?? 'mpc_wallet_state_default');
+    _client = await _createMpcClient(
+        storageId: _storageId ?? 'mpc_wallet_state_default');
     // Nothing to restore on a wallet that has never run a ceremony, so this is the ceremony.
     if (!await _client!.restoreState()) await _client!.doDkg();
 
@@ -397,8 +406,8 @@ class MpcService extends ChangeNotifier {
   ///  2. **Ask the cosigner** for the half of the key it dealt at DKG — the gesture that approves
   ///     that call is the one that yields the seed — and check the two halves make this wallet's
   ///     share. See [MpcClient.recover]: what is saved is the public half, never the share.
-  ///  3. **Open the wallet.** Its VTXOs, delegate and contacts were never on the old phone in the
-  ///     first place: they come back from the cosigner's seal as they always do.
+  ///  3. **Open the wallet.** Load VTXOs from the ASP. Contacts and requests are fetched separately
+  ///     when the user pulls to refresh their screens; a new delegate is recorded on the next seal.
   ///
   /// The exits do not come back — they are this device's copies of transactions signed for the old
   /// one — so the exit address is asked for again and the next seal reissues them.
@@ -416,7 +425,8 @@ class MpcService extends ChangeNotifier {
     // the tenant is minted from the enclave's own entropy and was never this device's to know.
     gate.authenticator = _passkey;
 
-    _client = await _createMpcClient(storageId: _storageId ?? 'mpc_wallet_state_default');
+    _client = await _createMpcClient(
+        storageId: _storageId ?? 'mpc_wallet_state_default');
     await _client!.recover();
 
     _dkgComplete = true;
@@ -438,7 +448,8 @@ class MpcService extends ChangeNotifier {
     if (!_isInitialized) throw StateError("MPC Service not initialized");
     if (!_dkgComplete) throw StateError("DKG not completed. Cannot restore.");
 
-    _client = await _createMpcClient(storageId: _storageId ?? 'mpc_wallet_state_default');
+    _client = await _createMpcClient(
+        storageId: _storageId ?? 'mpc_wallet_state_default');
     if (!await _client!.restoreState()) {
       throw StateError('this wallet has no key on this device to restore');
     }
@@ -479,11 +490,10 @@ class MpcService extends ChangeNotifier {
   /// Delete what this device stores about the wallet, so it can be restored from its passkey.
   ///
   /// The way out of an [IncompatibleWalletStateException], and deliberately the only one: this is
-  /// a development build with no migration, and the old state holds a blinded share and a plaintext
-  /// dealer secret in an append-only file that only deleting removes. **No key is lost** — none
-  /// that matters is in it: the wallet is its passkey plus the cosigner's seal, and
-  /// [restoreWallet] rebuilds it from those. What goes is this device's exit address and its
-  /// pre-signed exits, which the next seal reissues.
+  /// a development build with no migration. Deleting the store removes its old private-key
+  /// material and any pre-signed exits. Recovery requires the original passkey and a cosigner
+  /// that retained the recovery contribution; wallets predating recovery cannot be restored.
+  /// The exit address must be entered again and new exits signed after a successful recovery.
   ///
   /// The passkey's credential id is kept, since the passkey is still the wallet.
   Future<void> resetLocalWallet() async {
@@ -491,7 +501,8 @@ class MpcService extends ChangeNotifier {
     await _hangUp();
     _client = null;
     // Straight at the store: a client needs a gate and a passkey, and deleting a file needs neither.
-    await WalletStore(boxName: _storageId ?? 'mpc_wallet_state_default').destroy();
+    await WalletStore(boxName: _storageId ?? 'mpc_wallet_state_default')
+        .destroy();
     _dkgComplete = false;
     _isConnected = false;
     await _identityBox!.put('dkgComplete', false);
@@ -533,7 +544,7 @@ class MpcService extends ChangeNotifier {
       await refreshVtxos();
       _startVtxoPolling();
     } catch (e) {
-      debugPrint("Ark init failed (ASP unreachable — offline mode): $e");
+      debugPrint("Ark init failed (Ark unavailable): $e");
       _arkAvailable = false;
       // Keep polling so the ASP is re-probed and Ark auto-recovers when it returns.
       _startVtxoPolling();
@@ -591,7 +602,8 @@ class MpcService extends ChangeNotifier {
     if (expiring) return true;
 
     final delegate = _client?.delegateStatus;
-    if (delegate == null) return false; // Nothing was scheduled; that is what `fundsProtected` says.
+    if (delegate == null)
+      return false; // Nothing was scheduled; that is what `fundsProtected` says.
     final late = now.isAfter(delegate.validAt.add(_renewalGrace));
     return late && _held.any(delegate.covers);
   }
@@ -620,7 +632,9 @@ class MpcService extends ChangeNotifier {
   /// it, which is what [protectFunds] does.
   List<IndexerVtxo> get vtxosWithoutExit {
     final covered = {for (final e in exits) e.outpoint};
-    return _held.where((v) => !covered.contains('${v.txid}:${v.vout}')).toList();
+    return _held
+        .where((v) => !covered.contains('${v.txid}:${v.vout}'))
+        .toList();
   }
 
   /// Every transaction that has to reach the chain before [exit] can: the commitment, the batch
@@ -652,7 +666,8 @@ class MpcService extends ChangeNotifier {
   /// Whether the Ark tab should ask the user for something: to protect funds no delegate covers
   /// ([protectFunds]), or to refresh funds that are due and were not ([delegateNow]). Never acted on
   /// without them — each is a passkey approval, and an approval is a person.
-  bool get needsDelegateAction => _held.isNotEmpty && (refreshDue || !fundsProtected);
+  bool get needsDelegateAction =>
+      _held.isNotEmpty && (refreshDue || !fundsProtected);
 
   /// Whether the last [refreshVtxos] failure was our credentials being refused
   /// rather than the ASP being unreachable. The poll loop must not treat the
@@ -660,7 +675,7 @@ class MpcService extends ChangeNotifier {
   bool _lastVtxoFailureWasAuth = false;
 
   /// Refresh VTXO balance/state. Returns true if the ASP call succeeded — the
-  /// poll loop uses this to detect an ASP outage and flip into offline mode.
+  /// poll loop uses this to detect an ASP outage and mark Ark unavailable.
   Future<bool> refreshVtxos() async {
     if (_client == null) return false;
     bool ok = false;
@@ -673,11 +688,13 @@ class MpcService extends ChangeNotifier {
       // [fundsProtected].
       //
       // Spent ones too, in the same call: they are what the history is rebuilt from.
-      _chains.removeWhere((outpoint, _) => !exits.any((e) => e.outpoint == outpoint));
+      _chains.removeWhere(
+          (outpoint, _) => !exits.any((e) => e.outpoint == outpoint));
       final all = await _client!.listVtxos(includeSpent: true);
       _arkHistory = arkHistoryOf(all);
       _vtxos = all.where((v) => !v.isSpent).toList();
-      _arkBalance = _vtxos.fold(BigInt.zero, (sum, v) => sum + BigInt.from(v.amountSats));
+      _arkBalance =
+          _vtxos.fold(BigInt.zero, (sum, v) => sum + BigInt.from(v.amountSats));
       ok = true;
     } on CosignerException catch (e) {
       // Our credentials, not the ASP. Recorded so the poll loop does not read a
@@ -735,7 +752,8 @@ class MpcService extends ChangeNotifier {
     if (client == null) throw StateError('wallet not initialized');
     // Throw rather than silently return: the button's success feedback must
     // never fire for an attempt that didn't run.
-    if (_delegateInFlight) throw StateError('a delegate is already in progress');
+    if (_delegateInFlight)
+      throw StateError('a delegate is already in progress');
     _delegateInFlight = true;
     try {
       await client.settleDelegate();
@@ -747,14 +765,8 @@ class MpcService extends ChangeNotifier {
     }
   }
 
-  /// Periodic Ark health + VTXO poll. Runs continuously (idempotent; skips a
-  /// tick if one is in flight) and drives the offline-mode state machine:
-  ///  - forced offline    → do nothing (stay on-chain only);
-  ///  - Ark up            → refresh VTXOs; if the ASP call fails, probe
-  ///                        getArkInfo() and, if that also fails, flip to
-  ///                        offline mode (auto-fallback);
-  ///  - Ark down (auto)   → probe getArkInfo() and, on success, re-run initArk()
-  ///                        to restore Ark + polling (auto-recover).
+  /// Poll Ark availability and VTXOs, skipping overlapping ticks. A failed refresh is followed
+  /// by an ASP probe before marking Ark unavailable. Once the ASP returns, reinitialize Ark.
   void _startVtxoPolling() {
     _vtxoPollTimer?.cancel();
     _vtxoPollTimer = Timer.periodic(_vtxoPollInterval, (_) async {
@@ -763,19 +775,16 @@ class MpcService extends ChangeNotifier {
       try {
         if (_arkAvailable) {
           final ok = await refreshVtxos();
-          // An auth failure is not an outage. _probeArk() is itself an
-          // authenticated call, so it fails for the same reason and used to
-          // "confirm" a phantom outage — dropping the user out of Ark on a
-          // routine token expiry or a dismissed biometric prompt.
+          // Keep credential failures separate from ASP reachability failures.
           if (!ok && !_lastVtxoFailureWasAuth && !await _probeArk()) {
-            // ASP went down — enter offline mode.
+            // ASP went down — mark Ark unavailable.
             _arkAvailable = false;
-            debugPrint('Ark ASP unreachable — entering offline mode');
+            debugPrint('Ark ASP unreachable — marking Ark unavailable');
             notifyListeners();
           }
         } else if (await _probeArk()) {
           // ASP came back — restore Ark (re-fetches addresses, refreshes, notifies).
-          debugPrint('Ark ASP reachable again — leaving offline mode');
+          debugPrint('Ark ASP reachable again — restoring Ark');
           await initArk();
         }
       } finally {
@@ -785,7 +794,7 @@ class MpcService extends ChangeNotifier {
   }
 
   /// Cheap, definitive ASP reachability probe. Used so a single transient
-  /// listVtxos hiccup doesn't flap the offline flag.
+  /// listVtxos hiccup does not change Ark availability.
   Future<bool> _probeArk() async {
     final c = _client;
     if (c == null) return false;
@@ -876,13 +885,16 @@ class MpcService extends ChangeNotifier {
   List<Contact> get contacts => List.unmodifiable(_contacts);
 
   List<PaymentIntent> _paymentRequests = [];
-  List<PaymentIntent> get paymentRequests => List.unmodifiable(_paymentRequests);
+  List<PaymentIntent> get paymentRequests =>
+      List.unmodifiable(_paymentRequests);
 
   void _loadLocalLists() {
     List<T> read<T>(String key, T Function(List<int>) decode) {
       final stored = _identityBox?.get(key);
       if (stored is! List) return [];
-      return [for (final b64 in stored.cast<String>()) decode(base64.decode(b64))];
+      return [
+        for (final b64 in stored.cast<String>()) decode(base64.decode(b64))
+      ];
     }
 
     _contacts = read('contacts', Contact.fromBuffer);
@@ -890,9 +902,10 @@ class MpcService extends ChangeNotifier {
   }
 
   Future<void> _saveLocalLists() async {
-    await _identityBox?.put('contacts', [for (final c in _contacts) base64.encode(c.writeToBuffer())]);
-    await _identityBox
-        ?.put('paymentRequests', [for (final i in _paymentRequests) base64.encode(i.writeToBuffer())]);
+    await _identityBox?.put('contacts',
+        [for (final c in _contacts) base64.encode(c.writeToBuffer())]);
+    await _identityBox?.put('paymentRequests',
+        [for (final i in _paymentRequests) base64.encode(i.writeToBuffer())]);
   }
 
   /// Requests still awaiting a decision — what the inbox badge counts.
@@ -947,7 +960,9 @@ class MpcService extends ChangeNotifier {
     // What the cosigner did with them, mirrored: a revoked contact's pending requests go with it.
     _paymentRequests = [
       for (final i in _paymentRequests)
-        if (!(i.status == 'pending' && hex.encode(i.fromVerifyingKey) == contactGroupKeyHex)) i,
+        if (!(i.status == 'pending' &&
+            hex.encode(i.fromVerifyingKey) == contactGroupKeyHex))
+          i,
     ];
     await _saveLocalLists();
     notifyListeners();
@@ -992,9 +1007,11 @@ class MpcService extends ChangeNotifier {
     }
     final txid = await sendArk(intent.toArkAddress, intent.amountSats.toInt());
     // The cosigner marks it fulfilled as it records the send; mirrored rather than re-read.
-    _setRequest(intent.id, (i) => i
-      ..status = 'fulfilled'
-      ..arkTxid = txid);
+    _setRequest(
+        intent.id,
+        (i) => i
+          ..status = 'fulfilled'
+          ..arkTxid = txid);
     await _saveLocalLists();
     notifyListeners();
     return txid;
