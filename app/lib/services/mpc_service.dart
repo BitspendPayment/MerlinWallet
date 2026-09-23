@@ -275,6 +275,18 @@ class MpcService extends ChangeNotifier {
     await _identityBox!.put('serverHost', host);
   }
 
+  /// What this app checked the enclave against, and what it measured.
+  ///
+  /// The pins are the identity: PCR0 says which runtime image, PCR16 which guest that runtime is
+  /// serving. Neither alone is an identity — a known runtime can serve anything, and a guest
+  /// measurement is written by the runtime that loaded it. Null until the first attested call has
+  /// built the gate.
+  String? get pcr0 => _gate?.pins.pcr0;
+  String? get pcr16 => _gate?.pins.pcr16;
+
+  /// The guest the live attestation actually vouched for, from the most recent document.
+  String? get attestedGuestHash => _gate?.attested?.guestSha256;
+
   /// The gate for this host, built once and kept: its attested certificate is what the cosigner
   /// channel pins, and its passkey is what approves each call.
   Future<EnclaveGate> _ensureGate() async {

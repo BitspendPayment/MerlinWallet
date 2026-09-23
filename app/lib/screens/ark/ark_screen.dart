@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
@@ -72,6 +73,7 @@ class ArkScreen extends StatelessWidget {
                 children: [
                   const SizedBox(height: 24),
                   _buildArkBalanceCard(context, mpcService, arkBalance),
+                  _buildAttestation(context, mpcService),
                   const SizedBox(height: 32),
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 24.0),
@@ -109,6 +111,68 @@ class ArkScreen extends StatelessWidget {
               ),
       ),
       bottomNavigationBar: _buildBottomNav(context),
+    );
+  }
+
+  /// What this app checked the enclave against.
+  ///
+  /// Collapsed, because it is not a number anybody needs daily — but it is the answer to "what am I
+  /// trusting", and an app that cannot show it is asking to be taken on faith. PCR0 is the runtime
+  /// image; PCR16 is the cosigner the runtime loaded. Only together are they an identity.
+  Widget _buildAttestation(BuildContext context, MpcService mpcService) {
+    final pcr0 = mpcService.pcr0;
+    final pcr16 = mpcService.pcr16;
+    if (pcr0 == null || pcr16 == null) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24.0),
+      child: Theme(
+        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          tilePadding: EdgeInsets.zero,
+          childrenPadding: const EdgeInsets.only(bottom: 8),
+          leading: const Icon(Icons.verified_user_outlined,
+              color: Colors.greenAccent, size: 18),
+          title: Text(
+            'Verified enclave',
+            style: GoogleFonts.inter(
+              fontSize: 13,
+              color: Colors.white54,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          children: [
+            _buildMeasurement(context, 'PCR0 · runtime image', pcr0),
+            const SizedBox(height: 8),
+            _buildMeasurement(context, 'PCR16 · cosigner', pcr16),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMeasurement(BuildContext context, String label, String hex) {
+    return GestureDetector(
+      onTap: () {
+        Clipboard.setData(ClipboardData(text: hex));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('$label copied'), duration: const Duration(seconds: 2)),
+        );
+      },
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: GoogleFonts.inter(fontSize: 11, color: Colors.white38),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            hex,
+            style: GoogleFonts.robotoMono(fontSize: 10, color: Colors.white60),
+          ),
+        ],
+      ),
     );
   }
 
