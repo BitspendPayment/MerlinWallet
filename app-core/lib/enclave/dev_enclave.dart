@@ -41,10 +41,19 @@ class DevEnclave {
   /// What an assertion claims.
   String get origin => 'https://$rpId';
 
-  /// Where the runtime checkout lives, for `passkey-client`. `ENCLAVE_RUNTIME` overrides it, the
-  /// same way the Makefile's `wit-drift` target does.
+  /// Where the runtime lives, for `passkey-client`: a checkout, or a bundle `dev-enclave.sh --pack`
+  /// made (`make enclave-bundle`). `ENCLAVE_RUNTIME` overrides it, the same way the Makefile's
+  /// `wit-drift` target does.
   static String get defaultRuntimeRepo =>
       Platform.environment['ENCLAVE_RUNTIME'] ?? '${Platform.environment['HOME']}/enclave-runtime';
+
+  /// Whether [repo] is a bundle rather than a checkout: a pack records what it was built with in
+  /// `image.env`, and a checkout has no such file.
+  static bool isBundle(String repo) => File('$repo/image.env').existsSync();
+
+  /// The software passkey tool: built by cargo in a checkout, shipped under `bin/` in a bundle.
+  static String passkeyClient(String repo) =>
+      isBundle(repo) ? '$repo/bin/passkey-client' : '$repo/target/release/passkey-client';
 
   /// `target/qemu-nitro/<name>/`.
   final String runDir;
@@ -95,7 +104,7 @@ class DevEnclave {
   /// Shells out because enrolment needs a CBOR attestation object, and the runtime's own software
   /// authenticator already builds one. Registration is open — no invitation, no operator step.
   Future<void> enrol(File state) async {
-    final result = await Process.run('$runtimeRepo/target/release/passkey-client', [
+    final result = await Process.run(passkeyClient(runtimeRepo), [
       '--url', 'https://127.0.0.1:$port',
       '--state', state.path,
       '--trust-root', trustRoot,

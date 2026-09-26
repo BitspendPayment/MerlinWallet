@@ -49,7 +49,7 @@ Future<({MpcClient client, EnclaveGate gate})> wallet(String name, EnclavePins p
   // An address, not a name: the tool dials a socket address. Nothing depends on the name — it pins
   // the enclave through the attestation document, as the gate does.
   final address = (await InternetAddress.lookup(host, type: InternetAddressType.IPv4)).first.address;
-  final enrol = await Process.run('${DevEnclave.defaultRuntimeRepo}/target/release/passkey-client', [
+  final enrol = await Process.run(DevEnclave.passkeyClient(DevEnclave.defaultRuntimeRepo), [
     '--url', 'https://$address:443',
     '--state', state.path,
     '--trust-root', root.path,

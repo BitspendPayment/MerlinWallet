@@ -22,7 +22,7 @@
 	regtest-up regtest-down bitcoin-init mine-loop adb-reverse \
 	runtime-run runtime-stop \
 	arkd-up arkd-down arkd-init db-reset \
-	proto proto-check wit-drift threshold-test \
+	proto proto-check wit-drift threshold-test enclave-bundle enclave-bundle-args wasi-sdk \
 	flutter flutter-32 flutter-x86 ark-newaddress crypto-bench \
 	stress-test load-test \
 	mutinynet-deploy mutinynet-smoke \
@@ -101,9 +101,10 @@ e2e: e2e-enclave
 # Two ways to run it:
 #
 #   make e2e-enclave
-#       Boots an enclave for the run and stops it after. Minutes warm; a cold Nix build of the
-#       image is much longer. The --timeout covers that boot, which happens in setUpAll and is
-#       otherwise held to package:test's 30-second default. Tests that do real work set their own.
+#       Boots an enclave for the run and stops it after. Minutes warm; from a bundle there is no
+#       image build at all, and a cold Nix build of one is much longer. The --timeout covers that
+#       boot, which happens in setUpAll and is otherwise held to package:test's 30-second default.
+#       Tests that do real work set their own.
 #
 #   make e2e-enclave ENCLAVE_RUN=$$HOME/enclave-runtime/target/qemu-nitro/merlin
 #       Attaches to one already up — the developer loop. Start it once in another terminal:
@@ -113,12 +114,20 @@ e2e: e2e-enclave
 #       component it booted with.
 #
 # One enclave at a time (its MinIO port and vsock CID are fixed), and ENCLAVE_RUNTIME names the
-# runtime checkout, as for wit-drift.
-ENCLAVE_RUNTIME ?= $(HOME)/enclave-runtime
+# runtime, as for wit-drift: a checkout, or a bundle. A bundle is what `make enclave-bundle`
+# fetches into .enclave/ — the runtime's `dev-enclave.sh --pack` output, with the harness, the
+# WIT and the container images inside it — and it needs no Nix, no cargo and no checkout to boot.
+# With one in place it is the default; the checkout at ~/enclave-runtime is the fallback.
+ENCLAVE_RUNTIME ?= $(if $(wildcard $(CURDIR)/.enclave/image.env),$(CURDIR)/.enclave,$(HOME)/enclave-runtime)
+# The interactive stack (up-enclave, cli) keeps the checkout: its image is built with the app's rp
+# id and origins, options a bundle cannot take. ENCLAVE_RUNTIME set explicitly wins here too.
+ENCLAVE_CHECKOUT ?= $(if $(filter $(CURDIR)/.enclave,$(ENCLAVE_RUNTIME)),$(HOME)/enclave-runtime,$(ENCLAVE_RUNTIME))
 ENCLAVE_RUN     ?=
 E2E_TIMEOUT     ?= 30m
+# CI builds the FFI once, in its own job, and hands the library over; it sets this empty.
+FFI_DEP         ?= ffi-build
 
-e2e-enclave: cosigner-wasm ffi-build arkd-up bitcoin-init arkd-init
+e2e-enclave: cosigner-wasm $(FFI_DEP) arkd-up bitcoin-init arkd-init
 	@echo "Running the Ark E2E suite against the enclave$(if $(ENCLAVE_RUN), at $(ENCLAVE_RUN), booting one)..."
 	cd e2e && dart pub get && \
 		ENCLAVE_RUNTIME=$(ENCLAVE_RUNTIME) MERLIN_ENCLAVE_RUN=$(ENCLAVE_RUN) \
@@ -128,7 +137,7 @@ e2e-enclave: cosigner-wasm ffi-build arkd-up bitcoin-init arkd-init
 # foreground until Ctrl-C. Everything else attaches to it:
 #
 #   make cli                                                   a wallet REPL
-#   make e2e-enclave ENCLAVE_RUN=$(ENCLAVE_RUNTIME)/target/qemu-nitro/$(ENCLAVE_NAME)
+#   make e2e-enclave ENCLAVE_RUN=$(ENCLAVE_CHECKOUT)/target/qemu-nitro/$(ENCLAVE_NAME)
 #   make flutter                                               the app, pinned to this boot
 #
 # The store is kept between starts — tenants, passkeys and wallets survive a restart and a cosigner
@@ -145,7 +154,7 @@ ENCLAVE_PORT ?= 8443
 FRESH        ?=
 
 up-enclave: cosigner-wasm ffi-build arkd-up bitcoin-init arkd-init
-	@ENCLAVE_RUNTIME=$(ENCLAVE_RUNTIME) ENCLAVE_NAME=$(ENCLAVE_NAME) ENCLAVE_PORT=$(ENCLAVE_PORT) \
+	@ENCLAVE_RUNTIME=$(ENCLAVE_CHECKOUT) ENCLAVE_NAME=$(ENCLAVE_NAME) ENCLAVE_PORT=$(ENCLAVE_PORT) \
 		FRESH=$(FRESH) ./scripts/up-enclave.sh
 
 up: up-enclave
@@ -242,12 +251,38 @@ cosigner-wasm: wit-drift
 cosigner-check: wit-drift
 	cd cosigner && cargo build --release --lib && cargo test
 
+# The prebuilt dev enclave: a release of enclave-runtime, pinned by name and sha256 in
+# enclave-bundle.lock, unpacked into .enclave/. Bumping the pin is editing that file; making a new
+# bundle is the runtime's "Publish a dev enclave" workflow, dispatched with the image options
+# `make enclave-bundle-args` prints — the harness checks a bundle against those before booting.
+BUNDLE_URL ?= https://github.com/BitspendPayment/enclave-runtime/releases/download
+
+enclave-bundle: .enclave/image.env
+
+.enclave/image.env: enclave-bundle.lock
+	@. ./enclave-bundle.lock; \
+	[ -n "$$RELEASE" ] || { echo "enclave-bundle.lock names no release yet" >&2; exit 1; }; \
+	t=$$(mktemp); \
+	echo "fetching $$RELEASE"; \
+	curl -fL --retry 3 --retry-all-errors -o $$t "$(BUNDLE_URL)/$$RELEASE/$$RELEASE.tar.gz" && \
+	echo "$$SHA256  $$t" | sha256sum -c - && \
+	rm -rf .enclave && mkdir .enclave && tar xzf $$t -C .enclave --strip-components=1 && rm $$t && \
+	echo "unpacked into .enclave ($$(. .enclave/image.env; echo runtime $$ENCLAVE_RUNTIME_REV))"
+
+# The image options the e2e boots with, as the publish workflow's `image_args` input.
+enclave-bundle-args:
+	@cd e2e && dart pub get >/dev/null && dart run bin/bundle_args.dart
+
+# wasi-sdk, pinned by the runtime (its scripts/wasi-sdk.sh ships in a bundle too), for cosigner-wasm.
+wasi-sdk:
+	@$(ENCLAVE_RUNTIME)/scripts/wasi-sdk.sh
+
 # The cosigner vendors enclave-runtime's tasks.wit and notify.wit because wit-bindgen reads a path
 # inside the crate. Two copies that must be byte-identical is the thing that drifts unnoticed: both
-# sides still compile and the mismatch surfaces as a runtime trap. Override ENCLAVE_RUNTIME if the
-# runtime lives somewhere other than ~/enclave-runtime.
+# sides still compile and the mismatch surfaces as a runtime trap. The canonical copy is
+# ENCLAVE_RUNTIME's: the pinned bundle once fetched, else the checkout at ~/enclave-runtime.
 wit-drift:
-	@./scripts/wit-drift.sh
+	@ENCLAVE_RUNTIME=$(ENCLAVE_RUNTIME) ./scripts/wit-drift.sh
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  INFRASTRUCTURE
@@ -445,12 +480,12 @@ mutinynet-smoke: ffi-build
 #   make cli                                       the REPL
 #   make cli ARGS="fund 100000"                    one command
 #   make cli ENCLAVE_RUN=/path/to/qemu-nitro/<name>
-CLI_ENCLAVE_RUN ?= $(ENCLAVE_RUNTIME)/target/qemu-nitro/merlin
+CLI_ENCLAVE_RUN ?= $(ENCLAVE_CHECKOUT)/target/qemu-nitro/merlin
 ARGS ?=
 
 cli: ffi-build
 	cd cli && dart pub get >/dev/null && \
-		MERLIN_ENCLAVE_RUN=$(or $(ENCLAVE_RUN),$(CLI_ENCLAVE_RUN)) ENCLAVE_RUNTIME=$(ENCLAVE_RUNTIME) \
+		MERLIN_ENCLAVE_RUN=$(or $(ENCLAVE_RUN),$(CLI_ENCLAVE_RUN)) ENCLAVE_RUNTIME=$(ENCLAVE_CHECKOUT) \
 		dart run bin/merlin.dart $(ARGS)
 
 # Analyze without running — what CI would check.

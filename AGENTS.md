@@ -1,37 +1,66 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `app/` Flutter app UI; key areas include `app/lib/screens`, `app/lib/widgets`, and `app/lib/theme`.
-- `client/` Dart client library used by the app and tooling.
-- `server/` Dart gRPC server; entrypoint is `server/bin/server.dart`, core logic in `server/lib`.
-- `protocol/` shared Dart protocol package; generated stubs live in `protocol/lib/src/generated`.
-- `crates/` Rust support libraries (path deps): `crates/threshold` cryptography (unit tests in `crates/threshold/test`), `crates/ark` Ark protocol primitives, `crates/enclave-client` Nitro Enclave HTTP client.
-- `e2e/` integration tests and Docker setup for regtest services.
-- `protos/` protobuf definitions; top-level `docker-compose.yml` and `Makefile` support local regtest.
+- `app/` Flutter app (`app/lib/screens`, `app/lib/services/mpc_service.dart`, `app/lib/passkey/`).
+- `app-core/` Dart wallet core: `client.dart` (`MpcClient`), `sessions/` (one driver per ceremony
+  stream), `passkey/` (key derivation, share reconstruction, operation secrets), `cosigner/`
+  (the gRPC connection), `enclave/` (attested gate), `persistence/` (public state only).
+- `cosigner/` the Rust cosigner, a `wasm32-wasip2` component served by enclave-runtime — one
+  instance per tenant, no listener of its own. `cosigner/src/session.rs` routes; `handlers/` hold
+  the ceremonies; the seal (`store.rs`) is the only durable state.
+- `protocol/` shared Dart package; `protocol/protos/*.proto` are the source of truth. Generated Dart
+  (`protocol/lib/src/generated`) is **not checked in** — run `make proto`.
+- `crates/threshold` FROST/DKG cryptography; `crates/ark` Ark protocol; `crates/enclave-client`
+  attestation; `ffi/` the merged native library the Dart side loads (`make ffi-build`).
+- `e2e/` the enclave end-to-end suite and its harness; `cli/` a Dart REPL against a dev enclave;
+  `examples/card-escrow` a service paired into an escrow; `infrastructure/` the MutinyNet QEMU
+  deployment; `scripts/` what the Makefile calls.
 
 ## Build, Test, and Development Commands
-- `make regtest-up`: start Bitcoind + Electrs via Docker Compose.
-- `make server-run`: run the MPC server with local regtest defaults (`ELECTRUM_URL=127.0.0.1`, `ELECTRUM_PORT=50001`).
-- `make regtest`: convenience target for regtest services plus server; `make regtest-down` stops services.
-- `make proto`: regenerate Dart gRPC stubs from `protos/mpc_wallet.proto` (requires `protoc`).
-- `dart pub get`: install Dart dependencies inside each package (e.g., `server/`, `client/`).
-- `cd app && flutter run`: launch the Flutter app; `cd app && flutter test` runs UI tests.
-- `cd e2e && dart test`: run integration tests (expects regtest services running).
+- `make proto` regenerate Dart stubs (needs `protoc` and `dart pub global activate protoc_plugin`);
+  `make proto-check` diffs them.
+- `make ffi-build` build `ffi/target/release/libmpcwallet_ffi.so`; `app-core` tests need it.
+- `cd cosigner && cargo test` — the cosigner's tests run on the host. `make cosigner-wasm` builds
+  the component (needs wasi-sdk); `make cosigner-check` also checks WIT drift against
+  `ENCLAVE_RUNTIME` (the bundle in `.enclave/` once fetched, else `~/enclave-runtime`).
+- `cd app-core && dart test`; `cd app && flutter analyze --no-fatal-infos && flutter test`;
+  `dart analyze` in `protocol/`, `cli/`, `e2e/`. Flutter may be off PATH (`~/dev/flutter/bin`).
+- `make up-enclave` boots a dev enclave (docker regtest + arkd + QEMU from the `~/enclave-runtime`
+  checkout); `make e2e-enclave` runs the suite against one (or attaches with `ENCLAVE_RUN=`); `make cli`.
+- `make enclave-bundle` fetches the prebuilt dev enclave pinned in `enclave-bundle.lock` into
+  `.enclave/`, which then is the default `ENCLAVE_RUNTIME` for the e2e and the WIT check. The image
+  options the suite needs live in `e2e/lib/e2e_profile.dart`; changing them means a new bundle
+  (`make enclave-bundle-args` → the runtime's "Publish a dev enclave" workflow → the lock).
+- CI is `.github/workflows/ci.yml`; its `enclave-e2e` job runs the suite from the pinned bundle on a
+  hosted runner. Run it locally too before merging a change to a ceremony.
 
 ## Coding Style & Naming Conventions
-- Use standard Dart/Flutter conventions: `UpperCamelCase` for types, `lowerCamelCase` for members, `snake_case` file names.
-- Linting: `flutter_lints` in `app/` and `lints/recommended` in `crates/threshold/`; run `flutter analyze` or `dart analyze`.
-- Format Dart code with `dart format .` after changes.
+- Dart: `UpperCamelCase` types, `lowerCamelCase` members, `snake_case` files. Rust: rustfmt defaults
+  for new code. Both trees are hand-wrapped at 100 columns and are **not** `dart format` /
+  `cargo fmt` clean at baseline — do not reformat files wholesale; match the surrounding style.
+- Lints: `flutter_lints` in `app/`, `lints` in the Dart packages, clippy on the crates. Keep
+  `dart analyze` clean and add no new clippy warnings.
+- Comments explain why, at the depth the surrounding code does.
 
 ## Testing Guidelines
-- Tests live under `*/test` and use the `_test.dart` suffix.
-- Prefer unit tests for crypto and core logic (`crates/threshold/test`) and e2e flows in `e2e/test`.
-- For end-to-end changes, bring up regtest services before running `dart test` in `e2e/`.
+- Tests live under `*/test` (Dart, `_test.dart`) and `*/tests` (Rust). Crypto and core logic get
+  unit tests; `app-core/test/operation_lifecycle_test.dart` drives `MpcClient` against an
+  in-process cosigner; `cosigner/tests/*_test.rs` drive handlers and, through
+  `tests/common::wire`, the router over real frames.
+- A fix to a security-relevant path comes with a test that fails without it (mutation-check it).
+- `make e2e-enclave` needs docker, KVM, vsock and the bundle (`make enclave-bundle`) or a runtime
+  checkout; ~7 minutes warm.
+
+## Security Invariants (see README "No key at rest", SECURITY_FINDINGS RC-3/RC-4)
+- The device persists no private-key material. `WalletStore.saveClientState` refuses
+  `secretShare`/`onchainSecret`/`shareBlinded`/`signingSecret` at any depth; keep it that way.
+- Secrets live in a `WalletOperation`, one serialized operation at a time, disposed in a `finally`,
+  and every wait on a party other than the cosigner goes through `CancelSignal.guard`. A new
+  ceremony stream must be opened through `CosignerConnection._track`.
+- The cosigner returns its dealt halves only through `dealt_share_for`, never its own share, and
+  a change that must be durable goes through `try_seal()` before it is acted on.
 
 ## Commit & Pull Request Guidelines
-- Commit history mostly uses Conventional Commit prefixes (`feat:`, `fix:`, `refactor:`, `chore:`); prefer that style with a short imperative summary (e.g., `feat: add policy validation`).
-- PRs should include a concise description, testing notes, and linked issues; include screenshots or recordings for Flutter UI changes.
-
-## Security & Configuration Notes
-- The server relies on `ELECTRUM_URL` and `ELECTRUM_PORT` for connectivity; keep local overrides out of versioned files.
-- Treat generated artifacts in `protocol/lib/src/generated` as output from `make proto` rather than hand-edited code.
+- Conventional Commit prefixes (`feat:`, `fix:`, `refactor:`, `build:`), a short imperative summary,
+  and a body that says what changed and why — the history is written that way.
+- PRs: what was run, what was not (say so), and screenshots for Flutter UI changes.

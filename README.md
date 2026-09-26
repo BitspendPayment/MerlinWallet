@@ -166,22 +166,27 @@ The complete development stack targets **Linux with KVM and vsock**. Install:
 
 - Rust and native C/C++ build tools; `wasm32-wasip2` for the cosigner.
 - Dart for the client/CLI/tests and Flutter for the app. The app requires Dart `>=3.4.0 <4.0.0`; package manifests define the other SDK bounds.
-- Docker with Compose, Nix with flakes, `protoc`, `pkg-config`, and the native dependencies needed by enclave-runtime.
+- Docker with Compose, `protoc` and `pkg-config`. Nix with flakes only to build the enclave image from a runtime checkout; the e2e boots a prebuilt bundle instead.
 - `python3`, `jq`, `curl`, `openssl`, and standard Linux shell utilities.
 - wasi-sdk for the guest's `secp256k1-sys` C dependency.
 - For Android: the Android SDK/ADB and NDK. The Makefile defaults to NDK `27.0.12077973`; override its build variables to match an intentional toolchain change.
 
-Keep [enclave-runtime](https://github.com/BitspendPayment/enclave-runtime) checked out beside this repository, or set `ENCLAVE_RUNTIME` explicitly. From the MerlinWallet root:
+The enclave the e2e boots comes from [enclave-runtime](https://github.com/BitspendPayment/enclave-runtime), as a prebuilt bundle or from a checkout. The bundle is enough for `make e2e-enclave`: it carries the image, the host binaries, the harness, the WIT and the QEMU and MinIO container images, so the host needs Docker, KVM, vsock and `python3`, and none of Nix, cargo or git for the runtime. From the MerlinWallet root:
+
+```bash
+git submodule update --init --recursive
+rustup target add wasm32-wasip2
+sudo modprobe vsock_loopback
+
+make enclave-bundle   # the release pinned in enclave-bundle.lock, verified, unpacked into .enclave/
+make wasi-sdk         # wasi-sdk under ~/wasi-sdk unless WASI_SDK is set
+```
+
+With `.enclave/` in place it is the default `ENCLAVE_RUNTIME`. A checkout beside this repository (`~/enclave-runtime`, or `ENCLAVE_RUNTIME` set explicitly) is the fallback, and what `make up-enclave` and runtime-side work still need, since that image is built with the app's rp id and origins:
 
 ```bash
 export ENCLAVE_RUNTIME="$HOME/enclave-runtime"
-git submodule update --init --recursive
-rustup target add wasm32-wasip2
-
-# Installs wasi-sdk under ~/wasi-sdk unless WASI_SDK is set.
 "$ENCLAVE_RUNTIME/scripts/wasi-sdk.sh"
-
-sudo modprobe vsock_loopback
 docker build -t s3fs-qemu-nitro:latest "$ENCLAVE_RUNTIME/deploy/qemu-nitro"
 cargo install vhost-device-vsock --version 0.3.0 --locked \
   --root "$ENCLAVE_RUNTIME/target/qemu-nitro/tools"
@@ -268,7 +273,7 @@ The smoke command checks attestation, separate wallets, and DKG; its funded path
 | `cargo test --manifest-path cosigner/Cargo.toml` | Cosigner host tests without the Makefile's cross-repository WIT check. |
 | `make ffi-build` then `(cd app-core && dart pub get && dart test)` | Shared client tests, including share reconstruction, operation lifetimes, attestation, and persistence. |
 | `(cd app && flutter test)` | Flutter tests after package setup. |
-| `make e2e` | Builds the guest/FFI, starts regtest/arkd, and runs `e2e/test/enclave_ark_test.dart` against QEMU. |
+| `make e2e` | Builds the cosigner and FFI, starts regtest/arkd, boots the enclave (from the bundle in `.enclave/` if fetched, else the checkout) and runs `e2e/test/enclave_ark_test.dart`. |
 | `make wit-drift` | Confirms the copied runtime capability contracts match the canonical WIT. |
 | `make proto-check` | Verifies checked-in Dart stubs match the protobuf sources; requires `protoc` and the Dart plugin. |
 | `make crypto-bench` | The repository's cryptography benchmark entry point. |
@@ -281,9 +286,9 @@ For a complete E2E run, let the harness configure its own enclave. An existing o
 make e2e-enclave ENCLAVE_RUN="$ENCLAVE_RUNTIME/target/qemu-nitro/merlin"
 ```
 
-An attached image must also allow the suite's escrow-service fixture and use a renewal margin suitable for the test timeout. The delegate test reports a skip if the deadline is too far away. Only one emulator stack can own the fixed MinIO port/vsock configuration at a time.
+An attached image must also allow the suite's escrow-service fixture and use a renewal margin suitable for the test timeout. The delegate test reports a skip if the deadline is too far away. A bundle boots as it was packed, so the harness checks its `image.env` against the options in `e2e/lib/e2e_profile.dart` first and refuses a mismatch by name; `make enclave-bundle-args` prints the options a bundle for this suite is packed with. Only one emulator stack can own the fixed MinIO port/vsock configuration at a time.
 
-The older GitHub E2E workflow still contains native-server assumptions. Treat the current Makefile, component harness, and actual run output as the validation recipe until CI is updated. Host tests, QEMU integration tests, Android device tests, and real Nitro validation establish different properties.
+CI (`.github/workflows/ci.yml`) runs the cosigner's, threshold's and FFI's `cargo test`, every Dart package's analysis, `app-core`'s tests against the built FFI, the app's `flutter analyze` and `flutter test`, and the enclave e2e: the `enclave-e2e` job fetches the bundle pinned in `enclave-bundle.lock`, boots it on the runner's KVM (hosted runners have nested virtualisation; the runtime's own CI relies on the same) and runs the suite. Moving to a newer runtime is: dispatch the runtime's "Publish a dev enclave" workflow with `make enclave-bundle-args` as its image options, then put the release name and the sha256 from its `.sha256` asset into `enclave-bundle.lock`. A change to a ceremony is still run locally before it is called done. Host tests, QEMU integration tests, Android device tests, and real Nitro validation establish different properties.
 
 ## Repository guide
 
@@ -397,10 +402,25 @@ operation gives an attacker who has both nothing they could not already ask for.
   It now matters for every payment rather than only for recovery, which also means a PRF that
   drifted would be noticed on the first payment rather than on the day the phone is lost.
 
-Tests: `app-core/test/share_reconstruction_test.dart`, `app-core/test/operation_lifecycle_test.dart`
-(a cosigner in-process; reads the box file back as raw bytes),
-`cosigner/tests/stream_contribution_test.rs`, and the `nothing secret at rest` and
-`a wallet on a new phone` groups of `e2e/test/enclave_ark_test.dart`.
+**Escrows follow the same rule.** An escrow share is the wallet share plus two deltas — the
+wallet's, derived from the passkey under a per-escrow context, and the cosigner's, sealed — and is
+rebuilt inside the same operation, from the two halves the `PairService` or `EscrowReclaim` stream
+brings on its first round, checked against the escrow's stored verifying share, and released with
+the operation (`WalletOperation.escrowKeyPackage`). What the device keeps of an escrow is its key,
+its public package and that context; `Recover` hands a new device all three. An escrow minted
+before its context was recorded cannot be rebuilt by any passkey and is left out of recovery.
+
+An escrow a reclaim has been opened on is retired from deals, for good. Reclaim signatures stay
+valid for as long as the outpoints they spend exist, and the cosigner can see neither whether they
+left the device nor whether those outpoints are still there — so a deal struck over such an escrow
+would be one the owner could empty at will. The mark is sealed before the reclaim's first nonce,
+so an abandoned reclaim is as final as a finished one; the next deal gets a new escrow.
+
+Tests: `app-core/test/share_reconstruction_test.dart`, `escrow_reconstruction_test.dart`,
+`operation_lifecycle_test.dart` (a cosigner in-process; reads the box file back as raw bytes),
+`cancel_streams_test.dart`, `cosigner/tests/stream_contribution_test.rs`, `seal_test.rs`, and
+the `nothing secret at rest`, `a wallet on a new phone` and `pairing a service into an escrow`
+groups of `e2e/test/enclave_ark_test.dart`.
 
 ## Trust assumptions & failure modes
 

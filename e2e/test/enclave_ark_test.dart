@@ -38,6 +38,7 @@ import 'package:app_core/persistence/wallet_store.dart' show forbiddenStateKeys;
 import 'package:app_core/threshold_types.dart' as threshold;
 import 'package:protocol/protocol.dart' show PaymentIntent, PaymentRequestCreateRequest;
 import 'package:e2e/boarding_poll.dart';
+import 'package:e2e/e2e_profile.dart';
 import 'package:e2e/enclave_harness.dart';
 import 'package:e2e/logger.dart';
 import 'package:e2e/regtest_helper.dart';
@@ -95,15 +96,6 @@ Future<T> eventually<T>(
   fail('timed out after $timeout waiting for $what; last saw $last');
 }
 
-/// The escrow service these tests pair with.
-///
-/// Its identifier and its origin both go into the enclave's IMAGE, so both have to be decided
-/// before the enclave boots — a wallet names a service id and never a URL, and the image is what
-/// turns one into the other. Hence a fixed label and a fixed port.
-const servicePort = 7099;
-final serviceIdentifier =
-    ark_threshold.Identifier.derive(Uint8List.fromList('merlin-e2e-escrow-service'.codeUnits));
-
 void main() {
   EnclaveHarness? harness;
   EscrowService? service;
@@ -111,13 +103,11 @@ void main() {
   setUpAll(() async {
     // Before the enclave: the image has to name where this service is, and it cannot be told
     // afterwards.
+    // The service, its port and its origin as the image names them: `lib/e2e_profile.dart`, the
+    // one place they are decided, because a prebuilt bundle has to have been packed with them.
     service = EscrowService(identifier: serviceIdentifier);
     await service!.start(port: servicePort);
-    final serviceId = _hex(serviceIdentifier.serialize());
-    // 192.168.127.254 is this host as the guest sees it — the same address the ASP is reached at.
-    // `id:origin` rather than `id=origin`: `dev-enclave.sh` validates a `--guest-env` value against
-    // `[A-Za-z0-9:/._-]`, so the natural spelling cannot reach an image built through it.
-    final origins = '$serviceId:http://192.168.127.254:$servicePort';
+    final origins = serviceOrigins;
 
     harness = await EnclaveHarness.start(serviceOrigins: origins);
     Log.info('enclave up: pcr16=${harness!.pcr16.substring(0, 16)}…'

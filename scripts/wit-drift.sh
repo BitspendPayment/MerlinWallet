@@ -57,7 +57,8 @@ while IFS= read -r copy; do
         diff -u "${canonical[0]}" "$copy" >&2 || true
         status=1
     fi
-done < <(find . -type f -path '*/wit/deps/*.wit' -not -path '*/target/*' -not -path '*/vendor/*' | sort)
+done < <(find . -type f -path '*/wit/deps/*.wit' -not -path '*/target/*' -not -path '*/vendor/*' \
+    -not -path './.enclave/*' | sort)  # .enclave/ is the runtime itself, not a copy of it
 
 # A check that silently covers nothing is worse than no check, because it still reports green. If
 # the vendored copies move, this says so instead.

@@ -33,7 +33,8 @@ services:
 
 
   electrs:
-    image: ghcr.io/vulpemventures/electrs:latest
+    # Pinned by digest: the one image in this stack that floated, and CI now boots the stack.
+    image: ghcr.io/vulpemventures/electrs@sha256:999a2218f423c0fb167ee53b282aa7929a9d4abba38ef16f67f407acd00589d4
     container_name: mpc_electrs
     ports:
       - "50001:50001" # TCP

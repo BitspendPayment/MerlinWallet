@@ -99,6 +99,84 @@ class EnclaveHarness {
         .toList();
   }
 
+  /// The image options this suite's enclave is built with. Measured into PCR0, all of them: a
+  /// bundle has to have been packed with exactly these, and `bin/bundle_args.dart` prints them
+  /// for that purpose.
+  static List<String> imageOptions({
+    String? serviceOrigins,
+    List<String> extraEgress = const [],
+    Map<String, String> extraEnv = const {},
+  }) =>
+      [
+        // The cosigner runs sealed delegates itself, against arkd on the host — which is
+        // 192.168.127.254 from inside the enclave. The margin makes a delegate come due about five
+        // minutes after its VTXOs were made (regtest VTXOs live 15360s), so a test can watch one run.
+        '--guest-egress', 'http://192.168.127.254:7070',
+        '--guest-env', 'ASP_URL=http://192.168.127.254:7070',
+        '--guest-env', 'AUTO_SETTLE_SAFETY_MARGIN_SECS=15060',
+        // Each named service needs both halves of the permission: the guest has to be told the id
+        // means that origin, and the image has to allow the guest to dial it. Naming one without
+        // the other fails at delivery, which is the wrong place to find out.
+        if (serviceOrigins != null && serviceOrigins.isNotEmpty) ...[
+          '--guest-env', 'SERVICE_ORIGINS=$serviceOrigins',
+          for (final entry in serviceOrigins.split(RegExp(r'[,_]')))
+            // The origin is whatever follows the first separator; an origin's own `://` comes
+            // later. See `cosigner/src/handlers/delivery.rs` for why both spellings exist.
+            ...['--guest-egress', entry.replaceFirst(RegExp(r'^[0-9a-fA-F]+[:=]'), '')],
+        ],
+        for (final origin in extraEgress) ...['--guest-egress', origin],
+        for (final entry in extraEnv.entries) ...['--guest-env', '${entry.key}=${entry.value}'],
+        '--background-timeout', '600',
+      ];
+
+  /// Refuse a bundle packed with other image options than [image].
+  ///
+  /// `image.env` is what `dev-enclave.sh --pack` recorded: `printf %q` output, so a value is
+  /// `''` when empty and otherwise has every shell-special character backslashed, and repeated
+  /// options are joined with commas. Compared as sets — order is not a difference.
+  static void _checkBundle(String dir, List<String> image) {
+    final packed = <String, String>{};
+    for (final line in File('$dir/image.env').readAsLinesSync()) {
+      final m = RegExp(r'^([A-Z_][A-Z0-9_]*)=(.*)$').firstMatch(line);
+      if (m == null) continue; // the `:`/`export` lines: the image tags, which a caller may override
+      final raw = m.group(2)!;
+      packed[m.group(1)!] = raw == "''" ? '' : raw.replaceAll('\\', '');
+    }
+    final egress = <String>{}, env = <String>{};
+    String? timeout;
+    for (var i = 0; i + 1 < image.length; i += 2) {
+      switch (image[i]) {
+        case '--guest-egress':
+          egress.add(image[i + 1]);
+        case '--guest-env':
+          env.add(image[i + 1]);
+        case '--background-timeout':
+          timeout = image[i + 1];
+      }
+    }
+    Set<String> packedSet(String key) =>
+        (packed[key] ?? '').split(',').where((s) => s.isNotEmpty).toSet();
+    final mismatches = <String>[
+      if (!_sameSet(packedSet('GUEST_EGRESS_ORIGINS'), egress))
+        'GUEST_EGRESS_ORIGINS=${packed['GUEST_EGRESS_ORIGINS']} (this suite needs ${egress.join(',')})',
+      if (!_sameSet(packedSet('GUEST_ENV'), env))
+        'GUEST_ENV=${packed['GUEST_ENV']} (this suite needs ${env.join(',')})',
+      if ((packed['BACKGROUND_TIMEOUT_SECS'] ?? '') != (timeout ?? ''))
+        'BACKGROUND_TIMEOUT_SECS=${packed['BACKGROUND_TIMEOUT_SECS']} (this suite needs $timeout)',
+    ];
+    if (mismatches.isNotEmpty) {
+      throw StateError(
+        'the bundle at $dir (runtime ${packed['ENCLAVE_RUNTIME_REV'] ?? '?'}) was packed with '
+        'other image options than this suite boots with:\n  ${mismatches.join('\n  ')}\n'
+        'Repack it with: dev-enclave.sh --pack DIR ${image.join(' ')}',
+      );
+    }
+    Log.info('bundle: runtime ${packed['ENCLAVE_RUNTIME_REV'] ?? '?'}, image options match');
+  }
+
+  static bool _sameSet(Set<String> a, Set<String> b) =>
+      a.length == b.length && a.containsAll(b);
+
   /// Attach to a running enclave, or boot one.
   ///
   /// [component] defaults to the release component `make cosigner-wasm` writes.
@@ -141,31 +219,21 @@ class EnclaveHarness {
       throw StateError('no component at $wasm — build it first: make cosigner-wasm');
     }
 
-    Log.info('booting an enclave with $wasm');
+    final image =
+        imageOptions(serviceOrigins: serviceOrigins, extraEgress: extraEgress, extraEnv: extraEnv);
+    // A bundle (`make enclave-bundle`) is booted as it was packed: image options are refused by
+    // `--prebuilt`, so they are checked against what the pack recorded instead. Refusing here is
+    // the point — a bundle with another margin would not fail, it would quietly skip the delegate
+    // test.
+    final bundle = DevEnclave.isBundle(_runtimeRepo);
+    if (bundle) _checkBundle(_runtimeRepo, image);
+
+    Log.info('booting an enclave with $wasm${bundle ? ' from the bundle at $_runtimeRepo' : ''}');
     final proc = await Process.start(
       '$_runtimeRepo/deploy/qemu-nitro/dev-enclave.sh',
       [
         '--guest', wasm, '--name', name, '--port', '$port',
-        // The cosigner runs sealed delegates itself, against arkd on the host — which is
-        // 192.168.127.254 from inside the enclave. The margin makes a delegate come due about five
-        // minutes after its VTXOs were made (regtest VTXOs live 15360s), so a test can watch one run.
-        '--guest-egress', 'http://192.168.127.254:7070',
-        '--guest-env', 'ASP_URL=http://192.168.127.254:7070',
-        '--guest-env', 'AUTO_SETTLE_SAFETY_MARGIN_SECS=15060',
-        // Each named service needs both halves of the permission: the guest has to be told the id
-        // means that origin, and the image has to allow the guest to dial it. Naming one without
-        // the other fails at delivery, which is the wrong place to find out.
-        if (serviceOrigins != null && serviceOrigins.isNotEmpty) ...[
-          '--guest-env', 'SERVICE_ORIGINS=$serviceOrigins',
-          for (final entry in serviceOrigins.split(RegExp(r'[,_]')))
-            // The origin is whatever follows the first separator; an origin's own `://` comes
-            // later. See `cosigner/src/handlers/delivery.rs` for why both spellings exist.
-            ...['--guest-egress', entry.replaceFirst(RegExp(r'^[0-9a-fA-F]+[:=]'), '')],
-        ],
-        for (final origin in extraEgress) ...['--guest-egress', origin],
-        for (final entry in extraEnv.entries)
-          ...['--guest-env', '${entry.key}=${entry.value}'],
-        '--background-timeout', '600',
+        if (bundle) ...['--prebuilt', _runtimeRepo] else ...image,
       ],
       workingDirectory: _runtimeRepo,
     );

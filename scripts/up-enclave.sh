@@ -77,6 +77,9 @@ run="$runtime/target/qemu-nitro/$name"
 
 [[ -x "$runtime/deploy/qemu-nitro/dev-enclave.sh" ]] \
     || { echo "no enclave-runtime at $runtime — set ENCLAVE_RUNTIME" >&2; exit 1; }
+# A bundle boots as it was packed; this boot builds the image with the rp id and origins below.
+[[ ! -f "$runtime/image.env" ]] \
+    || { echo "$runtime is a prebuilt bundle; up-enclave needs a checkout — set ENCLAVE_RUNTIME" >&2; exit 1; }
 [[ -f "$wasm" ]] || { echo "no component at $wasm — make cosigner-wasm" >&2; exit 1; }
 
 # One enclave at a time: MinIO's port and the vsock CID are fixed. Say so now, rather than after
