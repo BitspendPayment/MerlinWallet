@@ -1,189 +1,329 @@
 # Merlin Wallet
 
-A **2-of-2 FROST threshold Bitcoin wallet**. The full private key never exists on any single device: two independent identities — your phone and a remote cosigning service running inside an AWS Nitro Enclave — jointly control your funds. Neither can move funds alone.
+**A passkey-based Bitcoin wallet with a Wasm cosigner: approve on your phone, verify the service you are trusting, and let previously authorized work continue while you are offline.**
 
-The wallet holds Bitcoin as **Ark off-chain VTXOs**. The FROST group key owns the
-VTXOs; boarding, sending, and settling use an Ark Service Provider (ASP). On-chain
-addresses are used for boarding deposits and exits to another wallet. Direct
-on-chain spending and the former on-chain-only offline mode have been removed.
+Merlin holds Bitcoin as **Ark off-chain VTXOs**. Ordinary wallet signing uses a **2-of-2 FROST key** shared between the phone and a remote cosigner. The phone reconstructs its signing share for each operation from its passkey and the cosigner's stored contribution, rather than keeping a FROST share in the application's persistent state.
 
-Both parties are required to produce a valid Taproot (BIP-340) Schnorr signature on the Ark path. The server alone cannot move funds; the phone alone cannot move Ark funds.
+The cosigner is a Rust component running on [**enclave-runtime**](https://github.com/BitspendPayment/enclave-runtime). The runtime supplies attested HTTPS, passkey authorization, tenant-scoped encrypted storage, background scheduling, maintained connections, and device wake notifications. Merlin supplies the wallet protocol, signing rules, Ark integration, and application policy.
+
+That division supports more than interactive payments. A user can sign a bounded renewal delegate while present, then let the cosigner execute it with an Ark Service Provider (ASP) later. An explicitly paired escrow service can also initiate a policy-checked exchange through a connection the runtime maintains.
+
+> **Development software; use test funds.** The documented local and MutinyNet environments use QEMU's emulated Nitro device and a development storage key. They exercise the integration but do not provide AWS Nitro's hardware trust boundary. Real Nitro deployment, independent security review, and resolution of wallet/runtime correctness findings remain prerequisites for production use.
+
+## Contents
+
+- [What Merlin implements](#what-merlin-implements)
+- [Architecture](#architecture)
+- [How Merlin uses enclave-runtime](#how-merlin-uses-enclave-runtime)
+- [A concrete demonstration: renew while the phone is offline](#a-concrete-demonstration-renew-while-the-phone-is-offline)
+- [Attestation, authorization, and isolation](#attestation-authorization-and-isolation)
+- [Build and run](#build-and-run)
+- [Testing](#testing)
+- [Repository guide](#repository-guide)
+- [Security model summary](#security-model-summary)
+- [No key at rest](#no-key-at-rest)
+- [Trust assumptions & failure modes](#trust-assumptions--failure-modes)
+- [Emergency exit](#emergency-exit)
+
+## What Merlin implements
+
+| Capability | What is in the repository |
+|---|---|
+| **Threshold wallet creation** | A distributed key-generation ceremony and FROST signing over secp256k1, with Taproot/BIP-340-compatible signatures. The protocol uses shares rather than reconstructing the full group private key. |
+| **Passkey-based signing and restoration** | A passkey PRF derives the phone's contribution; an approved cosigner stream returns the complementary dealt contribution. The reconstructed share is checked against the wallet's expected verifying share. |
+| **Ark payments** | Boarding deposits, VTXO discovery, sends, settlement, history, and renewed-fund tracking through an ASP. |
+| **Delegated renewal** | The user signs a delegate over a known set of funds; a durable runtime task attempts that renewal when due. Completion or inability to renew can wake the owner. |
+| **Contacts and payment requests** | Tenant-local contacts, signed requests to pay, inbox handling, approval, and fulfillment tracking. |
+| **Policy-controlled escrows** | Escrow creation, service pairing, release checks, allowance/reference tracking, and replies over runtime-held service connections. |
+| **Pre-signed exits** | Exit transaction construction and verification, coverage tracking, export, and ancestry display. The app does not yet broadcast the complete ancestor/exit chain. |
+| **An attested native client** | Nonce-bound verification of runtime/guest measurements and the connection certificate before an approved gRPC interaction is sent. |
+| **Development and integration tooling** | Android app, shared Dart core, regtest CLI, Rust/FFI tests, QEMU end-to-end tests, and a MutinyNet deployment runbook. |
+
+These are implementation capabilities, not a claim that every environment is validated or every finding is closed. The [security findings](SECURITY_FINDINGS.md) track known concerns, including cross-device PRF behavior, secret lifetimes, and test coverage. Some older assessments still refer to components that have since been replaced; current source and the test entry points below describe the active architecture.
 
 ## Architecture
 
-```
-   +-----------------------+         +-----------------------+
-   |   Cosigner Runtime    |         |   Ark Service         |
-   |   AWS Nitro Enclave   |         |   Provider (arkd)     |
-   |   Rust · native FROST |         |   VTXO batching /     |
-   |   Identity 2/2        |         |   settlement          |
-   +-----------+-----------+         +-----------+-----------+
-               |                                 |
-        attested HTTPS                     Ark rounds
-               |                                 |
-   +-----------+---------------------------------+-----------+
-   |   Android Phone — Flutter app — Identity 1/2            |
-   |   in-app FROST signing (FFI) · passkey-gated share      |
-   |   boarding deposits + pre-signed exits to another wallet     |
-   +--------------------------------------------------------+
+```mermaid
+flowchart TB
+    subgraph Phone[Android phone]
+        App[Flutter wallet and Dart app-core]
+        Passkey[Platform passkey and PRF]
+        FFI[Rust threshold, Ark, and attestation FFI]
+        Passkey --> App
+        App --> FFI
+    end
+    subgraph Enclave[Enclave image: real Nitro target or QEMU development]
+        Runtime[enclave-runtime: TLS, authentication, tenant locks]
+        Guest[cosigner.wasm: signing, Ark state, policy]
+        Storage[WASI filesystem over encrypted S3 blocks]
+        Workers[Tasks, service connections, and device wakes]
+        Runtime --> Guest
+        Guest --> Storage
+        Guest <--> Workers
+    end
+    App <-->|Attested HTTPS and gRPC streams| Runtime
+    App <-->|Interactive Ark operations| ASP[Ark Service Provider]
+    Guest <-->|Allowed origin: delegated work| ASP
+    Workers <-->|SSE and POST| Service[Paired escrow service]
+    Workers -->|Content-free wake| Push[FCM]
+    Push --> App
 ```
 
-| Identity | Held by | Role |
+| Participant | Responsibility |
+|---|---|
+| **Phone** | User interaction, passkey approval/PRF, share reconstruction, its side of FROST, and interactive Ark orchestration. |
+| **Cosigner guest** | Its signing share, persistent wallet state, validation of signing requests, delegates, escrows, and application-level replay/accounting rules. |
+| **enclave-runtime** | Component execution, measured boot, key release, TLS, tenant identity and filesystem scope, serialization, and the host capabilities the guest calls. |
+| **ASP** | Ark rounds, indexing, settlement, and the external service needed for normal Ark operations. |
+| **Paired service** | An explicitly configured counterparty for an escrow, subject to that escrow's policy. It does not receive the user's passkey or general wallet authority. |
+
+The current server artifact is [`cosigner.wasm`](cosigner/src/main.rs), built for `wasm32-wasip2`. It exports `wasi:http/incoming-handler`, `run-task`, and `on-message`. It has no listener, TLS server, or native per-user actor registry. The host library build exists for tests and development tools; running it as a standalone server is not the serving path.
+
+## How Merlin uses enclave-runtime
+
+Merlin is a concrete consumer of the runtime's capabilities. Its [`Host` trait](cosigner/src/host.rs) is implemented by the [WIT adapter](cosigner/src/main.rs), and its [component world](cosigner/wit/cosigner.wit) composes the tasks, notification, and stream interfaces.
+
+| Wallet need | Runtime capability | Merlin integration |
 |---|---|---|
-| **Wallet share** | Phone (share rebuilt from the passkey for each operation) | One half of the 2-of-2; signs in-app |
-| **Cosigner share** | Cosigner runtime in the enclave | The other half; co-signs, never sees the full key |
+| Identify the service before sending an approval | Attestation on `/auth/*`, PCR0/PCR16, and certificate binding | [`attestation.dart`](app-core/lib/enclave/attestation.dart), [`gate.dart`](app-core/lib/enclave/gate.dart) |
+| Carry multiple signing rounds under one approved interaction | Passkey-minted interaction token, HTTP/2, bidirectional request/response bodies | [`connection.dart`](app-core/lib/cosigner/connection.dart), [`session.rs`](cosigner/src/session.rs), [`grpc/`](cosigner/src/grpc/) |
+| Keep each wallet's files and execution separate | Tenant-scoped preopen and per-tenant execution lock | [`open_cosigner`](cosigner/src/main.rs), [`store.rs`](cosigner/src/store.rs) |
+| Preserve state beyond an invocation or restart | Copy-on-write encrypted filesystem and durable sync/rename operations | [`SnapshotState`](cosigner/src/types.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
+| Execute an already authorized renewal later | `enclave:tasks/queue` and the `run-task` callback | [`delegate.rs`](cosigner/src/handlers/delegate.rs), [`watch.rs`](cosigner/src/handlers/watch.rs) |
+| Reach the ASP during unattended work | Exact-origin guest egress policy | [`asp/`](cosigner/src/asp/), [`up-enclave.sh`](scripts/up-enclave.sh) |
+| Let a paired service initiate an exchange | `enclave:streams/connection` and `on-message` | [`service_stream.rs`](cosigner/src/service_stream.rs), [`release.rs`](cosigner/src/handlers/release.rs) |
+| Notify the owner without putting private details in a push | Runtime-owned device enrollment and FCM wake queue | [`host.rs`](cosigner/src/host.rs), [`watch.rs`](cosigner/src/handlers/watch.rs) |
 
-## The Cosigner Runtime
+### Persistent wallet state
 
-The remote cosigning service is built on two isolation boundaries, each addressing a different class of threat.
+The guest's store is a small **key-value layer over files**, not an embedded SQLite database. A value is stored at `<root>/<hex-tree>/<hex-key>`; writes use a temporary file and rename. Hex-encoded names prevent a caller-controlled key from becoming a filesystem path.
 
-```
-┌─ AWS Nitro Enclave ──────────────────────────────────────────┐  hardware-attested VM
-│  PCR0 measurement · KMS secrets PCR0-locked                  │  client trusts: "the right binary booted"
-│                                                              │
-│  ┌─ cosigner-runtime (Rust)   native actor per user ─────┐   │  concurrency + fault isolation
-│  │  per-user mailbox · serial commands · keys in-process  │   │  trust: "no cross-user state / races"
-│  │  FROST · DKG · Schnorr run natively here               │   │
-│  └────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────┘
-```
+Those are ordinary files from the guest's perspective. Under enclave-runtime, they live inside the wallet's tenant scope and are backed by encrypted S3 slabs and signed filesystem roots. Snapshot serialization is Merlin's responsibility; storage encryption, publication, and recovery are the runtime's. A native test using the same file store does not acquire enclave storage encryption automatically.
 
-### Outer layer: AWS Nitro Enclave
+The runtime mounts one shared filesystem and gives each tenant a restricted view. It serializes that tenant's HTTP invocations, background work, and message callbacks. Healthy HTTP instances may be reused for the same tenant; callbacks and restarts can rebuild them. Durable wallet state belongs in the store, not in assumptions about an instance staying alive.
 
-The runtime executes inside an AWS Nitro Enclave — an isolated VM with no persistent storage, no interactive shell, and no network except a vsock to the parent EC2 instance. The host's disk is invisible; the host operator can't read enclave RAM.
+### A service can speak while the phone is absent
 
-What the client gets in return: an **attestation document** signed by AWS, binding a `PCR0` measurement (the SHA-384 hash of the booted EIF image) to the enclave's attestation key. The client verifies `PCR0` matches a known build before trusting any response, and binds the enclave's response-signing key to the attestation (`appKeyHash`). Connecting to a different binary, or to the host itself, fails attestation — the client refuses to send DKG packets.
+The service connection solves a separate problem from a timer. An escrow counterparty has no passkey for the user's tenant, and a Wasm guest cannot maintain its own execution context between calls. The runtime holds the connection and invokes the cosigner when a message arrives.
 
-KMS-encrypted deployment secrets are decrypted inside the enclave via a **PCR0-locked KMS policy**: only an enclave measuring this exact `PCR0` can call `kms:Decrypt`. A modified runtime can't load secrets even with the same IAM role.
+The guest checks that the sending service is paired to the named escrow and evaluates the stored session, transaction policy, remaining allowance, and required evidence. It tracks request IDs and consumed payment references in persistent state. Runtime reconnection does not itself provide exactly-once payments; the application-level accounting is essential.
 
-The enclave plumbing — supervisor, attestation server, vsock proxies — is upstream from [introspector-enclave](https://github.com/ArkLabsHQ/introspector-enclave). The cosigner-runtime is the userspace app that boots inside it.
+Service destinations are configured in the measured image. The guest selects a service identity from that configuration; the wallet does not gain arbitrary outbound access by supplying a URL. See [`delivery.rs`](cosigner/src/handlers/delivery.rs), [`escrow_session.rs`](cosigner/src/escrow_session.rs), and the [service-stream tests](cosigner/tests/service_stream_test.rs).
 
-### Inner layer: Per-user native actor
+## A concrete demonstration: renew while the phone is offline
 
-Inside the runtime, every user (keyed by FROST verifying-share / group key) gets a dedicated tokio actor task that owns its keys and state:
+This flow shows what the runtime contributes to a working wallet:
 
-```rust
-// cosigner-runtime/src/cosigner/registry.rs
-const MAILBOX_CAPACITY: usize = 256;
+1. **Establish identity.** The app verifies the enclave's measurements and TLS certificate, enrolls a passkey, and completes DKG inside its tenant.
+2. **Board and protect funds.** The phone and cosigner complete an Ark operation. While the phone is present, they sign a renewal delegate covering the known VTXOs; configured exit transactions can be signed alongside it.
+3. **Persist the authorization.** The cosigner stores the delegate and enqueues `settle-watch`. The scheduler records the tenant and the due work outside the guest's invocation lifetime.
+4. **Let the phone disconnect.** At the deadline, the runtime invokes `run-task` under that tenant's lock. The cosigner reloads its state and executes the stored delegate against the allowed ASP.
+5. **Observe the result.** A successful refresh produces a new VTXO with a later expiry. The notification path can wake the owner; failure to complete the round is surfaced so the owner can act.
+6. **Authorize the next cycle.** The new VTXO has no new phone-signed delegate yet. On return, the wallet protects the new funds again and updates its exit coverage.
 
-let (tx, rx) = mpsc::channel::<CosignerCommand>(MAILBOX_CAPACITY);
-tokio::spawn(run_cosigner(rx, shared, registry));
-```
+**The authorization was signed before the phone went offline.** This is not authority for arbitrary new payments or an unlimited renewal loop. An unattended renewal also creates an output whose pre-signed exit must be obtained when the owner returns.
 
-Properties this gives you:
+The [`the delegate` end-to-end test](e2e/test/enclave_ark_test.dart) exercises renewal without a new signing call from the client, checks the changed outpoint and later expiry, then verifies that the new funds need protection again. It polls the indexer to observe progress. Separate tests exercise changed-guest/certificate refusals, distinct tenants, share reconstruction, and escrow-service delivery.
 
-- **No shared mutable state between users.** Each actor owns its `CosignerState` (key package, Ark secret, VTXOs, pending sessions) outright.
-- **Serial command processing per user.** The actor pulls commands one at a time; a DKG step finishes before the next sign-step starts, removing a class of same-user races.
-- **Fault isolation.** Handler work runs inside `spawn_blocking`; a panic on attacker input is caught (`JoinError::is_panic`), the request errors, and the actor is reseated from its snapshot rather than crashing the runtime.
-- **Slow user can't starve others.** A user holding a settle session blocks only their own mailbox.
-- **Constant-time routing.** [`CosignerRegistry`](cosigner-runtime/src/cosigner/registry.rs) is a `DashMap` from group key → mailbox handle; a request just looks up the handle and `send().await`. Idle actors are cheap — an idle actor is memory, not a thread.
+For a presentation, show the approval, original and refreshed outpoints, the absence of a new phone signing operation, and the notification. Add a preserved-store restart as a separate persistence demonstration. Record the revision, test environment, and observed outcome; distinguish QEMU protocol checks from hardware-backed Nitro evidence.
 
-## Other Components
+## Attestation, authorization, and isolation
 
-```
-MPCWallet/
-├── app/                  Flutter mobile app (Android)
-├── app-core/             Dart client library (DKG, signing, FFI wrapper, attested transport)
-├── cosigner-runtime/     Enclave runtime — native per-user actors (described above)
-├── crates/
-│   ├── ark/              Ark protocol: boarding, VTXO send/settle, delegate/auto-settle, checkpoints
-│   ├── threshold/        FROST + DKG core (no_std, secp256k1)
-│   └── enclave-client/   Nitro attestation verification (COSE/X.509/PCR0) + signed-response client
-├── ffi/                  Merged C-ABI shared library for Dart FFI (ark + threshold + enclave)
-├── protocol/             gRPC stubs and proto definitions
-├── infrastructure/       OpenTofu modules for enclave deployment (KMS, EC2, S3, SSM)
-├── e2e/                  End-to-end integration tests + local signer-server
-└── scripts/              Utilities (bitcoin.sh, arkd_init.sh, …)
+### Verify runtime, guest, and connection
+
+The client checks three identities together:
+
+- **PCR0:** the runtime image and its measured configuration.
+- **PCR16:** the cosigner component measured by that runtime before key release.
+- **TLS leaf certificate:** the certificate of the connection that delivered the attested authentication response.
+
+Each authentication request carries a fresh nonce. The client verifies the document's signature/chain, pinned root, expected measurements, nonce, timestamp, and connection binding through [`crates/enclave-client`](crates/enclave-client/) and FFI. [`PinnedTransportConnector`](app-core/lib/enclave/pinned_transport.dart) then checks the certificate before handing a socket to the gRPC transport.
+
+Attestation is carried on the runtime's `/auth/*` responses. Guest gRPC responses do not carry a separate response-signing key or an application-body signature from the runtime. Their transport is tied to the certificate already attested. Attestation identifies approved code and its connection; application checks still determine what it may sign.
+
+### Approve an interaction
+
+```text
+request options → verify enclave → user-verified passkey assertion
+                → single-use interaction token → approved gRPC stream
 ```
 
-### Flutter app ([app/](app/))
+The runtime token binds the method, path, and query. It does not by itself approve every payload byte or every signing round. Merlin's protocol must validate the transaction, policy, and cryptographic contributions inside the stream. A service-initiated escrow release uses the standing policy and paired service identity rather than manufacturing a fresh phone approval.
 
-Android wallet UI built with Provider + GoRouter. Onboarding guides server connection, passkey setup, and DKG. Supports Ark (VTXO) payments, on-chain boarding deposits, passkey-approved signing, and export of pre-signed exits. Ark operations are unavailable during an ASP outage; there is no on-chain spending fallback.
+The passkey has two distinct roles: authenticating an interaction to the runtime and deriving the phone's contribution through the PRF. Their combination is the basis of the [no-key-at-rest flow](#no-key-at-rest).
 
-### Dart client ([app-core/](app-core/))
+### Intended Nitro trust boundary and current emulator
 
-High-level Dart API that orchestrates the full protocol: drives DKG, FROST signing, key refresh, Ark boarding/send/settle, and pre-signed exits. Talks to the cosigner over **attested transport** (verifies the enclave's `PCR0` and response signatures), and handles Taproot address derivation, UTXO/VTXO tracking, and PSBT construction.
+Production key release is designed around enclave-runtime's KMS recipient flow, with both PCR0 and PCR16 approved for `GenerateDataKey` and `Decrypt`. It is the external key policy—not a guest's assertion about itself—that controls which image/application can obtain storage key material. Production provisioning and hardware validation remain work to complete.
 
-### Threshold library ([crates/threshold/](crates/threshold/))
+The QEMU environment generates its own attestation signing chain and uses a development storage key. Its operator can read state and forge documents under that emulator root. A public TLS certificate does not change that. The MutinyNet client obtains measurements and the emulator root from a deployment manifest; the publisher of that manifest is therefore part of the development trust configuration. Production measurement distribution needs its own reviewed trust policy.
 
-`#![no_std]` Rust implementation of FROST over secp256k1: the full 3-round DKG with proof-of-knowledge, Pedersen VSS, single-use nonce commitments, signature-share computation, Lagrange interpolation, Taproot key tweaking, and key refresh. Built for two targets: **native Rust** (the cosigner runtime) and **Dart FFI** (the phone, via `ffi/`).
-
-## Build & Run
+## Build and run
 
 ### Prerequisites
 
-- Dart ≥ 3.3, Flutter ≥ 3.4
-- Rust (stable toolchain)
-- Docker + Docker Compose
+The complete development stack targets **Linux with KVM and vsock**. Install:
+
+- Rust and native C/C++ build tools; `wasm32-wasip2` for the cosigner.
+- Dart for the client/CLI/tests and Flutter for the app. The app requires Dart `>=3.4.0 <4.0.0`; package manifests define the other SDK bounds.
+- Docker with Compose, Nix with flakes, `protoc`, `pkg-config`, and the native dependencies needed by enclave-runtime.
+- `python3`, `jq`, `curl`, `openssl`, and standard Linux shell utilities.
+- wasi-sdk for the guest's `secp256k1-sys` C dependency.
+- For Android: the Android SDK/ADB and NDK. The Makefile defaults to NDK `27.0.12077973`; override its build variables to match an intentional toolchain change.
+
+Keep [enclave-runtime](https://github.com/BitspendPayment/enclave-runtime) checked out beside this repository, or set `ENCLAVE_RUNTIME` explicitly. From the MerlinWallet root:
 
 ```bash
-rustup target add aarch64-linux-android          # FFI for Android arm64
+export ENCLAVE_RUNTIME="$HOME/enclave-runtime"
+git submodule update --init --recursive
+rustup target add wasm32-wasip2
+
+# Installs wasi-sdk under ~/wasi-sdk unless WASI_SDK is set.
+"$ENCLAVE_RUNTIME/scripts/wasi-sdk.sh"
+
+sudo modprobe vsock_loopback
+docker build -t s3fs-qemu-nitro:latest "$ENCLAVE_RUNTIME/deploy/qemu-nitro"
+cargo install vhost-device-vsock --version 0.3.0 --locked \
+  --root "$ENCLAVE_RUNTIME/target/qemu-nitro/tools"
 ```
 
-### Local development (regtest)
+The runtime's [development guide](https://github.com/BitspendPayment/enclave-runtime/blob/merkle-block-store/docs/DEV_ENCLAVE.md) describes the emulator prerequisites and network setup. The first image build can take much longer than a warm restart.
+
+### Start a persistent regtest environment
 
 ```bash
-make regtest-up        # bitcoind + electrs in Docker
-make bitcoin-init      # mine blocks
-make e2e               # Ark E2E: builds ffi + cosigner-runtime, starts regtest + arkd, runs the Dart harness
+make up
 ```
 
-The local cosigner runtime runs as a plain Rust binary (no enclave, no attestation) — the per-user native-actor isolation still applies. Useful for fast iteration.
+`make up` aliases `up-enclave`. It builds `cosigner.wasm` and the host FFI, starts Bitcoin/Electrs and arkd, initializes the regtest chain and ASP, then runs the enclave in the foreground. The script mines regtest blocks while running and configures allowed ASP egress and a development renewal margin.
 
-### Cloud deployment (mutinynet)
+The default enclave name is `merlin`, the host TLS port is `8443`, and the store is retained across starts. Artifacts and pins live under `$ENCLAVE_RUNTIME/target/qemu-nitro/merlin`. The image includes the configured Android relying-party/origin settings; a custom app signing key requires the corresponding origin and domain association.
+
+Stopping and restarting reloads the component and preserves the retained store. A changed component changes PCR16; the emulator trust root changes every boot. Rebuild/restart clients with the new development pins. `FRESH=1 make up` intentionally discards the retained enclave store and should only be used when a clean test state is wanted.
+
+### Explore with the CLI
+
+In another terminal:
 
 ```bash
-cd infrastructure/mutinynet-qemu/tofu && tofu init && tofu plan -out plan.out && tofu apply plan.out
-make mutinynet-deploy  # build, pack, ship over S3, install over SSM
-make mutinynet-smoke   # attestation, two wallets, DKG — and funds, with MUTINYNET_FUNDER_KEY
+make cli
 ```
 
-The cosigner runs in an **emulated** Nitro enclave (QEMU) on one EC2 instance at `mutiny.vtxos.network`, with a Let's Encrypt certificate and arkade's MutinyNet ASP. The app pins the image, the guest and the emulator's per-boot trust root from a manifest the host republishes on every boot. The step-by-step runbook is [infrastructure/mutinynet-qemu/README.md](infrastructure/mutinynet-qemu/README.md). Production is real Nitro, deployed with enclave-runtime's `deploy/tofu`.
+At its prompt:
 
-### Mobile app
+```text
+new alice
+whoami
+fund 100000
+balance
+protect
+```
+
+Use `help` for sending, contacts, payment requests, and wallet switching. `whoami` displays the verified runtime/guest identity; `balance` reports held VTXOs and delegated protection. [`cli/`](cli/) uses software passkeys and is **regtest tooling**: its passkey files under `~/.merlin-cli` (or `MERLIN_CLI_HOME`) are plaintext capabilities to act as those test wallets. They are distinct from the Android platform-passkey model.
+
+### Run the Android app
+
+With the enclave running and the device connected:
 
 ```bash
-adb pair <ip>:<port>           # pair (wireless debugging)
-adb connect <ip>:<port>
-make adb-reverse               # forward server ports to the phone
-cd app && flutter run
+rustup target add aarch64-linux-android
+(cd app && flutter pub get)
+make adb-reverse
+make flutter
 ```
+
+`make flutter` builds the Android FFI and reads this boot's trust root, TLS trust material, and measurements into the Flutter launch configuration. Plain `flutter run` without the correct configuration is not the equivalent. `ENCLAVE_RUN=/path/to/run` selects a different run directory; `flutter-32` and `flutter-x86` cover the additional build targets.
+
+### Stop the environment
+
+Stop the foreground `make up` with Ctrl-C, or use `make down-enclave` from another terminal. `make down` also stops the Compose services **and removes their volumes**, including the regtest/ASP state. Retaining enclave wallet files alone does not preserve a regtest chain that was deleted separately.
+
+### Build the component without booting
+
+```bash
+make cosigner-wasm
+# cosigner/target/wasm32-wasip2/release/cosigner.wasm
+```
+
+This checks the vendored WIT interfaces against the runtime before compiling. There is no native cosigner server to launch; the old `runtime-run` target explicitly refuses that path.
+
+### MutinyNet development deployment
+
+The [MutinyNet runbook](infrastructure/mutinynet-qemu/README.md) describes a QEMU enclave on EC2, public-domain ACME, the external ASP, retained MinIO storage, real Firebase wakes, and republished client pins. After completing its prerequisites and infrastructure setup, from the repository root:
+
+```bash
+make mutinynet-deploy
+make mutinynet-smoke
+```
+
+The smoke command checks attestation, separate wallets, and DKG; its funded path uses the explicitly configured test-network funder. Deployment uploads artifacts and changes remote services, so follow the runbook before invoking it. This is a test-network deployment. Real Nitro/KMS deployment is a separate integration and validation step, not a property conferred by running QEMU on EC2.
 
 ## Testing
 
+| Command | Purpose |
+|---|---|
+| `make threshold-test` | Rust threshold-cryptography tests. |
+| `make ffi-test` | Tests for the merged native FFI library. |
+| `make cosigner-check` | WIT drift check, host library build, and cosigner tests; needs the runtime checkout. |
+| `cargo test --manifest-path cosigner/Cargo.toml` | Cosigner host tests without the Makefile's cross-repository WIT check. |
+| `make ffi-build` then `(cd app-core && dart pub get && dart test)` | Shared client tests, including share reconstruction, operation lifetimes, attestation, and persistence. |
+| `(cd app && flutter test)` | Flutter tests after package setup. |
+| `make e2e` | Builds the guest/FFI, starts regtest/arkd, and runs `e2e/test/enclave_ark_test.dart` against QEMU. |
+| `make wit-drift` | Confirms the copied runtime capability contracts match the canonical WIT. |
+| `make proto-check` | Verifies checked-in Dart stubs match the protobuf sources; requires `protoc` and the Dart plugin. |
+| `make crypto-bench` | The repository's cryptography benchmark entry point. |
+
+The end-to-end suite covers measured-guest and certificate refusals, DKG, distinct tenants, boarding/settlement/sends, delegated renewal, payment requests, contribution isolation, reconstructed shares, exits, and service pairing. These tests exist in the source; this README does not imply a fresh successful run of every suite.
+
+For a complete E2E run, let the harness configure its own enclave. An existing one can be selected with:
+
 ```bash
-make threshold-test               # threshold library unit tests
-make ffi-test                     # merged FFI tests
-make e2e                          # Ark E2E (regtest + arkd + cosigner runtime + Dart harness)
-make cosigner-check               # the cosigner: build + `cargo test` (needs ~/enclave-runtime for the WIT check;
-                                  #   `cd cosigner && cargo test` runs the tests without it)
-make ffi-build && (cd app-core && dart test)
-                                  # the wallet core, headless: share reconstruction, the operation lifecycle
-                                  #   against an in-process cosigner, the store's no-secrets guard
-make crypto-bench                 # cryptography benchmarks (Criterion)
-make stress-test                  # multi-user E2E stress test
+make e2e-enclave ENCLAVE_RUN="$ENCLAVE_RUNTIME/target/qemu-nitro/merlin"
 ```
+
+An attached image must also allow the suite's escrow-service fixture and use a renewal margin suitable for the test timeout. The delegate test reports a skip if the deadline is too far away. Only one emulator stack can own the fixed MinIO port/vsock configuration at a time.
+
+The older GitHub E2E workflow still contains native-server assumptions. Treat the current Makefile, component harness, and actual run output as the validation recipe until CI is updated. Host tests, QEMU integration tests, Android device tests, and real Nitro validation establish different properties.
+
+## Repository guide
+
+| Path | Responsibility |
+|---|---|
+| [`app/`](app/) | Flutter Android UI, passkey platform integration, onboarding, payments, and exit display. |
+| [`app-core/`](app-core/) | Dart protocol orchestration, attested transport, passkey derivation, persistence, and Ark client operations. |
+| [`cosigner/`](cosigner/) | Rust Wasm component: gRPC handlers, signing, file-backed state, delegates, escrows, policy, and host capability bindings. |
+| [`crates/threshold/`](crates/threshold/) | FROST/DKG and supporting secp256k1 operations used by the guest and native FFI. |
+| [`crates/ark/`](crates/ark/) | Ark transaction/protocol primitives, delegate and exit construction, and contract VTXOs. |
+| [`crates/enclave-client/`](crates/enclave-client/) | Rust attestation verification used by the client through FFI. |
+| [`ffi/`](ffi/) | The merged C ABI for threshold, Ark, and enclave functionality. |
+| [`protocol/`](protocol/) | Protobuf contracts and generated Dart messages/stubs. |
+| [`cli/`](cli/) | Regtest wallet REPL using software passkeys and the same client core. |
+| [`e2e/`](e2e/) | QEMU harness, regtest integration scenarios, and test escrow service. |
+| [`infrastructure/mutinynet-qemu/`](infrastructure/mutinynet-qemu/) | Current emulated-enclave deployment and runbook. |
+| [`scripts/`](scripts/) | Component builds, interface checks, local stack startup, and development helpers. |
+| [`third_party/rust-sdk/`](third_party/rust-sdk/) | Ark SDK submodule and its own upstream license. |
+
+The runtime is maintained in its [separate repository](https://github.com/BitspendPayment/enclave-runtime). It owns the measured host and storage machinery; Merlin owns the application component and wallet clients.
 
 ## Security model summary
 
-- **The full private key never exists on any single device.** The Ark owner key is a 2-of-2 FROST split between the phone and the cosigner.
-- **The cosigner cannot unilaterally sign.** It always needs cooperation from the phone.
-- **The phone stores no private-key material.** Not the FROST share, not a blinded form of it, not the DKG dealer secret, not the passkey's PRF output. What is on disk is public: the wallet's identifier, its verifying share, the group key, the delegate and the pre-signed exits. The share is **rebuilt for each operation** — half derived from the passkey's PRF, half returned by the cosigner on the stream that operation already approved — checked against the stored verifying share, used for that stream's rounds, and let go. See [No key at rest](#no-key-at-rest) for how, and for what it does not promise.
-- **The passkey *is* the wallet.** The phone's dealer polynomial is derived from the passkey's PRF (`app-core/lib/passkey/key_derivation.dart`), not drawn at random, and the cosigner seals the half it dealt back. So the same passkey on a new phone does what the old phone did on every payment — derives its half, and is handed the other — with no seed phrase, no export, nothing to back up separately. A recovered wallet and a freshly made one are the same thing. The flip side is stated plainly: the passkey plus an approved call to the enclave is enough to reconstruct the share, so the platform's passkey security is the wallet's security.
-- **The cosigner runs in a Nitro Enclave with attested boot.** Clients refuse to send DKG packets to a runtime whose `PCR0` doesn't match a known build, and bind its response-signing key to the attestation.
-- **KMS secrets are PCR0-locked.** A modified runtime can't decrypt them even with the same IAM role.
-- **FROST keys are held by an isolated per-user native actor** — no shared mutable state, serial per-user processing, panic-recovered from a sealed snapshot.
-- **MPC requests are authenticated** with Schnorr signatures (or a passkey-minted session token) over timestamped messages, within a replay window.
-- **There is no wallet-alone signing path today.** An earlier on-chain single-key wallet is gone, and the key it used — the DKG dealer secret `a0` — is no longer stored; it remains derivable from the passkey, which is what the [recovery leaf](#the-better-answer-still-to-come) would spend with. What works with the cosigner gone is the [pre-signed exits](#emergency-exit), which need no key at all.
+- **Ordinary fresh wallet signatures require both FROST participants.** An unattended renewal executes an authorization the phone signed earlier; it does not give the cosigner the phone's share or permission for arbitrary new payments.
+- **The current Android wallet state format stores no FROST share, dealer secret, or PRF output.** Public identifiers, transaction metadata, delegates, and pre-signed exits remain privacy-sensitive. Secret copies can still exist temporarily in Dart/FFI memory.
+- **Passkey security is central.** The passkey's PRF plus an approved call to the correct cosigner reconstructs the phone's share. Restoration also depends on the cosigner retaining its state and the PRF behaving consistently on the restored device.
+- **The runtime supplies tenant scope and serialization.** The cosigner's file store is scoped to one tenant; encryption comes from the runtime filesystem, not from merely serializing a snapshot.
+- **Native clients verify PCR0, PCR16, and the connection certificate.** The provenance of their approved measurements and trust root is part of the security model.
+- **Production key release must approve both runtime and guest.** QEMU's development key and signing chain provide no confidentiality from the emulator operator.
+- **Pre-signed exits are limited recovery artifacts.** They cover specific outputs and destinations. Broadcasting ancestors, satisfying delays, and funding fees still matter; a phone-only recovery leaf is not implemented.
 
-The same 2-of-2 that stops the cosigner signing alone also stops *you* signing alone, which is
-why Ark balances depend on the cosigner being reachable. See
-[Trust assumptions & failure modes](#trust-assumptions--failure-modes) and
-[Emergency exit](#emergency-exit) before relying on this with real money.
+The same 2-of-2 requirement that prevents one participant creating an ordinary wallet signature alone creates an availability dependency on the cosigner. Read the [trust assumptions](#trust-assumptions--failure-modes) and [exit limitations](#emergency-exit) together with the [security findings](SECURITY_FINDINGS.md). The historical [production-readiness assessment](PRODUCTION_READINESS.md) is useful context, but includes findings against earlier server layouts and is not a current audit certificate.
 
 ## No key at rest
 
 **Status: implemented, in a development build. Not production-ready.**
+
+Here, “no key at rest” refers to the phone application's persisted FROST share and derivation
+secrets. The platform passkey remains a credential, and the cosigner persists its own signing
+share and the dealt contribution inside the runtime's encrypted store.
 
 A share is the sum of both dealers' polynomials at the wallet's identifier:
 
@@ -220,16 +360,18 @@ always did on `Send` and `Settle`; FROST's binding factor covers every commitmen
 theirs last. `Sign` is also now script-path only by name: it always was in effect, since the
 cosigner signs untweaked and checks every share.
 
-**Who may have the contribution.** Tenants are isolated by the runtime — one instance and one store
-per passkey — so an instance can only ever answer for its own wallet; the cosigner has no table of
-tenants to get wrong. Within an instance it answers only the identifier the ceremony recorded.
+**Who may have the contribution.** The runtime gives each tenant its own filesystem scope and
+execution slot over one shared encrypted filesystem. A cosigner invocation opens only that
+tenant's wallet; the guest does not route between tenants. Within an instance it answers only
+the identifier the ceremony recorded.
 That identifier is public, so the check authenticates nobody; it tells a wallet that is not this
 one — a wrong passkey, a PRF that answers differently — so, instead of handing it a scalar that
 would not add up.
 
-**What this changes in the threat model.** A stolen or imaged phone now yields nothing secret:
-before, it yielded a blinded share whose blinding the same passkey could remove, and a dealer secret
-in the clear. What it does *not* change is what `Recover` already made true: a passkey's PRF output
+**What this changes in the threat model.** Copying the current wallet application state no longer
+yields a persisted FROST share or dealer secret. Access to the platform passkey, live process
+memory, old development files, or an unlocked device remains a separate concern. As with
+`Recover`, a passkey's PRF output
 plus an approved call is the wallet's half of the key. Releasing the contribution on every approved
 operation gives an attacker who has both nothing they could not already ask for.
 
@@ -248,9 +390,9 @@ operation gives an attacker who has both nothing they could not already ask for.
   share was kept cannot serve any of this ("created before recovery existed"); that tenant has to
   be reset too.
 - **No new offline capability, and none lost.** Signing always needed the cosigner — it is a 2-of-2
-  — so rebuilding the share from it adds no dependency that was not there. The pre-signed exits
-  hold no secret and need none to broadcast; the cosigner's unattended renewals use no wallet
-  share. Both are unaffected.
+  — so rebuilding the share from it adds no dependency that was not there. A saved exit needs
+  no fresh FROST signature, although its ancestors, delay, and fee funding still matter. The
+  cosigner's unattended renewal executes a previously signed delegate without the phone's share.
 - **PRF stability across devices is still assumed, not proved** — see `SECURITY_FINDINGS.md` RC-2.
   It now matters for every payment rather than only for recovery, which also means a PRF that
   drifted would be noticed on the first payment rather than on the day the phone is lost.
@@ -267,16 +409,17 @@ you have to trust for it not to.
 
 ### The one that matters: the Ark owner key is 2-of-2
 
-Every VTXO and every boarding output is owned by the **FROST group key**, not by the phone's own
-key ([`bitcoin.dart`](app-core/lib/bitcoin.dart#L191-L194) — *"the FROST group key stays the Ark
-owner key (boarding + VTXO)"*). The stock Ark taptree gives a VTXO two spend paths:
+Ordinary wallet VTXOs and boarding outputs use the **FROST group key** as their owner key
+([`MpcClient._ownerXOnly`](app-core/lib/client.dart)). Escrow contracts have their own key and
+policy arrangements. The stock Ark taptree used for ordinary wallet outputs has two spend paths:
 
 ```
 forfeit leaf:  <asp_pk> OP_CHECKSIGVERIFY <owner_pk> OP_CHECKSIG
 exit leaf:     <delay>  OP_CSV OP_DROP    <owner_pk> OP_CHECKSIG
 ```
 
-(`Vtxo::new_default` → `multisig_script` + `csv_sig_script`, `ark-core/src/{vtxo,script}.rs`.)
+See [`Vtxo::new_default`](cosigner/vendor/ark-core/src/vtxo.rs) and the
+[`multisig_script` / `csv_sig_script` builders](cosigner/vendor/ark-core/src/script.rs).
 
 Both name `owner_pk`, and here it is the group key. The exit timelock controls
 when funds can be spent; it does not remove the need for a group-key signature.
@@ -286,59 +429,73 @@ transactions and satisfying the delay. Uncovered funds have no such fallback.
 The app can export saved exits and display their ancestry, but does not broadcast
 the full exit path. There is no separate on-chain wallet or offline spending mode.
 
-### AWS
+### AWS and the runtime
 
-The cosigner runs on AWS. In production it is a Nitro Enclave whose KMS secrets are PCR0-locked,
-which is what stops *us* from extracting your share — and is also why an account termination,
-a destroyed KMS key, or a lost data volume is unrecoverable **by anyone, including us**. The
-sealing that makes the operator untrusted for confidentiality makes AWS trusted for availability.
-That is a deliberate trade, and it is the whole reason the section below exists.
+The intended production deployment uses a real Nitro enclave and KMS recipient release bound to
+both the runtime image and the cosigner component. Hardware isolation, key policy, authenticated
+storage responses, correct runtime code, and correctly provisioned client pins all contribute to
+that boundary. The runtime remains under correctness review; storage recovery and guest lifecycle
+failures can directly affect wallet state and must be resolved before production use.
 
-The mutinynet deployment ([infrastructure/mutinynet-qemu/](infrastructure/mutinynet-qemu/)) runs
-the cosigner in an *emulated* enclave. The app attests it like any other, but on an emulator the
-host's operator can read every tenant's data and sign attestation documents, so it proves the image
-and the guest, not the hardware. It is signet-only for that reason.
+The parent can deny service. Loss of the cosigner's durable state or of the keys required to read
+it prevents new signatures and share reconstruction unless an adequate recovery/backup arrangement
+exists. The phone's public state does not replace the cosigner's share or dealt contribution.
+Saved exits remain useful only for the specific outputs and destination they cover.
+
+The [MutinyNet deployment](infrastructure/mutinynet-qemu/) uses an emulated enclave. Its operator
+controls the development storage key and the attestation signing chain. The client exercises its
+verification path against configured emulator pins; this does not establish confidentiality or
+independent code identity against that operator.
 
 ### The ASP
 
-Liveness for anything Ark: sends, settlements, receiving. If the ASP is down you fall back to
-on-chain. If the ASP is *malicious* it cannot steal — the forfeit leaf needs your signature too —
-but it can refuse service, and refusing service is what makes unilateral exit necessary, which
-loops back to the 2-of-2 problem above. We depend on a third-party ASP
-(`https://mutinynet.arkade.sh` today); we do not run it.
+Normal Ark operations depend on an available ASP and the protocol it implements. An unavailable
+ASP can prevent sends, settlement, renewal, and discovery of current state. Owner signatures are
+part of the spend authorization, but that does not remove the need to validate ASP responses or
+provide a practical recovery path.
+
+The available fallback is a covered pre-signed exit plus the necessary ancestor publication,
+timelocks, and fees. The app can inspect/export the material it has; automatic full-chain exit
+broadcasting and a general phone-only spending path are not implemented. The MutinyNet runbook
+configures an external ASP rather than an ASP operated by this repository.
 
 ### What Ark's privacy does *not* give you
 
-Ark keeps VTXOs off-chain. That is a scalability property, and it is routinely mistaken for a
-privacy one. It is not CoinJoin and it is not a mixnet:
+Keeping VTXOs off-chain does not hide all wallet activity from the services involved:
 
-- **The ASP sees everything** — every VTXO, every amount, and the sender/recipient pairing inside
-  every round. It is a full observer of your transaction graph, by construction.
-- **So does our cosigner.** It persists `vtxo_store`, `ark_tx_history`, `ark_script_to_user`,
-  `boarding_watches`, and your request-to-pay contacts. Enclave sealing keeps that from the
-  *operator*; it does not make the data not exist, and a future compelled-access or
-  implementation-flaw scenario is about that data.
+- **The ASP processes transaction information.** Inputs, outputs, amounts, and their relationships
+  are available to it through the operations it serves. Treat it as a participant with access to
+  sensitive payment metadata.
+- **The cosigner also processes wallet metadata.** Its snapshot includes VTXOs, history,
+  contacts, delegates, and escrow state. Production enclave storage is intended to keep this
+  from the host operator; it does not make the data invisible to the approved application or
+  eliminate implementation and logging risks.
 - **Exiting is public and linking.** A unilateral exit publishes your branch of the VTXO tree
   on-chain, tying those outputs together for anyone watching.
 - **Boarding and exit are on-chain events** with ordinary on-chain traceability.
 
-Treat Ark here as cheap, fast custody-minimised payments — not as anonymity.
+Off-chain operation alone does not establish anonymity; evaluate the information disclosed to each participant.
 
 ## Emergency exit
 
-**Status: the fallback is built. The recovery leaf is still designed, not implemented.**
+**Status: exit construction, verification, and export are implemented. Full exit broadcasting
+and a phone-only recovery leaf remain unfinished.**
 
-The wallet now holds **pre-signed exit transactions**, one per VTXO. At every seal — the end of
-each send, settle and renewal — the cosigner co-signs a spend of each VTXO through its *existing*
-exit leaf, paying an address in a wallet this app does not control, and the phone keeps it. They
-are on the Exit tab, and can be copied out as raw transactions. Nothing else is needed to broadcast
-them: no cosigner, no ASP, no key this phone does not already have.
+When an external exit destination is configured, the seal at the end of an interactive wallet
+operation can produce **pre-signed exit transactions** for eligible held VTXOs. The phone and
+cosigner sign a spend through each output's existing exit leaf, paying the configured address in
+a wallet this app does not control. The phone saves the transactions; the Exit tab displays them
+and supports raw export. Outputs that cannot produce a valid exit, including those below the
+builder's dust threshold, can remain uncovered. Without an exit destination, no exits are built.
 
-What it costs is per-VTXO bookkeeping and reissue on every operation, both of which ride the seal
-that already runs. What it does not cover is a VTXO created while nobody was here: a renewal the
-cosigner performs on its own makes a new output, and only its owner can sign its exit, so those
-funds have no exit until the wallet is next opened and seals again. The Exit tab says which funds
-are covered and which are not.
+An existing signature removes the need to ask the cosigner for another signature for that
+covered spend. Publishing the required ancestors, satisfying the exit delay, and supplying fees
+are still necessary. Coverage is specific to an output and destination, so spending or renewing
+funds requires new exit material.
+
+An unattended renewal creates a new output without a new phone-signed exit. Those funds remain
+uncovered until the owner returns and completes another seal with an exit destination. The Exit
+tab shows which held funds are covered and which are not.
 
 An exit pays no fee. It carries a P2A anchor instead, so whoever broadcasts it attaches a child
 that pays for both — a fee fixed at signing time would be a guess about a fee market years away,
@@ -347,75 +504,42 @@ off-chain in the first place — the batch tree branch, and the checkpoint and A
 funds not yet settled — is not in the app yet; the exit is the last hop, and the one that cannot be
 obtained later.
 
-Implementation: `crates/ark/src/exit.rs` (both sides build it), `ffi/src/ark/exit.rs` (and the
-wallet's check that what it is asked to sign is its own), `cosigner/src/handlers/delegate.rs`,
-`app-core/lib/sessions/exit_plan.dart`, `app/lib/screens/exit/exit_screen.dart`.
+Implementation: [`exit.rs`](crates/ark/src/exit.rs) (shared transaction construction),
+[`FFI exit verification`](ffi/src/ark/exit.rs), [`delegate.rs`](cosigner/src/handlers/delegate.rs),
+[`exit_plan.dart`](app-core/lib/sessions/exit_plan.dart), and
+[`exit_screen.dart`](app/lib/screens/exit/exit_screen.dart).
 
 ### The better answer, still to come
 
-A pre-signed exit is a snapshot; a **third taptree leaf spendable by a recovery key the phone
-controls alone**, after a long CSV delay, would need no snapshots at all:
+A proposed **third taptree leaf spendable by a phone-controlled recovery key after a long CSV
+delay** would address outputs for which no pre-signed exit was obtained. It is a design proposal,
+not a currently usable recovery path:
 
-```
-forfeit  leaf:  <asp_pk>       OP_CHECKSIGVERIFY <group_pk>    OP_CHECKSIG   # cooperative, today
-exit     leaf:  <exit_delay>   OP_CSV OP_DROP    <group_pk>    OP_CHECKSIG   # today (still 2-of-2)
-recovery leaf:  <recov_delay>  OP_CSV OP_DROP    <recovery_pk> OP_CHECKSIG   # new
-```
-
-Three things make this cheap rather than speculative, and all three already exist in this
-repository:
-
-**The recovery key already exists and needs no new custody.** `recovery_pk` is the DKG dealer
-secret `a0` — `walletPolynomial(seed).a0`, derived from the passkey's PRF
-([`key_derivation.dart`](app-core/lib/passkey/key_derivation.dart)). It is no longer stored on the
-phone, and does not need to be: the passkey that derives it is what the platform already syncs.
-Spending through this leaf would need the passkey and nothing else — no cosigner, no enclave — which
-is exactly the property the leaf is for. No new secret, no new backup surface, no extra thing to
-lose.
-
-**The cosigner already knows it.** That key's public point *is* the DKG `walletVk`, which the
-wallet sends during onboarding and the cosigner already persists as `wallet_vk`
-([`state.rs:192`](cosigner-runtime/src/cosigner/state.rs#L192)). Both sides can derive the same
-three-leaf address today with no new protocol message.
-
-**The ASP does not need to know or approve.** An Ark address is just `(server_key, vtxo_tap_key)`;
-the taptree is committed inside the output key, and arkd mints and co-signs against the
-cooperative path without inspecting the rest. That is not a hope — this project already ships
-contract eVTXOs built exactly this way. [`evtxo_tree`](crates/ark/src/lib.rs#L181-L193) takes the
-cooperative key and the exit-leaf key as **separate parameters**:
-
-```rust
-let cooperative = TapLeaf::new(contract_cooperative_script(commit, server_pk, evtxo_pk));
-let exit        = TapLeaf::new(evtxo_exit_script(exit_delay, owner_pk));   // different key
+```text
+forfeit  leaf:  <asp_pk>       OP_CHECKSIGVERIFY <group_pk>    OP_CHECKSIG   # cooperative
+exit     leaf:  <exit_delay>   OP_CSV OP_DROP    <group_pk>    OP_CHECKSIG   # still 2-of-2
+recovery leaf:  <recov_delay>  OP_CSV OP_DROP    <recovery_pk> OP_CHECKSIG   # proposed
 ```
 
-`ContractPolicy.owner_pk` is literally documented as "user-supplied exit-leaf owner x-only key",
-and the whole path is e2e-verified spending through arkd on regtest. The recovery leaf is the same
-construction with the recovery key in that slot.
+The candidate recovery scalar is the wallet's dealer secret `a0`, derived by
+[`walletPolynomial`](app-core/lib/passkey/key_derivation.dart) from the passkey PRF. Its public
+point could authorize a delayed recovery spend without reconstructing the ordinary group key.
+That would still depend on possession of a functioning passkey and stable derivation.
 
-The gap is narrow: plain wallet VTXOs still go through `Vtxo::new_default`, which reuses one
-`owner` for both leaves. eVTXOs got the better construction; ordinary VTXOs did not.
+The [contract VTXO builder](crates/ark/src/lib.rs) already demonstrates separate cooperative and
+exit-owner keys. This is useful implementation groundwork, not proof that a new ordinary-wallet
+three-leaf design is compatible with every ASP, fee model, or recovery scenario. The recovery
+key must be explicitly threaded and validated through the wallet/cosigner data model.
 
-The honest costs:
+Work remaining includes the taptree/address changes on both sides, a reviewed recovery delay and
+threat model, boarding/output migration, ASP compatibility checks, ancestor and fee handling, and
+an app broadcast flow. Existing outputs would keep their existing scripts until moved into new
+ones. A meaningful acceptance test would disable the cosigner and ASP and still recover covered
+funds using only the intended recovery credentials and chain access.
 
-- **A stolen phone gets the balance once `recov_delay` elapses.** Today a thief with the phone
-  cannot touch Ark funds without the cosigner. `recov_delay` must therefore be long — months, not
-  days — so the leaf only fires on genuine abandonment, and it must comfortably exceed the ASP's
-  own exit delay so the ASP's forfeit assumptions are never undercut.
-- **It is forward-only.** Changing the taptree changes the address, so existing VTXOs keep the
-  old script until they are re-settled. Boarding outputs need the same treatment.
-- **It depends on ASPs continuing not to constrain taptrees.** If arkade later requires
-  registering or validating VTXO scripts, this needs their buy-in.
-
-That last risk is why the pre-signed exits above were built first: they need no script change at
-all, so they work even against an ASP that rejects non-default taptrees. The recovery leaf would
-replace them with something that covers every VTXO the moment it exists, including the ones the
-cosigner makes while nobody is watching.
-
-Scope to close it: extend the taptree builder in `crates/ark` to the three-leaf form, thread
-`wallet_vk` through as the recovery key on both sides, add an exit-broadcast flow in the app, and
-a regtest E2E that permanently kills the cosigner *and* the ASP and still drains a wallet
-on-chain.
+The tradeoff also changes: an attacker who can use the recovery credential could spend after its
+delay. That delay and the relationship to existing Ark scripts need protocol review. Pre-signed
+exits remain the implemented mechanism while this broader path is unfinished.
 
 ## References
 
@@ -424,15 +548,15 @@ on-chain.
 - [BIP-341: Taproot](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki)
 - [Ark protocol](https://arkdev.info/) — off-chain VTXOs via an Ark Service Provider
 - [AWS Nitro Enclaves](https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave.html)
-- [introspector-enclave](https://github.com/ArkLabsHQ/introspector-enclave) — enclave host/runtime plumbing
+- [enclave-runtime](https://github.com/BitspendPayment/enclave-runtime) — the Wasm host, encrypted filesystem, attestation, and background capabilities used by Merlin
 
 ## License
 
-[MIT](LICENSE) — use it, fork it, run your own cosigner. Nothing here is licensed in a way that
-lets us strand you: the client, the cosigner runtime, the threshold library, and the deployment
-stack are all in this repository.
+This repository is [MIT-licensed](LICENSE). The client, cosigner component, threshold library,
+and repository-owned deployment code can be inspected and used under those terms.
 
-Third-party code keeps its own licensing and is not covered by the above:
-`third_party/rust-sdk` is a submodule ([arkade-os/rust-sdk](https://github.com/arkade-os/rust-sdk),
-MIT, see its own `LICENSE`), and the vendored crates under `cosigner-runtime/vendor/`
-remain under the licences of their respective upstreams.
+Third-party dependencies retain their own licenses. The runtime lives in its separate
+[Apache-2.0-declared workspace](https://github.com/BitspendPayment/enclave-runtime/blob/merkle-block-store/Cargo.toml).
+The [`third_party/rust-sdk`](third_party/rust-sdk/) submodule and vendored crates under
+[`cosigner/vendor`](cosigner/vendor/) retain their upstream licensing; this repository's MIT
+license does not replace it.
