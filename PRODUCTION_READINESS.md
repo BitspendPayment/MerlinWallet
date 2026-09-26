@@ -41,6 +41,16 @@ The MPC Wallet has working cryptography (FROST 2-of-2, Ark integration, MutinyNe
 - No key share backup/export mechanism anywhere in the codebase
 - If Sled DB is lost, all user wallets are permanently unrecoverable
 - **Impact**: Single point of failure for all funds
+- **Note (client-side recovery):** the *phone* half is now recoverable — it is derived from the
+  passkey's PRF, and the cosigner seals the half it dealt so a new device can rebuild the share
+  (`cosigner/src/handlers/recover.rs`). That makes this item **more** load-bearing, not less: the
+  cosigner's seal is now the only copy of anything, and losing it loses both the cosigner's share
+  and the half a user would recover with.
+  It is heavier again now that the phone keeps no share at all: the sealed contribution is read on
+  **every** signing operation, not only on recovery, so a lost seal stops payments the same day
+  rather than on the day a phone is replaced. (Signing already needed the cosigner's own share out
+  of the same seal, so this is one more field in a blob that was already indispensable — but it is
+  worth saying that nothing on the phone can stand in for it.)
 
 ---
 
@@ -58,10 +68,16 @@ The MPC Wallet has working cryptography (FROST 2-of-2, Ark integration, MutinyNe
 - `bitcoin/history.rs:178` -- `duration_since()` panics if system clock goes backwards
 - `main.rs:80` -- `panic!("Unknown persistence backend")`
 
-### 10. Key shares unencrypted by default on client
+### 10. Client store unencrypted by default — no longer holds key material
 - `app/lib/services/mpc_service.dart` never passes a `HiveCipher` to `MpcClient` or `WalletStore`
-- Signing secret stored in plaintext Hive box on device
-- PIN-derived encryption exists but is NOT wired up
+- The box no longer holds any private-key material: no share (blinded or not), no dealer secret.
+  The share is rebuilt per operation from the passkey's PRF and the cosigner's sealed contribution
+  (README "No key at rest"; `SECURITY_FINDINGS.md` RC-3). `WalletStore` refuses the old keys.
+- What is still in the clear is privacy-relevant, not spend-relevant: the group key, VTXO
+  outpoints, the exit address, and the pre-signed exit transactions (which pay only that address)
+- Argon2/AES store encryption exists and is tested, but is still NOT wired up in the app
+- Still not production-ready for other reasons: secrets in memory are not zeroizable in Dart, PRF
+  cross-device stability is unproven (RC-2), and old development state needs a manual reset
 
 ### 11. No graceful shutdown
 - In-flight DKG/signing sessions lost on kill

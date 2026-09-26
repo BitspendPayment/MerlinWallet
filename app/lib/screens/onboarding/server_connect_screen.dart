@@ -28,7 +28,11 @@ class _ServerConnectionScreenState extends State<ServerConnectionScreen> {
     try {
       await context.read<MpcService>().setHost(host);
       if (!mounted) return;
-      context.push('/onboarding/dkg', extra: extras);
+      // A restore skips creating a passkey: it goes looking for the one that already exists.
+      context.push(
+        extras['isRestore'] == true ? '/onboarding/restore' : '/onboarding/passkey',
+        extra: extras,
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() => _selecting = null);
@@ -63,7 +67,7 @@ class _ServerConnectionScreenState extends State<ServerConnectionScreen> {
               icon: Icons.shield_outlined,
               title: 'Mutiny',
               subtitle: 'Mutinynet (signet) at mutiny.vtxos.network — test coins, '
-                  'not enclave-attested',
+                  'emulated enclave',
               busy: _selecting == _mutinyHost,
               disabled: _selecting != null && _selecting != _mutinyHost,
               onTap: () => _pick(_mutinyHost),
@@ -75,7 +79,7 @@ class _ServerConnectionScreenState extends State<ServerConnectionScreen> {
                 icon: Icons.developer_board,
                 title: 'Regtest (local)',
                 subtitle:
-                    'Local cosigner-runtime on $_regtestHost — emulator',
+                    'Local cosigner on $_regtestHost — emulator',
                 busy: _selecting == _regtestHost,
                 disabled: _selecting != null && _selecting != _regtestHost,
                 onTap: () => _pick(_regtestHost),
@@ -86,7 +90,7 @@ class _ServerConnectionScreenState extends State<ServerConnectionScreen> {
                 icon: Icons.phone_android,
                 title: 'Regtest (phone)',
                 subtitle:
-                    'Local cosigner-runtime on $_regtestPhoneHost — physical phone via adb reverse',
+                    'Local cosigner on $_regtestPhoneHost — physical phone via adb reverse',
                 busy: _selecting == _regtestPhoneHost,
                 disabled:
                     _selecting != null && _selecting != _regtestPhoneHost,

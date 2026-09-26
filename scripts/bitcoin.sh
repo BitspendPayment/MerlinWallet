@@ -37,6 +37,16 @@ cmd_init() {
     bcli_no_wallet createwallet "default" > /dev/null 2>&1 || bcli_no_wallet loadwallet "default" > /dev/null 2>&1 || true
   fi
 
+  # Exactly one loaded wallet. NBXplorer — arkd-wallet's indexer — calls wallet RPCs on the root
+  # path, which bitcoind only answers when a single wallet is loaded; with two it fails every
+  # rescan, and arkd surfaces that as "failed to rescan boarding utxos". The `false` also drops the
+  # wallet from settings.json's load-on-startup list, so a bitcoind restart does not bring it back.
+  local other
+  for other in $(bcli_no_wallet listwallets | jq -r '.[] | select(. != "default") | @json'); do
+    echo "Unloading wallet $other (NBXplorer needs exactly one)..."
+    bcli_no_wallet unloadwallet "$(jq -r . <<<"$other")" false > /dev/null
+  done
+
   local addr
   addr=$(bcli getnewaddress "" bech32m)
   echo "Mining 150 blocks to $addr..."

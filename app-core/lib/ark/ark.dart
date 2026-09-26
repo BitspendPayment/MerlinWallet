@@ -11,6 +11,66 @@ import 'package:bitcoin_base/bitcoin_base.dart';
 import 'src/bindings.dart';
 import 'src/ffi_result.dart';
 
+/// Where this wallet receives off-chain.
+///
+/// The cosigner used to derive this and hand it back over `GetArkAddress` — an RPC that took a key
+/// the caller already held and ran ark-core over it. The Rust side has a parity test against
+/// `ark::client::address`, which is what makes deriving here safe rather than a second guess at a
+/// consensus-critical taptree.
+///
+/// [ownerXOnlyHex] is this wallet's group key, x-only. [aspPubkeyHex] may be x-only or compressed —
+/// the ASP publishes the compressed form.
+String arkAddress({
+  required String ownerXOnlyHex,
+  required String aspPubkeyHex,
+  required int exitDelay,
+  required String network,
+}) =>
+    _deriveAddress(arkAddressFfi, ownerXOnlyHex, aspPubkeyHex, exitDelay, network);
+
+/// Where this wallet receives on-chain, to be boarded into Ark.
+String boardingAddress({
+  required String ownerXOnlyHex,
+  required String aspPubkeyHex,
+  required int exitDelay,
+  required String network,
+}) =>
+    _deriveAddress(
+        arkBoardingAddressFfi, ownerXOnlyHex, aspPubkeyHex, exitDelay, network);
+
+/// The scriptPubKey this wallet's VTXOs sit under, for querying the indexer.
+///
+/// A wallet has TWO — one per exit delay. A boarded VTXO keeps the boarding delay while received
+/// and refreshed ones use the unilateral delay, so they sit under different scripts, and asking for
+/// one makes the other bucket invisible.
+String vtxoScriptPubkeyHex({
+  required String ownerXOnlyHex,
+  required String aspPubkeyHex,
+  required int exitDelay,
+  required String network,
+}) =>
+    _deriveAddress(
+        arkVtxoScriptPubkeyHexFfi, ownerXOnlyHex, aspPubkeyHex, exitDelay, network);
+
+String _deriveAddress(
+  dynamic fn,
+  String ownerXOnlyHex,
+  String aspPubkeyHex,
+  int exitDelay,
+  String network,
+) {
+  final ownerPtr = ownerXOnlyHex.toNativeUtf8();
+  final aspPtr = aspPubkeyHex.toNativeUtf8();
+  final netPtr = network.toNativeUtf8();
+  try {
+    return callFfiData(fn(ownerPtr, aspPtr, exitDelay, netPtr));
+  } finally {
+    calloc.free(ownerPtr);
+    calloc.free(aspPtr);
+    calloc.free(netPtr);
+  }
+}
+
 /// Spend info for a taproot script-path leaf.
 class SpendInfo {
   /// Raw script bytes (hex-encoded).

@@ -29,16 +29,17 @@ class _DkgProgressScreenState extends State<DkgProgressScreen> {
 
   void _startDkg() async {
     final mpcService = context.read<MpcService>();
-    // Wait for Init
-    if (!mpcService.isInitialized) {
-      await _addLog('Client init failed or slow. Retrying...');
-    }
-
-    await _addLog('Connected to server.');
-    setState(() => _currentStep = 0);
-
     try {
+      await mpcService.initFuture;
+      if (!mounted) return;
+      if (!mpcService.isInitialized) {
+        throw StateError('Client initialization failed');
+      }
+      await _addLog('Preparing wallet creation...');
+      setState(() => _currentStep = 0);
+
       await _addLog('Starting Distributed Key Generation...');
+      if (!mounted) return;
       setState(() => _currentStep = 1);
 
       await Future.delayed(const Duration(milliseconds: 500)); // UI pacing
@@ -47,11 +48,13 @@ class _DkgProgressScreenState extends State<DkgProgressScreen> {
       await mpcService.doDkg();
 
       await _addLog('DKG Finalized successfully.');
+      if (!mounted) return;
       setState(() => _currentStep = 2);
       await Future.delayed(const Duration(seconds: 1));
 
       if (mounted) {
-        context.push('/onboarding/passkey');
+        // The key exists; now the one thing it cannot be given later — somewhere to exit to.
+        context.push('/onboarding/exit-address');
       }
     } catch (e) {
       await _addLog('Error: $e');

@@ -32,6 +32,7 @@ use crate::client::types::ArkInfo;
 // ---------------------------------------------------------------------------
 
 /// VTXO input descriptor for off-chain send.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendVtxoInput {
     pub txid: String,
     pub vout: u32,
@@ -346,6 +347,34 @@ impl SendSession {
             final_checkpoints.push(encode_psbt_b64(&asp_cp));
         }
         Ok(final_checkpoints)
+    }
+
+    /// The transactions as built, before anybody has signed: the ark tx and one checkpoint per
+    /// input, base64 PSBTs.
+    ///
+    /// For a counterparty that has to submit *exactly* what was approved rather than rebuild it.
+    /// `build` is deterministic, so a party running it over the same inputs gets the same bytes —
+    /// but "the same, we checked" is a weaker thing to rest a release on than "these, verbatim",
+    /// and a signature is only valid over the transaction whose sighashes it covers anyway.
+    pub fn unsigned(&self) -> (String, Vec<String>) {
+        (
+            encode_psbt_b64(&self.ark_tx),
+            self.checkpoint_txs.iter().map(encode_psbt_b64).collect(),
+        )
+    }
+
+    /// The ark transaction's id, known as soon as it is built.
+    ///
+    /// Fixed before anything is signed: these are taproot script-path spends, so the signatures go
+    /// in the witness and the txid does not move. That is what lets a caller write down what it is
+    /// about to submit, and afterwards ask the chain whether it landed.
+    pub fn ark_txid(&self) -> String {
+        self.ark_tx.unsigned_tx.compute_txid().to_string()
+    }
+
+    /// The ark transaction's outputs — where the money actually goes — for a policy to judge.
+    pub fn outputs(&self) -> &[bitcoin::TxOut] {
+        &self.ark_tx.unsigned_tx.output
     }
 
     /// Mark the session complete after finalization succeeds.

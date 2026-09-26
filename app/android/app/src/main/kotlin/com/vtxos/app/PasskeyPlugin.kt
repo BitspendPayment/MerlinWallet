@@ -15,7 +15,9 @@ import androidx.credentials.GetCredentialResponse
 import androidx.credentials.GetPublicKeyCredentialOption
 import androidx.credentials.PublicKeyCredential
 import androidx.credentials.exceptions.CreateCredentialException
+import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.GetCredentialException
+import androidx.credentials.exceptions.NoCredentialException
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -136,10 +138,19 @@ class PasskeyPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHand
             return
         }
 
+        // With `immediate`, a passkey that is not usable on this device right now fails fast as
+        // NoCredentialException instead of opening the "Sign in another way" sheet. A passkey that
+        // was created seconds ago is in exactly that state until the provider has indexed it, so
+        // the app can wait for it without putting UI in front of the user.
+        val immediate = call.argument<Boolean>("immediate") ?: false
+
         val flutterResult = result
         val cm = CredentialManager.create(activity)
         val option = GetPublicKeyCredentialOption(requestJson)
-        val request = GetCredentialRequest(listOf(option))
+        val request = GetCredentialRequest(
+            listOf(option),
+            preferImmediatelyAvailableCredentials = immediate,
+        )
         cm.getCredentialAsync(
             activity,
             request,
@@ -153,7 +164,12 @@ class PasskeyPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHand
 
                 override fun onError(e: GetCredentialException) {
                     Log.e(TAG, "getCredential failed", e)
-                    mainHandler.post { flutterResult.error("passkey_get", e.message, null) }
+                    val code = when (e) {
+                        is NoCredentialException -> "passkey_no_credential"
+                        is GetCredentialCancellationException -> "passkey_cancelled"
+                        else -> "passkey_get"
+                    }
+                    mainHandler.post { flutterResult.error(code, e.message, null) }
                 }
             },
         )

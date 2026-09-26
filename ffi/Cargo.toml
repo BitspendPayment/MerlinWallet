@@ -8,7 +8,7 @@ name = "mpcwallet_ffi"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-ark = { path = "../crates/ark", features = ["std"] }
+ark = { path = "../crates/ark", features = ["std", "exit"] }
 ark-core = "0.9"
 bitcoin = { version = "0.32", features = ["serde"] }
 threshold = { path = "../crates/threshold", features = ["std"] }
@@ -20,3 +20,10 @@ enclave-client = { path = "../crates/enclave-client" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
+
+[dev-dependencies]
+# `ark/signing` only for the parity test in src/ark/address.rs, which compares this crate's
+# derivation against `ark::client::address`. A dev-dependency rather than a feature on the real one:
+# `signing` drags `tonic-build` into ark's build script, and the four Android ABIs, iOS and the
+# enclave should not need `protoc` to build a library that never calls a prost type.
+ark = { path = "../crates/ark", features = ["signing"] }

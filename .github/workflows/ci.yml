@@ -1,0 +1,169 @@
+# Four jobs. Three run on any runner: the cosigner's tests (on the host — the component's wasm
+# build proves nothing more), the threshold and FFI crates, every Dart package's analysis and
+# tests, and the app under Flutter. The fourth is the enclave e2e — the only thing that proves the
+# ceremonies end to end — booted from a prebuilt dev enclave (enclave-bundle.lock, a release of
+# enclave-runtime with the QEMU image inside it) on a hosted runner's KVM, exactly as
+# enclave-runtime's own CI boots one. Nested virtualisation there works but is not something
+# GitHub supports, so that job is the one that can fail for reasons outside this repository; its
+# logs are uploaded when it does.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A superseded push's run is not worth finishing.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (cosigner, threshold, ffi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cosigner/target
+            crates/threshold/target
+            ffi/target
+          key: rust-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: rust-
+      - name: cosigner tests
+        run: cd cosigner && cargo test
+      - name: threshold tests
+        run: cd crates/threshold && cargo test --features std
+      - name: ffi build and tests
+        run: |
+          cargo build --release --manifest-path ffi/Cargo.toml
+          cargo test --release --manifest-path ffi/Cargo.toml
+      - name: Share the FFI library with the Dart job
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffi
+          retention-days: 1
+          path: ffi/target/release/libmpcwallet_ffi.so
+
+  dart:
+    name: Dart (protocol, app-core, cli, e2e)
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ffi
+          # Where `app-core/lib/threshold/src/native_library.dart` looks, walking up from cwd.
+          path: ffi/target/release
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.12.2'
+      - name: Install protoc and the Dart plugin
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          # Pinned: the generator must match the protobuf runtime `protocol` pins (^3.1.0). The
+          # latest plugin emits code for protobuf 6, which does not analyze against 3.
+          dart pub global activate protoc_plugin 21.1.2
+      # The generated Dart is not checked in.
+      - name: Generate protocol stubs
+        run: make proto
+      - name: Analyze every package
+        run: |
+          for pkg in protocol app-core cli e2e; do
+            (cd $pkg && dart pub get && dart analyze)
+          done
+      - name: app-core tests
+        run: cd app-core && dart test
+
+  flutter:
+    name: Flutter (analyze, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Install protoc and the Dart plugin
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          # Pinned: the generator must match the protobuf runtime `protocol` pins (^3.1.0). The
+          # latest plugin emits code for protobuf 6, which does not analyze against 3.
+          dart pub global activate protoc_plugin 21.1.2
+      - name: Generate protocol stubs
+        run: make proto
+      - name: Analyze and test
+        run: |
+          cd app
+          flutter pub get
+          # Infos are style, and there are a few dozen pre-existing ones; errors and warnings fail.
+          flutter analyze --no-fatal-infos
+          flutter test
+
+  enclave-e2e:
+    name: Enclave e2e (prebuilt dev enclave, KVM)
+    needs: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # The bundle, once fetched. Absolute: the harness runs the enclave from it.
+      ENCLAVE_RUNTIME: ${{ github.workspace }}/.enclave
+      # The FFI comes from the rust job; do not build it again.
+      FFI_DEP: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ffi
+          path: ffi/target/release
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cosigner/target
+          key: enclave-e2e-${{ hashFiles('cosigner/Cargo.lock', 'cosigner/Cargo.toml') }}
+          restore-keys: enclave-e2e-
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.12.2'
+      - name: Install protoc and the Dart plugin
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          # Pinned: the generator must match the protobuf runtime `protocol` pins (^3.1.0). The
+          # latest plugin emits code for protobuf 6, which does not analyze against 3.
+          dart pub global activate protoc_plugin 21.1.2
+      - name: Let this user open KVM, and load the vsock loopback transport
+        # What enclave-runtime's scripts/ci-e2e.sh does on the same runners: /dev/kvm exists but is
+        # root-owned, and the harness forwards the enclave's vsock to host loopback.
+        run: |
+          if [ -e /dev/kvm ] && [ ! -r /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+          [ -e /dev/vsock ] || sudo modprobe vsock_loopback
+      - name: Fetch the pinned dev enclave, wasi-sdk, and the protocol stubs
+        run: make enclave-bundle wasi-sdk proto
+      - name: The suite, against the enclave
+        run: make e2e-enclave E2E_TIMEOUT=30m
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: enclave-e2e-logs
+          path: .enclave/target/qemu-nitro/merlin/*.log

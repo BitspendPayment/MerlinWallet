@@ -9,8 +9,10 @@ use std::ptr;
 
 use ark::taptree::TapLeaf;
 
+mod address;
 mod evtxo_address;
 mod evtxo_spend;
+mod exit;
 mod send;
 
 // ---------------------------------------------------------------------------

@@ -5,9 +5,11 @@ import 'page_objects.dart';
 import 'test_setup.dart';
 
 class Flows {
+  /// Onboarding, up to the wallet opening. [exitAddress] is where unilateral exits will pay; the
+  /// step is blocking, because without one nothing can be pre-signed.
   static Future<void> completeOnboarding(
     WidgetTester tester, {
-    String pin = '123456',
+    required String exitAddress,
   }) async {
     await pumpUntilFound(
       tester,
@@ -15,40 +17,20 @@ class Flows {
       timeout: const Duration(seconds: 30),
     );
     await WelcomePage.tapCreate(tester);
-    await tester.pumpAndSettle();
-    await PinPage.enter(tester, pin);
-    await tester.pumpAndSettle();
-    // Onboarding goes straight to the server step after the PIN.
+    await pumpUntilFound(tester, find.byKey(const Key('serverPresetRegtest')));
     await ServerConnectPage.pickRegtest(tester);
-    // Don't pumpAndSettle here — the DKG screen has a CircularProgressIndicator
-    // that never "settles" until DKG completes, so pumpAndSettle would block
-    // (up to its 10-min cap). waitForReady polls via pump() instead, which is
-    // unaffected by ongoing animations.
-    await DkgProgressPage.waitForReady(
+    await pumpUntilFound(tester, find.byKey(const Key('passkeyCreateBtn')));
+    await PasskeySetupPage.create(tester);
+    // Credential Manager requires the owner's approval on a device. DKG and passkey setup
+    // animate while waiting, so poll for the next step instead of waiting for animations to stop.
+    await DkgProgressPage.waitForExitAddress(
       tester,
       timeout: const Duration(minutes: 3),
     );
+    await ExitAddressPage.enter(tester, exitAddress);
+    await pumpUntilFound(tester, find.byKey(const Key('walletReadyBtn')));
     await WalletReadyPage.tapGoToWallet(tester);
     await tester.pumpAndSettle();
   }
 
-  /// Home → Send → Review → Sign → back to Home.
-  static Future<void> doOnChainSend(
-    WidgetTester tester, {
-    required String destination,
-    required String amountSats,
-  }) async {
-    await HomePage.tapSend(tester);
-    await tester.pumpAndSettle();
-    await SendPage.enterAddress(tester, destination);
-    await SendPage.enterAmount(tester, amountSats);
-    await SendPage.tapReview(tester);
-    await pumpUntilFound(tester, find.byKey(const Key('reviewSignBtn')));
-    await ReviewPage.tapSign(tester);
-    await pumpUntilFound(
-      tester,
-      find.byKey(const Key('homeSendBtn')),
-      timeout: const Duration(seconds: 90),
-    );
-  }
 }

@@ -43,15 +43,9 @@ class WelcomePage {
       _tapKey(tester, 'welcomeCreateBtn');
 }
 
-class PinPage {
-  static Future<void> enter(WidgetTester tester, String pin) async {
-    await _enterText(tester, 'pinField1', pin);
-    await _enterText(tester, 'pinField2', pin);
-    await tester.pumpAndSettle();
-    await _dismissKeyboard(tester);
-    await _tapKey(tester, 'pinContinueBtn');
-    await tester.pumpAndSettle();
-  }
+class PasskeySetupPage {
+  static Future<void> create(WidgetTester tester) =>
+      _tapKey(tester, 'passkeyCreateBtn');
 }
 
 class ServerConnectPage {
@@ -62,13 +56,13 @@ class ServerConnectPage {
 }
 
 class DkgProgressPage {
-  static Future<void> waitForReady(
+  static Future<void> waitForExitAddress(
     WidgetTester tester, {
     Duration timeout = const Duration(seconds: 90),
   }) async {
     await pumpUntilFound(
       tester,
-      find.byKey(const Key('walletReadyBtn')),
+      find.byKey(const Key('exitAddressField')),
       timeout: timeout,
     );
   }
@@ -79,53 +73,34 @@ class WalletReadyPage {
       _tapKey(tester, 'walletReadyBtn');
 }
 
-class HomePage {
-  static Future<void> tapSend(WidgetTester tester) =>
-      _tapKey(tester, 'homeSendBtn');
-  static Future<void> tapReceive(WidgetTester tester) =>
-      _tapKey(tester, 'homeReceiveBtn');
-  static Future<void> tapArkTab(WidgetTester tester) async {
-    await tester.tap(find.descendant(
-      of: find.byType(BottomNavigationBar),
-      matching: find.text('Ark'),
-    ));
-    await tester.pump();
+/// Where the money goes if the service disappears — asked once, after the key exists.
+class ExitAddressPage {
+  static Future<void> enter(WidgetTester tester, String address) async {
+    await _enterText(tester, 'exitAddressField', address);
+    await _dismissKeyboard(tester);
+    await _tapKey(tester, 'exitAddressSaveBtn');
   }
+}
 
-  /// Tap the 'Home' bottom-nav item. No-op on the Home screen itself; from
-  /// the Ark screen it `context.go('/')` (replacing the stack).
-  static Future<void> tapHomeTab(WidgetTester tester) async {
+class ExitPage {
+  static Future<void> open(WidgetTester tester) async {
     await tester.tap(find.descendant(
       of: find.byType(BottomNavigationBar),
-      matching: find.text('Home'),
+      matching: find.text('Exit'),
     ));
     await tester.pumpAndSettle();
   }
-}
 
-class SendPage {
-  static Future<void> enterAddress(WidgetTester tester, String address) =>
-      _enterText(tester, 'sendAddressField', address);
-  static Future<void> enterAmount(WidgetTester tester, String sats) =>
-      _enterText(tester, 'sendAmountField', sats);
-  static Future<void> tapReview(WidgetTester tester) async {
-    await _dismissKeyboard(tester);
-    await _tapKey(tester, 'sendReviewBtn');
-  }
-}
-
-class ReviewPage {
-  static Future<void> tapSign(WidgetTester tester) =>
-      _tapKey(tester, 'reviewSignBtn');
+  static Future<void> signExits(WidgetTester tester) => _tapKey(tester, 'exitProtectBtn');
 }
 
 class ArkPage {
   static Future<void> tapSend(WidgetTester tester) =>
       _tapKey(tester, 'arkSendBtn');
+  /// Receiving IS boarding: on-chain to the boarding address, then settle.
   static Future<void> tapReceive(WidgetTester tester) =>
       _tapKey(tester, 'arkReceiveBtn');
-  static Future<void> tapBoard(WidgetTester tester) =>
-      _tapKey(tester, 'arkBoardBtn');
+  static Future<void> tapBoard(WidgetTester tester) => tapReceive(tester);
 }
 
 class ArkBoardPage {

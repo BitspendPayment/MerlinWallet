@@ -1,0 +1,96 @@
+package enclave:streams@0.1.0;
+
+/// A durable outbound connection the RUNTIME holds on a guest's behalf.
+///
+/// # Why the runtime holds it and not the guest
+///
+/// A guest has no execution context of its own. An instance is created to serve
+/// one invocation and dropped at the end, so it cannot own a socket that
+/// outlives the call — and nothing inside it can reconnect, because between
+/// invocations there is no "inside it".
+///
+/// That left exactly two ways for a guest to be reached: an inbound request,
+/// which the gate binds to a passkey, and the task queue, which is a scheduler.
+/// Neither serves a counterparty that wants to *initiate*. A service holding
+/// half of an escrow key has no passkey for its user's tenant and cannot be
+/// made to wait for a timer to come round.
+///
+/// So the runtime keeps the connection, and the guest stays stateless: each
+/// message the far side sends becomes one invocation, exactly as a task run is
+/// one invocation. The guest replies from within that call, and may also send
+/// unprompted from any invocation it is already in — an inbound request from
+/// its owner, or another message.
+///
+/// # What it is, on the wire
+///
+/// Server-sent events for what arrives, POST for what is sent. Two HTTP shapes
+/// rather than one socket, because that is what the egress path already
+/// carries and what a service can serve without a WebSocket stack. The logical
+/// channel is bidirectional; the transport is not exotic.
+///
+/// ```text
+///   GET  <origin>/escrow/stream?id=<tenant hex>-<id>   held open, text/event-stream
+///   POST <origin>/escrow/send?id=<tenant hex>-<id>     one message, and one reply
+/// ```
+///
+/// Because what is sent is a request of its own and not a write into the held
+/// one, the id is the ONLY thing tying the two together — which is why it names
+/// the tenant as well as the stream. A far side serving several customers keys
+/// its connections by the whole of it.
+///
+/// # What is NOT promised
+///
+/// Delivery is at least once in both directions, and a message may be seen
+/// twice after a reconnect. Handlers deduplicate by their own identifiers, as
+/// task handlers deduplicate by run id. Ordering holds within one connection
+/// and not across a reconnect.
+/// Names carry a `stream-` prefix although the interface already namespaces them. A guest mirrors
+/// these onto a FLAT trait, and `connection.status` beside `queue.status` would be two different
+/// things with one name on it — the sort of collision a mirror check cannot see through.
+interface connection {
+    /// Ask the runtime to maintain a connection, and keep asking until told to
+    /// stop. Durable: it survives a runtime restart, and is re-established
+    /// without the guest being involved.
+    ///
+    /// `id` is a tenant-local idempotency key (ASCII letters, digits, '-' or
+    /// '_'). Opening one that already exists with the same origin is a no-op;
+    /// with a different origin it is an error rather than a silent move.
+    ///
+    /// **Tenant-local, and the far side is told so.** A guest usually derives
+    /// this from something about the counterparty, so every tenant it serves
+    /// opens under the same name. What goes on the wire is therefore the tenant
+    /// and this id together — a service that saw only this could not tell one
+    /// customer's connection from another's, nor tell which of them a message
+    /// sent to it belonged to, since that arrives as a request of its own.
+    ///
+    /// `origin` must be one the image allows, exactly as an outgoing request
+    /// must. A guest cannot reach further by asking the runtime to hold the
+    /// connection than by making the request itself.
+    stream-open: func(id: string, origin: string) -> result<_, string>;
+
+    /// Stop maintaining it and forget the record. Idempotent.
+    stream-close: func(id: string) -> result<_, string>;
+
+    /// Send one message to the far side.
+    ///
+    /// Fails if the connection is not currently established — the caller
+    /// decides whether that is fatal or worth repeating, because only the
+    /// caller knows whether the message is still wanted.
+    stream-send: func(id: string, payload: list<u8>) -> result<_, string>;
+
+    /// A JSON record: whether it is connected, when it last was, and how many
+    /// times it has been re-established.
+    stream-status: func(id: string) -> result<string, string>;
+}
+
+world streaming {
+    import connection;
+
+    /// One message from the far side, as one invocation.
+    ///
+    /// `message-id` is stable for a given message and repeats if it is
+    /// delivered again — deduplicate by it. A guest that returns an error has
+    /// the message redelivered; one that returns bytes has them sent back as
+    /// the reply, or none if it returns nothing to say.
+    export on-message: func(id: string, message-id: string, payload: list<u8>) -> result<list<u8>, string>;
+}

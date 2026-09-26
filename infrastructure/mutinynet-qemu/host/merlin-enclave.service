@@ -1,0 +1,22 @@
+[Unit]
+Description=Merlin cosigner in an emulated Nitro enclave (MutinyNet)
+After=docker.service network-online.target srv-merlin-work.mount
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=merlin
+Group=merlin
+WorkingDirectory=/srv/merlin
+ExecStart=/srv/merlin/host/run-enclave.sh
+# The harness tears down its containers on SIGTERM; give it the time.
+KillMode=mixed
+TimeoutStopSec=90
+# A cold boot waits on ACME; the harness bounds each wait itself.
+TimeoutStartSec=infinity
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

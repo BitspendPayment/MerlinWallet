@@ -19,6 +19,24 @@ final arkDefaultVtxoScriptPubkeyFfi = nativeLib
     .lookupFunction<_ArkVtxoSpkNative, _ArkVtxoSpkDart>(
         'ark_default_vtxo_script_pubkey');
 
+// Address derivation. Three symbols with the same shape: (owner_pk, asp_pk, exit_delay, network).
+//
+// These came back from the cosigner over `GetArkAddress`/`GetBoardingAddress` until it stopped
+// doing anything the caller could do itself. The Rust side has a parity test against
+// `ark::client::address`, which is what makes deriving here safe rather than a second guess at a
+// consensus-critical taptree.
+typedef _ArkAddrNative = Pointer<FfiResult> Function(
+    Pointer<Utf8>, Pointer<Utf8>, Uint32, Pointer<Utf8>);
+typedef _ArkAddrDart = Pointer<FfiResult> Function(
+    Pointer<Utf8>, Pointer<Utf8>, int, Pointer<Utf8>);
+
+final arkAddressFfi =
+    nativeLib.lookupFunction<_ArkAddrNative, _ArkAddrDart>('ark_address');
+final arkBoardingAddressFfi =
+    nativeLib.lookupFunction<_ArkAddrNative, _ArkAddrDart>('ark_boarding_address');
+final arkVtxoScriptPubkeyHexFfi = nativeLib
+    .lookupFunction<_ArkAddrNative, _ArkAddrDart>('ark_vtxo_script_pubkey_hex');
+
 typedef _ArkForfeitNative = Pointer<FfiResult> Function(
     Pointer<Utf8>, Pointer<Utf8>, Uint32);
 typedef _ArkForfeitDart = Pointer<FfiResult> Function(
@@ -113,3 +131,29 @@ typedef _ArkEvtxoArkAddressDart = Pointer<FfiResult> Function(Pointer<Utf8>);
 final arkEvtxoArkAddressFfi = nativeLib
     .lookupFunction<_ArkEvtxoArkAddressNative, _ArkEvtxoArkAddressDart>(
         'ark_evtxo_ark_address');
+
+// ---------------------------------------------------------------------------
+// The unilateral exit
+// ---------------------------------------------------------------------------
+//
+// JSON in, JSON out — see `ffi/src/ark/exit.rs`. The wallet builds the same exit transactions the
+// cosigner builds, so that it can check the sighashes it is asked to sign before signing them.
+// `ark_exit_spend_info` above is a different, older thing: it derives from a taptree real VTXOs do
+// not use, and is on its way out.
+
+typedef _ArkJsonNative = Pointer<FfiResult> Function(Pointer<Utf8>);
+typedef _ArkJsonDart = Pointer<FfiResult> Function(Pointer<Utf8>);
+
+final arkVtxoExitSpendInfoFfi = nativeLib
+    .lookupFunction<_ArkJsonNative, _ArkJsonDart>('ark_vtxo_exit_spend_info');
+final arkBuildExitTxFfi =
+    nativeLib.lookupFunction<_ArkJsonNative, _ArkJsonDart>('ark_build_exit_tx');
+final arkFinalizeExitTxFfi =
+    nativeLib.lookupFunction<_ArkJsonNative, _ArkJsonDart>('ark_finalize_exit_tx');
+final arkVerifyExitTxFfi =
+    nativeLib.lookupFunction<_ArkJsonNative, _ArkJsonDart>('ark_verify_exit_tx');
+
+typedef _ArkSpkNative = Pointer<FfiResult> Function(Pointer<Utf8>, Pointer<Utf8>);
+typedef _ArkSpkDart = Pointer<FfiResult> Function(Pointer<Utf8>, Pointer<Utf8>);
+final arkOnchainScriptPubkeyFfi = nativeLib
+    .lookupFunction<_ArkSpkNative, _ArkSpkDart>('ark_onchain_script_pubkey');

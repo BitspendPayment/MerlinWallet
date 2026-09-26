@@ -1,13 +1,10 @@
 {
   "rust-analyzer.linkedProjects": [
-    "cosigner-runtime/Cargo.toml",
-    "contracts/contract-sdk/Cargo.toml",
-    "contracts/examples/spending-limit/Cargo.toml",
+    "cosigner/Cargo.toml",
     "crates/threshold/Cargo.toml",
     "crates/ark/Cargo.toml",
     "crates/enclave-client/Cargo.toml",
-    "ffi/Cargo.toml",
-    "cli/Cargo.toml"
+    "ffi/Cargo.toml"
   ],
   "cmake.sourceDirectory": "/home/joshua/MPCWallet/app/linux"
 }

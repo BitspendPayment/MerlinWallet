@@ -1,0 +1,31 @@
+package enclave:tasks@0.1.0;
+
+/// Calls are bound to the current tenant by the runtime. Mutations require
+/// an interactive invocation; a background invocation cannot grant itself work.
+interface queue {
+    /// id is a tenant-local idempotency key (ASCII letters, digits, '-' or '_').
+    /// run-at is Unix milliseconds. interval-ms, when present, is >= 1000.
+    enqueue: func(id: string, payload: list<u8>, run-at: u64, interval-ms: option<u64>) -> result<_, string>;
+    /// A JSON task record, including state, attempt count and result bytes.
+    status: func(id: string) -> result<string, string>;
+    cancel: func(id: string) -> result<_, string>;
+    /// Remove a terminal record to release quota. Never removes running work.
+    forget: func(id: string) -> result<_, string>;
+}
+
+world background {
+    import queue;
+    /// task-id is a run id, not the id the task was enqueued under. Its form
+    /// is `<id>:<generation>:<occurrence>`: the enqueued id, 32 lowercase hex
+    /// digits minted at enqueue, and a decimal count of recurring occurrences
+    /// starting at 0. An id cannot contain ':', so the enqueued id is
+    /// everything before the first one.
+    ///
+    /// It remains stable across retries of the same occurrence, and changes
+    /// for the next occurrence of a recurring task or for a task enqueued again
+    /// under the same id after `forget`. Deduplicate effects by the whole run
+    /// id; look up application state by the enqueued id.
+    ///
+    /// A successful result is persisted for the client; errors are retried.
+    export run-task: func(task-id: string, payload: list<u8>) -> result<list<u8>, string>;
+}

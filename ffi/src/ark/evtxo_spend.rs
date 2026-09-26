@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use super::{hex_decode, hex_encode, hex_to_32};
 
 /// PSBT proprietary key carrying off-chain contract args, mirrored from
-/// `cosigner-runtime`'s `tx_parser::{CONTRACT_ARGS_PREFIX, CONTRACT_ARGS_SUBTYPE}`.
+/// `cosigner`'s `tx_parser::{CONTRACT_ARGS_PREFIX, CONTRACT_ARGS_SUBTYPE}`.
 /// Keep these byte-identical or the cosigner won't read the args.
 const CONTRACT_ARGS_PREFIX: &[u8] = b"EVTXO";
 const CONTRACT_ARGS_SUBTYPE: u8 = 0x01;

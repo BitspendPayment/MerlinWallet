@@ -2,51 +2,105 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:app/services/server_host.dart';
 
 void main() {
-  group('requiresAttestation', () {
-    test('mainnet demands attestation', () {
-      expect(requiresAttestation('mainnet.vtxos.network'), isTrue);
+  const dev = DevEnclaveConfig(
+    port: 8443,
+    certificateName: 'enclave.test',
+    rpId: 'vtxos.com',
+    caPemBase64: '',
+    trustRootBase64: 'AAEC',
+    pcr0: '8f2026d5a6c50479e27152c06ca86852ce0ec9528efd5f13d8bee969f128076adf1c720ead49d5629724fe2562a1cd99',
+    pcr16: 'e5d19028de3519c28511df1942d0bac7ba3e633707adbd3c4017d4ba8ca8e515a1b79e5b91081ec19267cf35f732f9b3',
+  );
+
+  group('enclaveEndpoint', () {
+    /// The dev enclave listens on loopback with a certificate for its rp id: dial one, verify the
+    /// other.
+    test('a local host dials the dev enclave port and verifies its certificate name', () {
+      final e = enclaveEndpoint('10.0.2.2', dev: dev);
+      expect(e.host, '10.0.2.2');
+      expect(e.port, 8443);
+      expect(e.authority, 'enclave.test');
+      expect(e.baseUrl, 'https://enclave.test:8443');
     });
 
-    test('mutinynet is waived — no enclave fronts it yet', () {
-      expect(requiresAttestation('mutiny.vtxos.network'), isFalse);
+    test('a remote host is itself, on 443', () {
+      final e = enclaveEndpoint('mainnet.vtxos.network', dev: dev);
+      expect(e.host, 'mainnet.vtxos.network');
+      expect(e.authority, 'mainnet.vtxos.network');
+      expect(e.port, 443);
+      expect(e.baseUrl, 'https://mainnet.vtxos.network');
+    });
+  });
+
+  group('relying party', () {
+    /// The certificate still says enclave.test; the relying party is whatever the image was built
+    /// with, which for a phone has to be a domain that vouches for the app.
+    test('local is the dev image\'s rp id, independent of its certificate', () {
+      expect(relyingPartyId('127.0.0.1', dev: dev), 'vtxos.com');
+      expect(origin('127.0.0.1', dev: dev), 'https://vtxos.com');
+      expect(enclaveEndpoint('127.0.0.1', dev: dev).authority, 'enclave.test');
     });
 
-    test('local dev addresses are waived', () {
-      for (final h in ['127.0.0.1', 'localhost', '10.0.2.2', '192.168.1.42']) {
-        expect(requiresAttestation(h), isFalse, reason: h);
-      }
-    });
-
-    /// The whole point of spelling the rule as a waiver list. If this ever
-    /// inverts to "attest only when host == mainnet", every case below silently
-    /// downgrades to unattested plain REST against an arbitrary server.
-    test('unknown hosts fail closed', () {
-      for (final h in [
-        'evil.example.com',
-        'mainnet.vtxos.network.evil.com', // suffix-smuggling
-        'evilmainnet.vtxos.network', // prefix-smuggling
-        'MAINNET.VTXOS.NETWORK', // case variant is not the known-good host
-        'mutiny.vtxos.network.evil.com',
-        '',
-        '10.0.2.3', // adjacent to the emulator alias, not it
-        '192.168', // prefix of the local rule but not a host in it
-      ]) {
-        expect(requiresAttestation(h), isTrue, reason: h);
+    /// The domain whose assetlinks.json names the app — not each deployment's own host, which
+    /// publishes none, so a passkey bound to it could never be created on a phone.
+    test('every remote deployment shares vtxos.com', () {
+      for (final h in ['mutiny.vtxos.network', 'mainnet.vtxos.network']) {
+        expect(relyingPartyId(h, dev: dev), 'vtxos.com', reason: h);
+        expect(origin(h, dev: dev), 'https://vtxos.com', reason: h);
       }
     });
   });
 
-  group('baseUrlFor', () {
-    test('local hosts get plain HTTP on the REST port', () {
-      expect(baseUrlFor('10.0.2.2'), 'http://10.0.2.2:7074');
-      expect(baseUrlFor('127.0.0.1'), 'http://127.0.0.1:7074');
-      expect(baseUrlFor('192.168.1.5'), 'http://192.168.1.5:7074');
+  group('DevEnclaveConfig', () {
+    test('carries the pins it was built with', () {
+      final pins = dev.pins();
+      expect(pins.pcr0, dev.pcr0);
+      expect(pins.pcr16, dev.pcr16);
+      expect(pins.trustRoot, [0, 1, 2]);
     });
 
-    test('remote hosts get HTTPS whether or not they are attested', () {
-      expect(baseUrlFor('mainnet.vtxos.network'), 'https://mainnet.vtxos.network');
-      // Waived from attestation, but still TLS — the two rules are independent.
-      expect(baseUrlFor('mutiny.vtxos.network'), 'https://mutiny.vtxos.network');
+    /// A build without pins has nothing to hold the enclave to. Refusing is the point.
+    test('a build without pins refuses rather than trusting whatever answers', () {
+      expect(() => const DevEnclaveConfig().pins(), throwsStateError);
+      expect(
+        () => DevEnclaveConfig(trustRootBase64: 'AAEC', pcr0: dev.pcr0, pcr16: 'short').pins(),
+        throwsStateError,
+      );
+    });
+  });
+
+  group('aspEndpoint', () {
+    test('local dev points at the regtest arkd beside the cosigner', () {
+      final e = aspEndpoint('10.0.2.2');
+      expect(e.host, '10.0.2.2');
+      expect(e.port, 7070);
+      expect(e.secure, isFalse);
+    });
+
+    test('mutinynet has its own ASP, not the cosigner host', () {
+      final e = aspEndpoint('mutiny.vtxos.network');
+      expect(e.host, 'mutinynet.arkade.sh');
+      expect(e.secure, isTrue);
+    });
+
+    /// An unconfigured host must fail loudly rather than default. The cosigner
+    /// derives every output it signs from the ASP's signer key, so the wrong ASP
+    /// does not redirect funds — it produces a wallet that reads as empty, which
+    /// is a far more confusing way to find out.
+    test('an unknown host is refused rather than guessed', () {
+      expect(() => aspEndpoint('mainnet.vtxos.network'), throwsStateError);
+    });
+  });
+
+  group('pinsUrl', () {
+    test('the MutinyNet host publishes its own pins, trust root included', () {
+      expect(pinsUrl('mutiny.vtxos.network').toString(),
+          'https://vtxos-mutinynet-enclave.s3.amazonaws.com/pins/deployment.json');
+    });
+
+    test('any other host falls back to the release manifest', () {
+      expect(pinsUrl('mainnet.vtxos.network'), isNull);
+      expect(pinsUrl('10.0.2.2'), isNull);
     });
   });
 

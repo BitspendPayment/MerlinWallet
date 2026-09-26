@@ -74,6 +74,16 @@ final dkgResharePart1Ffi = nativeLib
     .lookupFunction<_DkgResharePart1Native, _DkgResharePart1Dart>(
         'threshold_dkg_reshare_part1');
 
+// Reshare round 1 from an EXPLICIT polynomial — same shape as `dkg_part1`, because a wallet's
+// escrow delta comes from its passkey rather than from an RNG or a seed expander.
+typedef _DkgResharePart1FromNative = Pointer<FfiResult> Function(
+    Pointer<Utf8>, Uint32, Uint32, Pointer<Utf8>, Pointer<Utf8>);
+typedef _DkgResharePart1FromDart = Pointer<FfiResult> Function(
+    Pointer<Utf8>, int, int, Pointer<Utf8>, Pointer<Utf8>);
+final dkgResharePart1FromFfi = nativeLib
+    .lookupFunction<_DkgResharePart1FromNative, _DkgResharePart1FromDart>(
+        'threshold_dkg_reshare_part1_from');
+
 // eVTXO reshare finalizer for a DEALER (the author): r2_secret handle, peer
 // round1 pkgs, shares dealt to me, old PKP, old KP, receiver ids.
 typedef _DkgResharePart3Native = Pointer<FfiResult> Function(

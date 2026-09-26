@@ -87,10 +87,6 @@ BigInt modNOne() => BigInt.one;
 /// and cosigner's refresh halves into a participant's share `P_i`.
 BigInt modNAdd(BigInt a, BigInt b) => (a + b) % _secp256k1N;
 
-/// Difference of two scalars modulo the secp256k1 group order (result in `[0, n)`).
-/// Used to blind a share: `δ = P_full − b` (reconstruct with [modNAdd]).
-BigInt modNSub(BigInt a, BigInt b) => (a - b) % _secp256k1N;
-
 /// Serialize a point (given as compressed hex) to compressed bytes.
 /// When called with a compressed hex string, returns the bytes.
 Uint8List elemSerializeCompressed(String compressedHex) {

@@ -3,7 +3,7 @@
 ## `fcm_test_key.pem`
 
 Throwaway 2048-bit RSA private key used by the e2e FCM mock-server test. The
-cosigner-runtime's `FcmClient` (in [`cosigner-runtime/src/fcm_client.rs`])
+cosigner's `FcmClient` (in [`cosigner/src/fcm_client.rs`])
 signs an OAuth2 JWT bearer assertion with the private key from its
 service-account JSON; that signature is then sent to the OAuth token endpoint.
 

@@ -1,5 +1,0 @@
-# Contracts compile to wasm32-wasip2 components. The TEMPLATE imports `crypto` AND
-# `author:config/vars` (its variable requirement) — no wasi:*. The `author:config` import is
-# satisfied by composition with a synthesized provider before the contract is evaluated.
-[build]
-target = "wasm32-wasip2"

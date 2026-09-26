@@ -1,10 +1,9 @@
 // One end-to-end testWidgets covering the user lifecycle:
-//   onboarding (DKG) → on-chain send → Ark board/send/receive.
+//   server → passkey → DKG → exit address → Ark board/send/receive.
 
 // ignore_for_file: avoid_print
 
 import 'package:app/services/mpc_service.dart';
-import 'package:app/services/push_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
@@ -22,54 +21,28 @@ void main() {
   testWidgets(
     'full flow: onboarding → send → ark',
     (tester) async {
-      const pin = '123456';
       final btc = RegtestHelper();
       await btc.ensureWalletLoaded('default');
 
       // ── Onboarding ───────────────────────────────────────────────────────
+      //
+      // The wallet is Ark-only now: there is no on-chain balance, no on-chain send, and no home
+      // screen for either. What onboarding gained instead is the exit address, which is asked for
+      // before the wallet opens because every later seal pre-signs a spend to it.
       await resetAppState();
       await bootApp(tester);
-      await Flows.completeOnboarding(tester, pin: pin);
-      await pumpUntilFound(tester, find.byKey(const Key('homeSendBtn')));
-      expect(find.byKey(const Key('homeSendBtn')), findsOneWidget);
+      final exitAddress = await btc.getNewAddress();
+      await Flows.completeOnboarding(tester, exitAddress: exitAddress);
+      await pumpUntilFound(tester, find.byKey(const Key('arkSendBtn')));
 
-      final ctxOnboard = tester.element(find.byKey(const Key('homeSendBtn')));
-      final originalAddress =
-          Provider.of<MpcService>(ctxOnboard, listen: false).receiveAddress;
-      expect(originalAddress, isNotNull);
+      final ctxOnboard = tester.element(find.byKey(const Key('arkSendBtn')));
+      final service = Provider.of<MpcService>(ctxOnboard, listen: false);
+      expect(service.exitAddress, exitAddress,
+          reason: 'the address given at onboarding is what exits will pay');
 
-      // ── On-chain send ────────────────────────────────────────────────────
-      await HomePage.tapReceive(tester);
-      await pumpUntilFound(tester, find.byType(SelectableText));
-      final receiveAddress =
-          tester.widget<SelectableText>(find.byType(SelectableText)).data!;
-
-      await btc.sendToAddress(receiveAddress, 0.01);
       final minerAddr = await btc.getNewAddress();
-      await btc.generateToAddress(1, minerAddr);
-
-      await tester.pageBack();
-      await pumpUntilFound(tester, find.byKey(const Key('homeSendBtn')));
-
-      await waitForBalance(tester, BigInt.from(1000000));
-
-      final destination = await btc.getNewAddress();
-      await HomePage.tapSend(tester);
-      await tester.pumpAndSettle();
-      await SendPage.enterAddress(tester, destination);
-      await SendPage.enterAmount(tester, '50000');
-      await SendPage.tapReview(tester);
-      await pumpUntilFound(tester, find.byKey(const Key('reviewSignBtn')));
-      await ReviewPage.tapSign(tester);
-      await pumpUntilFound(
-        tester,
-        find.byKey(const Key('homeSendBtn')),
-        timeout: const Duration(seconds: 90),
-      );
 
       // ── Ark boarding (skipped when ASP not configured) ──────────────────
-      await HomePage.tapArkTab(tester);
-      await tester.pumpAndSettle();
       final arkAvailable = find.text('Ark Not Available').evaluate().isEmpty;
       if (!arkAvailable) {
         print('Ark not available — skipping ark sub-flow');
@@ -77,8 +50,7 @@ void main() {
         await ArkPage.tapBoard(tester);
         await pumpUntilFound(tester, find.byKey(const Key('arkBoardNowBtn')));
 
-        final ctxBoard = tester.element(find.byKey(const Key('arkBoardNowBtn')));
-        final svcBoard = Provider.of<MpcService>(ctxBoard, listen: false);
+        final svcBoard = service;
         final boardingAddress = svcBoard.boardingAddress;
         expect(boardingAddress, isNotNull,
             reason: 'boardingAddress should be populated by the ark wallet');
@@ -106,15 +78,29 @@ void main() {
         await svcBoard.refreshVtxos();
         final delegDeadline =
             DateTime.now().add(const Duration(seconds: 30));
-        while (!svcBoard.hasActiveDelegate &&
+        while (!svcBoard.fundsProtected &&
             DateTime.now().isBefore(delegDeadline)) {
           await tester.pump(const Duration(seconds: 1));
         }
-        expect(svcBoard.hasActiveDelegate, isTrue,
+        expect(svcBoard.fundsProtected, isTrue,
             reason:
                 'after boarding + refresh, _delegateIfNeeded must have '
                 'stored a delegate intent. If false, the foreground '
                 'auto-delegate path regressed.');
+
+        // ── The exits are real ───────────────────────────────────────
+        //
+        // Sealing a delegate also signs one unilateral exit per VTXO. This is the thing the
+        // cosigner cannot be asked for later: if it stops answering, these are the money.
+        expect(svcBoard.exits, isNotEmpty,
+            reason: 'boarding sealed a delegate, which must also have signed an exit');
+        expect(svcBoard.vtxosWithoutExit, isEmpty,
+            reason: 'every held VTXO should have an exit after a seal');
+        final boardedExit = svcBoard.exits.first;
+        expect(boardedExit.rawTx, isNotEmpty);
+        expect(boardedExit.amountSats, greaterThan(0));
+        expect(boardedExit.sequence, greaterThan(0),
+            reason: 'an exit waits out its VTXO\'s exit delay');
 
         // ── Ark send (App → Bob, an external ark-sample wallet) ─────
         final bob = BobClient();
@@ -134,6 +120,11 @@ void main() {
         );
         expect(svcBoard.arkBalance < appArkBalanceBefore, isTrue,
             reason: 'app ark balance should drop after sending to Bob');
+        expect(svcBoard.exits.map((e) => e.outpoint),
+            isNot(contains(boardedExit.outpoint)),
+            reason: 'the send spent the boarded VTXO, so its exit is replaced by the change\'s');
+        expect(svcBoard.vtxosWithoutExit, isEmpty,
+            reason: "a send seals on its way out, and that seal signs the change's exit");
 
         // Poll Bob's balance — the off-chain transfer settles in <30s.
         final bobDeadline = DateTime.now().add(const Duration(seconds: 30));
@@ -159,22 +150,26 @@ void main() {
           timeout: const Duration(seconds: 60),
         );
 
-        // ── Background push handler ─────────────────────────────────
-        // 1500 sats fits Bob's residual budget after the 3000-sat send
-        // above; deliberately no refreshVtxos before the handler call
-        // (it would fire foreground _delegateIfNeeded and steal the work).
+        // ── A receive re-arms the renewal ───────────────────────────
+        //
+        // This used to drive PushService.handleBackgroundMessageForTest and
+        // assert the background isolate had stored a delegate. Both ends of
+        // that are gone: the isolate cannot drive an ASP batch round, and the
+        // cosigner could not have used a stored delegate by itself anyway —
+        // a Wasm guest has no egress, so waking its owner is what it does
+        // instead. The renewal happens in the foreground now, which is what
+        // this exercises.
+        //
+        // 1500 sats fits Bob's residual budget after the 3000-sat send above.
         final preBgArkBalance = svcBoard.arkBalance;
         await bob.sendTo(myArkAddress, 1500);
         await Future<void>.delayed(const Duration(seconds: 15));
 
-        await PushService.handleBackgroundMessageForTest(const {
-          'type': 'vtxo_received',
-          'user_id': '',
-        });
-
+        // A fresh outpoint makes the sealed renewal stale, so refreshVtxos ->
+        // _delegateIfNeeded settles again and re-arms it.
         await svcBoard.refreshVtxos();
-        final bgDeadline = DateTime.now().add(const Duration(seconds: 30));
-        while (!svcBoard.hasActiveDelegate &&
+        final bgDeadline = DateTime.now().add(const Duration(minutes: 3));
+        while (!svcBoard.fundsProtected &&
             DateTime.now().isBefore(bgDeadline)) {
           await tester.pump(const Duration(seconds: 1));
           await svcBoard.refreshVtxos();
@@ -182,14 +177,21 @@ void main() {
         expect(svcBoard.arkBalance, greaterThanOrEqualTo(
             preBgArkBalance + BigInt.from(1000)),
             reason: 'Alice should hold Bob\'s 1500-sat VTXO (after fees)');
-        expect(svcBoard.hasActiveDelegate, isTrue,
+        expect(svcBoard.fundsProtected, isTrue,
             reason:
-                'after PushService.handleBackgroundMessageForTest ran, '
-                'the cosigner should hold a stored delegate covering '
-                'Bob\'s fresh outpoint. If false, _runBackgroundDelegate '
-                'failed somewhere — Hive open in the background isolate, '
-                'MpcClient.restoreState(), or the FROST sign round of '
-                'settleDelegate(storeOnly:true).');
+                'a fresh outpoint should have triggered a settle, leaving a '
+                'renewal that covers it. If false, _delegateIfNeeded did not '
+                'run or the settle round failed — the round waits on the ASP\'s '
+                'own schedule, so give it longer before suspecting the wiring.');
+        expect(svcBoard.vtxosWithoutExit, isEmpty,
+            reason: 'the seal that covered the received funds also signed their exit');
+
+        // ── The Exit tab shows them ─────────────────────────────────
+        await ExitPage.open(tester);
+        await tester.pumpAndSettle();
+        expect(find.text('Your exit address'), findsOneWidget);
+        expect(find.byKey(const Key('exitCopyBtn')), findsWidgets,
+            reason: 'each signed exit can be copied out of the app');
       }
     },
     timeout: const Timeout(Duration(minutes: 12)),

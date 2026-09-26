@@ -1,34 +1,22 @@
-//! Pure-verification library for AWS Nitro Enclave attestation.
+//! Verifying that a connection reaches the enclave a client pinned.
 //!
-//! No HTTP, no async — callers (Dart, integration tests, other Rust
-//! crates) fetch attestation documents and response signatures
-//! themselves and pass bytes in.
+//! enclave-runtime attaches an attestation document to every `/auth/*` response, in
+//! `x-enclave-attestation`, over the nonce the client sent in `x-enclave-nonce`. The document is
+//! an AWS Nitro COSE_Sign1 whose `user_data` binds the TLS certificate the connection served and
+//! the guest component behind it. [`verify_connection`] checks all of it; the client then holds
+//! [`Attested::certificate_sha256`] and refuses any later connection that serves a different
+//! certificate, since guest responses carry no document of their own.
 //!
-//! # Example
-//!
-//! ```no_run
-//! use enclave_client::{verify_attestation_doc, verify_schnorr_signature};
-//!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let doc_bytes: &[u8] = &[/* base64-decoded attestation doc */];
-//! let pcr0 = "79f5fb125b00ad80...";
-//! let nonce = [0u8; 20];
-//!
-//! let result = verify_attestation_doc(doc_bytes, pcr0, &nonce)?;
-//! let app_key_hash_hex =
-//!     enclave_client::extract_app_key_hash(&result.document)?;
-//! // …caller fetches /v1/enclave-info to get the attestation pubkey,
-//! //   compares SHA256(pubkey) to app_key_hash, then per response:
-//! let body: &[u8] = b"{\"status\":\"ready\"}";
-//! verify_schnorr_signature(body, "sig_hex…", "pubkey_hex…")?;
-//! # Ok(())
-//! # }
-//! ```
+//! No HTTP, no async: callers fetch the document and read the served certificate off their own
+//! socket, and pass bytes in.
 
+mod connection;
+mod document;
 mod error;
-mod nitro;
-mod verify;
 
+pub use connection::{
+    guest_pcr, pcr_after_one_extend, verify_connection, Attested, AttestationHashes, Pins,
+    ATTESTATION_HASHES_LEN, PCR_GUEST,
+};
+pub use document::{verify, AttestationDocument, AWS_NITRO_ROOT_G1_PEM};
 pub use error::{Error, Result};
-pub use nitro::{AttestationDocument, NitroVerifyResult};
-pub use verify::{extract_app_key_hash, verify_attestation_doc, verify_schnorr_signature};

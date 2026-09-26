@@ -527,6 +527,62 @@ pub extern "C" fn threshold_refresh_share_to_id(
 // eVTXO key resharing
 // ---------------------------------------------------------------------------
 
+/// Resharing round 1 from an EXPLICIT polynomial, the way `threshold_dkg_part1` takes one.
+///
+/// The seeded sibling below draws its constant term from the RNG and expands its coefficients from
+/// a caller's seed — two different derivations, one of them the improvised expander
+/// `SECURITY_FINDINGS` TH-6 flags. A wallet minting an escrow needs neither: its delta comes from
+/// the passkey through the same labelled HKDF as everything else it holds, so it arrives here as
+/// scalars and is used as given. That is what makes an escrow share rebuildable on another device.
+///
+/// - `secret_hex`: 64-char hex scalar (the delta's constant term — NON-zero, so the key moves).
+/// - `coefficients_json`: JSON array of hex scalars (length = min_signers - 1).
+#[no_mangle]
+pub extern "C" fn threshold_dkg_reshare_part1_from(
+    id_hex: *const c_char,
+    max_signers: u32,
+    min_signers: u32,
+    secret_hex: *const c_char,
+    coefficients_json: *const c_char,
+) -> *mut FfiResult {
+    let result = (|| -> Result<(String, *mut c_void), String> {
+        let id_str = read_cstr(id_hex).ok_or("null id_hex")?;
+        let identifier = parse_identifier_hex(&id_str)?;
+        let secret_str = read_cstr(secret_hex).ok_or("null secret_hex")?;
+        let coeffs_str = read_cstr(coefficients_json).ok_or("null coefficients_json")?;
+
+        let secret = parse_scalar_hex(&secret_str)?;
+        let coeffs_val: serde_json::Value =
+            serde_json::from_str(&coeffs_str).map_err(|e| format!("bad coefficients JSON: {e}"))?;
+        let coeffs_arr = coeffs_val.as_array().ok_or("coefficients must be array")?;
+        let mut coefficients = Vec::new();
+        for item in coeffs_arr {
+            let hex = item.as_str().ok_or("coefficient must be hex string")?;
+            coefficients.push(parse_scalar_hex(hex)?);
+        }
+
+        let mut rng = OsRng;
+        let (secret_pkg, pub_pkg) = dkg::dkg_reshare_part1(
+            &identifier,
+            max_signers as usize,
+            min_signers as usize,
+            &secret,
+            &coefficients,
+            &mut rng,
+        )
+        .map_err(|e| format!("dkg_reshare_part1 failed: {e}"))?;
+
+        let data = serialize_round1_pkg(&pub_pkg);
+        let handle = box_handle(secret_pkg);
+        Ok((data, handle))
+    })();
+
+    match result {
+        Ok((data, handle)) => FfiResult::ok_with_handle(&data, handle),
+        Err(e) => FfiResult::err(&e),
+    }
+}
+
 /// eVTXO reshare round 1: deal a fresh NON-zero polynomial under an EXPLICIT
 /// identifier (the dealer's existing identity). Used by the signer (hardware /
 /// software). Round 2 then uses the regular `threshold_dkg_part2`.

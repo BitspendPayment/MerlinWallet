@@ -18,14 +18,10 @@ class ContactsScreen extends StatefulWidget {
 }
 
 class _ContactsScreenState extends State<ContactsScreen> {
-  bool _loading = true;
+  // Shown from the service's local copy at once; reading the cosigner is a passkey approval, so it
+  // only happens on pull-to-refresh.
+  bool _loading = false;
   String? _error;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
-  }
 
   Future<void> _refresh() async {
     setState(() {

@@ -42,7 +42,7 @@ class WelcomeScreen extends StatelessWidget {
               ),
               const SizedBox(height: 16),
               Text(
-                'Secure 2-of-2 Multi-Party Computation Bitcoin Wallet.\n\nYou hold one key share on this device.\nThe co-signing server holds the other.\nNeither can move your funds alone.',
+                'Secure 2-of-2 Multi-Party Computation Bitcoin Wallet.\n\nYour passkey rebuilds your wallet’s key share when needed.\nThe co-signing server holds the other.\nNeither can move your funds alone.',
                 style: GoogleFonts.inter(
                   fontSize: 16,
                   color: Colors.white70,
@@ -55,12 +55,24 @@ class WelcomeScreen extends StatelessWidget {
                 key: const Key('welcomeCreateBtn'),
                 onPressed: () {
                   // Software signer is the only path (hardware signer dropped).
-                  // Spending is gated by a passkey (created after DKG), not a PIN.
+                  // Spending is gated by a passkey (created before DKG), not a PIN.
                   context.push('/onboarding/server', extra: {
                     'isRestore': false,
                   });
                 },
                 child: const Text('Create MPC Wallet'),
+              ),
+              const SizedBox(height: 12),
+              TextButton(
+                key: const Key('welcomeRestoreBtn'),
+                onPressed: () {
+                  // Same passkey, new phone: the wallet is derived from it, so there is nothing
+                  // else to bring across. See `RestoreWalletScreen`.
+                  context.push('/onboarding/server', extra: {
+                    'isRestore': true,
+                  });
+                },
+                child: const Text('I already have a wallet'),
               ),
             ],
           ),

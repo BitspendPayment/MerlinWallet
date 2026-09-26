@@ -1,0 +1,75 @@
+[package]
+name = "cosigner"
+version = "0.1.0"
+edition = "2021"
+
+# A component, not a server. `wstd::http_server` exports `wasi:http/incoming-handler`; the
+# runtime owns the socket and calls it once per request.
+[[bin]]
+name = "cosigner"
+path = "src/main.rs"
+
+[features]
+default = []
+
+[dependencies]
+# The guest's std: `wasi:http` server plumbing and an executor over the WASI reactor. This is what
+# replaced tonic + tokio, neither of which builds for wasm32-wasip2 — tonic not at all, and tokio
+# only with `sync,macros,io-util,rt,time`, none of which a single-instance-per-request guest wants.
+wstd = "0.6"
+prost = "0.13"
+bytes = "1"
+# The streaming response body, held open while the request body is still being read — see
+# `src/grpc/duplex.rs` for why both can be held at once.
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tracing = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+# Bitcoin
+bitcoin = { version = "0.32", features = ["serde"] }
+
+# Ark protocol
+ark = { path = "../crates/ark", features = ["signing"] }
+
+# Crypto
+sha2 = "0.10"
+# Zeroize secret key material on drop.
+zeroize = "1"
+threshold = { path = "../crates/threshold", features = ["std"] }
+parking_lot = "0.12"
+k256 = { version = "0.13", features = ["arithmetic"] }
+
+# Misc
+rand = "0.8"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+hex = "0.4"
+# Driving the handler over a synthetic request body, which is what the transport tests do now that
+# there is no socket to bind.
+http-body-util = "0.1"
+
+# The component's two imports from the runtime, generated from `wit/cosigner.wit`.
+#
+# Target-scoped because the generated code is component-model bindings: a native build has nothing
+# to link them against, and `src/host.rs`'s `Detached` is what stands in there. See `mod runtime` in
+# `main.rs`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = "0.46"
+
+# Runs on the HOST, so `protoc` here costs the wasm build nothing. Both generators are switched off
+# in `build.rs`: what lands in the crate is prost messages and no transport.
+[build-dependencies]
+tonic-build = "0.12"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

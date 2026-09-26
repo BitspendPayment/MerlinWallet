@@ -1,0 +1,4 @@
+.enclave/
+
+# Runtime state: the KV database this cosigner writes at DEFAULT_SQLITE_PATH.
+data/

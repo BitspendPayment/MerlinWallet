@@ -88,7 +88,8 @@ pub fn batch_includes_intent(event: &proto::BatchStartedEvent, intent_id: &str) 
     let hash_hex: String = hash.as_byte_array().iter().map(|b| format!("{b:02x}")).collect();
     event.intent_id_hashes.iter().any(|h| h == &hash_hex)
 }
-#[cfg(feature = "client")]
+// A prost message type, not transport: classifying an event needs no ASP connection, and the guest
+// that drives a settle from relayed events needs exactly this.
 use crate::client::proto::get_event_stream_response::Event;
 
 // ---------------------------------------------------------------------------
@@ -542,6 +543,7 @@ impl SettleSession {
 
 #[cfg(feature = "client")]
 impl SettleSession {
+    #[cfg(feature = "client")]
     /// Submit FROST signatures for the intent proof and register with the ASP.
     ///
     /// `signatures` must be in the same order as the sighashes returned by
@@ -623,6 +625,7 @@ impl SettleSession {
         Ok(())
     }
 
+    #[cfg(feature = "client")]
     /// Drive the event stream forward.
     ///
     /// Call this repeatedly until it returns [`SettleAction::Settled`] or
@@ -729,6 +732,7 @@ impl SettleSession {
         }
     }
 
+    #[cfg(feature = "client")]
     /// Submit FROST signatures for the commitment PSBT and finalize.
     pub async fn submit_commitment_signatures(
         &mut self,
@@ -808,6 +812,7 @@ impl SettleSession {
         self.batch_id.as_deref() == Some(id)
     }
 
+    #[cfg(feature = "client")]
     async fn handle_batch_started(
         &mut self,
         asp: &mut AspClient,
@@ -1234,6 +1239,9 @@ pub struct DelegateOutput {
 enum DelegatePhase {
     AwaitingSignatures,
     ReadyToSettle,
+    /// Entered only by the host-side `settle()` loop, which is behind the `client` feature. The
+    /// step methods a guest drives never set it, so without that feature nothing constructs it.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     Settling,
     Done,
 }
@@ -2036,6 +2044,7 @@ impl DelegateSettleSession {
 
 #[cfg(feature = "client")]
 impl DelegateSettleSession {
+    #[cfg(feature = "client")]
     /// Drive the entire batch protocol autonomously.
     ///
     /// This registers the pre-signed intent, subscribes to the event stream,
