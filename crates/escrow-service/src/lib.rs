@@ -1,11 +1,12 @@
-//! The card programme's settlement service: what it holds, what it claims, and what it waits for.
+//! A settlement service's side of a Merlin escrow: what it holds, what it claims, and what it waits
+//! for.
 //!
 //! # What this service is
 //!
-//! It is the party that already paid the merchant. A card programme settles a purchase in fiat when
-//! it clears, and then has to be made whole. Here, being made whole means being reimbursed out of
-//! the cardholder's Bitcoin escrow — so this service holds **half of the escrow key**, and the
-//! cosigner inside the enclave holds the other half.
+//! It is the party that pays first — a card programme settling a purchase with the merchant, a
+//! payout platform sending money to a bank — and is then made whole out of the customer's Bitcoin
+//! escrow. So it holds **half of the escrow key**, and the cosigner inside the enclave holds the
+//! other half.
 //!
 //! It cannot pay itself. `{service, cosigner}` is a 2-of-2, so every sat it takes needs the
 //! cosigner to agree, and the cosigner agrees only on evidence it fetched itself.
@@ -13,12 +14,13 @@
 //! # The lifecycle it tracks
 //!
 //! ```text
-//!   Paired ──▶ EscrowActive ──▶ CardAuthorized ──▶ CardCleared
-//!                                     │                 │
-//!                                     │                 ▼
-//!                                     │          EvidenceVerified ──▶ ReleaseSigned ──▶ ReleaseConfirmed
-//!                                     │
-//!                                     └── reversed or expired: nothing is owed, nothing is asked
+//!   Paired ──▶ EscrowActive ──▶ Started ──▶ Settled
+//!                                  │           │
+//!                                  │           ▼
+//!                                  │    EvidenceVerified ──▶ ReleaseSigned ──▶ ReleaseConfirmed
+//!                                  │
+//!                                  └── failed, reversed or expired: nothing is owed, so it is
+//!                                      given up on (see `Service::give_up`)
 //! ```
 //!
 //! Two of those states are not this service's to declare. **EvidenceVerified** is the cosigner's —
@@ -26,15 +28,14 @@
 //! **ReleaseConfirmed** is the chain's: a signature is not a payment, and tracking submission apart
 //! from signing is what stops a service believing it has been paid because the maths worked.
 //!
-//! # Asking only after clearing
+//! # Asking only once it settled
 //!
-//! An authorization is a hold. It can expire, be reversed, or clear for a different amount, and a
-//! programme that reimbursed itself on one would be reimbursing itself for something that may never
-//! happen. So this service waits for the clearing record — a **separate** record, linked to the
-//! authorization — and asks against that.
+//! A payment that has started has not happened. A card authorization is a hold that can expire, be
+//! reversed, or clear for a different amount; a bank payout can fail. So this service waits for the
+//! record that shows settlement — a card clearing, a completed payout — and asks against that.
 //!
 //! The cosigner does not take its word for any of it. It fetches the same record, with its own
-//! read-only credential, and checks six things about it.
+//! read-only credential, and checks what the sealed policy says to check.
 //!
 //! # What survives a restart, and what must not
 //!
@@ -60,7 +61,7 @@ pub mod wire;
 
 pub use signing::PairedShare;
 
-/// Where a purchase has got to, from this service's point of view.
+/// Where a payment has got to, from this service's point of view.
 ///
 /// Ordered, and the order is the claim: a state cannot be reached without the one before it. What
 /// each means is in the module note; the two that are not this service's to declare are marked.
@@ -71,10 +72,10 @@ pub enum Stage {
     Paired,
     /// The owner committed the escrow to a deal, so there is an allowance to draw on.
     EscrowActive,
-    /// A card was presented. A hold, not a payment.
-    CardAuthorized,
-    /// The purchase settled. This is what money is owed on.
-    CardCleared,
+    /// The payment started — a card was presented, a payout was quoted. Not a payment yet.
+    Started,
+    /// The payment settled — a card clearing, a completed payout. This is what money is owed on.
+    Settled,
     /// The COSIGNER fetched the evidence and it satisfied the sealed policy. Not this service's
     /// judgement, and not reached by this service believing anything.
     EvidenceVerified,
@@ -89,8 +90,8 @@ impl Stage {
         match self {
             Stage::Paired => "Paired",
             Stage::EscrowActive => "Escrow active",
-            Stage::CardAuthorized => "Card authorized",
-            Stage::CardCleared => "Card cleared",
+            Stage::Started => "Payment started",
+            Stage::Settled => "Payment settled",
             Stage::EvidenceVerified => "Evidence verified",
             Stage::ReleaseSigned => "Release signed",
             Stage::ReleaseConfirmed => "Release confirmed",
@@ -98,22 +99,25 @@ impl Stage {
     }
 }
 
-/// One purchase this service is tracking, and the reimbursement it is owed for it.
+/// One payment this service is tracking, and the reimbursement it is owed for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reimbursement {
     /// This service's idempotency key for the ask. Stable across every retry of the same request —
     /// that is what lets the cosigner answer a repeat without counting it twice.
     pub request_id: String,
     pub escrow_key: String,
-    /// The authorization: the hold taken when the card was presented.
-    pub authorization_token: String,
-    /// The clearing that settled it. `None` until it exists — and until it does, nothing is asked.
-    pub clearing_token: Option<String>,
-    /// What cleared, in minor units of `currency`.
+    /// The record made when the payment started: a card authorization, a payout quote. Never what
+    /// is asked about.
+    pub started_ref: String,
+    /// The record that shows it settled: a card clearing, a completed payout. `None` until it
+    /// exists — and until it does, nothing is asked.
+    pub settled_ref: Option<String>,
+    /// What settled, in minor units of `currency`.
     pub amount_minor: u64,
     pub currency: String,
-    /// What that is worth at the sealed rate. Computed once, by the same integer arithmetic the
-    /// cosigner checks the evidence with.
+    /// What this service is owed for it, in sats — at a sealed rate, or what the provider says was
+    /// paid. Computed once, the way the cosigner will check it; never the authority, because the
+    /// cosigner recomputes from the evidence it fetched.
     pub sats: u64,
     pub stage: Stage,
     /// Why the last ask was refused, if it was. Kept so a walkthrough can show the reason rather
@@ -139,7 +143,7 @@ pub struct Reimbursement {
     /// Why they have to be here: a release that was approved and signed, and whose process then
     /// died before it submitted, cannot get a second approval once the deadline has passed. The
     /// cosigner is right to refuse — the deal is over. But the payment was already agreed, and the
-    /// service has already paid the merchant. With these, the transaction can be rebuilt from the
+    /// service has already paid out. With these, the transaction can be rebuilt from the
     /// proposal and submitted without asking anybody for anything.
     #[serde(default)]
     pub signatures: Vec<String>,
@@ -162,19 +166,23 @@ pub struct Reimbursement {
     /// The Ark transaction that paid it, once one has.
     #[serde(default)]
     pub ark_txid: Option<String>,
+    /// This service stopped pursuing it: the payment will never settle, and nothing was signed.
+    /// See [`Service::give_up`].
+    #[serde(default)]
+    pub given_up: bool,
 }
 
 impl Reimbursement {
-    /// What this service asks the cosigner about — the clearing, never the authorization.
+    /// What this service asks the cosigner about — the settlement, never the start.
     pub fn reference(&self) -> Option<&str> {
-        self.clearing_token.as_deref()
+        self.settled_ref.as_deref()
     }
 
     /// Whether this has picked out VTXOs that may yet be spent.
     ///
     /// True from the moment a proposal exists until the release is confirmed or given up on. While
     /// it is true, nothing else may spend from the same escrow: those inputs are still live, and a
-    /// second purchase selecting them would get its own signatures for money only one of the two
+    /// second payment selecting them would get its own signatures for money only one of the two
     /// can actually move.
     pub fn holds_a_spend(&self) -> bool {
         self.proposal.is_some()
@@ -182,13 +190,15 @@ impl Reimbursement {
             && self.stage < Stage::ReleaseConfirmed
     }
 
-    /// Whether it is worth asking: cleared, not already paid, and not waiting on a person.
+    /// Whether it is worth asking: settled, not already paid, not given up on, and not waiting on
+    /// a person.
     pub fn ready_to_ask(&self) -> bool {
-        self.clearing_token.is_some()
+        self.settled_ref.is_some()
             && !self.needs_reconciliation
+            && !self.given_up
             && matches!(
                 self.stage,
-                Stage::CardCleared | Stage::EvidenceVerified | Stage::ReleaseSigned
+                Stage::Settled | Stage::EvidenceVerified | Stage::ReleaseSigned
             )
     }
 }
@@ -202,7 +212,7 @@ pub struct Store {
     /// this lands in is the service's key material, exactly as the cosigner's seal is its own.
     #[serde(default)]
     pub shares: BTreeMap<String, PairedShare>,
-    /// Purchases being tracked, by request id.
+    /// Payments being tracked, by request id.
     #[serde(default)]
     pub reimbursements: BTreeMap<String, Reimbursement>,
     /// What the service has issued so far, so request ids are its own and monotonic.
@@ -226,7 +236,7 @@ pub struct Service {
     saving: Mutex<()>,
     /// Escrows something is spending from right now.
     ///
-    /// Keyed by escrow, because that is the resource. Two purchases on one escrow asked for at
+    /// Keyed by escrow, because that is the resource. Two payments on one escrow asked for at
     /// once would each read the same VTXOs and each be signed for them — spending the allowance
     /// twice for money only one of them can move. Keying by reimbursement would also miss the
     /// simpler collision it was first written for: two asks under one request id each registering
@@ -239,12 +249,6 @@ pub struct Service {
     pub payout_ark_address: String,
     /// The ASP, for reading what an escrow holds and for submitting what was approved.
     pub asp_url: String,
-    /// Where the payment provider is, from this service's side. The COSIGNER's copy of this comes
-    /// from its own image and is not this value — see `crate::policy`.
-    pub provider_origin: String,
-    /// What the agreed conversion is, so a reimbursement is sized the same way the cosigner checks
-    /// it. Never the authority: the cosigner recomputes from the evidence it fetched.
-    pub terms: crate::policy::Terms,
 }
 
 impl Service {
@@ -252,8 +256,6 @@ impl Service {
         identifier: threshold::identifier::Identifier,
         payout_ark_address: String,
         asp_url: String,
-        provider_origin: String,
-        terms: crate::policy::Terms,
         path: Option<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -264,8 +266,6 @@ impl Service {
             identifier,
             payout_ark_address,
             asp_url,
-            provider_origin,
-            terms,
         })
     }
 
@@ -327,7 +327,7 @@ impl Service {
 
     /// Claim the right to spend from one escrow, or find somebody already has.
     ///
-    /// **Per escrow, not per reimbursement.** An escrow's funds are one resource: two purchases
+    /// **Per escrow, not per reimbursement.** An escrow's funds are one resource: two payments
     /// asked for at once would each read the same VTXOs, each propose spending them, and each be
     /// signed — consuming the allowance twice for money only one of them can actually move, and
     /// leaving the loser tied to inputs that no longer exist.
@@ -349,7 +349,7 @@ impl Service {
     ///
     /// A reimbursement reserves its escrow from the moment it has a **proposal** — the point at
     /// which specific VTXOs have been picked out and may yet be spent — until it is confirmed or
-    /// given up on. Another purchase must not select the same inputs meanwhile.
+    /// given up on. Another payment must not select the same inputs meanwhile.
     ///
     /// **Derived from what is written down, not from a lock.** A lock lives for one attempt: it is
     /// released when that attempt returns, including when it returns because submission failed —
@@ -376,7 +376,7 @@ impl Service {
         self.store.lock().await.reimbursements.values().cloned().collect()
     }
 
-    /// Move a purchase to a later stage. Never backwards: a stage is a thing that happened, and
+    /// Move a payment to a later stage. Never backwards: a stage is a thing that happened, and
     /// "confirmed" does not become "signed" again because a later message arrived out of order.
     pub async fn advance(self: &Arc<Self>, request_id: &str, to: Stage) {
         let mut store = self.store.lock().await;
@@ -385,6 +385,49 @@ impl Service {
                 r.stage = to;
             }
         }
+    }
+
+    /// Stop pursuing a payment that will never settle, and free its escrow.
+    ///
+    /// **Why this has to exist.** The first ask writes its proposal down before anything is asked,
+    /// and a written-down proposal holds the escrow ([`Reimbursement::holds_a_spend`]). If the
+    /// payment then fails, is reversed or expires, nothing will ever complete that proposal — and
+    /// without this, it would block every later payment on the same escrow for good.
+    ///
+    /// **Refused once anything was signed.** Signatures on hand, or a transaction id written down,
+    /// mean the release may yet be submitted or may already have landed; handing its inputs back
+    /// would let a second release pick them. That is reconciliation, not giving up. With nothing
+    /// signed, nothing can spend the inputs: this service's half of every signature was never made.
+    pub async fn give_up(self: &Arc<Self>, request_id: &str, why: &str) -> Result<(), String> {
+        let escrow_key = self
+            .store
+            .lock()
+            .await
+            .reimbursements
+            .get(request_id)
+            .map(|r| r.escrow_key.to_ascii_lowercase())
+            .ok_or_else(|| format!("nothing is tracked under {request_id}"))?;
+        // Not while an ask is running on this escrow: that ask may be about to sign.
+        let Some(_claim) = self.claim(&escrow_key).await else {
+            return Err("an ask on this escrow is running; try again once it returns".into());
+        };
+        {
+            let mut store = self.store.lock().await;
+            let Some(r) = store.reimbursements.get_mut(request_id) else {
+                return Err(format!("nothing is tracked under {request_id}"));
+            };
+            if !r.signatures.is_empty() || r.expected_txid.is_some() {
+                return Err(format!(
+                    "{request_id} was signed, so it may yet be paid; reconcile it instead"
+                ));
+            }
+            r.proposal = None;
+            r.given_up = true;
+            r.last_refusal = Some(why.to_string());
+        }
+        self.persist()
+            .await
+            .map_err(|e| format!("giving up could not be written down: {e}"))
     }
 }
 
@@ -435,12 +478,12 @@ impl Drop for InFlight {
 mod tests {
     use super::*;
 
-    fn a_reimbursement(stage: Stage, cleared: bool) -> Reimbursement {
+    fn a_reimbursement(stage: Stage, settled: bool) -> Reimbursement {
         Reimbursement {
             request_id: "reimb-0001".into(),
             escrow_key: "02aa".into(),
-            authorization_token: "txn_auth_0001".into(),
-            clearing_token: cleared.then(|| "txn_clr_0002".to_string()),
+            started_ref: "txn_auth_0001".into(),
+            settled_ref: settled.then(|| "txn_clr_0002".to_string()),
             amount_minor: 2_000,
             currency: "USD".into(),
             sats: 20_000,
@@ -451,19 +494,79 @@ mod tests {
             signatures: Vec::new(),
             expected_txid: None,
             ark_txid: None,
+            given_up: false,
         }
     }
 
-    /// The whole point of the example in one assertion: an authorization is not something to be
-    /// paid for.
+    fn a_proposal() -> PersistedProposal {
+        PersistedProposal {
+            to_ark_address: "ark1example".into(),
+            amount_sats: 20_000,
+            inputs: vec![PersistedInput {
+                txid: "11".repeat(32),
+                vout: 0,
+                amount_sats: 100_000,
+                exit_delay: 512,
+            }],
+        }
+    }
+
+    /// A payment that has only started is not something to be paid for.
     #[test]
-    fn nothing_is_asked_for_until_a_purchase_has_cleared() {
-        assert!(!a_reimbursement(Stage::CardAuthorized, false).ready_to_ask());
-        assert!(a_reimbursement(Stage::CardCleared, true).ready_to_ask());
-        // And what is asked about is the CLEARING, never the hold.
-        let cleared = a_reimbursement(Stage::CardCleared, true);
-        assert_eq!(cleared.reference(), Some("txn_clr_0002"));
-        assert_ne!(cleared.reference(), Some(cleared.authorization_token.as_str()));
+    fn nothing_is_asked_for_until_the_payment_has_settled() {
+        assert!(!a_reimbursement(Stage::Started, false).ready_to_ask());
+        assert!(a_reimbursement(Stage::Settled, true).ready_to_ask());
+        // And what is asked about is the SETTLEMENT, never the start.
+        let settled = a_reimbursement(Stage::Settled, true);
+        assert_eq!(settled.reference(), Some("txn_clr_0002"));
+        assert_ne!(settled.reference(), Some(settled.started_ref.as_str()));
+    }
+
+    /// A payment that will never settle must not hold its escrow for ever.
+    #[tokio::test]
+    async fn giving_up_on_an_unsigned_reimbursement_frees_its_escrow() {
+        let service = service();
+        let mut stuck = a_reimbursement(Stage::Settled, true);
+        stuck.proposal = Some(a_proposal());
+        service
+            .store
+            .lock()
+            .await
+            .reimbursements
+            .insert("reimb-0001".into(), stuck);
+        assert_eq!(
+            service.reserved_by("02aa", "reimb-0002").await.as_deref(),
+            Some("reimb-0001")
+        );
+
+        service.give_up("reimb-0001", "the payout failed").await.unwrap();
+
+        assert_eq!(service.reserved_by("02aa", "reimb-0002").await, None);
+        let store = service.store.lock().await;
+        let gone = &store.reimbursements["reimb-0001"];
+        assert!(!gone.ready_to_ask(), "given up means not asked about again");
+        assert_eq!(gone.last_refusal.as_deref(), Some("the payout failed"));
+    }
+
+    /// Once anything is signed the release may yet land, so its inputs are not handed back.
+    #[tokio::test]
+    async fn a_signed_reimbursement_cannot_be_given_up() {
+        let service = service();
+        let mut signed = a_reimbursement(Stage::ReleaseSigned, true);
+        signed.proposal = Some(a_proposal());
+        signed.signatures = vec!["00".repeat(64)];
+        service
+            .store
+            .lock()
+            .await
+            .reimbursements
+            .insert("reimb-0001".into(), signed);
+
+        assert!(service.give_up("reimb-0001", "changed my mind").await.is_err());
+        assert_eq!(
+            service.reserved_by("02aa", "reimb-0002").await.as_deref(),
+            Some("reimb-0001")
+        );
     }
 
     /// Once it is paid it is not asked for again.
@@ -484,7 +587,7 @@ mod tests {
 
     /// One escrow is spent from by one thing at a time.
     ///
-    /// Two purchases on one escrow, asked for at once, would each read the same VTXOs and each be
+    /// Two payments on one escrow, asked for at once, would each read the same VTXOs and each be
     /// signed for them — spending the allowance twice for money only one of them can move, and
     /// leaving the loser tied to inputs that no longer exist.
     #[tokio::test]
@@ -494,7 +597,7 @@ mod tests {
         assert!(alices.is_some());
         assert!(
             service.claim("02aa").await.is_none(),
-            "a second purchase must wait, not race for the same inputs"
+            "a second payment must wait, not race for the same inputs"
         );
         // Another escrow is another resource, and is free to run.
         assert!(service.claim("02bb").await.is_some());
@@ -520,7 +623,7 @@ mod tests {
                 .reimbursements
                 .insert("reimb-0001".into(), a_reimbursement(Stage::ReleaseConfirmed, true));
         }
-        service.advance("reimb-0001", Stage::CardCleared).await;
+        service.advance("reimb-0001", Stage::Settled).await;
         let store = service.store.lock().await;
         assert_eq!(
             store.reimbursements["reimb-0001"].stage,
@@ -537,12 +640,12 @@ mod tests {
             let mut store = service.store.lock().await;
             store
                 .reimbursements
-                .insert("reimb-0001".into(), a_reimbursement(Stage::CardCleared, true));
+                .insert("reimb-0001".into(), a_reimbursement(Stage::Settled, true));
             store.issued = 1;
         }
         let json = serde_json::to_string(&*service.store.lock().await).unwrap();
         let back: Store = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.reimbursements["reimb-0001"].stage, Stage::CardCleared);
+        assert_eq!(back.reimbursements["reimb-0001"].stage, Stage::Settled);
         assert_eq!(back.issued, 1);
         assert!(
             !json.contains("nonce"),
@@ -562,8 +665,6 @@ mod tests {
             threshold::identifier::Identifier::derive(b"test-service").unwrap(),
             "ark1example".into(),
             "http://127.0.0.1:7070".into(),
-            "http://127.0.0.1:7100".into(),
-            crate::policy::Terms::example("ark1example".into(), "http://127.0.0.1:7100".into()),
             None,
         )
     }

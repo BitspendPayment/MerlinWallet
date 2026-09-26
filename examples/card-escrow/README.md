@@ -260,9 +260,10 @@ a signature is arithmetic, and money moves when the ASP accepts the transaction.
 | a settled or abandoned spend frees the escrow | ″ |
 | a pairing that cannot be stored is refused | `tests/pairing_storage.rs` |
 | one whose outcome cannot be determined stops the retrying | ″ |
-| only one ask runs per reimbursement at a time | `src/service/mod.rs` |
+| only one ask runs per reimbursement at a time | [`crates/escrow-service/src/lib.rs`](../../crates/escrow-service/src/lib.rs) |
 | nothing that survives a restart is a nonce | ″ |
 | a late message cannot un-confirm a payment | ″ |
+| a payment that will never settle can be given up, freeing its escrow — unless it was signed | ″ |
 | two customers are two connections under one name | ″ |
 | **two customers receive only their own events** | `tests/two_customers.rs` |
 | one customer disconnecting does not disturb the other | ″ |

@@ -485,8 +485,11 @@ pub fn safe_reference(reference: &str) -> Option<String> {
         && reference.len() <= 128
         && reference
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
         // `.` is allowed because references contain it; `..` is not, because it climbs.
+        // `:` is allowed because Lightspark Grid's are `Transaction:<uuid>`. The URL is always
+        // `provider + path`, and the path starts with `/`, so a colon lands inside a path segment,
+        // where it cannot start a scheme or an authority.
         && !reference.contains("..");
     ok.then(|| reference.to_string())
 }
@@ -806,6 +809,8 @@ mod tests {
             "abc#frag",
             "abc/def",
             "//evil.example",
+            // A colon is allowed, so a scheme-looking reference must still be stopped by its `/`.
+            "https://evil.example",
             "abc\\def",
             "",
             &"x".repeat(129),
@@ -815,6 +820,19 @@ mod tests {
                 "{bad:?} must not reach a URL"
             );
         }
+    }
+
+    /// Lightspark Grid names a payment `Transaction:<uuid>`. The colon stays inside the path.
+    #[test]
+    fn a_grid_transaction_id_is_accepted_and_stays_in_the_path() {
+        let id = "Transaction:019542f5-b3e7-1d02-0000-000000000004";
+        let facts = ReleaseFacts {
+            reference: id.into(),
+            ..release()
+        };
+        let request = condition().request(&facts).unwrap();
+        assert_eq!(request.provider, "https://diva.example");
+        assert_eq!(request.path, format!("/v1/transactions/{id}"));
     }
 
     #[test]

@@ -113,8 +113,6 @@ async fn main() -> anyhow::Result<()> {
         identifier.clone(),
         payout.clone(),
         args.asp.clone(),
-        args.provider.clone(),
-        terms.clone(),
         args.store.clone(),
     );
     service.restore().await?;
@@ -245,18 +243,19 @@ async fn authorize(
             Reimbursement {
                 request_id: request_id.clone(),
                 escrow_key: request.escrow_key,
-                authorization_token: token.to_string(),
-                clearing_token: None,
+                started_ref: token.to_string(),
+                settled_ref: None,
                 amount_minor: request.amount_minor,
                 currency: request.currency,
                 sats,
-                stage: Stage::CardAuthorized,
+                stage: Stage::Started,
                 last_refusal: None,
                 needs_reconciliation: false,
                 proposal: None,
                 signatures: Vec::new(),
                 expected_txid: None,
                 ark_txid: None,
+                given_up: false,
             },
         );
     }
@@ -265,7 +264,7 @@ async fn authorize(
         "request_id": request_id,
         "authorization": token,
         "sats_when_cleared": sats,
-        "stage": Stage::CardAuthorized.label(),
+        "stage": Stage::Started.label(),
         "simulated": true,
     }))
     .into_response()
@@ -279,7 +278,7 @@ async fn clear(
     let authorization = {
         let store = app.wire.service.store.lock().await;
         match store.reimbursements.get(&request_id) {
-            Some(r) => r.authorization_token.clone(),
+            Some(r) => r.started_ref.clone(),
             None => return bad("nothing is tracked under that id"),
         }
     };
@@ -302,9 +301,9 @@ async fn clear(
     {
         let mut store = app.wire.service.store.lock().await;
         if let Some(r) = store.reimbursements.get_mut(&request_id) {
-            r.clearing_token = Some(token.to_string());
-            if r.stage < Stage::CardCleared {
-                r.stage = Stage::CardCleared;
+            r.settled_ref = Some(token.to_string());
+            if r.stage < Stage::Settled {
+                r.stage = Stage::Settled;
             }
         }
     }
@@ -313,7 +312,7 @@ async fn clear(
         "request_id": request_id,
         "authorization": authorization,
         "clearing": token,
-        "stage": Stage::CardCleared.label(),
+        "stage": Stage::Settled.label(),
         "simulated": true,
     }))
     .into_response()
@@ -327,7 +326,7 @@ async fn reverse(
     let authorization = {
         let store = app.wire.service.store.lock().await;
         match store.reimbursements.get(&request_id) {
-            Some(r) => r.authorization_token.clone(),
+            Some(r) => r.started_ref.clone(),
             None => return bad("nothing is tracked under that id"),
         }
     };
@@ -357,7 +356,7 @@ async fn reimburse_one(
         Some("authorization") => {
             let store = app.wire.service.store.lock().await;
             match store.reimbursements.get(&request_id) {
-                Some(r) => Some(r.authorization_token.clone()),
+                Some(r) => Some(r.started_ref.clone()),
                 None => return bad("nothing is tracked under that id"),
             }
         }

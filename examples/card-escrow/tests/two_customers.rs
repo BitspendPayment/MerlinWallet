@@ -25,7 +25,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use card_escrow::policy::Terms;
 use card_escrow::service::wire::{router, say, Connections, Wire};
 use card_escrow::service::Service;
 use cosigner::service_stream::FromService;
@@ -119,8 +118,6 @@ async fn service() -> (Arc<Wire>, String) {
         threshold::identifier::Identifier::derive(b"merlin-e2e-escrow-service").unwrap(),
         "ark1service".into(),
         "http://127.0.0.1:7070".into(),
-        "http://127.0.0.1:7100".into(),
-        Terms::example("ark1service".into(), "http://127.0.0.1:7100".into()),
         None,
     );
     let connections = Arc::new(Connections::default());

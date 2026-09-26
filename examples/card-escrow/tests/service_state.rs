@@ -5,21 +5,14 @@
 
 use std::sync::Arc;
 
-use card_escrow::policy::Terms;
 use card_escrow::service::wire::Connections;
 use card_escrow::service::{PersistedInput, PersistedProposal, Reimbursement, Service, Stage};
-
-fn terms() -> Terms {
-    Terms::example("ark1service".into(), "http://127.0.0.1:7100".into())
-}
 
 fn service(path: Option<std::path::PathBuf>) -> Arc<Service> {
     Service::new(
         threshold::identifier::Identifier::derive(b"merlin-e2e-escrow-service").unwrap(),
         "ark1service".into(),
         "http://127.0.0.1:7070".into(),
-        "http://127.0.0.1:7100".into(),
-        terms(),
         path,
     )
 }
@@ -28,18 +21,19 @@ fn cleared(request_id: &str) -> Reimbursement {
     Reimbursement {
         request_id: request_id.into(),
         escrow_key: "02".to_string() + &"ab".repeat(32),
-        authorization_token: "txn_auth_0001".into(),
-        clearing_token: Some("txn_clr_0002".into()),
+        started_ref: "txn_auth_0001".into(),
+        settled_ref: Some("txn_clr_0002".into()),
         amount_minor: 2_000,
         currency: "USD".into(),
         sats: 20_000,
-        stage: Stage::CardCleared,
+        stage: Stage::Settled,
         last_refusal: None,
         needs_reconciliation: false,
         proposal: None,
         signatures: Vec::new(),
         expected_txid: None,
         ark_txid: None,
+        given_up: false,
     }
 }
 
@@ -68,7 +62,7 @@ async fn a_restart_keeps_work_that_was_not_finished() {
     after.restore().await.unwrap();
     let tracked = after.tracked().await;
     assert_eq!(tracked.len(), 1);
-    assert_eq!(tracked[0].stage, Stage::CardCleared);
+    assert_eq!(tracked[0].stage, Stage::Settled);
     assert!(
         tracked[0].ready_to_ask(),
         "a cleared purchase that was never paid is still owed after a restart"
@@ -112,7 +106,7 @@ async fn a_late_message_cannot_unconfirm_a_payment() {
         .reimbursements
         .insert("reimb-0001".into(), paid);
 
-    s.advance("reimb-0001", Stage::CardCleared).await;
+    s.advance("reimb-0001", Stage::Settled).await;
     let tracked = s.tracked().await;
     assert_eq!(tracked[0].stage, Stage::ReleaseConfirmed);
     assert!(!tracked[0].ready_to_ask(), "and it is not asked for again");
@@ -166,7 +160,7 @@ async fn work_outlives_the_connection_it_was_waiting_on() {
 
     // The reimbursement is untouched by the connection going, and is still owed.
     let tracked = s.tracked().await;
-    assert_eq!(tracked[0].stage, Stage::CardCleared);
+    assert_eq!(tracked[0].stage, Stage::Settled);
     assert!(
         tracked[0].ready_to_ask(),
         "a drop is a reason to ask again, not a reason to stop"
@@ -222,7 +216,7 @@ async fn a_retry_carries_the_same_request_id() {
     // Whatever else changes between attempts, this does not.
     let again = s.tracked().await.into_iter().next().unwrap();
     assert_eq!(again.request_id, first.request_id);
-    assert_eq!(again.clearing_token, first.clearing_token);
+    assert_eq!(again.settled_ref, first.settled_ref);
 }
 
 /// A reimbursement whose outcome this service cannot determine stops being asked about.

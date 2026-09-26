@@ -33,9 +33,10 @@
 //!   not.
 //! - [`policy`] — the deal, written down: destination, per-purchase cap, total allowance, the fixed
 //!   conversion, and the six things the evidence must show.
-//! - [`service`] — the settlement service itself: it holds half of the escrow key, watches the card
-//!   lifecycle, asks for reimbursement only once a purchase has cleared, and submits exactly the
-//!   transaction the cosigner approved.
+//! - [`service`] — the settlement service itself: it holds half of the escrow key, asks for
+//!   reimbursement only once a purchase has cleared, and submits exactly the transaction the
+//!   cosigner approved. It lives in `crates/escrow-service`, shared with every other service paid
+//!   out of an escrow; here a card authorization is its `Started` and a clearing its `Settled`.
 //!
 //! # What is real
 //!
@@ -45,4 +46,4 @@
 
 pub mod policy;
 pub mod provider;
-pub mod service;
+pub use escrow_service as service;

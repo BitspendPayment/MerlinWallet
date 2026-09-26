@@ -14,7 +14,6 @@ mod common;
 
 use std::sync::Arc;
 
-use card_escrow::policy::Terms;
 use card_escrow::service::wire::{router, Connections, Wire};
 use card_escrow::service::Service;
 use rand::rngs::OsRng;
@@ -74,8 +73,6 @@ async fn service_storing_at(path: Option<std::path::PathBuf>) -> (Arc<Wire>, Str
         Identifier::derive(b"merlin-e2e-escrow-service").unwrap(),
         "ark1service".into(),
         "http://127.0.0.1:7070".into(),
-        "http://127.0.0.1:7100".into(),
-        Terms::example("ark1service".into(), "http://127.0.0.1:7100".into()),
         path,
     );
     let connections = Arc::new(Connections::default());

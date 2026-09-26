@@ -1,0 +1,25 @@
+[package]
+name = "escrow-service"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A settlement service's side of a Merlin escrow: its half of the key, its claims, and turning an approval into an Ark payment."
+
+[dependencies]
+# The wire, the policy and the release shapes are the cosigner's, imported rather than restated.
+cosigner = { path = "../../cosigner" }
+ark = { path = "../ark", features = ["signing", "client"] }
+threshold = { path = "../threshold", features = ["std"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs"] }
+axum = "0.8"
+tokio-stream = "0.1"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+rand = "0.8"
+k256 = { version = "0.13", features = ["arithmetic"] }
+base64 = "0.22"
+tracing = "0.1"
+anyhow = "1"

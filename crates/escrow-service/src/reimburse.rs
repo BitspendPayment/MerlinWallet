@@ -9,7 +9,7 @@
 //! built, and signs what it judged.
 //!
 //! Commitments ride the ask, because the cosigner cannot hold a nonce between messages. See
-//! [`crate::service::signing`].
+//! [`crate::signing`].
 //!
 //! # And then it is checked, not trusted
 //!
@@ -69,37 +69,50 @@ pub enum Asked {
     /// Something went wrong on this side. Worth retrying.
     Failed { reason: String },
     /// The outcome cannot be determined from here — see the note on
-    /// [`Reimbursement::needs_reconciliation`](crate::service::Reimbursement::needs_reconciliation).
+    /// [`Reimbursement::needs_reconciliation`](crate::Reimbursement::needs_reconciliation).
     NeedsReconciliation,
 }
 
-/// Ask to be reimbursed for one purchase, and see it through to the chain.
+/// Ask to be reimbursed for one payment, and see it through to the chain.
 pub async fn ask(wire: &Arc<Wire>, request_id: &str) -> Asked {
     ask_against(wire, request_id, None).await
 }
 
-/// Ask, naming a payment reference other than the clearing.
+/// Ask, naming a payment reference other than the settlement.
 ///
-/// Only a demonstration has a use for this. A settlement service asks about the **clearing**,
-/// because that is what money is owed on — it would not ask about a hold, and this service's own
-/// `ready_to_ask` says so. But "the cosigner refuses an authorization" is worth *showing* rather
-/// than asserting, and the only way to show it is to ask badly on purpose.
+/// A settlement service asks about the **settlement**, because that is what money is owed on, and
+/// this service's own `ready_to_ask` says so. Asking about anything else is refused by the cosigner,
+/// and that refusal is what this is for:
 ///
-/// The cosigner does not care that the ask is ill-advised. It fetches whatever reference it is
-/// given and checks six things about it; an authorization fails on being the wrong kind of record
-/// and on not having completed, which is the refusal the walkthrough prints.
+/// - a demonstration asks about a card authorization on purpose, so the refusal can be seen rather
+///   than taken on trust;
+/// - a payout service asks about its payout *before funding it*. The one refusal it expects, "not
+///   completed", shows every other term of the sealed policy already holds — so it knows it will
+///   be paid before it pays. The proposal written down by that ask is the one the real ask reuses.
+///
+/// The cosigner does not care that the ask is early. It fetches whatever reference it is given and
+/// checks what the sealed policy says to check.
 pub async fn ask_against(
     wire: &Arc<Wire>,
     request_id: &str,
     reference: Option<&str>,
 ) -> Asked {
-    // One at a time per ESCROW, not per reimbursement. Two purchases on one escrow asked for at
+    // One at a time per ESCROW, not per reimbursement. Two payments on one escrow asked for at
     // once would each read the same VTXOs, each propose spending them, and each be signed — which
     // spends the allowance twice for money only one of them can move, and leaves the loser tied to
     // inputs that no longer exist.
     let escrow_key = {
         let store = wire.service.store.lock().await;
         match store.reimbursements.get(request_id) {
+            // Returned before anything is written, so the reason it was given up on survives.
+            Some(r) if r.given_up => {
+                return Asked::Failed {
+                    reason: format!(
+                        "{request_id} was given up on ({}), so nothing is asked about it",
+                        r.last_refusal.as_deref().unwrap_or("no reason recorded")
+                    ),
+                }
+            }
             Some(r) => r.escrow_key.to_ascii_lowercase(),
             None => {
                 return Asked::Failed {
@@ -139,14 +152,14 @@ async fn attempt(
             .ok_or_else(|| format!("nothing is tracked under {request_id}"))?
     };
 
-    // Is another purchase part-way through spending this escrow?
+    // Is another payment part-way through spending this escrow?
     //
     // Asked before anything is dialled, and only when this reimbursement has not already picked out
     // its own inputs — a retry of a spend that is already reserved is the holder itself coming back.
     //
     // The in-memory claim is not enough on its own. It is released when an attempt returns, and an
     // attempt returns on a failed submission too — at which point the transaction may still be on
-    // its way to the chain, the inputs are still unspent, and a second purchase would happily
+    // its way to the chain, the inputs are still unspent, and a second payment would happily
     // select them. It also dies with the process.
     if reimbursement.proposal.is_none() {
         if let Some(holder) = wire
@@ -179,7 +192,7 @@ async fn attempt(
         Some(forced) => forced.to_string(),
         None => reimbursement
             .reference()
-            .ok_or("that purchase has not cleared, so there is nothing to be reimbursed for")?
+            .ok_or("that payment has not settled, so there is nothing to be reimbursed for")?
             .to_string(),
     };
 
@@ -242,7 +255,7 @@ async fn attempt(
     // This is the path that matters after a crash between signing and submitting. The release was
     // approved and the signatures are on hand, so no second approval is needed — which is just as
     // well, because a deadline that has passed since means the cosigner would rightly refuse to
-    // give one, and the service has already paid the merchant.
+    // give one, and the service has already paid out.
     if !reimbursement.signatures.is_empty() {
         let signatures = signatures_from_hex(&reimbursement.signatures)?;
         let (mut session, _) = proposal.build(&info)?;
@@ -579,7 +592,7 @@ pub async fn keep_trying(wire: Arc<Wire>) {
                 Asked::NeedsReconciliation => {
                     tracing::warn!(%request_id, "needs reconciling; not asking again")
                 }
-                // Refusals and failures are the ordinary state of a purchase that is not payable
+                // Refusals and failures are the ordinary state of a payment that is not payable
                 // yet. Logged at debug so a quiet service stays quiet.
                 other => tracing::debug!(%request_id, ?other, "still outstanding"),
             }

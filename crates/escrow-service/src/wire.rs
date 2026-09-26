@@ -43,7 +43,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 use super::Service;
-use crate::service::signing::{NotPaired, PairedShare};
+use crate::signing::{NotPaired, PairedShare};
 
 /// One connection the runtime is holding, by the id it announced.
 struct Held {
@@ -382,8 +382,9 @@ async fn status(State(wire): State<Arc<Wire>>) -> axum::response::Response {
         "reimbursements": tracked.iter().map(|r| serde_json::json!({
             "request_id": r.request_id,
             "stage": r.stage.label(),
-            "authorization": r.authorization_token,
-            "clearing": r.clearing_token,
+            "started": r.started_ref,
+            "settled": r.settled_ref,
+            "given_up": r.given_up,
             "sats": r.sats,
             "ark_txid": r.ark_txid,
             "last_refusal": r.last_refusal,

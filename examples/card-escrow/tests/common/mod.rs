@@ -217,6 +217,7 @@ impl World {
                     wallet_confirmed: true,
                 }),
                 session: None,
+                reclaim_opened_at: None,
             })
             .ok()?;
         cosigner
