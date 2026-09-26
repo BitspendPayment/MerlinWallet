@@ -368,7 +368,7 @@ PUB_BIN := $(HOME)/.pub-cache/bin
 proto:
 	@command -v protoc >/dev/null || { echo "protoc not found — install protobuf-compiler"; exit 1; }
 	@test -x "$(PUB_BIN)/protoc-gen-dart" || { \
-		echo "protoc-gen-dart not found — run: dart pub global activate protoc_plugin"; exit 1; }
+		echo "protoc-gen-dart not found — run: dart pub global activate protoc_plugin 21.1.2"; exit 1; }
 	@echo "Generating Dart stubs: the cosigner's service and the ASP's..."
 	@mkdir -p protocol/lib/src/generated
 	PATH="$$PATH:$(PUB_BIN)" protoc -I protocol/protos \

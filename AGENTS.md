@@ -17,7 +17,8 @@
   deployment; `scripts/` what the Makefile calls.
 
 ## Build, Test, and Development Commands
-- `make proto` regenerate Dart stubs (needs `protoc` and `dart pub global activate protoc_plugin`);
+- `make proto` regenerate Dart stubs (needs `protoc` and `dart pub global activate protoc_plugin
+  21.1.2`, the generator for the protobuf 3 runtime `protocol` pins);
   `make proto-check` diffs them.
 - `make ffi-build` build `ffi/target/release/libmpcwallet_ffi.so`; `app-core` tests need it.
 - `cd cosigner && cargo test` — the cosigner's tests run on the host. `make cosigner-wasm` builds

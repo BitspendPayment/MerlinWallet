@@ -73,7 +73,9 @@ jobs:
       - name: Install protoc and the Dart plugin
         run: |
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
-          dart pub global activate protoc_plugin
+          # Pinned: the generator must match the protobuf runtime `protocol` pins (^3.1.0). The
+          # latest plugin emits code for protobuf 6, which does not analyze against 3.
+          dart pub global activate protoc_plugin 21.1.2
       # The generated Dart is not checked in.
       - name: Generate protocol stubs
         run: make proto
@@ -96,7 +98,9 @@ jobs:
       - name: Install protoc and the Dart plugin
         run: |
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
-          dart pub global activate protoc_plugin
+          # Pinned: the generator must match the protobuf runtime `protocol` pins (^3.1.0). The
+          # latest plugin emits code for protobuf 6, which does not analyze against 3.
+          dart pub global activate protoc_plugin 21.1.2
       - name: Generate protocol stubs
         run: make proto
       - name: Analyze and test
@@ -140,7 +144,9 @@ jobs:
       - name: Install protoc and the Dart plugin
         run: |
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
-          dart pub global activate protoc_plugin
+          # Pinned: the generator must match the protobuf runtime `protocol` pins (^3.1.0). The
+          # latest plugin emits code for protobuf 6, which does not analyze against 3.
+          dart pub global activate protoc_plugin 21.1.2
       - name: Let this user open KVM, and load the vsock loopback transport
         # What enclave-runtime's scripts/ci-e2e.sh does on the same runners: /dev/kvm exists but is
         # root-owned, and the harness forwards the enclave's vsock to host loopback.
