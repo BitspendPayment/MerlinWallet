@@ -78,9 +78,82 @@ Do NOT fix yet — just record. Fix pass happens once, after this list is comple
   operation on a graceful close). Deliberately NOT wired: app backgrounding, or any timer — a round
   abandoned after its intent is registered is one the ASP was counting on, and arkd may penalize it.
   Product/ASP-policy call. Also: send, protect and renew have no "Stop waiting" of their own.
-- [ ] NK-6 CI does not run what proves RC-3/RC-4: `app-core` tests have no Makefile target and no CI
-  job, and `.github/workflows/e2e.yml` still points at the deleted `e2e/test/ark_e2e_test.dart`.
-  (`AGENTS.md` also still describes the old `client/` + `server/` layout.)
+- [x] NK-6 ✓ DONE 2026-09-26 — `.github/workflows/ci.yml` replaces `e2e.yml` (which built a native
+  `cosigner` binary that no longer exists and ran an archived test, so it could not pass): cosigner,
+  threshold and ffi `cargo test`; every Dart package analyzed; `app-core` tests against the built
+  FFI; `flutter analyze` + `flutter test`. `AGENTS.md` rewritten for the current layout.
+  Required-check names changed — branch protection, if any, needs `Rust (cosigner, threshold, ffi)`
+  / `Dart (…)` / `Flutter (…)`. Later the same day: the `enclave-e2e` job boots the e2e from a
+  *downloaded* dev-enclave bundle (a GitHub Release asset of enclave-runtime, pinned in
+  `enclave-bundle.lock`). Its `image.env` is sourced as bash and its container images are
+  `docker load`ed, so the sha256 in the lock is the trust boundary: `make enclave-bundle` verifies
+  it before unpacking, and a lock bump is a review of what the runtime published, not a refresh.
+
+### PR #55 review, 2026-09-26 — the escrow commits (b8b98050..50f9bd0c), fixed in this pass
+Each was reproduced or read end to end before it was fixed, and each fix has a test that fails
+without it. The enclave e2e was run over the fixed tree on 2026-09-26: 27/27, including the five
+escrow tests — the branch's first end-to-end run since the escrow commits.
+- [x] **P55-H1** escrow operations could not be cancelled, and a cancelled reclaim could still move
+  money: the three escrow streams were built outside `CosignerConnection._track`, the polynomial
+  and delta were moved out of the `WalletOperation` into closures, and `ReclaimSession` /
+  `PairingSession` awaited the ASP, the HTTP delivery of a secret and the confirmation without
+  `CancelSignal.guard`. Now tracked, rebuilt inside the operation (`escrowKeyPackage`, same
+  first-round-only contract as the wallet's), guarded, and `_stillRunning`-checked. Also found on
+  the way: `Duplex.close()` never returned for a stream nobody had listened to yet. Tests:
+  `cancel_streams_test.dart`, `escrow_reconstruction_test.dart` ("inside an operation").
+- [x] **P55-H2** a release was signed BEFORE it was recorded, and `seal()` only logged a failed
+  write; one failed write after a signed release was one payment paid twice (reproduced). Now
+  record → `try_seal` → sign, with the in-memory record rolled back on a failed seal, so the
+  instance and the seal always agree. Test: `release_test.rs`
+  `a_release_the_seal_cannot_record_is_not_signed`.
+- [x] **P55-H3** a pre-signed reclaim bypassed a later deal: reclaim signatures taken while no deal
+  was live could be kept and spent under a deal struck afterwards — nothing in Bitcoin stops it,
+  both pairings sign the same key, and `EscrowOpenSession` neither invalidated them nor knew they
+  existed. The cosigner cannot see whether signatures left the device or whether the outpoints
+  they spend still exist, so the only sound rule with what it knows: an escrow a reclaim was ever
+  OPENED on is retired from deals for good (`EscrowRecord.reclaim_opened_at`, set and sealed
+  before the reclaim's first nonce, checked first in `open_escrow_session`). A reclaim empties
+  the escrow anyway; the next deal gets a new one. Tests: `release_test.rs`
+  `an_escrow_a_reclaim_was_opened_on_cannot_be_committed_again` (the bypass, and its survival of
+  a reopen) and `…abandoned_after_its_first_message…` (over the wire, cut off before the wallet
+  answers). Not done: invalidating the signatures themselves, which would need the escrow's funds
+  moved at every deal open — a ceremony, not a check.
+- [x] **P55-M1** `x_only` byte-sliced `k[2..]` after `to_ascii_lowercase`, so a 66-byte key with a
+  multibyte character — which a paired service can send — panicked the guest. One `pub(crate)`
+  copy now, sliced only when ASCII. Unit test in `cosigner.rs`.
+- [x] **P55-M2** a seal that was present but unreadable opened as a wallet with no key, so a store
+  read fault would have let a DKG re-key the tenant over sealed funds. `restore_snapshot` now
+  distinguishes "no seal" from "unreadable seal" and `open_with_host` refuses the latter. Test:
+  `seal_test.rs`. (Pre-existing; RC-3 made the seal the only copy of anything.)
+- [x] **P55-M3** the plain-HTTP exception for the pairing contribution was a hostname prefix
+  match (`10.attacker.com` passed). `isLocalDevelopmentHost` parses an address: loopback or
+  RFC 1918, never a name. Test: `escrow_recovery_test.dart`.
+- [x] **P55-M4** escrows were not recoverable (`recoverEscrows` existed only in a doc comment,
+  `EscrowSummary` carried no context) and `resetLocalState` left `_escrows` populated, so a reset
+  and a recovery of another wallet saved the old wallet's escrows under the new one. `Recover`
+  now returns `EscrowSummary` with `context`; `recover()` rebuilds them (`fromSummary`, which
+  refuses another wallet's identifier and skips a context-less escrow); reset and an empty
+  restore clear them. Tests: `recover_test.rs`, `escrow_recovery_test.dart`.
+- [x] **P55-M5** `restoreWallet` persisted the credential id before `recover()`, so a failed
+  restore left a passkey the next Create reused for a DKG the cosigner refuses. Rolled back on
+  failure. No automated test: needs the platform channel.
+- [x] **P55-M6** `signing_screen` called `setState` after `await sendArk` with no `mounted` check,
+  logging a completed send as failed. Plus the same guard in four onboarding screens.
+- [x] **P55-L** a release answered under a previous deal is now refused rather than re-signed
+  uncounted; `provider[8..]` / `origin[8..]` use `get`; `threshold_dkg_reshare_part1` exports
+  again (a misplaced `#[no_mangle]`); `resetLocalWallet` clears the mirrored contact and request
+  lists, as its copy says.
+- [ ] **P55-open** — not fixed, recorded: `PairService`/`EscrowReclaim` check the identifier
+  against the sealed one, so the check cannot fail (design; the client-side check runs first);
+  evidence is not cryptographically bound to amount or reference — the policy author binds it
+  with `MatchesReference`/`MatchesAmount`; `MAX_RELEASED_REFERENCES` is fail-closed but
+  permanent and burnable by a paired service under an `Always` policy; `now_secs()` falls back
+  to 0, fail-open for release; a cold start whose `restoreSession` fails has no retry
+  (`reconnect()` is unreachable); no in-process test drives the `PairService`/`EscrowReclaim`
+  streams; `app/integration_test` still targets the deleted PIN screens; `EscrowRecord` /
+  `ServicePairing` derive an un-redacted `Debug`; dead Makefile targets (`runtime-run` and what
+  depends on it); wallet-level `SpendingPolicy` and `ServiceList`/`ServiceRevoke` have no
+  equivalent on this branch.
 - [ ] TH-7 reject non-canonical signature `s ≥ n`; TH-4 constant-time ECIES MAC compare; TH-9 PoK domain tag / seeded-zero / into_even_y.
 - [ ] CL-2 encrypted store + shorter TTL for the session token (the store no longer holds key material — see RC-3 — so this is now about privacy of outpoints and the exit address; the two-minute PRF seed cache is gone); CR-6 bounds-check compose.rs:80-87; CR-7 tighten CORS / remove unauth redeem; EC-2/EC-4 doc-timestamp recency + attestation catch_unwind.
 - [ ] IN-5 SHA-pin CI actions; ignore committed empty terraform.tfstate; Firebase API-key restrictions; docker-compose 0.0.0.0 bind comment.
@@ -211,7 +284,10 @@ Do NOT fix yet — just record. Fix pass happens once, after this list is comple
       operation; and that cleanup cannot take a newer operation's approval with it, because the
       next operation waits for it (`_promptInFlight`) before asking for a gesture of its own;
     - operations still waiting their turn are untouched, and an operation waiting behind a stale
-      prompt can itself be cancelled.
+      prompt can itself be cancelled;
+    - the escrow operations — mint, pair, reclaim — are held to the same rule since P55-H1: their
+      streams are tracked, the escrow share is rebuilt inside the operation, and the ASP, the
+      HTTP delivery of a contribution and the pairing confirmation are guarded waits.
   - *Known limits — accepted.*
     - **A prompt cannot be withdrawn** from Dart; the platform plugin takes no cancellation signal.
       The queue behind a stale prompt waits for it (NK-2).

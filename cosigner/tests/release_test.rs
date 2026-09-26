@@ -10,7 +10,11 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use common::wire::{self, block_on, collect, service, TENANT};
 use common::Recorder;
+use cosigner::session::proto;
+use cosigner::types::VtxoInput;
+use cosigner::wallet_proto as wp;
 use cosigner::asp::AspApi;
 use cosigner::escrow_session::EscrowSession;
 use cosigner::evidence::{Evidence, EvidenceRequest, FetchEvidence, HttpGet, OnUnavailable, Predicate};
@@ -250,6 +254,7 @@ fn paired_with(
             session: (!finished).then(|| {
                 EscrowSession::open(policy.clone(), now, now + lasts).expect("a deal")
             }),
+            reclaim_opened_at: None,
         })
         .expect("install escrow");
     if finished {
@@ -1131,4 +1136,191 @@ fn a_request_id_is_scoped_to_the_escrow_that_answered_it() {
         matches!(ask(&mut p, &elsewhere, &Provider::default()), ToService::ReleaseSigned(_)),
         "a request id is the service's key for one escrow, not a wallet-wide name"
     );
+}
+
+
+/// The ledger is the only thing that stops a payment paying twice, and every request reopens from
+/// the seal — so a release the seal cannot record must not be signed. It used to be signed first
+/// and written down after, with a failed write only logged; one such failure was one payment paid
+/// twice.
+#[test]
+fn a_release_the_seal_cannot_record_is_not_signed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        cosigner::store::Store::open(dir.path().to_str().unwrap(), 1800).expect("a file store"),
+    );
+    let mut p = paired(&store, Policy::ReleasedTotalMax { sats: PAYOUT_SATS });
+    p.cosigner.seal();
+    let group_key = p.cosigner.group_key().to_string();
+
+    // Make the next seal write fail: the store writes `<key>.writing` and renames it into place,
+    // and a directory sitting where that file goes cannot be created over.
+    let writing = dir
+        .path()
+        .join(hex::encode("sealed_state"))
+        .join(format!("{}.writing", hex::encode(&group_key)));
+    std::fs::create_dir_all(&writing).unwrap();
+
+    let (_, commitments) = service_commits(2);
+    let req = request(&p, commitments);
+    let reply = block_on_ready(p.cosigner.release(&p.stream.clone(), &req, Some(Asp), &Provider::default()));
+    assert!(
+        reply.is_err(),
+        "a release that could not be written down must not be signed: {reply:?}"
+    );
+
+    // Nothing was recorded either — in this instance, which rolled the record back, or in the
+    // seal, which never got it. The two agree, which is the point.
+    assert!(p.cosigner.released_references().is_empty(), "the in-memory ledger was not rolled back");
+    let reopened = cosigner::Cosigner::open_with_host(
+        store.clone(),
+        group_key,
+        Arc::new(Recorder::default()),
+    )
+    .expect("the old seal is still readable");
+    assert!(reopened.released_references().is_empty());
+
+    // With the store writable again, the same release is answered — and recorded.
+    std::fs::remove_dir(&writing).unwrap();
+    let (_, commitments) = service_commits(2);
+    let req = request(&p, commitments);
+    let reply = ask(&mut p, &req, &Provider::default());
+    assert!(matches!(reply, ToService::ReleaseSigned(_)), "{reply:?}");
+    assert_eq!(p.cosigner.released_references().len(), 1);
+}
+
+
+fn proto_ark_info() -> wp::ArkInfo {
+    let i = ark_info();
+    wp::ArkInfo {
+        signer_pubkey: i.signer_pubkey,
+        forfeit_pubkey: i.forfeit_pubkey,
+        forfeit_address: i.forfeit_address,
+        checkpoint_tapscript: i.checkpoint_tapscript,
+        network: i.network,
+        session_duration: i.session_duration,
+        unilateral_exit_delay: i.unilateral_exit_delay,
+        boarding_exit_delay: i.boarding_exit_delay,
+        vtxo_min_amount: i.vtxo_min_amount,
+        dust: i.dust,
+    }
+}
+
+fn escrow_vtxo() -> VtxoInput {
+    VtxoInput {
+        txid: "11".repeat(32),
+        vout: 0,
+        amount_sats: VTXO_SATS,
+        exit_delay: 512,
+        expires_at: 0,
+    }
+}
+
+/// The bypass: reclaim signatures taken while no deal is live, kept, and spent under a deal struck
+/// afterwards. Nothing in Bitcoin stops it — both pairings sign the same key and the signatures
+/// stay valid — so what has to stop it is the cosigner refusing the deal: an escrow a reclaim was
+/// ever opened on is done with deals.
+#[test]
+fn an_escrow_a_reclaim_was_opened_on_cannot_be_committed_again() {
+    let Some(store) = common::try_store() else { return };
+    // A finished pairing and a deal that has already ended: exactly the state the owner would
+    // reclaim from, and the state a second deal would be struck from.
+    let mut p = paired_for(&store, permissive(), 1);
+    let later = now() + HOUR;
+    p.cosigner
+        .reclaim_open(&p.escrow_key, vec![escrow_vtxo()], &ark_info(), later)
+        .expect("the deal is over, so the owner may take the money back");
+    // What the handler does between opening the reclaim and making a nonce.
+    p.cosigner
+        .mark_escrow_reclaim_opened(&p.escrow_key, later)
+        .expect("marked");
+    p.cosigner.try_seal().expect("sealed");
+
+    let refusal = p
+        .cosigner
+        .open_escrow_session(
+            &p.escrow_key,
+            EscrowSession::open(permissive(), later, later + HOUR).expect("a deal"),
+            later,
+        )
+        .expect_err("a deal over an escrow with reclaim signatures out is a deal the owner can empty");
+    assert!(refusal.contains("reclaim"), "{refusal}");
+
+    // Durably: the next request reopens from the seal and refuses the same way.
+    let group_key = p.cosigner.group_key().to_string();
+    let mut reopened =
+        cosigner::Cosigner::open_with_host(store, group_key, Arc::new(Recorder::default()))
+            .expect("reopen");
+    let refusal = reopened
+        .open_escrow_session(
+            &p.escrow_key,
+            EscrowSession::open(permissive(), later, later + HOUR).expect("a deal"),
+            later,
+        )
+        .expect_err("the mark must survive the seal");
+    assert!(refusal.contains("reclaim"), "{refusal}");
+    assert!(
+        reopened.escrows()[0].reclaim_opened_at.is_some(),
+        "and it is what the wallet is told about"
+    );
+}
+
+/// Over the wire, and cut off: the stream is abandoned after the cosigner's first message, before
+/// the wallet answers — the case where nobody can say whether signatures left. The mark has to be
+/// in the seal by then.
+#[test]
+fn a_reclaim_abandoned_after_its_first_message_has_already_retired_the_escrow() {
+    let Some(store) = common::try_store() else { return };
+    // A finished pairing whose deal ends in a second — the handler reads the real clock, so the
+    // deal has to be over by the time the stream opens. Exactly the state the bypass starts from.
+    let p = paired_for(&store, permissive(), 1);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let group_key = p.cosigner.group_key().to_string();
+    let escrow_key = p.escrow_key.clone();
+
+    let open = proto::EscrowReclaimClientMsg {
+        session_id: "r".into(),
+        seq: 0,
+        body: Some(proto::escrow_reclaim_client_msg::Body::Open(
+            proto::EscrowReclaimOpen {
+                escrow_key: escrow_key.clone(),
+                vtxos: vec![proto::VtxoInput {
+                    txid: "11".repeat(32),
+                    vout: 0,
+                    amount_sats: VTXO_SATS,
+                    exit_delay: 512,
+                    expires_at: 0,
+                }],
+                ark_info: Some(proto_ark_info()),
+            },
+        )),
+    };
+    let answer = collect::<proto::EscrowReclaimServerMsg>(block_on(
+        service(p.cosigner).route(wire::request("EscrowReclaim", &[open], Some(TENANT))),
+    ));
+    assert_eq!(
+        answer.messages.len(),
+        1,
+        "the sighashes went out: {} {}",
+        answer.code,
+        answer.message
+    );
+    assert!(matches!(
+        answer.messages[0].body,
+        Some(proto::escrow_reclaim_server_msg::Body::Sighashes(_))
+    ));
+
+    // The next request, from the seal alone.
+    let mut reopened =
+        cosigner::Cosigner::open_with_host(store, group_key, Arc::new(Recorder::default()))
+            .expect("reopen");
+    let later = now();
+    let refusal = reopened
+        .open_escrow_session(
+            &escrow_key,
+            EscrowSession::open(permissive(), later, later + HOUR).expect("a deal"),
+            later,
+        )
+        .expect_err("retired before the first message went out");
+    assert!(refusal.contains("reclaim"), "{refusal}");
 }

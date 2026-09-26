@@ -45,7 +45,7 @@ class _ExitAddressScreenState extends State<ExitAddressScreen> {
       await service.setExitAddress(_controller.text);
       if (mounted) context.push('/onboarding/ready');
     } catch (e) {
-      setState(() => _error = '$e');
+      if (mounted) setState(() => _error = '$e');
     } finally {
       if (mounted) setState(() => _saving = false);
     }

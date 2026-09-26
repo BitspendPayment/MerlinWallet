@@ -47,6 +47,7 @@ import 'package:fixnum/fixnum.dart';
 import 'package:protocol/cosigner_v1.dart' as cs;
 
 import '../cosigner/connection.dart';
+import '../passkey/operation_secrets.dart';
 import '../threshold_types.dart' as threshold;
 import 'service_delivery.dart';
 
@@ -94,7 +95,12 @@ class PairingSession {
     required threshold.KeyPackage Function(
             List<int> walletDealtShare, List<int> escrowDeltaShare)
         resolveEscrow,
+    CancelSignal? cancel,
   }) async {
+    // The delivery is an HTTP call carrying a secret, and the confirmation is what makes the
+    // pairing usable: neither may go on after the owner has cancelled. See `CancelSignal`.
+    Future<T> guarded<T>(Future<T> work) => cancel?.guard(work) ?? work;
+
     // The escrow's other holder: the one identifier in its package that is not this wallet's. A
     // 2-of-2 has exactly one, and anything else is not the escrow this wallet thinks it is.
     final others = escrowPkp.verifyingShares.keys.where((id) => id != walletIdentifier).toList();
@@ -182,7 +188,7 @@ class PairingSession {
           'own to the same place',
         );
       }
-      await _delivery.deliver(
+      await guarded(_delivery.deliver(
         origin,
         ServiceContribution(
           escrowKeyHex: escrowKeyHex,
@@ -190,14 +196,14 @@ class PairingSession {
           serviceIdentifierHex: _hex(serviceIdentifier.serialize()),
           contributionHex: _hex(threshold.bigIntToBytes(atService)),
         ),
-      );
+      ));
 
       // The service has both and has checked the share they sum to — it answered 2xx, which is what
       // that means. Only now is the pairing usable, and only now does the cosigner agree.
-      await _conn.pairServiceConfirm(cs.PairServiceConfirmRequest(
+      await guarded(_conn.pairServiceConfirm(cs.PairServiceConfirmRequest(
         escrowKey: escrowKeyHex,
         attemptId: done.done.attemptId,
-      ));
+      )));
 
       return PairingResult(pkp, done.done.serviceVerifyingShare, attemptHex, origin);
     } finally {

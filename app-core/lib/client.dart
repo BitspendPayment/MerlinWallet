@@ -213,17 +213,17 @@ class MpcClient {
 
     final state =
         debugState != null ? validateClientState(debugState) : await _store.getClientState();
+    // Before the early return: a device with nothing stored holds nothing, escrows included.
+    _escrows.clear();
     if (state == null) return false;
 
     _userId = hex.decode(state['userId'] as String);
     final wallet = state['wallet'];
     _wallet = wallet is Map ? WalletPublicState.fromJson(Map<String, dynamic>.from(wallet)) : null;
-    _escrows
-      ..clear()
-      ..addAll([
-        for (final e in (state['escrows'] as List? ?? const []))
-          EscrowPublicState.fromJson(Map<String, dynamic>.from(e as Map)),
-      ]);
+    _escrows.addAll([
+      for (final e in (state['escrows'] as List? ?? const []))
+        EscrowPublicState.fromJson(Map<String, dynamic>.from(e as Map)),
+    ]);
 
     final delegate = state['delegate'];
     _delegate =
@@ -260,6 +260,7 @@ class MpcClient {
     await _store.destroy();
     _userId = null;
     _wallet = null;
+    _escrows.clear();
     _delegate = null;
     _exitScriptPubkeyHex = null;
   }
@@ -307,6 +308,7 @@ class MpcClient {
     required Future<P> Function() prepare,
     required Future<T> Function(WalletOperation operation, P prepared) run,
     bool forWallet = true,
+    WalletPublicState? escrow,
     Uint8List? escrowContext,
     Uint8List? pairingContext,
   }) {
@@ -320,6 +322,7 @@ class MpcClient {
             prepare: prepare,
             run: run,
             forWallet: forWallet,
+            escrow: escrow,
             escrowContext: escrowContext,
             pairingContext: pairingContext));
       } finally {
@@ -347,6 +350,7 @@ class MpcClient {
     required Future<P> Function() prepare,
     required Future<T> Function(WalletOperation operation, P prepared) run,
     required bool forWallet,
+    WalletPublicState? escrow,
     Uint8List? escrowContext,
     Uint8List? pairingContext,
   }) async {
@@ -382,6 +386,7 @@ class MpcClient {
     final operation = await WalletOperation.begin(
       seed,
       wallet: forWallet ? wallet : null,
+      escrow: escrow,
       cancel: cancel,
       escrowContext: escrowContext,
       pairingContext: pairingContext,
@@ -587,8 +592,21 @@ class MpcClient {
       // Rebuilt to be checked, not to be kept: what is saved is what it was checked against.
       reconstructWalletShare(polynomial: polynomial, dealtShare: resp.dealtShare, wallet: wallet);
 
+      // The escrows, the same way: public state only, checked on first use — the halves a share
+      // is rebuilt from ride the stream that signs with it. One minted before its context was
+      // recorded cannot be rebuilt by any passkey, and is left out rather than kept as a key this
+      // device could see and never spend from.
+      final escrows = [
+        for (final e in resp.escrows)
+          EscrowPublicState.fromSummary(e,
+              walletIdentifier: operation.identifier, minSigners: _minSigners),
+      ].whereType<EscrowPublicState>().toList();
+
       _stillRunning(operation);
       _adopt(wallet);
+      _escrows
+        ..clear()
+        ..addAll(escrows);
       await _saveState();
     });
   }
@@ -692,30 +710,24 @@ class MpcClient {
 
     return _withOperation<void, PairingResult>(
       'PairService',
+      escrow: escrow.wallet,
       escrowContext: Uint8List.fromList(hex.decode(escrow.contextHex)),
       pairingContext: pairingContext,
       prepare: _nothingToPrepare,
       run: (operation, _) async {
-        final wallet = _wallet!;
-        final delta = operation.takeEscrowDelta();
-        final polynomial = operation.takePolynomial();
-        final slope = operation.takePairingSlope();
-        return PairingSession(_conn, delivery: delivery).run(
+        final result = await PairingSession(_conn, delivery: delivery).run(
           escrowKeyHex: escrow.escrowKeyHex,
           escrowPkp: escrow.wallet.publicKeyPackage,
           serviceIdentifier: serviceIdentifier,
           walletIdentifier: operation.identifier,
           attemptId: attempt,
-          slope: slope,
-          resolveEscrow: (dealtShare, deltaShare) => reconstructEscrowShare(
-            polynomial: polynomial,
-            escrowDelta: delta,
-            dealtShare: dealtShare,
-            deltaShare: deltaShare,
-            wallet: wallet,
-            escrow: escrow.wallet,
-          ),
+          slope: operation.takePairingSlope(),
+          // Rebuilt inside the operation, so it is let go with it — never in a closure here.
+          resolveEscrow: operation.escrowKeyPackage,
+          cancel: operation.cancel,
         );
+        _stillRunning(operation);
+        return result;
       },
     );
   }
@@ -742,26 +754,21 @@ class MpcClient {
 
     return _withOperation<void, ReclaimResult>(
       'EscrowReclaim',
+      escrow: escrow.wallet,
       escrowContext: Uint8List.fromList(hex.decode(escrow.contextHex)),
       prepare: _nothingToPrepare,
       run: (operation, _) async {
-        final wallet = _wallet!;
-        final delta = operation.takeEscrowDelta();
-        final polynomial = operation.takePolynomial();
-        return ReclaimSession(_conn, _asp).run(
+        final result = await ReclaimSession(_conn, _asp).run(
           escrowKeyHex: escrow.escrowKeyHex,
           vtxos: vtxos,
           info: arkInfo,
           escrowPubKey: escrow.wallet.publicKeyPackage,
-          resolveEscrow: (dealtShare, deltaShare) => reconstructEscrowShare(
-            polynomial: polynomial,
-            escrowDelta: delta,
-            dealtShare: dealtShare,
-            deltaShare: deltaShare,
-            wallet: wallet,
-            escrow: escrow.wallet,
-          ),
+          // Rebuilt inside the operation, so it is let go with it — never in a closure here.
+          resolveEscrow: operation.escrowKeyPackage,
+          cancel: operation.cancel,
         );
+        _stillRunning(operation);
+        return result;
       },
     );
   }

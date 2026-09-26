@@ -150,3 +150,58 @@ fn the_dealt_share_survives_seal_and_restore() {
         .expect("a restored wallet must still be recoverable");
     assert_eq!(resp.dealt_share, DEALT.to_vec());
 }
+
+
+/// A new device rebuilds its escrows the way it rebuilt the wallet: from the passkey, and from
+/// what the cosigner hands back. The one thing it cannot re-derive alone is the context each
+/// escrow's delta was minted under, so `Recover` returns it with the rest — and none of it is a
+/// share.
+#[test]
+fn recover_returns_the_escrows_a_new_device_needs_to_rebuild() {
+    let Some(store) = common::try_store() else {
+        return;
+    };
+    let (kps, pkp) = common::dkg_2of2();
+    let group_key = hex::encode(pkp.verifying_key.serialize());
+    let cosigner = common::open_cosigner(&store, &group_key);
+    common::seed_policy_with_dealt_share(
+        &cosigner,
+        &group_key,
+        &kps[1],
+        &kps[0],
+        &pkp,
+        Some(hex::encode([9u8; 32])),
+        Some(hex::encode(DEALT)),
+    );
+    let escrow_key = format!("02{}", "ab".repeat(32));
+    let context = [3u8; 16];
+    cosigner
+        .lock()
+        .unwrap()
+        .install_escrow(cosigner::types::EscrowRecord {
+            escrow_key: escrow_key.clone(),
+            key_package_json: kps[1].to_json(),
+            public_key_package_json: pkp.to_json(),
+            wallet_identifier_hex: hex::encode(kps[0].identifier.serialize()),
+            context_hex: hex::encode(context),
+            wallet_delta_share_hex: hex::encode([4u8; 32]),
+            created_at: 1,
+            pairing: None,
+            session: None,
+            reclaim_opened_at: None,
+        })
+        .expect("install");
+
+    let resp = recover(&cosigner.lock().unwrap(), asking_as(&kps[0].identifier)).expect("answered");
+    assert_eq!(resp.escrows.len(), 1);
+    let e = &resp.escrows[0];
+    assert_eq!(e.escrow_key, escrow_key);
+    assert_eq!(e.context, context.to_vec(), "the context, verbatim");
+    assert_eq!(e.wallet_identifier, kps[0].identifier.serialize().to_vec());
+    // The cosigner's share of the escrow stays in the seal. Its dealt delta rides the streams that
+    // rebuild a share, under their own approval — not this.
+    let own = hex::encode(threshold::scalar::scalar_to_bytes(&kps[1].secret_share));
+    let wire = format!("{e:?}");
+    assert!(!wire.contains(&own), "the cosigner's own escrow share left on Recover");
+    assert!(!wire.contains(&hex::encode([4u8; 32])), "the sealed delta left on Recover");
+}

@@ -57,7 +57,12 @@ class Duplex<Q, R> {
     if (_closed) return;
     _closed = true;
     _onClose?.call(this);
-    await _out.close();
+    // A controller nobody has listened to never delivers its done event, so its `close()` never
+    // completes. A ceremony cancelled before its driver's first read is exactly that, and must
+    // not hang the cancel on it.
+    final listened = _out.hasListener;
+    final closed = _out.close();
+    if (listened) await closed;
     await inbound.cancel(immediate: true);
   }
 }
@@ -110,9 +115,23 @@ class CosignerConnection {
     return duplex;
   }
 
-  /// Single-round calls that can be cancelled. Only `Recover` is: it is the one unary call that
-  /// runs inside an operation, with the wallet's polynomial waiting on its answer.
+  /// Single-round calls that can be cancelled: the ones that run inside an operation, with a
+  /// secret waiting on their answer — `Recover`, and a pairing's confirmation.
   final Set<ResponseFuture<dynamic>> _calls = {};
+
+  /// Ceremonies in flight. For a test that checks a stream can be cancelled: one built without
+  /// [_track] is one [cancelOpenStreams] cannot reach.
+  int get streamsInFlight => _open.length;
+
+  /// Await [call] as one [cancelOpenStreams] can end.
+  Future<T> _cancellable<T>(ResponseFuture<T> call) async {
+    _calls.add(call);
+    try {
+      return await call;
+    } finally {
+      _calls.remove(call);
+    }
+  }
 
   /// End every ceremony in flight, now — and any cancellable single-round call with them.
   ///
@@ -193,20 +212,20 @@ class CosignerConnection {
   /// `sessions/escrow_session.dart`.
   Duplex<cs.EscrowClientMsg, cs.EscrowServerMsg> openEscrow() {
     final out = StreamController<cs.EscrowClientMsg>();
-    return Duplex(out, _stream('Escrow', (o) => _stub.escrow(out.stream, options: o)));
+    return _track(out, _stream('Escrow', (o) => _stub.escrow(out.stream, options: o)));
   }
 
   /// Pairing a service into an escrow. See `sessions/pairing_session.dart`.
   Duplex<cs.PairServiceClientMsg, cs.PairServiceServerMsg> openPairService() {
     final out = StreamController<cs.PairServiceClientMsg>();
-    return Duplex(
+    return _track(
         out, _stream('PairService', (o) => _stub.pairService(out.stream, options: o)));
   }
 
   /// Taking back what is left of an escrow. See `sessions/reclaim_session.dart`.
   Duplex<cs.EscrowReclaimClientMsg, cs.EscrowReclaimServerMsg> openEscrowReclaim() {
     final out = StreamController<cs.EscrowReclaimClientMsg>();
-    return Duplex(
+    return _track(
         out, _stream('EscrowReclaim', (o) => _stub.escrowReclaim(out.stream, options: o)));
   }
 
@@ -249,15 +268,8 @@ class CosignerConnection {
   ///
   /// Cancellable, by [cancelOpenStreams]: the answer is half a key, and a caller that has stopped
   /// waiting for it should not be sent it.
-  Future<cs.RecoverResponse> recover(cs.RecoverRequest r) async {
-    final call = _stub.recover(r, options: await _approved('Recover'));
-    _calls.add(call);
-    try {
-      return await call;
-    } finally {
-      _calls.remove(call);
-    }
-  }
+  Future<cs.RecoverResponse> recover(cs.RecoverRequest r) async =>
+      _cancellable(_stub.recover(r, options: await _approved('Recover')));
 
   /// The escrow keys this wallet holds. Public projection only, so a device that keeps nothing can
   /// ask what exists rather than remembering.
@@ -265,16 +277,15 @@ class CosignerConnection {
       _stub.escrowList(cs.EscrowListRequest(), options: await _approved('EscrowList'));
 
   /// Mark a pairing usable, once the service has both halves and its share checks out.
+  /// Cancellable: it is the last step of an operation that holds the escrow share.
   Future<cs.PairServiceConfirmResponse> pairServiceConfirm(
           cs.PairServiceConfirmRequest r) async =>
-      _stub.pairServiceConfirm(r, options: await _approved('PairServiceConfirm'));
+      _cancellable(_stub.pairServiceConfirm(r, options: await _approved('PairServiceConfirm')));
 
   /// Commit an escrow to a deal: what the paired service may take, and until when.
   Future<cs.EscrowOpenSessionResponse> escrowOpenSession(
           cs.EscrowOpenSessionRequest r) async =>
       _stub.escrowOpenSession(r, options: await _approved('EscrowOpenSession'));
-
-  /// Close a deal early.
 
   Future<void> shutdown() => _channel.shutdown();
 }

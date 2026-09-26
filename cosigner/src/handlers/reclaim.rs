@@ -133,10 +133,7 @@ impl Cosigner {
         .map_err(|e| Status::internal(format!("deriving where this wallet is paid: {e}")))?;
 
         // The escrow's key is the owner of what is being spent.
-        let escrow_x_only = {
-            let k = escrow.escrow_key.trim().to_ascii_lowercase();
-            if k.len() == 66 { k[2..].to_string() } else { k }
-        };
+        let escrow_x_only = crate::cosigner::x_only(&escrow.escrow_key);
         let (session, _change_delay, sighashes) = crate::cosigner::build_send(
             &escrow_x_only,
             &vtxos,

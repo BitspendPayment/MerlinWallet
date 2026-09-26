@@ -40,7 +40,7 @@ class _RestoreWalletScreenState extends State<RestoreWalletScreen> {
       // them — which is why restore ends where onboarding does.
       if (mounted) context.push('/onboarding/exit-address');
     } catch (e) {
-      setState(() => _error = '$e');
+      if (mounted) setState(() => _error = '$e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }

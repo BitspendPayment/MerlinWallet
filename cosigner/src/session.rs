@@ -291,43 +291,49 @@ impl CosignerService {
         let now = crate::handlers::helpers::now_secs();
         let c = lock(&self.cosigner);
         Ok(proto::EscrowListResponse {
-            escrows: c
-                .escrows()
-                .iter()
-                .map(|e| proto::EscrowSummary {
-                    escrow_key: e.escrow_key.clone(),
-                    wallet_identifier: hex::decode(&e.wallet_identifier_hex).unwrap_or_default(),
-                    public_key_package_json: e.public_key_package_json.clone(),
-                    created_at: e.created_at,
-                    service_identifier: e
-                        .pairing
-                        .as_ref()
-                        .map(|p| p.service_identifier_hex.clone())
-                        .unwrap_or_default(),
-                    service_ready: e
-                        .pairing
-                        .as_ref()
-                        .is_some_and(|p| p.state() == crate::types::PairingState::Ready),
-                    // Reported apart as well as together: they arrive by different routes, at
-                    // different moments, and a caller waiting on one wants to know which.
-                    service_confirmed: e
-                        .pairing
-                        .as_ref()
-                        .is_some_and(|p| p.service_confirmed),
-                    wallet_confirmed: e
-                        .pairing
-                        .as_ref()
-                        .is_some_and(|p| p.wallet_confirmed),
-                    session: e.session.as_ref().map(|s| proto::EscrowSessionSummary {
-                        open: s.is_open(now),
-                        deadline_secs: s.deadline,
-                        opened_at: s.opened_at,
-                        released_sats: s.released_sats,
-                        policy_description: s.policy.describe(),
-                    }),
-                })
-                .collect(),
+            escrows: c.escrows().iter().map(|e| escrow_summary(e, now)).collect(),
         })
+    }
+}
+
+/// One escrow as a caller may see it: the public projection, as of [now]. What `EscrowList`
+/// returns, and what `Recover` hands a new device so it can rebuild its escrows the way it
+/// rebuilt the wallet.
+pub(crate) fn escrow_summary(e: &crate::types::EscrowRecord, now: i64) -> proto::EscrowSummary {
+    proto::EscrowSummary {
+
+        escrow_key: e.escrow_key.clone(),
+        wallet_identifier: hex::decode(&e.wallet_identifier_hex).unwrap_or_default(),
+        public_key_package_json: e.public_key_package_json.clone(),
+        created_at: e.created_at,
+        service_identifier: e
+            .pairing
+            .as_ref()
+            .map(|p| p.service_identifier_hex.clone())
+            .unwrap_or_default(),
+        service_ready: e
+            .pairing
+            .as_ref()
+            .is_some_and(|p| p.state() == crate::types::PairingState::Ready),
+        // Reported apart as well as together: they arrive by different routes, at
+        // different moments, and a caller waiting on one wants to know which.
+        service_confirmed: e
+            .pairing
+            .as_ref()
+            .is_some_and(|p| p.service_confirmed),
+        wallet_confirmed: e
+            .pairing
+            .as_ref()
+            .is_some_and(|p| p.wallet_confirmed),
+        session: e.session.as_ref().map(|s| proto::EscrowSessionSummary {
+            open: s.is_open(now),
+            deadline_secs: s.deadline,
+            opened_at: s.opened_at,
+            released_sats: s.released_sats,
+            policy_description: s.policy.describe(),
+        }),
+        context: hex::decode(&e.context_hex).unwrap_or_default(),
+        reclaim_opened: e.reclaim_opened_at.is_some(),
     }
 }
 
@@ -562,6 +568,7 @@ async fn escrow(
             created_at: crate::handlers::helpers::now_secs(),
             pairing: None,
             session: None,
+            reclaim_opened_at: None,
         })
         .map_err(Status::failed_precondition)?;
         c.seal();
@@ -865,12 +872,26 @@ async fn escrow_reclaim(
         .map(ark_info_from_proto)
         .ok_or_else(|| Status::invalid_argument("EscrowReclaimOpen carried no ark_info"))?;
 
+    let now = crate::handlers::helpers::now_secs();
     let mut reclaim = lock(&cosigner).reclaim_open(
         &open.escrow_key,
         vtxos_from_proto(open.vtxos.clone()),
         &info,
-        crate::handlers::helpers::now_secs(),
+        now,
     )?;
+
+    // From here on the owner may come to hold signatures that empty this escrow, and nothing
+    // that happens later on this stream — or fails to — tells the cosigner whether they did. So
+    // the escrow is retired from deals now, and durably, before a single nonce exists: a seal
+    // that cannot be written means no round at all. See `Cosigner::open_escrow_session`.
+    {
+        let mut c = lock(&cosigner);
+        c.mark_escrow_reclaim_opened(&open.escrow_key, now)
+            .map_err(Status::failed_precondition)?;
+        c.try_seal().map_err(|e| {
+            Status::unavailable(format!("could not record the reclaim, so it does not begin: {e}"))
+        })?;
+    }
 
     // Round one, on this stream, as a send does it: the cosigner commits first so the whole batch
     // costs one round trip — but with the ESCROW's share, not the wallet's.

@@ -63,6 +63,7 @@ fn seed(c: &mut cosigner::Cosigner, escrow_key: &str, attempt: &str) {
             wallet_confirmed: false,
         }),
         session: None,
+        reclaim_opened_at: None,
     })
     .expect("install escrow");
 }

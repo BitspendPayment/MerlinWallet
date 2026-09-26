@@ -43,6 +43,7 @@ fn seed_escrow(
             wallet_confirmed: true,
         }),
         session: None,
+        reclaim_opened_at: None,
     })
     .expect("install escrow");
 }
@@ -327,6 +328,7 @@ fn a_deal_cannot_be_committed_to_a_pairing_the_service_has_not_finished() {
                     wallet_confirmed: false,
                 }),
                 session: None,
+                reclaim_opened_at: None,
             })
             .expect("install escrow");
     }
@@ -394,6 +396,7 @@ fn a_pairing_needs_both_parties_whichever_order_they_speak_in() {
                 wallet_confirmed: false,
             }),
             session: None,
+            reclaim_opened_at: None,
         })
         .expect("install escrow");
 
@@ -486,6 +489,7 @@ fn an_unfinished_pairing_may_be_replaced_but_a_finished_one_may_not() {
                 created_at: NOW,
                 pairing: Some(second("dd")), // Pending
                 session: None,
+                reclaim_opened_at: None,
             })
             .expect("install escrow");
         guard
@@ -547,6 +551,7 @@ fn a_reclaim_ignores_the_exit_delay_it_is_given() {
             created_at: NOW,
             pairing: None,
             session: None,
+            reclaim_opened_at: None,
         })
         .expect("install escrow");
 

@@ -32,7 +32,7 @@ class _PasskeySetupScreenState extends State<PasskeySetupScreen> {
       await context.read<MpcService>().enablePasskey();
       if (mounted) context.push('/onboarding/dkg');
     } catch (e) {
-      setState(() => _error = '$e');
+      if (mounted) setState(() => _error = '$e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }

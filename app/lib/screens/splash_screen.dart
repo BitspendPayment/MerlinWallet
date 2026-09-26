@@ -19,6 +19,8 @@ class _SplashScreenState extends State<SplashScreen> {
   /// neither read nor quietly replaced: the owner is told, and resets it.
   IncompatibleWalletStateException? _incompatible;
   bool _resetting = false;
+  bool _checking = false;
+  String? _restoreError;
 
   @override
   void initState() {
@@ -27,30 +29,37 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 
   Future<void> _checkWalletState() async {
+    if (_checking) return;
+    setState(() {
+      _checking = true;
+      _restoreError = null;
+    });
     final mpcService = context.read<MpcService>();
-
-    // Wait for init() to finish loading persisted config from Hive
-    await mpcService.initFuture;
-
-    if (!mounted) return;
-
-    if (mpcService.dkgComplete) {
-      // Keys exist — restore session and go to home
-      try {
+    try {
+      await mpcService.initFuture;
+      if (!mounted) return;
+      if (mpcService.dkgComplete) {
         await mpcService.restoreSession();
-      } on IncompatibleWalletStateException catch (e) {
-        if (mounted) setState(() => _incompatible = e);
-        return;
-      } catch (e) {
-        // Session restore failed — will start in disconnected state
-        print(
-            "Session restore failed: $e — opening wallet in disconnected state");
+        if (mounted) context.go('/');
+      } else {
+        if (mounted) context.go('/onboarding/welcome');
       }
-      if (mounted) context.go('/');
-    } else {
-      // No keys — start onboarding
-      if (mounted) context.go('/onboarding/welcome');
+    } on IncompatibleWalletStateException catch (e) {
+      if (mounted) setState(() => _incompatible = e);
+    } catch (e) {
+      if (mounted) setState(() => _restoreError = '$e');
+    } finally {
+      if (mounted) setState(() => _checking = false);
     }
+  }
+
+  Future<void> _retry() async {
+    if (_checking) return;
+    final service = context.read<MpcService>();
+    // A failed initialization needs a new attempt too; awaiting the same failed future cannot
+    // recover. A session failure keeps the already-loaded identity and public wallet data.
+    if (!service.isInitialized) service.initFuture = service.init();
+    await _checkWalletState();
   }
 
   Future<void> _reset() async {
@@ -111,6 +120,37 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   Widget build(BuildContext context) {
     if (_incompatible != null) return _incompatibleState(context);
+    if (_restoreError != null) {
+      return Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Icon(Icons.cloud_off, size: 64),
+                  const SizedBox(height: 24),
+                  Text('Could not open your wallet',
+                      style: GoogleFonts.inter(fontSize: 24, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 16),
+                  const Text('Your saved wallet data has been kept. Check your connection '
+                      'and try again.'),
+                  const SizedBox(height: 12),
+                  Text(_restoreError!, style: const TextStyle(color: Colors.white70)),
+                  const SizedBox(height: 24),
+                  FilledButton(
+                    key: const Key('restoreSessionRetryBtn'),
+                    onPressed: _checking ? null : _retry,
+                    child: const Text('Try again'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
     return Scaffold(
       body: Center(
         child: Column(

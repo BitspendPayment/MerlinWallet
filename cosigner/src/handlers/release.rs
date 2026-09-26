@@ -77,6 +77,7 @@ use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::nonce::{self, SigningCommitments};
 use threshold::{point, scalar, signing};
 
+use crate::cosigner::x_only;
 use crate::asp::AspApi;
 use crate::cosigner::Cosigner;
 use crate::types::{Admission, ReleaseRecord};
@@ -391,6 +392,16 @@ impl Cosigner {
         // service whose reply was lost would be locked out of the answer it was owed.
         let already_released_sats = match &admission {
             Admission::AlreadyAnswered(record) => {
+                // Answered under THIS deal, or it is not an answer this deal owes. A release signed
+                // under the last deal and never broadcast would otherwise be re-signed here, judged
+                // as a repeat, and never counted against this deal's allowance.
+                if record.at < session.opened_at {
+                    return Err(Denial::Refused(format!(
+                        "request {} was answered under a previous deal; a release from this one \
+                         needs a new request id and a new payment",
+                        request.request_id
+                    )));
+                }
                 session.released_sats.saturating_sub(record.sats)
             }
             Admission::New => session.released_sats,
@@ -438,17 +449,17 @@ impl Cosigner {
             })?;
         let service_id = identifier_from_hex(&pairing.service_identifier_hex)
             .map_err(|e| Denial::Faulted(format!("this pairing's sealed identifier: {e}")))?;
-        let halves = sign_second(
-            &key_package,
-            &public_key_package,
-            &service_id,
-            &sighashes,
-            &request.commitments,
-        )
-        .map_err(Denial::Refused)?;
-
+        // --- written down and sealed, and only then signed ------------------------------------
+        //
+        // In that order, because the ledger is the only thing that stops a payment paying twice,
+        // and every request reopens from the seal: a release signed before its record was durable
+        // is one the next instance has never heard of. If the seal cannot be written the release
+        // is refused, and the in-memory record is rolled back so this instance does not go on
+        // believing something the seal does not. The service retries; a retry of a release that
+        // WAS recorded is answered again from the record, so nothing is lost by refusing here.
         let already_counted = matches!(admission, Admission::AlreadyAnswered(_));
         if !already_counted {
+            let before = self.to_snapshot().map_err(Denial::Faulted)?;
             self.record_escrow_release(
                 &escrow_key,
                 request.payment_reference.clone(),
@@ -464,8 +475,24 @@ impl Cosigner {
                 },
             )
             .map_err(Denial::Faulted)?;
-            self.seal();
+            if let Err(e) = self.try_seal() {
+                if let Err(undo) = self.restore_snapshot(&before) {
+                    tracing::error!("rolling back an unsealed release failed too: {undo}");
+                }
+                return Err(Denial::Faulted(format!(
+                    "this release could not be written down, so it was not signed: {e}"
+                )));
+            }
         }
+
+        let halves = sign_second(
+            &key_package,
+            &public_key_package,
+            &service_id,
+            &sighashes,
+            &request.commitments,
+        )
+        .map_err(Denial::Refused)?;
 
         let (ark_tx, checkpoint_txs) = send.unsigned();
         Ok(ReleaseApproval {
@@ -566,15 +593,6 @@ fn identifier_from_hex(s: &str) -> Result<Identifier, String> {
         .try_into()
         .map_err(|_| "an identifier is 32 bytes".to_string())?;
     Identifier::deserialize(&bytes).map_err(|e| format!("{e}"))
-}
-
-/// A compressed key without its parity byte, lowercased.
-fn x_only(key_hex: &str) -> String {
-    let k = key_hex.trim().to_ascii_lowercase();
-    match k.len() {
-        66 => k[2..].to_string(),
-        _ => k,
-    }
 }
 
 /// The scriptPubKeys that belong to this escrow: one per exit delay among the inputs, plus the one

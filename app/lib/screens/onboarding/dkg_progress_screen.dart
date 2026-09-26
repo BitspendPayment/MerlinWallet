@@ -39,6 +39,7 @@ class _DkgProgressScreenState extends State<DkgProgressScreen> {
       setState(() => _currentStep = 0);
 
       await _addLog('Starting Distributed Key Generation...');
+      if (!mounted) return;
       setState(() => _currentStep = 1);
 
       await Future.delayed(const Duration(milliseconds: 500)); // UI pacing
@@ -47,6 +48,7 @@ class _DkgProgressScreenState extends State<DkgProgressScreen> {
       await mpcService.doDkg();
 
       await _addLog('DKG Finalized successfully.');
+      if (!mounted) return;
       setState(() => _currentStep = 2);
       await Future.delayed(const Duration(seconds: 1));
 

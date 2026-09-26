@@ -82,6 +82,9 @@ class _SigningScreenState extends State<SigningScreen> {
 
       final arkTxid = await mpcService.sendArk(destination, amount);
 
+      // Gone mid-send: the payment went through, and there is no screen to say so on. Calling
+      // setState here would throw into the catch below and log a send that succeeded as failed.
+      if (!mounted) return;
       setState(() {
         _currentStep = 2;
         _statusText = 'Submitted to Ark...';

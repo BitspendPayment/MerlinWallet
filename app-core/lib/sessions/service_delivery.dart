@@ -86,7 +86,7 @@ class HttpServiceDelivery implements DeliverToService {
     // Plain HTTP is refused unless the origin is a loopback or private address — a dev stack is
     // reachable that way and a real service is not. A secret must not leave this device in the
     // clear because a URL happened to say `http`.
-    if (uri.scheme != 'https' && !_isLocal(uri.host)) {
+    if (uri.scheme != 'https' && !isLocalDevelopmentHost(uri.host)) {
       throw ServiceDeliveryException(
         'refusing to send a pairing contribution to $origin in the clear: it is a secret, and '
         'that host is not a local development address',
@@ -116,11 +116,21 @@ class HttpServiceDelivery implements DeliverToService {
     }
   }
 
-  static bool _isLocal(String host) =>
-      host == 'localhost' ||
-      host == '127.0.0.1' ||
-      host == '::1' ||
-      host.startsWith('10.') ||
-      host.startsWith('192.168.') ||
-      RegExp(r'^172\.(1[6-9]|2\d|3[01])\.').hasMatch(host);
+}
+
+/// Whether [host] is somewhere a secret may go in the clear: the loopback, or a private IPv4
+/// address, as a dev stack is reached.
+///
+/// An ADDRESS, never a name. This used to be a prefix test on the string — `10.` — which
+/// `10.attacker.com` passes; a name is resolved by whoever answers DNS, and is not a place.
+bool isLocalDevelopmentHost(String host) {
+  if (host == 'localhost') return true;
+  final address = InternetAddress.tryParse(host);
+  if (address == null) return false;
+  if (address.isLoopback) return true;
+  if (address.type != InternetAddressType.IPv4) return false;
+  final b = address.rawAddress;
+  return b[0] == 10 ||
+      (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
+      (b[0] == 192 && b[1] == 168);
 }

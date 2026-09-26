@@ -43,15 +43,9 @@ class WelcomePage {
       _tapKey(tester, 'welcomeCreateBtn');
 }
 
-class PinPage {
-  static Future<void> enter(WidgetTester tester, String pin) async {
-    await _enterText(tester, 'pinField1', pin);
-    await _enterText(tester, 'pinField2', pin);
-    await tester.pumpAndSettle();
-    await _dismissKeyboard(tester);
-    await _tapKey(tester, 'pinContinueBtn');
-    await tester.pumpAndSettle();
-  }
+class PasskeySetupPage {
+  static Future<void> create(WidgetTester tester) =>
+      _tapKey(tester, 'passkeyCreateBtn');
 }
 
 class ServerConnectPage {
@@ -62,13 +56,13 @@ class ServerConnectPage {
 }
 
 class DkgProgressPage {
-  static Future<void> waitForReady(
+  static Future<void> waitForExitAddress(
     WidgetTester tester, {
     Duration timeout = const Duration(seconds: 90),
   }) async {
     await pumpUntilFound(
       tester,
-      find.byKey(const Key('walletReadyBtn')),
+      find.byKey(const Key('exitAddressField')),
       timeout: timeout,
     );
   }

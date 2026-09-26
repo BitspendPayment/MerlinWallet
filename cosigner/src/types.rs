@@ -230,6 +230,11 @@ pub struct EscrowRecord {
     /// — a minted escrow is a key, not yet a commitment. See `crate::escrow_session`.
     #[serde(default)]
     pub session: Option<crate::escrow_session::EscrowSession>,
+    /// When a reclaim was first opened on this escrow, if one ever was. From that moment the owner
+    /// may hold signatures that empty it — whether the stream finished or not, the cosigner cannot
+    /// see — so it may never again be committed to a deal. See `Cosigner::open_escrow_session`.
+    #[serde(default)]
+    pub reclaim_opened_at: Option<i64>,
 }
 
 /// Whether a pairing is finished.

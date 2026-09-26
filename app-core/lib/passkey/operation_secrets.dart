@@ -97,6 +97,7 @@ class WalletOperation {
     this._pairingSlope,
     this.identifier,
     this._wallet,
+    this._escrow,
     this.cancel,
   );
 
@@ -109,13 +110,15 @@ class WalletOperation {
   /// checked against the wallet's here, so a wrong passkey is refused before a stream is opened
   /// or anything is sent. Throws [WrongPasskey].
   ///
-  /// [escrowContext], for the one operation that mints an escrow key, derives that escrow's delta
-  /// here as well. It is done now rather than later because the seed is overwritten before this
-  /// returns and never read twice: whatever an operation will need from the passkey, it takes in
-  /// this one place.
+  /// [escrowContext] derives that escrow's delta here as well — for the operation that mints the
+  /// escrow, and for the ones that sign with it ([escrowKeyPackage]). It is done now rather than
+  /// later because the seed is overwritten before this returns and never read twice: whatever an
+  /// operation will need from the passkey, it takes in this one place. [escrow] is what a rebuilt
+  /// escrow share is checked against.
   static Future<WalletOperation> begin(
     Uint8List seed, {
     WalletPublicState? wallet,
+    WalletPublicState? escrow,
     CancelSignal? cancel,
     Uint8List? escrowContext,
     Uint8List? pairingContext,
@@ -133,6 +136,7 @@ class WalletOperation {
         slope,
         identifier,
         wallet,
+        escrow,
         cancel ?? CancelSignal(),
       );
     } finally {
@@ -148,10 +152,12 @@ class WalletOperation {
   final threshold.Identifier identifier;
 
   final WalletPublicState? _wallet;
+  final WalletPublicState? _escrow;
   WalletPolynomial? _polynomial;
   WalletPolynomial? _escrowDelta;
   BigInt? _pairingSlope;
   threshold.KeyPackage? _keyPackage;
+  threshold.KeyPackage? _escrowKeyPackage;
   bool _disposed = false;
 
   bool get isDisposed => _disposed;
@@ -161,7 +167,8 @@ class WalletOperation {
       _polynomial != null ||
       _escrowDelta != null ||
       _pairingSlope != null ||
-      _keyPackage != null;
+      _keyPackage != null ||
+      _escrowKeyPackage != null;
 
   /// The key package for this operation — see [KeyResolver].
   ///
@@ -195,14 +202,46 @@ class WalletOperation {
     return _keyPackage = rebuilt;
   }
 
-  /// The polynomial itself, for the two operations that deal with it directly: DKG deals it, and
-  /// recovery rebuilds from it before there is a [WalletPublicState] to check against. The
-  /// operation keeps no copy.
-  /// The escrow delta this operation was begun with, for the one operation that mints an escrow
-  /// key. The operation keeps no copy.
+  /// The key package for one ESCROW, from the two halves the cosigner sends on the first round of
+  /// a pairing or a reclaim — see [keyPackage] for the contract, which is the same: rebuilt once,
+  /// held for the stream, released with the operation. Both polynomials are dropped as soon as
+  /// the share exists.
   ///
-  /// Distinct from [takePolynomial]: minting an escrow needs *both* — the wallet share is rebuilt
-  /// from the wallet polynomial, and the delta is what is dealt on top of it.
+  /// Inside the operation rather than in a closure the caller builds, because a closure over the
+  /// polynomial and the delta is one [dispose] cannot reach.
+  threshold.KeyPackage escrowKeyPackage(List<int> dealtShare, List<int> deltaShare) {
+    _ensureLive();
+    final existing = _escrowKeyPackage;
+    if (existing != null) {
+      if (dealtShare.isNotEmpty || deltaShare.isNotEmpty) {
+        throw ContributionProtocolException(
+            'sent the escrow halves a second time on one stream');
+      }
+      return existing;
+    }
+    if (dealtShare.isEmpty || deltaShare.isEmpty) {
+      throw ContributionProtocolException(
+          'asked for an escrow signature without returning both halves of the share');
+    }
+    final wallet = _wallet;
+    final escrow = _escrow;
+    final delta = _escrowDelta;
+    if (wallet == null || escrow == null || delta == null) {
+      throw StateError('this operation was begun without an escrow to rebuild a share for');
+    }
+    final rebuilt = reconstructEscrowShare(
+      polynomial: _polynomial!,
+      escrowDelta: delta,
+      dealtShare: dealtShare,
+      deltaShare: deltaShare,
+      wallet: wallet,
+      escrow: escrow,
+    );
+    _polynomial = null;
+    _escrowDelta = null;
+    return _escrowKeyPackage = rebuilt;
+  }
+
   /// The slope this operation deals a service pairing on. Derived under the escrow key and the
   /// attempt id, so retrying one attempt's delivery reproduces the same contribution.
   BigInt takePairingSlope() {
@@ -215,6 +254,9 @@ class WalletOperation {
     return slope;
   }
 
+  /// The escrow delta this operation was begun with, for the one operation that DEALS it — minting
+  /// an escrow key. The operation keeps no copy. An operation that signs with an escrow does not
+  /// take it; it rebuilds through [escrowKeyPackage] instead.
   WalletPolynomial takeEscrowDelta() {
     _ensureLive();
     final delta = _escrowDelta;
@@ -225,6 +267,9 @@ class WalletOperation {
     return delta;
   }
 
+  /// The polynomial itself, for the two operations that deal with it directly: DKG deals it, and
+  /// recovery rebuilds from it before there is a [WalletPublicState] to check against. The
+  /// operation keeps no copy.
   WalletPolynomial takePolynomial() {
     _ensureLive();
     final polynomial = _polynomial;
@@ -240,6 +285,7 @@ class WalletOperation {
     _escrowDelta = null;
     _pairingSlope = null;
     _keyPackage = null;
+    _escrowKeyPackage = null;
   }
 
   void _ensureLive() {

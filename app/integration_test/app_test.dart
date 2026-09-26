@@ -1,5 +1,5 @@
 // One end-to-end testWidgets covering the user lifecycle:
-//   onboarding (DKG) → on-chain send → Ark board/send/receive.
+//   server → passkey → DKG → exit address → Ark board/send/receive.
 
 // ignore_for_file: avoid_print
 
@@ -21,7 +21,6 @@ void main() {
   testWidgets(
     'full flow: onboarding → send → ark',
     (tester) async {
-      const pin = '123456';
       final btc = RegtestHelper();
       await btc.ensureWalletLoaded('default');
 
@@ -33,7 +32,7 @@ void main() {
       await resetAppState();
       await bootApp(tester);
       final exitAddress = await btc.getNewAddress();
-      await Flows.completeOnboarding(tester, pin: pin, exitAddress: exitAddress);
+      await Flows.completeOnboarding(tester, exitAddress: exitAddress);
       await pumpUntilFound(tester, find.byKey(const Key('arkSendBtn')));
 
       final ctxOnboard = tester.element(find.byKey(const Key('arkSendBtn')));

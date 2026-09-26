@@ -131,8 +131,9 @@ impl ServiceRegistry {
             if !(origin.starts_with("https://") || origin.starts_with("http://")) {
                 continue;
             }
-            if origin[8..].contains('/') {
-                continue;
+            match origin.get(8..) {
+                Some(rest) if !rest.is_empty() && !rest.contains('/') => {}
+                _ => continue,
             }
             origins.insert(id, origin.to_string());
         }

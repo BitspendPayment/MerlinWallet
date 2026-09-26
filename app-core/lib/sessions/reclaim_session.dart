@@ -28,6 +28,7 @@ import 'package:protocol/cosigner_v1.dart' as cs;
 
 import '../asp/asp_client.dart';
 import '../cosigner/connection.dart';
+import '../passkey/operation_secrets.dart';
 import '../threshold_types.dart' as threshold;
 import 'in_band_round.dart';
 import 'send_session.dart' show arkInfoToProto, vtxosToProto;
@@ -72,7 +73,12 @@ class ReclaimSession {
     required ArkInfo info,
     required ResolveEscrowShare resolveEscrow,
     required threshold.PublicKeyPackage escrowPubKey,
+    CancelSignal? cancel,
   }) async {
+    // Every wait on the ASP goes through this: from the first sighashes on, this frame holds the
+    // escrow share, and a cancel has to be able to unwind it — see `CancelSignal`.
+    Future<T> guarded<T>(Future<T> work) => cancel?.guard(work) ?? work;
+
     final duplex = _conn.openEscrowReclaim();
     try {
       duplex.send(cs.EscrowReclaimClientMsg(
@@ -115,10 +121,10 @@ class ReclaimSession {
       if (!submit.hasSubmit()) {
         throw CosignerException('expected what to submit, got ${submit.whichBody()}');
       }
-      final submitted = await _asp.submitTx(
+      final submitted = await guarded(_asp.submitTx(
         submit.submit.arkTxB64,
         submit.submit.checkpointTxs,
-      );
+      ));
       duplex.send(cs.EscrowReclaimClientMsg(
         sessionId: '',
         seq: 2,
@@ -133,10 +139,10 @@ class ReclaimSession {
       if (!finalize.hasFinalize()) {
         throw CosignerException('expected what to finalize, got ${finalize.whichBody()}');
       }
-      await _asp.finalizeTx(
+      await guarded(_asp.finalizeTx(
         finalize.finalize.arkTxid,
         finalize.finalize.finalCheckpointTxs,
-      );
+      ));
       duplex.send(cs.EscrowReclaimClientMsg(
         sessionId: '',
         seq: 3,

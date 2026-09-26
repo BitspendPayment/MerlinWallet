@@ -289,54 +289,46 @@ pub(crate) fn seal_snapshot_for(
     group_key: &str,
 ) {
     let store = actor.store.clone();
-    seal_snapshot(actor, &store, group_key);
+    if let Err(e) = seal_snapshot(actor, &store, group_key) {
+        tracing::warn!("{e}");
+    }
 }
 
 pub(crate) fn seal_snapshot(
     actor: &mut Cosigner,
     store: &Store,
     group_key: &str,
-) {
-    match actor.to_snapshot() {
-        Ok(blob) => {
-            if let Err(e) = store
-                
-                .put(SEALED_STATE_TREE, group_key, &hex::encode(blob))
-            {
-                tracing::warn!("persist sealed_state/{group_key} failed: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("snapshot failed: {e}"),
-    }
+) -> Result<(), String> {
+    let blob = actor.to_snapshot().map_err(|e| format!("snapshot failed: {e}"))?;
+    store
+        .put(SEALED_STATE_TREE, group_key, &hex::encode(blob))
+        .map_err(|e| format!("persist sealed_state/{group_key} failed: {e}"))
 }
 
 /// Restore the actor's state from a persisted snapshot, if one exists (on spawn/reseat).
 /// Returns `true` when a snapshot was restored — meaning the actor now holds its policy +
 /// keys from the sealed blob, so the caller can SKIP `InstallPolicy` (no plaintext key read).
 /// `false` when there's no stored blob (first run) or restore failed.
+/// `Ok(false)` is a wallet that has never sealed anything. `Err` is a seal that is there and
+/// cannot be read — which is not that, and must not be treated as it: see `Cosigner::open_with_host`.
 pub(crate) fn restore_snapshot(
     actor: &mut Cosigner,
     store: &Store,
     group_key: &str,
-) -> bool {
-    let stored = store.get(SEALED_STATE_TREE, group_key);
-    let Ok(Some(hex_blob)) = stored else {
-        return false;
+) -> Result<bool, String> {
+    let stored = store
+        .get(SEALED_STATE_TREE, group_key)
+        .map_err(|e| format!("sealed_state/{group_key}: {e}"))?;
+    let Some(hex_blob) = stored else {
+        return Ok(false);
     };
-    let Ok(blob) = hex::decode(&hex_blob) else {
-        tracing::warn!("sealed_state/{group_key}: corrupt hex; ignoring");
-        return false;
-    };
-    match actor.restore_snapshot(&blob) {
-        Ok(()) => {
-            tracing::info!("restored actor snapshot for {group_key}");
-            true
-        }
-        Err(e) => {
-            tracing::warn!("restore failed: {e}");
-            false
-        }
-    }
+    let blob =
+        hex::decode(&hex_blob).map_err(|e| format!("sealed_state/{group_key}: corrupt hex: {e}"))?;
+    actor
+        .restore_snapshot(&blob)
+        .map_err(|e| format!("sealed_state/{group_key}: {e}"))?;
+    tracing::info!("restored actor snapshot for {group_key}");
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

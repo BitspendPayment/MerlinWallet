@@ -158,7 +158,12 @@ class MpcService extends ChangeNotifier {
       final persistencePath = '${appDir.path}/mpc_client';
       await MpcClient.initPersistence(path: persistencePath);
     }();
-    await _persistenceInitFuture;
+    try {
+      await _persistenceInitFuture;
+    } catch (_) {
+      _persistenceInitFuture = null;
+      rethrow;
+    }
   }
 
   Future<void> init() async {
@@ -437,9 +442,22 @@ class MpcService extends ChangeNotifier {
     // the tenant is minted from the enclave's own entropy and was never this device's to know.
     gate.authenticator = _passkey;
 
-    _client = await _createMpcClient(
-        storageId: _storageId ?? 'mpc_wallet_state_default');
-    await _client!.recover();
+    try {
+      _client = await _createMpcClient(
+          storageId: _storageId ?? 'mpc_wallet_state_default');
+      await _client!.recover();
+    } catch (_) {
+      // Back to "no passkey on this device". A credential kept for a wallet that did not come
+      // back — the wrong passkey picked, or a cosigner that cannot recover it — would make the
+      // next Create skip enrolment and run a DKG the cosigner refuses, and the next Restore fail
+      // the same way, with no way out short of clearing app data.
+      await _identityBox!.delete('passkeyCredentialId');
+      gate.authenticator = null;
+      _passkey = PlatformPasskey(rpId: server_host.relyingPartyId(_host));
+      await _hangUp();
+      _client = null;
+      rethrow;
+    }
 
     _dkgComplete = true;
     _isConnected = true;
@@ -460,15 +478,25 @@ class MpcService extends ChangeNotifier {
     if (!_isInitialized) throw StateError("MPC Service not initialized");
     if (!_dkgComplete) throw StateError("DKG not completed. Cannot restore.");
 
-    _client = await _createMpcClient(
-        storageId: _storageId ?? 'mpc_wallet_state_default');
-    if (!await _client!.restoreState()) {
-      throw StateError('this wallet has no key on this device to restore');
+    _isConnected = false;
+    await _hangUp();
+    _client = null;
+    try {
+      _client = await _createMpcClient(
+          storageId: _storageId ?? 'mpc_wallet_state_default');
+      if (!await _client!.restoreState()) {
+        throw StateError('this wallet has no saved public state on this device to restore');
+      }
+      _isConnected = true;
+      await initArk();
+      notifyListeners();
+    } catch (_) {
+      await _hangUp();
+      _client = null;
+      _isConnected = false;
+      notifyListeners();
+      rethrow;
     }
-    _isConnected = true;
-
-    await initArk();
-    notifyListeners();
   }
 
   /// Stop the operation in flight — a board, a send, a renewal — if there is one.
@@ -519,6 +547,12 @@ class MpcService extends ChangeNotifier {
     _isConnected = false;
     await _identityBox!.put('dkgComplete', false);
     await _identityBox!.delete('exitAddress');
+    // The lists mirrored from the cosigner go too: they were this wallet's, and the next wallet
+    // restored here may be another. "Deletes this phone's wallet data" has to mean all of it.
+    _contacts = [];
+    _paymentRequests = [];
+    await _identityBox!.delete('contacts');
+    await _identityBox!.delete('paymentRequests');
     notifyListeners();
   }
 

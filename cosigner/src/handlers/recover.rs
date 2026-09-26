@@ -49,11 +49,13 @@ pub fn recover(c: &Cosigner, req: RecoverRequest) -> Result<RecoverResponse, Sta
         _ => return Err(Status::internal("the wallet has a dealt share and no key package")),
     };
 
+    let now = crate::handlers::helpers::now_secs();
     tracing::info!("Recover: returning the dealt share to the wallet's own identifier");
     Ok(RecoverResponse {
         dealt_share,
         public_key_package_json,
         group_key,
+        escrows: c.escrows().iter().map(|e| crate::session::escrow_summary(e, now)).collect(),
     })
 }
 

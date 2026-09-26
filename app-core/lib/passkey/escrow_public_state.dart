@@ -8,10 +8,18 @@
 /// is what the passkey's delta was derived under, so without it a new device could not reproduce
 /// that delta at all. It is not a secret — the cosigner holds it, and it is meaningless without
 /// the PRF — but it is load-bearing, and a device that lost it would have an escrow it could see
-/// and not spend from. [MpcClient.recoverEscrows] fetches it back with the rest.
+/// and not spend from. `Recover` hands it back with the rest — see [MpcClient.recover] and
+/// [EscrowPublicState.fromSummary].
 library;
 
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:convert/convert.dart';
+import 'package:protocol/cosigner_v1.dart' as cs;
+
 import 'package:app_core/passkey/wallet_public_state.dart';
+import 'package:app_core/threshold/threshold.dart' as threshold;
 
 class EscrowPublicState {
   const EscrowPublicState({
@@ -36,6 +44,33 @@ class EscrowPublicState {
         'wallet': wallet.toJson(),
         'context': contextHex,
       };
+
+  /// What a new device keeps of an escrow the cosigner lists — on `Recover`, or `EscrowList`.
+  ///
+  /// Null for an escrow this device cannot rebuild: one minted before its context was recorded,
+  /// whose delta no passkey can re-derive. Throws if the summary is not about [walletIdentifier]
+  /// — the wallet this device just recovered — since an escrow it is not a member of is not its.
+  static EscrowPublicState? fromSummary(
+    cs.EscrowSummary summary, {
+    required threshold.Identifier walletIdentifier,
+    required int minSigners,
+  }) {
+    if (summary.context.isEmpty) return null;
+    final listed = threshold.Identifier.deserialize(
+        Uint8List.fromList(summary.walletIdentifier));
+    if (listed != walletIdentifier) {
+      throw StateError(
+          'the cosigner listed escrow ${summary.escrowKey} under another wallet identifier');
+    }
+    final package = threshold.PublicKeyPackage.fromJson(
+        jsonDecode(summary.publicKeyPackageJson) as Map<String, dynamic>);
+    return EscrowPublicState(
+      escrowKeyHex: summary.escrowKey.toLowerCase(),
+      wallet: WalletPublicState.fromPublicKeyPackage(package, walletIdentifier,
+          minSigners: minSigners),
+      contextHex: hex.encode(summary.context),
+    );
+  }
 
   factory EscrowPublicState.fromJson(Map<String, dynamic> json) => EscrowPublicState(
         escrowKeyHex: json['escrowKey'] as String,

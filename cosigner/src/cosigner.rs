@@ -62,11 +62,33 @@ const TERMINAL_INTENT_RETENTION_SECS: i64 = 24 * 60 * 60;
 /// A compressed key without its parity byte, lowercased. Two keys differing only in parity are the
 /// same x-only key, and an Ark address commits to the x-only form — so a caller naming an escrow by
 /// the address it pays must resolve to the escrow that pays it.
-fn x_only(key_hex: &str) -> String {
+///
+/// Byte-sliced, so only a string that IS hex may be sliced: a service names an escrow by this, and
+/// a multibyte character in the first two bytes would otherwise panic the guest on its say-so.
+pub(crate) fn x_only(key_hex: &str) -> String {
     let k = key_hex.trim().to_ascii_lowercase();
-    match k.len() {
-        66 => k[2..].to_string(),
+    match (k.len(), k.is_ascii()) {
+        (66, true) => k[2..].to_string(),
         _ => k,
+    }
+}
+
+#[cfg(test)]
+mod x_only_tests {
+    use super::x_only;
+
+    #[test]
+    fn strips_the_parity_byte_of_a_compressed_key() {
+        assert_eq!(x_only(&format!("02{}", "ab".repeat(32))), "ab".repeat(32));
+        assert_eq!(x_only(&"ab".repeat(32)), "ab".repeat(32));
+    }
+
+    #[test]
+    fn a_multibyte_key_the_length_of_a_compressed_one_does_not_panic() {
+        // 1 + 3 + 62 = 66 bytes, and byte 2 is inside the euro sign.
+        let k = format!("0\u{20ac}{}", "a".repeat(62));
+        assert_eq!(k.len(), 66);
+        assert_eq!(x_only(&k), k);
     }
 }
 
@@ -203,7 +225,15 @@ impl Cosigner {
         host: Arc<dyn crate::host::Host>,
     ) -> Result<Self, Status> {
         let mut cosigner = Self::new(store.clone(), group_key.clone(), host);
-        crate::store::restore_snapshot(&mut cosigner, &store, &group_key);
+        // A seal that is there and cannot be read is not the same as no seal. Opening as a wallet
+        // with no key would let a DKG re-key the tenant over funds sealed under the old one — and
+        // since the seal is the only copy of anything, a read fault must stop here.
+        crate::store::restore_snapshot(&mut cosigner, &store, &group_key).map_err(|e| {
+            Status::failed_precondition(format!(
+                "this wallet's sealed state is present but unreadable ({e}); refusing to open it \
+                 as a wallet with no key"
+            ))
+        })?;
         Ok(cosigner)
     }
 
@@ -398,9 +428,17 @@ impl Cosigner {
     /// Seal this actor's state. Storage is the whole of the persistence now, so a method that
     /// mutates durable state seals here rather than trusting its caller to remember.
     pub fn seal(&mut self) {
+        if let Err(e) = self.try_seal() {
+            tracing::warn!("{e}");
+        }
+    }
+
+    /// Seal, and say whether it took. For the one place a change must not be acted on unless it
+    /// is durable: a release signed but not written down is a payment that can be asked for again.
+    pub fn try_seal(&mut self) -> Result<(), String> {
         let store = self.store.clone();
         let group_key = self.group_key.clone();
-        crate::store::seal_snapshot(self, &store, &group_key);
+        crate::store::seal_snapshot(self, &store, &group_key)
     }
 
     /// Record a settled boarding output: replace it in the owned set with the VTXO it became, and
@@ -879,6 +917,17 @@ impl Cosigner {
             .iter_mut()
             .find(|e| x_only(&e.escrow_key) == want)
             .ok_or("this wallet holds no such escrow")?;
+        // Before anything else. Signatures a reclaim handed out are valid for as long as the
+        // outpoints they spend exist, and this cosigner can see neither whether they left the
+        // device nor whether those outpoints are still there. A deal struck over them would be
+        // one the owner could empty at will — so an escrow a reclaim was ever opened on is done
+        // with deals, and the next deal gets a new escrow.
+        if let Some(at) = record.reclaim_opened_at {
+            return Err(format!(
+                "a reclaim was opened on this escrow at {at}, so signatures that empty it may \
+                 exist; it cannot be committed to a deal again — mint a new escrow"
+            ));
+        }
         match record.pairing.as_ref().map(|p| p.state()) {
             None => {
                 return Err(
@@ -910,6 +959,22 @@ impl Cosigner {
             );
         }
         record.session = Some(session);
+        Ok(())
+    }
+
+    /// A reclaim is being opened on [escrow_key]: retire it from deals, for good.
+    ///
+    /// Called before the reclaim's round begins, and sealed by the caller before any nonce is
+    /// made, so an abandoned stream is as final as a finished one. The first time is kept; a
+    /// second reclaim on the same escrow — after an ASP failure, say — changes nothing.
+    pub fn mark_escrow_reclaim_opened(&mut self, escrow_key: &str, now: i64) -> Result<(), String> {
+        let want = x_only(escrow_key);
+        let record = self
+            .escrows
+            .iter_mut()
+            .find(|e| x_only(&e.escrow_key) == want)
+            .ok_or("this wallet holds no such escrow")?;
+        record.reclaim_opened_at.get_or_insert(now);
         Ok(())
     }
 

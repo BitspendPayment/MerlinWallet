@@ -527,10 +527,6 @@ pub extern "C" fn threshold_refresh_share_to_id(
 // eVTXO key resharing
 // ---------------------------------------------------------------------------
 
-/// eVTXO reshare round 1: deal a fresh NON-zero polynomial under an EXPLICIT
-/// identifier (the dealer's existing identity). Used by the signer (hardware /
-/// software). Round 2 then uses the regular `threshold_dkg_part2`.
-#[no_mangle]
 /// Resharing round 1 from an EXPLICIT polynomial, the way `threshold_dkg_part1` takes one.
 ///
 /// The seeded sibling below draws its constant term from the RNG and expands its coefficients from
@@ -587,6 +583,10 @@ pub extern "C" fn threshold_dkg_reshare_part1_from(
     }
 }
 
+/// eVTXO reshare round 1: deal a fresh NON-zero polynomial under an EXPLICIT
+/// identifier (the dealer's existing identity). Used by the signer (hardware /
+/// software). Round 2 then uses the regular `threshold_dkg_part2`.
+#[no_mangle]
 pub extern "C" fn threshold_dkg_reshare_part1(
     id_hex: *const c_char,
     max_signers: u32,

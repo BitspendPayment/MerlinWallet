@@ -374,7 +374,12 @@ impl HttpGet {
         if !(self.provider.starts_with("https://") || self.provider.starts_with("http://")) {
             return Err(format!("{:?} is not an origin", self.provider));
         }
-        if self.provider.trim_end_matches('/')[8..].contains('/') {
+        // `get`, not a slice: `http://` is seven bytes, and a provider is owner-supplied.
+        let rest = self.provider.trim_end_matches('/').get(8..).unwrap_or_default();
+        if rest.is_empty() {
+            return Err("a provider needs a host".into());
+        }
+        if rest.contains('/') {
             return Err("a provider is a scheme, a host and a port, never a path".into());
         }
         if !self.path.starts_with('/') {

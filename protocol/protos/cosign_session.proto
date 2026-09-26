@@ -204,6 +204,9 @@ message RecoverResponse {
   // The group key, hex — also inside the package above, returned plainly so a caller can compare
   // without parsing.
   string group_key = 3;
+  // The escrows this wallet holds, so a new device can rebuild them the way it rebuilt the wallet:
+  // each carries the context its delta was derived under. Public throughout.
+  repeated EscrowSummary escrows = 4;
 }
 
 message SettleClientMsg {
@@ -904,6 +907,12 @@ message EscrowSummary {
   bool wallet_confirmed = 9;
   // The live deal, when there is one.
   EscrowSessionSummary session = 6;
+  // The derivation context the wallet's delta was minted under — what a new device needs to
+  // re-derive it. Not a secret: it is meaningless without the PRF, and the cosigner holds it.
+  bytes context = 10;
+  // A reclaim was opened on this escrow. It is retired from deals for good — the owner may hold
+  // signatures that empty it — and the next deal needs a new escrow.
+  bool reclaim_opened = 11;
 }
 
 message EscrowSessionSummary {
