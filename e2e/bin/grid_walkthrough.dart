@@ -125,6 +125,11 @@ Future<void> main(List<String> args) async {
     print('  price            ${quoted['sats']} sats — what Alice agrees to pay');
     print('  platform\'s cost  ${(quoted['grid_cost_micro_usdb'] as int) / 1e6} USDB at Grid, funded '
         'just in time; priced at ${quoted['sats_per_usd']} sats/USD');
+    // The name the bank holds, for Alice to confirm before she seals anything: money sent to the
+    // wrong person is the one mistake she cannot take back.
+    final payee = (quoted['payee'] as Map).cast<String, dynamic>();
+    print('  the bank says    ${payee['name_at_bank'] ?? '(no name check on this rail)'}'
+        ' (${payee['name_check'] ?? 'unchecked'}); Alice typed ${payee['name_given']}');
 
     _step(4, 'Check the policy, then seal it');
     final policy = (quoted['policy'] as Map).cast<String, dynamic>();
@@ -145,8 +150,10 @@ Future<void> main(List<String> args) async {
     print('  Alice agrees: $described');
 
     _step(5, 'MerlinPlatform checks it will be repaid, then pays');
-    final funded = (await _postEmpty(platformBase, '/payouts/$requestId/fund'))
-        as Map<String, dynamic>;
+    // The platform cannot see the deal Alice sealed, so she tells it when it ends; it will not
+    // pay into a deal too close to its end to be repaid in.
+    final funded = (await _postJson(platformBase, '/payouts/$requestId/fund',
+        {'deal_deadline': deadline.millisecondsSinceEpoch ~/ 1000})) as Map<String, dynamic>;
     if (funded['outcome'] != 'funded') throw StateError('not funded: ${jsonEncode(funded)}');
     print('  the cosigner refused only because the payout had not completed — so it paid');
     print('  payout           ${funded['transaction_id']}');
@@ -343,14 +350,6 @@ Future<dynamic> _postJson(String base, String path, Map<String, dynamic> body) a
   request.persistentConnection = false;
   request.headers.contentType = ContentType.json;
   request.write(jsonEncode(body));
-  final response = await request.close();
-  return jsonDecode(await response.transform(utf8.decoder).join());
-}
-
-Future<dynamic> _postEmpty(String base, String path) async {
-  final request = await _http.postUrl(Uri.parse('$base$path'));
-  request.persistentConnection = false;
-  request.contentLength = 0;
   final response = await request.close();
   return jsonDecode(await response.transform(utf8.decoder).join());
 }

@@ -1486,7 +1486,7 @@ impl Cosigner {
             Err(e) => return Err(format!("ark_address: {e}")),
         };
         let outputs = vec![DelegateOutput {
-            ark_address: owner_ark_address,
+            address: owner_ark_address,
             amount_sats: total,
         }];
 

@@ -1230,9 +1230,39 @@ pub struct DelegateVtxoInput {
 
 /// Output descriptor for delegate settle.
 pub struct DelegateOutput {
-    /// Ark address string (bech32m encoded).
-    pub ark_address: String,
+    /// Where it goes. An Ark address (bech32m) stays in Ark, as a fresh VTXO. A bitcoin address
+    /// leaves Ark: a collaborative exit, paid on chain by the batch's commitment transaction.
+    pub address: String,
     pub amount_sats: u64,
+}
+
+/// One destination as an intent carries it.
+///
+/// An Ark address stays off-chain. A bitcoin address is an on-chain output — a collaborative
+/// exit — which `prepare_delegate_psbts_at` then lists in the intent's `onchain_output_indexes`,
+/// so the server pays it in the commitment transaction.
+fn intent_output(
+    address: &str,
+    amount_sats: u64,
+    network: bitcoin::Network,
+) -> Result<ark_core::intent::Output, String> {
+    let value = Amount::from_sat(amount_sats);
+    if let Ok(ark_addr) = address.parse::<ark_core::ArkAddress>() {
+        return Ok(ark_core::intent::Output::Offchain(TxOut {
+            value,
+            script_pubkey: ark_addr.to_p2tr_script_pubkey(),
+        }));
+    }
+    let onchain: bitcoin::Address<bitcoin::address::NetworkUnchecked> = address
+        .parse()
+        .map_err(|e| format!("{address:?} is neither an Ark nor a bitcoin address: {e}"))?;
+    let onchain = onchain
+        .require_network(network)
+        .map_err(|e| format!("{address:?} is for another network: {e}"))?;
+    Ok(ark_core::intent::Output::Onchain(TxOut {
+        value,
+        script_pubkey: onchain.script_pubkey(),
+    }))
 }
 
 /// Phase of the delegate session state machine.
@@ -1441,14 +1471,7 @@ impl DelegateSettleSession {
         // Build intent::Output for each destination.
         let intent_outputs: Vec<ark_core::intent::Output> = outputs
             .iter()
-            .map(|o| {
-                let ark_addr: ark_core::ArkAddress = o.ark_address.parse()
-                    .map_err(|e| format!("invalid ark address: {e}"))?;
-                Ok(ark_core::intent::Output::Offchain(TxOut {
-                    value: Amount::from_sat(o.amount_sats),
-                    script_pubkey: ark_addr.to_p2tr_script_pubkey(),
-                }))
-            })
+            .map(|o| intent_output(&o.address, o.amount_sats, network))
             .collect::<Result<Vec<_>, String>>()?;
 
         // Parse forfeit address.
@@ -2568,5 +2591,34 @@ mod batch_intent_tests {
     fn does_not_match_the_raw_intent_id() {
         // arkd sends hashes, never the ids themselves.
         assert!(!batch_includes_intent(&event(&[TEST_INTENT]), TEST_INTENT));
+    }
+
+    /// A bitcoin address in a delegate is a collaborative exit, an on-chain output; an Ark
+    /// address stays in Ark.
+    #[test]
+    fn a_bitcoin_address_leaves_ark_and_an_ark_address_stays() {
+        use bitcoin::key::TweakedPublicKey;
+        use bitcoin::Network;
+        let owner = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let asp = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        let ark = crate::client::ark_address(owner, asp, 512, Network::Regtest).unwrap();
+        let xonly: bitcoin::XOnlyPublicKey = owner.parse().unwrap();
+        let onchain = bitcoin::Address::p2tr_tweaked(
+            TweakedPublicKey::dangerous_assume_tweaked(xonly),
+            Network::Regtest,
+        )
+        .to_string();
+
+        assert!(matches!(
+            intent_output(&ark, 1_000, Network::Regtest),
+            Ok(ark_core::intent::Output::Offchain(_))
+        ));
+        assert!(matches!(
+            intent_output(&onchain, 1_000, Network::Regtest),
+            Ok(ark_core::intent::Output::Onchain(o)) if o.value.to_sat() == 1_000
+        ));
+        // Another network's address, and something that is no address, are refused.
+        assert!(intent_output(&onchain, 1_000, Network::Bitcoin).is_err());
+        assert!(intent_output("not an address", 1_000, Network::Regtest).is_err());
     }
 }
