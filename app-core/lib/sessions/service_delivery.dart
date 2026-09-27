@@ -134,3 +134,33 @@ bool isLocalDevelopmentHost(String host) {
       (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
       (b[0] == 192 && b[1] == 168);
 }
+
+/// Delivery to a service the enclave names by an address this device reaches under another name.
+///
+/// The cosigner reports the origin it delivered to, and the wallet sends its own half to the same
+/// one — which is what keeps the two halves from being split between two hosts. But in a dev stack
+/// the enclave and this device do not share a view of the network: `192.168.127.254` is the QEMU
+/// host as the guest sees it, while the same host is `127.0.0.1` to a process on it, or to a phone
+/// through `adb reverse`. A real service has one public name, and this never applies to it.
+///
+/// Only that one host is rewritten, and [HttpServiceDelivery] still refuses to send a secret in
+/// the clear to anything that is not a local development address.
+class RewritingDelivery implements DeliverToService {
+  RewritingDelivery({this.guestFacingHost = '192.168.127.254', this.hostFacingHost = '127.0.0.1'});
+
+  final String guestFacingHost;
+  final String hostFacingHost;
+  final HttpServiceDelivery _inner = HttpServiceDelivery();
+
+  /// Every origin this was asked to deliver to, as the enclave named it.
+  final List<String> asked = [];
+
+  @override
+  Future<void> deliver(String origin, ServiceContribution contribution) {
+    asked.add(origin);
+    final uri = Uri.parse(origin);
+    final reachable =
+        uri.host == guestFacingHost ? uri.replace(host: hostFacingHost).toString() : origin;
+    return _inner.deliver(reachable, contribution);
+  }
+}

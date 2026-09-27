@@ -1,16 +1,10 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show PlatformException;
-import 'package:convert/convert.dart' show hex;
-import 'package:fixnum/fixnum.dart';
 import 'package:hive/hive.dart';
-import 'package:protobuf/protobuf.dart' show GeneratedMessageGenericExtensions;
 import 'package:path_provider/path_provider.dart';
-// `ArkInfo` also exists as a proto message; the ASP's value type is the one meant here.
-import 'package:protocol/protocol.dart' hide ArkInfo;
 
 import 'package:app_core/asp/asp_client.dart';
 import 'package:app_core/asp/exit_chain.dart';
@@ -100,6 +94,9 @@ class MpcService extends ChangeNotifier {
 
   // Hardcoded for now, could be configurable
   String _host = '10.0.2.2'; // Default, will be overwritten by persistence
+
+  /// The cosigner host this wallet uses — see `server_host.dart` for what else it decides.
+  String get host => _host;
 
   /// Where a remote enclave's measurements are published, for a host with no pins URL of its own
   /// (`server_host.pinsUrl`).
@@ -203,7 +200,9 @@ class MpcService extends ChangeNotifier {
       // Replaced by the watch the client persists with its own state.
       await _identityBox!.delete('delegatedOutpoints');
 
-      _loadLocalLists();
+      // Contacts and payment requests were removed; drop their cached lists.
+      await _identityBox!.delete('contacts');
+      await _identityBox!.delete('paymentRequests');
 
       _isInitialized = true;
     } catch (e) {
@@ -423,8 +422,7 @@ class MpcService extends ChangeNotifier {
   ///  2. **Ask the cosigner** for the half of the key it dealt at DKG — the gesture that approves
   ///     that call is the one that yields the seed — and check the two halves make this wallet's
   ///     share. See [MpcClient.recover]: what is saved is the public half, never the share.
-  ///  3. **Open the wallet.** Load VTXOs from the ASP. Contacts and requests are fetched separately
-  ///     when the user pulls to refresh their screens; a new delegate is recorded on the next seal.
+  ///  3. **Open the wallet.** Load VTXOs from the ASP; a new delegate is recorded on the next seal.
   ///
   /// The exits do not come back — they are this device's copies of transactions signed for the old
   /// one — so the exit address is asked for again and the next seal reissues them.
@@ -543,16 +541,13 @@ class MpcService extends ChangeNotifier {
     // Straight at the store: a client needs a gate and a passkey, and deleting a file needs neither.
     await WalletStore(boxName: _storageId ?? 'mpc_wallet_state_default')
         .destroy();
+    // The payouts, and the key of the escrow they are paid from, were this wallet's too. Cleared
+    // rather than deleted: PayoutService holds the box open.
+    await (await Hive.openBox('payouts')).clear();
     _dkgComplete = false;
     _isConnected = false;
     await _identityBox!.put('dkgComplete', false);
     await _identityBox!.delete('exitAddress');
-    // The lists mirrored from the cosigner go too: they were this wallet's, and the next wallet
-    // restored here may be another. "Deletes this phone's wallet data" has to mean all of it.
-    _contacts = [];
-    _paymentRequests = [];
-    await _identityBox!.delete('contacts');
-    await _identityBox!.delete('paymentRequests');
     notifyListeners();
   }
 
@@ -912,169 +907,6 @@ class MpcService extends ChangeNotifier {
     final arkTxid = await client.sendVtxo(recipientArkAddress, amountSats);
     await refreshVtxos();
     return arkTxid;
-  }
-
-  // --- Request-to-pay -------------------------------------------------------
-  //
-  // A party is identified by its GROUP key — what another wallet allowlists, and what a payer's
-  // cosigner derives our payee address from.
-
-  //
-  // Both lists are kept here, and persisted, as what the app shows — not fetched to show them.
-  // Reading either from the cosigner is a call, and every call is a passkey approval, so opening a
-  // screen used to cost a fingerprint or two. Nothing else writes them: contacts are added and
-  // removed from this app, and a request reaches the cosigner only when this app delivers it. So
-  // each change this app makes is applied to the local copy as the cosigner confirms it, and a
-  // pull-to-refresh is the only read.
-
-  List<Contact> _contacts = [];
-  List<Contact> get contacts => List.unmodifiable(_contacts);
-
-  List<PaymentIntent> _paymentRequests = [];
-  List<PaymentIntent> get paymentRequests =>
-      List.unmodifiable(_paymentRequests);
-
-  void _loadLocalLists() {
-    List<T> read<T>(String key, T Function(List<int>) decode) {
-      final stored = _identityBox?.get(key);
-      if (stored is! List) return [];
-      return [
-        for (final b64 in stored.cast<String>()) decode(base64.decode(b64))
-      ];
-    }
-
-    _contacts = read('contacts', Contact.fromBuffer);
-    _paymentRequests = read('paymentRequests', PaymentIntent.fromBuffer);
-  }
-
-  Future<void> _saveLocalLists() async {
-    await _identityBox?.put('contacts',
-        [for (final c in _contacts) base64.encode(c.writeToBuffer())]);
-    await _identityBox?.put('paymentRequests',
-        [for (final i in _paymentRequests) base64.encode(i.writeToBuffer())]);
-  }
-
-  /// Requests still awaiting a decision — what the inbox badge counts.
-  List<PaymentIntent> get pendingPaymentRequests =>
-      _paymentRequests.where((i) => i.status == 'pending').toList();
-
-  /// This wallet's shareable identity: give it to someone so they can allowlist you.
-  String? get myGroupKey => _client?.groupKeyHex;
-
-  /// Re-read contacts from the cosigner. A passkey approval — pull-to-refresh only.
-  Future<void> refreshContacts() async {
-    if (_client == null) return;
-    _contacts = await _client!.contactList();
-    await _saveLocalLists();
-    notifyListeners();
-  }
-
-  /// Re-read the inbox from the cosigner. A passkey approval — pull-to-refresh only.
-  Future<void> refreshPaymentRequests() async {
-    if (_client == null) return;
-    _paymentRequests = await _client!.paymentRequests();
-    await _saveLocalLists();
-    notifyListeners();
-  }
-
-  /// Authorize someone to bill this wallet.
-  Future<void> addContact(String contactGroupKeyHex, String label) async {
-    if (_client == null) throw StateError('Client not initialized');
-    final key = contactGroupKeyHex.trim();
-    await _client!.contactAdd(key, label.trim());
-    _contacts = [
-      for (final c in _contacts)
-        if (hex.encode(c.verifyingKey) != key) c,
-      Contact(
-        verifyingKey: hex.decode(key),
-        label: label.trim(),
-        addedAt: Int64(DateTime.now().millisecondsSinceEpoch ~/ 1000),
-      ),
-    ];
-    await _saveLocalLists();
-    notifyListeners();
-  }
-
-  /// Revoke a contact; the cosigner drops their pending requests too.
-  Future<void> removeContact(String contactGroupKeyHex) async {
-    if (_client == null) throw StateError('Client not initialized');
-    await _client!.contactRemove(contactGroupKeyHex);
-    _contacts = [
-      for (final c in _contacts)
-        if (hex.encode(c.verifyingKey) != contactGroupKeyHex) c,
-    ];
-    // What the cosigner did with them, mirrored: a revoked contact's pending requests go with it.
-    _paymentRequests = [
-      for (final i in _paymentRequests)
-        if (!(i.status == 'pending' &&
-            hex.encode(i.fromVerifyingKey) == contactGroupKeyHex))
-          i,
-    ];
-    await _saveLocalLists();
-    notifyListeners();
-  }
-
-  /// Ask [payerGroupKeyHex] to pay us. **Not reachable from the app today.**
-  ///
-  /// The request is signed by us and addressed to the PAYER's cosigner — their
-  /// contact allowlist is what authorizes it, which is why the payee address is
-  /// derived there from our allowlisted key rather than supplied by us. That
-  /// needs a connection to their cosigner, and there is no way to open one:
-  /// enclave-runtime resolves the tenant from the caller's own interaction
-  /// token and strips any tenant header a client sends, so every connection we
-  /// can open lands in our own instance. Calling it against our own cosigner
-  /// would create a request for *us* to pay, which is backwards.
-  ///
-  /// The inbox half is unaffected — [paymentRequests], [approvePaymentRequest]
-  /// and [declinePaymentRequest] all read our own cosigner and work.
-  ///
-  /// What would close this: carry the signed request out of band (a QR code or
-  /// a link) and have the payer's app submit it to the payer's own cosigner.
-  /// The RPC already takes the requester's `user_id`, `signature` and
-  /// `timestamp_ms`, so nothing on the cosigner needs to change — only how the
-  /// request travels, which is a product decision rather than a port.
-  Future<PaymentIntent> requestPayment(
-    String payerGroupKeyHex,
-    int amountSats, {
-    String memo = '',
-  }) async {
-    throw UnsupportedError(
-      'Requesting a payment needs a connection to the payer\'s cosigner, and '
-      'the runtime routes every connection to our own. Share the request out '
-      'of band instead — see MpcService.requestPayment.',
-    );
-  }
-
-  /// Pay a request. Amount and payee come from the STORED intent, never the UI — that is what
-  /// lets the cosigner match the settled send back to the request.
-  Future<String> approvePaymentRequest(PaymentIntent intent) async {
-    if (intent.status != 'pending') {
-      throw StateError('Request is ${intent.status}, not pending');
-    }
-    final txid = await sendArk(intent.toArkAddress, intent.amountSats.toInt());
-    // The cosigner marks it fulfilled as it records the send; mirrored rather than re-read.
-    _setRequest(
-        intent.id,
-        (i) => i
-          ..status = 'fulfilled'
-          ..arkTxid = txid);
-    await _saveLocalLists();
-    notifyListeners();
-    return txid;
-  }
-
-  Future<void> declinePaymentRequest(String id) async {
-    if (_client == null) throw StateError('Client not initialized');
-    await _client!.declinePaymentRequest(id);
-    _setRequest(id, (i) => i..status = 'declined');
-    await _saveLocalLists();
-    notifyListeners();
-  }
-
-  void _setRequest(String id, PaymentIntent Function(PaymentIntent) change) {
-    _paymentRequests = [
-      for (final i in _paymentRequests) i.id == id ? change(i.deepCopy()) : i,
-    ];
   }
 
   Future<String> settleDelegate() async {

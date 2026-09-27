@@ -66,6 +66,8 @@ e2e/hive_db
 
 # The prebuilt dev enclave `make enclave-bundle` unpacks (hundreds of MB; pinned by enclave-bundle.lock).
 .enclave/
+# The payout platform the regtest stack runs: its build copy, state and logs. See scripts/platform.sh.
+.platform/
 
 # Vendored Rust crate sources (cosigner-runtime/vendor/) are committed so the
 # EIF / offline build needs zero crates.io access. Crates legitimately contain

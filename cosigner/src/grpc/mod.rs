@@ -7,7 +7,7 @@
 //! behaviour rather than a trick).
 //!
 //! What is deliberately absent is a generated service trait. The router below matches `:path`
-//! itself, because the paths are `/cosigner.v1.Cosigner/<Method>` and there are fourteen of them —
+//! itself, because the paths are `/cosigner.v1.Cosigner/<Method>` and there are fifteen of them —
 //! a table is clearer than a code generator, and it is the only thing tonic was still providing.
 //!
 //! The messages are still generated: `build.rs` runs prost over the same `.proto` the Dart client

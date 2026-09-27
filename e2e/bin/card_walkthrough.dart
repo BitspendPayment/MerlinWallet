@@ -24,8 +24,9 @@ import 'package:app_core/asp/asp_client.dart' show IndexerVtxo;
 import 'package:app_core/client.dart';
 import 'package:app_core/threshold_types.dart' as ark_threshold;
 import 'package:e2e/boarding_poll.dart';
+import 'package:e2e/e2e_profile.dart' show writeEnclavePins;
 import 'package:e2e/enclave_harness.dart';
-import 'package:e2e/escrow_service.dart' show HostSideDelivery;
+import 'package:app_core/sessions/service_delivery.dart' show RewritingDelivery;
 import 'package:e2e/logger.dart';
 import 'package:e2e/regtest_helper.dart';
 
@@ -70,6 +71,8 @@ Future<void> main(List<String> args) async {
     },
   );
   Log.info('enclave up: pcr16=${harness.pcr16.substring(0, 16)}…');
+  // The settlement service believes an enclave only once it knows this boot's PCRs and root.
+  await writeEnclavePins(harness);
 
   final btc = RegtestHelper(rpcUrl: 'http://127.0.0.1:18443/wallet/default');
   final alice = await harness.wallet('alice', aspHost: '127.0.0.1', aspPort: 7070);
@@ -84,7 +87,7 @@ Future<void> main(List<String> args) async {
     final pairing = await alice.client.pairService(
       escrowKeyHex: escrow.escrowKeyHex,
       serviceIdentifier: serviceIdentifier,
-      delivery: HostSideDelivery(),
+      delivery: RewritingDelivery(),
     );
     print('  cosigner delivered its half over the runtime-held stream');
     print('  wallet delivered its own half straight to ${pairing.serviceOrigin}');

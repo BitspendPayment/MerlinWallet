@@ -409,27 +409,6 @@ class FakeCosigner extends cs.CosignerServiceBase {
     }
   }
   @override
-  Future<ContactAddResponse> contactAdd(ServiceCall call, ContactAddRequest request) =>
-      _no('keep contacts');
-  @override
-  Future<ContactRemoveResponse> contactRemove(ServiceCall call, ContactRemoveRequest request) =>
-      _no('keep contacts');
-  @override
-  Future<ContactListResponse> contactList(ServiceCall call, ContactListRequest request) =>
-      _no('keep contacts');
-  @override
-  Future<PaymentRequestCreateResponse> paymentRequestCreate(
-          ServiceCall call, PaymentRequestCreateRequest request) =>
-      _no('take payment requests');
-  @override
-  Future<PaymentRequestListResponse> paymentRequestList(
-          ServiceCall call, PaymentRequestListRequest request) =>
-      _no('take payment requests');
-  @override
-  Future<PaymentRequestDeclineResponse> paymentRequestDecline(
-          ServiceCall call, PaymentRequestDeclineRequest request) =>
-      _no('take payment requests');
-  @override
   Future<GetServerInfoResponse> getServerInfo(ServiceCall call, GetServerInfoRequest request) async =>
       GetServerInfoResponse(bitcoinNetwork: 'regtest');
   @override

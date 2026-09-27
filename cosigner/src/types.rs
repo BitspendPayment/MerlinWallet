@@ -46,63 +46,6 @@ pub struct VtxoInput {
 
 
 
-/// A party authorized to bill this wallet. One-way — the contact gives no consent. An
-/// AUTHORIZATION list, so it lives in the seal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Contact {
-    /// The contact's group verifying key, hex (33-byte compressed) — its whole identity.
-    pub vk_hex: String,
-    /// Local display name chosen by the owner.
-    pub label: String,
-    /// Unix seconds.
-    pub added_at: i64,
-}
-
-/// Lifecycle of a payment request held for the payer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IntentStatus {
-    Pending,
-    Fulfilled,
-    Declined,
-    Expired,
-}
-
-impl IntentStatus {
-    /// Wire form (also what the app renders).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            IntentStatus::Pending => "pending",
-            IntentStatus::Fulfilled => "fulfilled",
-            IntentStatus::Declined => "declined",
-            IntentStatus::Expired => "expired",
-        }
-    }
-
-    /// Terminal states are kept only briefly (for the payer's history) then pruned.
-    pub fn is_terminal(&self) -> bool {
-        !matches!(self, IntentStatus::Pending)
-    }
-}
-
-/// A request-to-pay held for the payer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaymentIntent {
-    /// Random 16-byte hex id.
-    pub id: String,
-    /// The requester's verifying key hex — was on the payer's allowlist at create time.
-    pub from_vk_hex: String,
-    /// DERIVED from `from_vk_hex`; never taken from the request body.
-    pub to_ark_address: String,
-    pub amount_sats: u64,
-    pub memo: String,
-    pub created_at: i64,
-    pub expires_at: i64,
-    pub status: IntentStatus,
-    /// Set when the payer's send settles.
-    #[serde(default)]
-    pub ark_txid: String,
-}
-
 /// The actor's durable state, serialized into the sealed snapshot blob. Excludes in-flight
 /// sessions (MuSig2 secret nonces must never persist).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,21 +74,6 @@ pub struct SnapshotState {
     /// retried run follows that registration instead of making a second. `default` for older seals.
     #[serde(default)]
     pub delegate_intent_id: Option<String>,
-    /// Parties authorized to send this wallet payment requests. `default` so seals written
-    /// before request-to-pay restore cleanly.
-    #[serde(default)]
-    pub contacts: Vec<Contact>,
-    /// Request-to-pay records held for this wallet. Bounded by per-requester + global caps and
-    /// pruned on every mutation (the whole snapshot is re-serialized on each change).
-    #[serde(default)]
-    pub payment_intents: Vec<PaymentIntent>,
-    /// Payment-request nonces this wallet has accepted, hex, each with the `not_after` it arrived
-    /// under. Sealed rather than held in memory because a replay does not have to wait for the same
-    /// instance: the runtime rebuilds instances freely, and a set that died with one would let the
-    /// next accept the same request again. Pruned once `not_after` passes — after that the request
-    /// is refused for being stale anyway, so remembering it buys nothing. `default` for older seals.
-    #[serde(default)]
-    pub seen_request_nonces: std::collections::BTreeMap<String, i64>,
     /// The escrow keys this wallet has minted, newest last. `default` for seals written before
     /// escrow existed — a wallet with none simply has none.
     #[serde(default)]
@@ -179,6 +107,14 @@ pub struct ReleaseRecord {
     /// What was approved, hashed. A repeat must be the same proposal, or it is a different release
     /// wearing an answered request's name.
     pub proposal_hash: String,
+    /// The deadline of the deal that approved it, unix seconds.
+    ///
+    /// Until then a repeat of this request is signed again, and the owner may not take the escrow
+    /// back — the service may still hold these signatures unsubmitted, even if a newer deal has
+    /// since been struck over the same escrow. `0` on a record written before this was kept: it
+    /// answers no repeat and holds up no reclaim.
+    #[serde(default)]
+    pub deadline: i64,
 }
 
 /// What the wallet says about a release it is being asked for.

@@ -16,8 +16,7 @@ package mpc_wallet;
 // passkey-gated wallet holds no plaintext share, so it could not produce one at all.
 //
 // The fields are reserved rather than reused, so a client still sending them fails to parse instead of
-// having its bytes read as something else. What remains that is a signature — the authorship proof on a
-// payment request — is a different claim, about who wrote a request rather than who is calling.
+// having its bytes read as something else.
 // ---------------------------------------------------------------------------------------------------
 
 // The service lives in cosign_session.proto now: one `Cosigner`, with the ceremonies as
@@ -98,66 +97,9 @@ message GetServerInfoResponse {
 
 // Push notification registration
 
-// ---------------------------------------------------------------------------
-// Request-to-pay
-// ---------------------------------------------------------------------------
-
-// A party this wallet has authorized to send it payment requests. One-way: the owner decides who
-// may bill it; the contact needs no consent and is not notified.
-message Contact {
-  bytes verifying_key = 1;   // the contact's group verifying key (33-byte compressed)
-  string label = 2;          // local display name, chosen by the owner
-  int64 added_at = 3;        // unix seconds
-}
-
-message ContactAddRequest {
-  // Authentication is the runtime's — see the note at the top of this file.
-  reserved 1, 4, 5;
-  reserved "user_id", "signature", "timestamp_ms";
-  bytes contact_verifying_key = 2;
-  string label = 3;
-}
-message ContactAddResponse {
-  bool ok = 1;
-}
-
-message ContactRemoveRequest {
-  // Authentication is the runtime's — see the note at the top of this file.
-  reserved 1, 3, 4;
-  reserved "user_id", "signature", "timestamp_ms";
-  bytes contact_verifying_key = 2;
-}
-message ContactRemoveResponse {
-  bool ok = 1;
-}
-
-message ContactListRequest {
-  // Authentication is the runtime's — see the note at the top of this file.
-  reserved 1, 2, 3;
-  reserved "user_id", "signature", "timestamp_ms";
-}
-message ContactListResponse {
-  repeated Contact contacts = 1;
-}
-
-// A request-to-pay held for the payer. NOT a pre-signed transaction: FROST is 2-round interactive
-// and Ark checkpoints need an ASP counter-signature, so no payment can be fully signed ahead of the
-// payer's approval. This records WHO asked, HOW MUCH, TO WHICH ADDRESS and UNTIL WHEN; the payer
-// reviews it and either signs the payment or declines.
-message PaymentIntent {
-  string id = 1;
-  bytes from_verifying_key = 2;      // the requester (was on the payer's allowlist at create time)
-  string to_ark_address = 3;         // DERIVED by the cosigner from from_verifying_key
-  uint64 amount_sats = 4;
-  string memo = 5;
-  int64 created_at = 6;
-  int64 expires_at = 7;
-  string status = 8;                 // pending | fulfilled | declined | expired
-  string ark_txid = 9;               // set when fulfilled
-}
-
-// Sent by the REQUESTER but routed to the PAYER's actor: `user_id` is the requester (who signs),
-// while the URL/actor id is the payer. The payer's allowlist is the only authorization.
+// The ASP's parameters, as its `GetInfo` reports them. Supplied by the caller, because the caller is
+// the one talking to the ASP — see `SettleOpen` in cosign_session.proto for why a wrong one cannot
+// redirect funds.
 message ArkInfo {
   string signer_pubkey = 1;
   string forfeit_pubkey = 2;
@@ -169,75 +111,4 @@ message ArkInfo {
   int64 boarding_exit_delay = 8;
   int64 vtxo_min_amount = 9;
   int64 dust = 10;
-}
-
-message PaymentRequestCreateRequest {
-  // Authentication is the runtime's — see the note at the top of this file.
-  reserved 1, 5, 6;
-  reserved "user_id", "signature", "timestamp_ms";
-  uint64 amount_sats = 2;
-  string memo = 3;
-  int64 expires_in_secs = 4;         // 0 ⇒ cosigner default
-  // The ASP parameters the payee address is derived with. From the caller, because the caller is
-  // the one talking to the ASP — and it cannot redirect the payment with them: the address is
-  // derived from the ALLOWLISTED key, never a supplied one.
-  ArkInfo ark_info = 7;
-  // Proof that the requester wrote this. Required.
-  RequestAuthorship authorship = 8;
-}
-
-// That a payment request was written by the wallet it names.
-//
-// The caller of `PaymentRequestCreate` is the PAYER, not the requester. The runtime resolves a tenant
-// from the caller's own token and strips any tenant header a client sends, so nobody can address
-// another wallet's cosigner — a request has to travel out of band, and the payer's own app submits it
-// to the payer's own cosigner. The runtime therefore authenticates the payer, which says nothing about
-// who asked. This does.
-//
-// It is a BIP-340 signature by the requester's GROUP key, which only the requester and the requester's
-// cosigner together can produce. That is the point of it being the group key: the old check took a
-// share key and resolved it to a group key through `policy_owner_idx`, an index DKG writes into each
-// wallet's own store — which worked only while every wallet shared one store, and would otherwise have
-// derived the payee address from a share key, an address the requester could not spend.
-//
-// The signature covers
-//
-// ```text
-// sha256( "merlin/payment-request/v1" ‖ payer_group_key ‖ requester_group_key
-//         ‖ amount_sats ‖ expires_in_secs ‖ not_after ‖ nonce ‖ sha256(memo) )
-// ```
-//
-// Fenced as text on purpose: prost copies these comments into the generated Rust as doc comments,
-// and an indented block there is compiled as a doctest.
-// with integers as 8-byte big-endian. The domain tag means it can never double as a transaction
-// sighash; the payer's key means a request to one wallet cannot be replayed to another; `not_after` and
-// the nonce mean it cannot be replayed to the same wallet later.
-message RequestAuthorship {
-  bytes requester_group_key = 1;     // 33-byte compressed — must be an allowlisted contact
-  bytes payer_group_key = 2;         // 33-byte compressed — must be the receiving wallet's own
-  int64 not_after = 3;               // unix seconds; refused after this, and at most a day ahead
-  bytes nonce = 4;                   // 16 random bytes; refused if this wallet has seen it
-  bytes signature = 5;               // 64-byte BIP-340 over the digest above
-}
-message PaymentRequestCreateResponse {
-  PaymentIntent intent = 1;
-}
-
-message PaymentRequestListRequest {
-  // Authentication is the runtime's — see the note at the top of this file.
-  reserved 1, 2, 3;
-  reserved "user_id", "signature", "timestamp_ms";
-}
-message PaymentRequestListResponse {
-  repeated PaymentIntent intents = 1;
-}
-
-message PaymentRequestDeclineRequest {
-  // Authentication is the runtime's — see the note at the top of this file.
-  reserved 1, 3, 4;
-  reserved "user_id", "signature", "timestamp_ms";
-  string id = 2;
-}
-message PaymentRequestDeclineResponse {
-  bool ok = 1;
 }

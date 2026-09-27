@@ -145,8 +145,7 @@ pub fn seed_policy_with_dealt_share(
 /// A 2-of-2 BIP-340 signature over [message] by the group key, both halves played host-side.
 ///
 /// What a wallet and its cosigner produce together — used where a test needs a group-key signature
-/// without standing up a ceremony, such as authoring a payment request. `key_packages` is the pair
-/// `dkg_2of2` returns.
+/// without standing up a ceremony. `key_packages` is the pair `dkg_2of2` returns.
 pub fn group_sign(
     key_packages: &[KeyPackage],
     public_key_package: &PublicKeyPackage,

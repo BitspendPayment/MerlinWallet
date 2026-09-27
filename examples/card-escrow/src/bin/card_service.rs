@@ -63,6 +63,11 @@ struct Args {
     #[arg(long, env = "SERVICE_LABEL", default_value = "merlin-e2e-escrow-service")]
     label: String,
     /// Where to keep what must survive a restart. Its signing share lives here.
+    /// A pins file for an enclave this service believes — `deployment.json`'s shape: `pcr0`,
+    /// `pcr16`, and `trust_root` for an emulated enclave. Repeatable. Read again when it changes, so
+    /// a dev enclave booted after this service is believed once its boot writes the file.
+    #[arg(long = "enclave-pins", env = "ENCLAVE_PINS", required = true)]
+    enclave_pins: Vec<std::path::PathBuf>,
     #[arg(long, env = "SERVICE_STORE")]
     store: Option<std::path::PathBuf>,
 }
@@ -119,7 +124,9 @@ async fn main() -> anyhow::Result<()> {
 
     let wire = Arc::new(Wire {
         service: Arc::clone(&service),
-        connections: Arc::new(Connections::default()),
+        connections: Arc::new(Connections::new(
+            card_escrow::service::trust::EnclaveTrust::from_files(args.enclave_pins.clone()),
+        )),
     });
     let app = Arc::new(App {
         wire: Arc::clone(&wire),
@@ -371,7 +378,7 @@ async fn reimburse_one(
             "stage": Stage::ReleaseConfirmed.label(),
         }))
         .into_response(),
-        Asked::Refused { reason } => Json(serde_json::json!({
+        Asked::Refused { reason, .. } => Json(serde_json::json!({
             "outcome": "refused",
             "reason": reason,
         }))

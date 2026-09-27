@@ -65,7 +65,15 @@ pub enum Asked {
     Confirmed { ark_txid: String, sats: u64 },
     /// The cosigner would not sign, and said why. Not an error — it is an answer, and usually the
     /// right one.
-    Refused { reason: String },
+    ///
+    /// `deal` is the deal the escrow is committed to, as the cosigner itself reported it — its
+    /// deadline and which policy was sealed. What a service that asks before paying reads, rather
+    /// than anything the owner's app told it. `None` when there is no deal, or the answer came
+    /// from something other than the escrow's own cosigner.
+    Refused {
+        reason: String,
+        deal: Option<cosigner::escrow_session::DealTerms>,
+    },
     /// Something went wrong on this side. Worth retrying.
     Failed { reason: String },
     /// The outcome cannot be determined from here — see the note on
@@ -134,6 +142,45 @@ pub async fn ask_against(
                 r.last_refusal = Some(reason.clone());
             }
             Asked::Failed { reason }
+        }
+    }
+}
+
+/// Tell the cosigner this service is done with a deal — a payout that failed, say — so the escrow
+/// is free at once rather than at a deadline that may be hours away.
+///
+/// `policy_sha256` names the deal (see [`cosigner::escrow_session::DealTerms`]), so an end that
+/// arrives late cannot close the next deal struck over the same escrow. The deal protects this
+/// service, so this gives up nothing but its own claim: only give up on a payment first, and never
+/// one that has been signed for. `Ok` once the cosigner acknowledged it.
+pub async fn end_deal(wire: &Arc<Wire>, escrow_key: &str, policy_sha256: &str) -> Result<(), String> {
+    let stream_id = wire
+        .service
+        .store
+        .lock()
+        .await
+        .shares
+        .get(&escrow_key.to_ascii_lowercase())
+        .map(|share| share.stream_id.clone())
+        .ok_or_else(|| format!("this service holds no share of {escrow_key}"))?;
+    wait_for_connection(wire, &stream_id).await?;
+
+    let answer = wire.connections.expect(&stream_id, policy_sha256);
+    say(
+        wire,
+        &stream_id,
+        FromService::EndDeal {
+            escrow_key: escrow_key.to_string(),
+            policy_sha256: policy_sha256.to_string(),
+        },
+    );
+    match tokio::time::timeout(ANSWER_TIMEOUT, answer).await {
+        Ok(Ok(ToService::Ack { .. })) => Ok(()),
+        Ok(Ok(ToService::Refused { reason, .. })) => Err(reason),
+        Ok(Ok(other)) => Err(format!("the cosigner said something unexpected: {other:?}")),
+        Ok(Err(_)) | Err(_) => {
+            wire.connections.stop_expecting(&stream_id, policy_sha256);
+            Err("the cosigner did not answer".into())
         }
     }
 }
@@ -295,28 +342,23 @@ async fn attempt(
 
     // Registered before the question goes out: an answer faster than this service can start
     // listening still has somewhere to land.
-    let answer = wire.connections.expect(request_id);
+    let answer = wire.connections.expect(&stream_id, request_id);
     say(wire, &stream_id, FromService::ReleaseRequest(Box::new(request)));
 
     let reply = match tokio::time::timeout(ANSWER_TIMEOUT, answer).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(_)) | Err(_) => {
-            wire.connections.stop_expecting(request_id);
+            wire.connections.stop_expecting(&stream_id, request_id);
             return Err("the cosigner did not answer".into());
         }
     };
 
     let approval = match reply {
         ToService::ReleaseSigned(approval) => approval,
-        ToService::ReleaseRefused { reason, .. } | ToService::Refused { reason, .. } => {
-            let mut store = wire.service.store.lock().await;
-            if let Some(r) = store.reimbursements.get_mut(request_id) {
-                r.last_refusal = Some(reason.clone());
-            }
-            drop(store);
-            let _ = wire.service.persist().await;
-            return Ok(Asked::Refused { reason });
+        ToService::ReleaseRefused { reason, deal, .. } => {
+            return refused(wire, request_id, reason, deal).await
         }
+        ToService::Refused { reason, .. } => return refused(wire, request_id, reason, None).await,
         other => return Err(format!("the cosigner said something unexpected: {other:?}")),
     };
 
@@ -352,6 +394,22 @@ async fn attempt(
         .map_err(|e| format!("what is about to be submitted could not be written down: {e}"))?;
 
     submit_and_record(wire, request_id, session, &mut asp, reimbursement.sats).await
+}
+
+/// The cosigner refused: write down why, and say so. An answer, not a failure — see [`Asked`].
+async fn refused(
+    wire: &Arc<Wire>,
+    request_id: &str,
+    reason: String,
+    deal: Option<cosigner::escrow_session::DealTerms>,
+) -> Result<Asked, String> {
+    let mut store = wire.service.store.lock().await;
+    if let Some(r) = store.reimbursements.get_mut(request_id) {
+        r.last_refusal = Some(reason.clone());
+    }
+    drop(store);
+    let _ = wire.service.persist().await;
+    Ok(Asked::Refused { reason, deal })
 }
 
 /// Submit what has been signed, and write down what the chain did with it.

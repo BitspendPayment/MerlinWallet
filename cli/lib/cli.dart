@@ -1,7 +1,6 @@
 /// The commands, over wallets whose cosigners run inside a dev enclave.
 library;
 
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:app_core/asp/asp_client.dart' show IndexerVtxo;
@@ -15,7 +14,6 @@ import 'package:blockchain_utils/blockchain_utils.dart' hide hex;
 import 'package:fixnum/fixnum.dart';
 import 'package:hive/hive.dart';
 import 'package:protocol/cosigner_v1.dart' show BoardingUtxo;
-import 'package:protocol/protocol.dart' show PaymentRequestCreateRequest;
 
 import 'bitcoind.dart';
 import 'home.dart';
@@ -34,18 +32,6 @@ board                            settle every confirmed boarding deposit into Ar
 balance                          VTXOs held, and whether a sealed delegate renews them
 protect                          seal a delegate over what is held, so the cosigner renews it itself
 send <ark-address|wallet> <sats> pay, off-chain
-
-contacts                         who may send this wallet payment requests
-contact-add <wallet|key> [label] allow a wallet (by name here, or group key) to bill this one
-contact-rm <wallet|key>
-
-request <wallet|key> <sats> [memo]
-                                 bill a wallet: prints the signed request, and hands it over
-                                 directly when the payer is a wallet here
-accept-request <base64>          take a request someone wrote into this wallet's inbox
-requests                         this wallet's inbox
-approve <id>                     pay a pending request
-decline <id>
 
 reset <name>                     delete this machine's stored state for a wallet and rebuild it
                                  from its passkey — for state an older build wrote
@@ -168,52 +154,6 @@ class Cli {
         final address = home.wallets.containsKey(to) ? await (await _wallet(to)).client.getArkAddress() : to;
         final txid = await bitcoind.whileMining(() => w.client.sendVtxo(address, sats));
         print('sent $sats sats: $txid');
-      case 'contacts':
-        final (_, w) = await _active();
-        final contacts = await w.client.contactList();
-        if (contacts.isEmpty) print('no contacts');
-        for (final c in contacts) {
-          print('  ${_hex(c.verifyingKey)}  ${c.label}');
-        }
-      case 'contact-add':
-        final (_, w) = await _active();
-        final who = _arg(rest, 0, 'wallet or group key');
-        final key = await _groupKey(who);
-        await w.client.contactAdd(key, rest.length > 1 ? rest.sublist(1).join(' ') : who);
-        print('added $key');
-      case 'contact-rm':
-        final (_, w) = await _active();
-        final key = await _groupKey(_arg(rest, 0, 'wallet or group key'));
-        await w.client.contactRemove(key);
-        print('removed $key');
-      case 'request':
-        await _request(rest);
-      case 'accept-request':
-        final (_, w) = await _active();
-        final request = PaymentRequestCreateRequest.fromBuffer(base64Url.decode(_arg(rest, 0, 'request')));
-        final intent = await w.client.receivePaymentRequest(request);
-        print('request ${intent.id}: ${intent.amountSats} sats to ${intent.toArkAddress}');
-      case 'requests':
-        final (_, w) = await _active();
-        final inbox = await w.client.paymentRequests();
-        if (inbox.isEmpty) print('no requests');
-        for (final i in inbox) {
-          print('  ${i.id}  ${i.status.padRight(9)} ${i.amountSats} sats  from ${_short(_hex(i.fromVerifyingKey))}'
-              '${i.memo.isEmpty ? '' : '  "${i.memo}"'}${i.arkTxid.isEmpty ? '' : '  paid in ${i.arkTxid}'}');
-        }
-      case 'approve':
-        final (_, w) = await _active();
-        final id = _arg(rest, 0, 'id');
-        final intent = (await w.client.paymentRequests()).where((i) => i.id == id).firstOrNull;
-        if (intent == null) throw ArgumentError('no request $id');
-        if (intent.status != 'pending') throw StateError('request $id is ${intent.status}');
-        final txid = await bitcoind.whileMining(
-            () => w.client.sendVtxo(intent.toArkAddress, intent.amountSats.toInt()));
-        print('paid ${intent.amountSats} sats: $txid');
-      case 'decline':
-        final (_, w) = await _active();
-        await w.client.declinePaymentRequest(_arg(rest, 0, 'id'));
-        print('declined');
       default:
         print('unknown command ${args.first} — `help`');
     }
@@ -301,27 +241,6 @@ class Cli {
     }
   }
 
-  Future<void> _request(List<String> rest) async {
-    final (name, w) = await _active();
-    final payer = _arg(rest, 0, 'wallet or group key');
-    final sats = _sats(rest, 1);
-    final memo = rest.length > 2 ? rest.sublist(2).join(' ') : '';
-    final payerKey = await _groupKey(payer);
-
-    final written = await w.client.writePaymentRequest(payerKey, sats, memo: memo);
-    final encoded = base64Url.encode(written.writeToBuffer());
-    print('request from $name for $sats sats, signed:\n$encoded');
-
-    // Out of band by necessity — a wallet can only reach its own cosigner — but when both wallets
-    // are here, the band is this process.
-    if (home.wallets.containsKey(payer)) {
-      final intent = await (await _wallet(payer)).client.receivePaymentRequest(written);
-      print('delivered to $payer: request ${intent.id}');
-    } else {
-      print('give that to the payer: `accept-request <it>`');
-    }
-  }
-
   Future<(String, ({MpcClient client, EnclaveGate gate}))> _active() async {
     final name = home.active;
     if (name == null) throw StateError('no active wallet — `new <name>` or `use <name>`');
@@ -347,11 +266,6 @@ class Cli {
   WalletRecord _record(String name) =>
       home.wallets[name] ?? (throw ArgumentError('no wallet $name on this enclave — `wallets`'));
 
-  Future<String> _groupKey(String walletOrKey) async {
-    if (!home.wallets.containsKey(walletOrKey)) return walletOrKey;
-    return home.wallets[walletOrKey]!.groupKey ?? (await _wallet(walletOrKey)).client.groupKeyHex!;
-  }
-
   static String _arg(List<String> args, int i, String what) =>
       i < args.length ? args[i] : throw ArgumentError('missing <$what>');
 
@@ -359,10 +273,6 @@ class Cli {
       int.tryParse(_arg(args, i, 'sats')) ?? (throw ArgumentError('<sats> must be a whole number'));
 
   static int _total(List<IndexerVtxo> vtxos) => vtxos.fold(0, (s, v) => s + v.amountSats);
-
-  static String _hex(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-
-  static String _short(String hex) => hex.length > 16 ? '${hex.substring(0, 16)}…' : hex;
 
   static List<String> _split(String line) =>
       line.trim().split(RegExp(r'\s+')).where((s) => s.isNotEmpty).toList();

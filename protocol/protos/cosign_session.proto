@@ -30,8 +30,7 @@ package cosigner.v1;
 // passkey-gated wallet holds no plaintext share, so it could not produce one at all.
 //
 // The fields are reserved rather than reused, so a client still sending them fails to parse instead of
-// having its bytes read as something else. What remains that is a signature — the authorship proof on a
-// payment request — is a different claim, about who wrote a request rather than who is calling.
+// having its bytes read as something else.
 // ---------------------------------------------------------------------------------------------------
 
 service Cosigner {
@@ -64,19 +63,6 @@ service Cosigner {
   // The rest. Not ceremonies — one round each, with nothing to hold between messages, so a stream
   // would buy nothing.
   //
-  // Request-to-pay: a wallet allowlists a contact, and that contact may then bill it. The payer's
-  // cosigner authenticates the requester, checks the allowlist, DERIVES the requester's Ark address
-  // from the allowlisted key — never a supplied one — and records the intent.
-  rpc ContactAdd(mpc_wallet.ContactAddRequest) returns (mpc_wallet.ContactAddResponse);
-  rpc ContactRemove(mpc_wallet.ContactRemoveRequest) returns (mpc_wallet.ContactRemoveResponse);
-  rpc ContactList(mpc_wallet.ContactListRequest) returns (mpc_wallet.ContactListResponse);
-  rpc PaymentRequestCreate(mpc_wallet.PaymentRequestCreateRequest)
-      returns (mpc_wallet.PaymentRequestCreateResponse);
-  rpc PaymentRequestList(mpc_wallet.PaymentRequestListRequest)
-      returns (mpc_wallet.PaymentRequestListResponse);
-  rpc PaymentRequestDecline(mpc_wallet.PaymentRequestDeclineRequest)
-      returns (mpc_wallet.PaymentRequestDeclineResponse);
-
   // Deployment metadata: the Bitcoin network, so a caller renders addresses with the right HRP
   // without having to be told separately. Unauthenticated.
   rpc GetServerInfo(mpc_wallet.GetServerInfoRequest) returns (mpc_wallet.GetServerInfoResponse);

@@ -2,5 +2,5 @@
 # by its "Publish a dev enclave" workflow with the image options `make enclave-bundle-args`
 # prints. `make enclave-bundle` fetches it into .enclave/ and refuses a tarball whose sha256 is
 # not this one. Shell syntax; sourced by make.
-RELEASE=dev-enclave-merlin-e2e-d9acc69
-SHA256=7e4c7c6bf4c871335de27fb3013cf5109566c46c1728958537c68844c2751f64
+RELEASE=dev-enclave-merlin-e2e-410a7c8
+SHA256=f7228f1541c2af0e067f5fb87e28384fd320755d083577091585cac018fd32a4

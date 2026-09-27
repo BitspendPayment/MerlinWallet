@@ -14,6 +14,8 @@ import 'dart:convert';
 
 import 'package:app_core/enclave/attestation.dart';
 import 'package:app_core/enclave/endpoint.dart';
+import 'package:app_core/sessions/service_delivery.dart';
+import 'package:app_core/threshold_types.dart' as threshold;
 
 /// Dev/loopback addresses: a dev enclave (`dev-enclave.sh`) on the workstation.
 ///
@@ -156,3 +158,33 @@ Endpoint aspEndpoint(String host) {
     'rather than guessing, since the wrong ASP reads as an empty wallet',
   );
 }
+
+// --- Sending to banks and mobile money -----------------------------------------------------------
+
+/// The payout platform's name in the enclave's image — MerlinPlatform's `--label`.
+const String platformServiceLabel = 'merlin-platform';
+
+/// The platform's identifier, as a pairing names it. Derived through the FFI, on first use.
+final threshold.Identifier platformIdentifier =
+    threshold.Identifier.derive(utf8.encode(platformServiceLabel));
+
+/// Where [host]'s payout platform answers, or null where there is none — and then sending to banks
+/// is not offered. Local: MerlinPlatform beside the dev enclave and the ASP, reached the same way.
+///
+/// ponytail: no platform for MutinyNet or production yet; add its URL here when one runs.
+Uri? platformBase(String host) => isLocalHost(host) ? Uri.parse('http://$host:7200') : null;
+
+/// Grid as [host]'s enclave reaches it: where every sealed payout policy must fetch its evidence.
+/// Pinned per environment and never taken from the platform — see `checkPayoutPolicy`.
+///
+/// Local: the dev host's fake Grid, which the guest reaches at the QEMU host's address.
+String gridOriginForPolicy(String host) => isLocalHost(host)
+    ? const String.fromEnvironment('DEV_GRID_ORIGIN',
+        defaultValue: 'http://192.168.127.254:7300')
+    : 'https://api.lightspark.com';
+
+/// How the wallet's half of a pairing reaches the platform. A dev enclave names the platform by
+/// the QEMU host as the guest sees it, which this device reaches as [host]. Anywhere else, null:
+/// plain HTTPS to the origin the enclave names.
+DeliverToService? platformDelivery(String host) =>
+    isLocalHost(host) ? RewritingDelivery(hostFacingHost: host) : null;

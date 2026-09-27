@@ -24,7 +24,7 @@ env:
 
 jobs:
   rust:
-    name: Rust (cosigner, threshold, ffi)
+    name: Rust (cosigner, threshold, ffi, escrow crates)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +38,9 @@ jobs:
             ~/.cargo/git
             cosigner/target
             crates/threshold/target
+            crates/enclave-client/target
+            crates/escrow-service/target
+            examples/card-escrow/target
             ffi/target
           key: rust-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: rust-
@@ -45,6 +48,13 @@ jobs:
         run: cd cosigner && cargo test
       - name: threshold tests
         run: cd crates/threshold && cargo test --features std
+      # What a settlement service runs: the attestation check on everything the enclave sends it,
+      # the service's own share and claims, and the card example built on both.
+      - name: escrow service tests
+        run: |
+          (cd crates/enclave-client && cargo test)
+          (cd crates/escrow-service && cargo test)
+          (cd examples/card-escrow && cargo test)
       - name: ffi build and tests
         run: |
           cargo build --release --manifest-path ffi/Cargo.toml

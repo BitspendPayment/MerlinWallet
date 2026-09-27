@@ -70,8 +70,7 @@ class _RestoreWalletScreenState extends State<RestoreWalletScreen> {
                 'Your wallet is not a file on your old phone — it is derived from the passkey '
                 'you made it with. Pick that passkey and this device works out its half of the '
                 'key again, then asks the co-signing enclave for the other half.\n\n'
-                'Your balance is loaded when Ark is available. After restoring, pull down on the '
-                'Contacts and Requests screens to load your contacts and pending payments.',
+                'Your balance is loaded when Ark is available.',
                 style: GoogleFonts.inter(
                     color: Colors.white70, fontSize: 16, height: 1.5),
                 textAlign: TextAlign.center,

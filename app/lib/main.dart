@@ -7,11 +7,7 @@ import 'screens/onboarding/dkg_progress_screen.dart';
 import 'screens/onboarding/passkey_setup_screen.dart';
 import 'screens/onboarding/restore_wallet_screen.dart';
 import 'screens/onboarding/wallet_ready_screen.dart';
-import 'screens/spending/send_screen.dart';
-import 'screens/spending/review_screen.dart';
 import 'screens/spending/signing_screen.dart';
-import 'screens/contacts/contacts_screen.dart';
-import 'screens/payments/requests_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/exit/exit_screen.dart';
 import 'screens/onboarding/exit_address_screen.dart';
@@ -19,9 +15,14 @@ import 'screens/splash_screen.dart';
 import 'screens/ark/ark_screen.dart';
 import 'screens/ark/ark_send_screen.dart';
 import 'screens/ark/ark_board_screen.dart';
+import 'screens/send/send_hub_screen.dart';
+import 'screens/send/payout_form_screen.dart';
+import 'screens/send/payout_quote_screen.dart';
+import 'screens/send/payout_progress_screen.dart';
 
 import 'package:provider/provider.dart';
 import 'services/mpc_service.dart';
+import 'services/payout_service.dart';
 import 'services/push_service.dart';
 
 void main() async {
@@ -50,6 +51,11 @@ void main() async {
           svc.addListener(loginListener);
           return svc;
         }),
+        // Not lazy: it picks up payouts still in flight as soon as the wallet opens.
+        ChangeNotifierProvider(
+          lazy: false,
+          create: (context) => PayoutService(context.read<MpcService>()),
+        ),
       ],
       child: const MerlinWalletApp(),
     ),
@@ -121,27 +127,8 @@ GoRouter _buildRouter(MpcService mpc) => GoRouter(
           builder: (context, state) => const WalletReadyScreen(),
         ),
         GoRoute(
-          path: '/spending/send',
-          builder: (context, state) => const SendScreen(),
-        ),
-        GoRoute(
           path: '/onboarding/exit-address',
           builder: (context, state) => const ExitAddressScreen(),
-        ),
-        GoRoute(
-          path: '/contacts',
-          builder: (context, state) => const ContactsScreen(),
-        ),
-        GoRoute(
-          path: '/requests',
-          builder: (context, state) => const RequestsScreen(),
-        ),
-        GoRoute(
-          path: '/spending/review',
-          builder: (context, state) {
-            final extras = state.extra as Map<String, dynamic>? ?? {};
-            return ReviewScreen(extras: extras);
-          },
         ),
         GoRoute(
           path: '/spending/signing',
@@ -161,6 +148,26 @@ GoRouter _buildRouter(MpcService mpc) => GoRouter(
         GoRoute(
           path: '/ark/send',
           builder: (context, state) => const ArkSendScreen(),
+        ),
+        // Sending to bank accounts and mobile money, through the payout platform.
+        GoRoute(
+          path: '/send',
+          builder: (context, state) => const SendHubScreen(),
+        ),
+        GoRoute(
+          path: '/send/payout',
+          builder: (context, state) =>
+              PayoutFormScreen(args: state.extra! as PayoutFormArgs),
+        ),
+        GoRoute(
+          path: '/send/payout/quote',
+          builder: (context, state) =>
+              PayoutQuoteScreen(draft: state.extra! as PayoutDraft),
+        ),
+        GoRoute(
+          path: '/send/payout/progress',
+          builder: (context, state) =>
+              PayoutProgressScreen(dealTag: state.extra! as String),
         ),
         GoRoute(
           path: '/settings',

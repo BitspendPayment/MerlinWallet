@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:app_core/sessions/service_delivery.dart' show RewritingDelivery;
 import 'package:app/services/server_host.dart';
 
 void main() {
@@ -108,6 +109,40 @@ void main() {
     test('does not treat remote deployments as local', () {
       expect(isLocalHost('mutiny.vtxos.network'), isFalse);
       expect(isLocalHost('mainnet.vtxos.network'), isFalse);
+    });
+  });
+
+  group('payout platform', () {
+    test('a local host has MerlinPlatform beside the enclave, reached the same way', () {
+      expect(platformBase('127.0.0.1').toString(), 'http://127.0.0.1:7200');
+      expect(platformBase('10.0.2.2').toString(), 'http://10.0.2.2:7200');
+    });
+
+    /// No platform runs for them yet, so sending to banks is not offered there.
+    test('remote deployments have none', () {
+      expect(platformBase('mutiny.vtxos.network'), isNull);
+      expect(platformBase('mainnet.vtxos.network'), isNull);
+    });
+
+    test('Grid is pinned per environment, never taken from the platform', () {
+      expect(gridOriginForPolicy('127.0.0.1'), 'http://192.168.127.254:7300');
+      expect(gridOriginForPolicy('mutiny.vtxos.network'), 'https://api.lightspark.com');
+    });
+
+    /// The enclave names the platform by the QEMU host as the guest sees it; this device reaches
+    /// that same host under the name it dialled.
+    test('a dev stack rewrites the guest-facing host to the one this device dials', () {
+      expect(
+        platformDelivery('10.0.2.2'),
+        isA<RewritingDelivery>()
+            .having((d) => d.guestFacingHost, 'guestFacingHost', '192.168.127.254')
+            .having((d) => d.hostFacingHost, 'hostFacingHost', '10.0.2.2'),
+      );
+      expect(platformDelivery('mutiny.vtxos.network'), isNull);
+    });
+
+    test('the platform is paired under the label its image knows it by', () {
+      expect(platformServiceLabel, 'merlin-platform');
     });
   });
 }

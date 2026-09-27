@@ -48,6 +48,23 @@ egress=(--guest-egress "$asp_origin"
         --guest-env "AUTO_SETTLE_SAFETY_MARGIN_SECS=${ENCLAVE_DELEGATE_MARGIN:-15060}"
         --background-timeout "${ENCLAVE_TASK_TIMEOUT:-600}")
 
+# The payout platform, when `make platform-up` started one (scripts/platform.sh): the image names it
+# as a service, lets the cosigner reach the fake Grid it pays through, and binds the fake's view-only
+# token to that origin so it is sent nowhere else. Measured into PCR0 like the rest.
+platform_pid="$repo/.platform/run/platform.pid"
+platform_id=""
+if [[ -f "$platform_pid" ]] && kill -0 "$(cat "$platform_pid")" 2>/dev/null; then
+    platform_id="$("$repo/scripts/platform.sh" id)"
+    ENCLAVE_SERVICE_ORIGINS="${ENCLAVE_SERVICE_ORIGINS:+${ENCLAVE_SERVICE_ORIGINS}_}$platform_id:http://192.168.127.254:7200"
+    grid_origin="http://192.168.127.254:7300"
+    egress+=(--guest-egress "$grid_origin"
+             --guest-env "SERVICE_CREDENTIALS_GRID=dev-view:dev-view-secret"
+             --guest-env "SERVICE_CREDENTIAL_ORIGIN_GRID=$grid_origin")
+fi
+
+platform_hint="none — no MerlinPlatform running, so the app has no bank sends"
+[[ -n "$platform_id" ]] && platform_hint="MerlinPlatform on :7200, paying through the fake Grid (logs in .platform/run)"
+
 # Escrow services this image may pair with, as `<service id hex>=<origin>,…`. A wallet names a
 # service by id and never by URL, so the set of reachable services is decided here, in the image,
 # and is measured into PCR0 like every other choice — see cosigner/src/handlers/delivery.rs. Each
@@ -99,8 +116,8 @@ trap 'kill $miner $watcher 2>/dev/null || true; rm -f "$stamp"' EXIT
 
 # A phone over USB reaches the enclave, arkd and electrs on its own loopback.
 if command -v adb >/dev/null && adb get-state >/dev/null 2>&1; then
-    for p in "$port" 7070 50001; do adb reverse "tcp:$p" "tcp:$p" >/dev/null || true; done
-    echo "adb reverse: $port (enclave), 7070 (arkd), 50001 (electrs)"
+    for p in "$port" 7070 50001 7200; do adb reverse "tcp:$p" "tcp:$p" >/dev/null || true; done
+    echo "adb reverse: $port (enclave), 7070 (arkd), 50001 (electrs), 7200 (MerlinPlatform)"
 fi
 
 hints() {
@@ -115,7 +132,8 @@ hints() {
   e2e        make e2e-enclave ENCLAVE_RUN=$run
   app        make adb-reverse && make flutter           (pins this boot's root and PCRs into the build)
   rp id      ${rp_id:-enclave.test}
-  egress     $asp_origin (the ASP) — nothing else
+  egress     $asp_origin (the ASP)${platform_id:+, and the fake Grid at 192.168.127.254:7300}
+  platform   $platform_hint
   delegates  run by the cosigner ${ENCLAVE_DELEGATE_MARGIN:-15060}s before the earliest expiry
   store      kept in $run-store${FRESH:+ (started fresh)} — make up-enclave FRESH=1 discards it
 
@@ -138,6 +156,9 @@ HINTS
         sleep 3
     done
     sleep 2
+    # The platform believes this boot's enclave once it knows its PCRs and root, which are new
+    # every boot.
+    if [[ -n "$platform_id" ]]; then "$repo/scripts/platform.sh" pins "$run"; fi
     hints
 ) &
 watcher=$!

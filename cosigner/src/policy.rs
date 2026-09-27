@@ -416,6 +416,35 @@ impl Policy {
             Policy::HttpGet(condition) => condition.describe(),
         }
     }
+
+    /// The cap on what a deal under this policy may release in total, where the policy states one
+    /// unconditionally: at its root, or anywhere down a chain of `all_of`. The smallest, if there
+    /// are several.
+    ///
+    /// Never from inside an `any_of`. A cap there binds one branch, and the deal can be satisfied
+    /// down another without it — so it says nothing about when the deal has had everything it can
+    /// have. See [`EscrowSession::spent`](crate::escrow_session::EscrowSession::spent).
+    pub fn released_total_cap(&self) -> Option<u64> {
+        match self {
+            Policy::ReleasedTotalMax { sats } => Some(*sats),
+            Policy::AllOf { of } => of.iter().filter_map(Policy::released_total_cap).min(),
+            _ => None,
+        }
+    }
+}
+
+/// A policy's identity: SHA-256 over its JSON, hex.
+///
+/// Over the parsed policy re-serialized, not over whatever text arrived, so the service that wrote
+/// a policy and the cosigner that sealed it reach the same value from the same terms however the
+/// JSON travelled in between. What a service compares against the policy it offered — see
+/// [`DealTerms`](crate::escrow_session::DealTerms).
+pub fn policy_sha256(policy: &Policy) -> String {
+    use sha2::{Digest, Sha256};
+    // Serializing a policy cannot fail — every term is plain data. If it ever did, the empty input
+    // hashes to a value no offered policy has, which refuses rather than matching anything.
+    let bytes = serde_json::to_vec(policy).unwrap_or_default();
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Apply a policy to a caller-supplied transaction.

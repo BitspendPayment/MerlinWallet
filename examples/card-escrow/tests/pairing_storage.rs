@@ -75,7 +75,7 @@ async fn service_storing_at(path: Option<std::path::PathBuf>) -> (Arc<Wire>, Str
         "http://127.0.0.1:7070".into(),
         path,
     );
-    let connections = Arc::new(Connections::default());
+    let connections = Arc::new(Connections::new(card_escrow::service::trust::EnclaveTrust::accept_all()));
     let wire = Arc::new(Wire {
         service: Arc::clone(&service),
         connections: Arc::clone(&connections),
@@ -94,7 +94,10 @@ async fn deliver(base: &str, h: &Halves) -> reqwest::StatusCode {
     let client = reqwest::Client::new();
     // The cosigner's half, as it arrives on the held connection.
     client
-        .post(format!("{base}/escrow/send?id=tenant-svc-x"))
+        .post(format!(
+            "{base}/escrow/send?id=tenant-{}",
+            cosigner::service_stream::service_stream_id(&h.service_identifier)
+        ))
         .json(&serde_json::json!({
             "kind": "pairing-half",
             "escrow_key": h.escrow_key,

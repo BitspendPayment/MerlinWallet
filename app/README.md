@@ -8,10 +8,8 @@ and asks for an exit address in another wallet. Returning users select
 “I already have a wallet” and restore using their original passkey and cosigner.
 Wallets created before recovery support cannot be restored this way.
 
-The app supports Ark sends, boarding confirmed Bitcoin deposits, approving or
-declining payment requests, managing contacts, and exporting pre-signed exits.
-Sending payment requests is not supported yet. Contacts and requests are cached
-locally; pull down on their screens to fetch them after restoring.
+The app supports Ark sends, boarding confirmed Bitcoin deposits, and exporting
+pre-signed exits.
 
 The wallet reconstructs its signing share for each operation rather than storing
 it. A signed delegate enables one automatic renewal without the phone; the new

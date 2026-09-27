@@ -20,7 +20,7 @@
 //! It is not a key escrow. The scalar returned is one term of a sum whose other term exists only
 //! behind the owner's biometric; alone it signs nothing and identifies nothing. And it is not a
 //! ceremony: nothing is installed, no policy is written, no share is re-keyed. A recovery that
-//! re-keyed would strand the VTXOs, the delegate and the contacts the seal already holds — which is
+//! re-keyed would strand the VTXOs, the delegate and the escrows the seal already holds — which is
 //! exactly the accident `refuse_if_onboarded` exists to prevent, and this is its mirror image: that
 //! one refuses when a policy exists, this one refuses when none does.
 //!

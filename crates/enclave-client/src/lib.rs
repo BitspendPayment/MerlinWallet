@@ -13,6 +13,7 @@
 mod connection;
 mod document;
 mod error;
+mod stream;
 
 pub use connection::{
     guest_pcr, pcr_after_one_extend, verify_connection, Attested, AttestationHashes, Pins,
@@ -20,3 +21,6 @@ pub use connection::{
 };
 pub use document::{verify, AttestationDocument, AWS_NITRO_ROOT_G1_PEM};
 pub use error::{Error, Result};
+pub use stream::{
+    stream_user_data, verify_stream, KIND_OPEN, KIND_SEND, STREAM_ATTESTATION_HEADER, STREAM_DOMAIN,
+};

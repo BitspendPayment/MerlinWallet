@@ -128,7 +128,7 @@ fn two_customers_are_held_as_two_connections_under_one_name() {
     assert!(bob.ends_with(&format!("-{local}")));
 
     // And a service keying by the whole id holds both at once.
-    let connections = Connections::default();
+    let connections = Connections::new(card_escrow::service::trust::EnclaveTrust::accept_all());
     assert_eq!(connections.held_under(&local), 0);
     assert!(!connections.is_holding(&alice));
 }
@@ -155,7 +155,7 @@ async fn work_outlives_the_connection_it_was_waiting_on() {
         .reimbursements
         .insert("reimb-0001".into(), cleared("reimb-0001"));
 
-    let connections = Connections::default();
+    let connections = Connections::new(card_escrow::service::trust::EnclaveTrust::accept_all());
     assert_eq!(connections.drop_all(), 0, "nothing held yet");
 
     // The reimbursement is untouched by the connection going, and is still owed.
@@ -172,7 +172,7 @@ async fn work_outlives_the_connection_it_was_waiting_on() {
 /// Not dropped: the runtime re-establishes these, so a moment without a connection is a wait.
 #[tokio::test]
 async fn what_could_not_be_said_waits_for_the_next_connection() {
-    let connections = std::sync::Arc::new(Connections::default());
+    let connections = std::sync::Arc::new(Connections::new(card_escrow::service::trust::EnclaveTrust::accept_all()));
     let service = service(None);
     let wire = std::sync::Arc::new(card_escrow::service::wire::Wire {
         service,
@@ -460,7 +460,7 @@ async fn a_second_purchase_on_one_escrow_waits_for_the_first() {
     }
     let wire = std::sync::Arc::new(card_escrow::service::wire::Wire {
         service: std::sync::Arc::clone(&s),
-        connections: std::sync::Arc::new(card_escrow::service::wire::Connections::default()),
+        connections: std::sync::Arc::new(card_escrow::service::wire::Connections::new(card_escrow::service::trust::EnclaveTrust::accept_all())),
     });
 
     // Something is already spending from this escrow.
@@ -532,7 +532,7 @@ async fn a_failed_submission_still_holds_the_escrow() {
 
     let wire = std::sync::Arc::new(card_escrow::service::wire::Wire {
         service: std::sync::Arc::clone(&s),
-        connections: std::sync::Arc::new(card_escrow::service::wire::Connections::default()),
+        connections: std::sync::Arc::new(card_escrow::service::wire::Connections::new(card_escrow::service::trust::EnclaveTrust::accept_all())),
     });
     match card_escrow::service::reimburse::ask(&wire, "reimb-0002").await {
         card_escrow::service::reimburse::Asked::Failed { reason } => assert!(

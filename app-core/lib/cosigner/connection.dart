@@ -1,6 +1,6 @@
 /// The wallet's connection to its cosigner.
 ///
-/// One service, `cosigner.v1.Cosigner`: four bidirectional streams for the ceremonies and seven
+/// One service, `cosigner.v1.Cosigner`: seven bidirectional streams for the ceremonies and eight
 /// single-round calls beside them. This owns the channel and the generated stub, and hands the
 /// session drivers a duplex to work over.
 ///
@@ -238,20 +238,6 @@ class CosignerConnection {
 
   Future<GetServerInfoResponse> getServerInfo() async =>
       _stub.getServerInfo(GetServerInfoRequest(), options: await _approved('GetServerInfo'));
-
-  Future<ContactAddResponse> contactAdd(ContactAddRequest r) async =>
-      _stub.contactAdd(r, options: await _approved('ContactAdd'));
-  Future<ContactRemoveResponse> contactRemove(ContactRemoveRequest r) async =>
-      _stub.contactRemove(r, options: await _approved('ContactRemove'));
-  Future<ContactListResponse> contactList(ContactListRequest r) async =>
-      _stub.contactList(r, options: await _approved('ContactList'));
-
-  Future<PaymentRequestCreateResponse> paymentRequestCreate(PaymentRequestCreateRequest r) async =>
-      _stub.paymentRequestCreate(r, options: await _approved('PaymentRequestCreate'));
-  Future<PaymentRequestListResponse> paymentRequestList(PaymentRequestListRequest r) async =>
-      _stub.paymentRequestList(r, options: await _approved('PaymentRequestList'));
-  Future<PaymentRequestDeclineResponse> paymentRequestDecline(PaymentRequestDeclineRequest r) async =>
-      _stub.paymentRequestDecline(r, options: await _approved('PaymentRequestDecline'));
 
   /// Enrol a device for wake signals. The cosigner forwards this to the runtime and keeps nothing —
   /// it has no push channel of its own, and `deviceCount` returns a number rather than the tokens

@@ -57,6 +57,7 @@ use tokio::sync::Mutex;
 
 pub mod reimburse;
 pub mod signing;
+pub mod trust;
 pub mod wire;
 
 pub use signing::PairedShare;

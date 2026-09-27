@@ -28,8 +28,6 @@ use common::wire::{block_on, collect, request, service, TENANT};
 /// it is added, rather than whenever somebody remembers to write a test for it.
 const METHODS: &[&str] = &[
     "Sign", "Dkg", "Send", "Settle",
-    "ContactAdd", "ContactRemove", "ContactList",
-    "PaymentRequestCreate", "PaymentRequestList", "PaymentRequestDecline",
     "GetServerInfo", "RegisterDevice", "ForgetDevice", "DeviceCount", "Recover",
 ];
 

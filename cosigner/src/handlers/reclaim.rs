@@ -80,6 +80,16 @@ impl Cosigner {
                 });
             }
         }
+        // And every deal before it that released anything. A deal can end early — spent, or ended
+        // by its service — and the service may still be holding that release's signatures; it was
+        // promised until that deal's deadline to submit them. See `Cosigner::reclaim_horizon`.
+        let horizon = self.reclaim_horizon(escrow_key);
+        if now < horizon {
+            return Err(Status::failed_precondition(format!(
+                "a release from this escrow may still be on its way to the ASP until {horizon}; \
+                 it can be taken back after that"
+            )));
+        }
 
         if vtxos.is_empty() {
             return Err(Status::failed_precondition(

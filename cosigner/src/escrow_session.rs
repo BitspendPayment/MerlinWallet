@@ -11,24 +11,30 @@
 //!     │  wallet  + cosigner may NOT reclaim       │  service may no longer release
 //! ```
 //!
-//! # The clock, and nothing else
+//! # The clock, and only the protected party may move it
 //!
-//! There is no state here, and no way to end a deal early — not for the owner, not for anybody.
 //! A session is a policy and a date, and which side of that date `now` falls on is the whole
-//! decision.
+//! decision. There is no flag that says a deal is over: every answer below is read out of the seal
+//! and the clock.
 //!
-//! **The owner especially cannot end it.** She is the one who committed, and a commitment she can
-//! revoke at will is not one: a service that has already paid a merchant against it would be left
-//! holding the loss, which is exactly the thing this is supposed to prevent. Her control is in
-//! choosing the deadline, not in taking it back afterwards — short sessions, struck again as
-//! needed, which costs nothing because a session is just a policy and a date over an escrow that
-//! already exists.
+//! **The owner cannot end a deal.** She is the one who committed, and a commitment she can revoke
+//! at will is not one: a service that has already paid a merchant against it would be left holding
+//! the loss, which is exactly the thing this is supposed to prevent. Her control is in choosing the
+//! deadline, not in taking it back afterwards.
 //!
-//! What that buys is worth saying plainly: there is now exactly **one** way a deal ends, it leaves
-//! no record because there is nothing to record, and every decision reaches it the same way — by
-//! reading the seal and asking the clock. A second way to end would be a second thing to get
-//! wrong, and the one that was here could be got wrong silently, because it wrote a flag that a
-//! lapse never writes.
+//! **The service may.** A deal protects the service, so the service is the one party that can give
+//! that protection up: [`end_by_service`](EscrowSession::end_by_service) brings the deadline
+//! forward to now, and never pushes it back. A payout that failed is the case — the service is owed
+//! nothing, and an escrow held until a deadline hours away would help nobody.
+//!
+//! **And a spent deal holds nothing.** Once everything a deal allows has been released
+//! ([`spent`](EscrowSession::spent)), the service has had all this deal could give it, so the
+//! escrow is free to be committed to the next one. Its deadline still stands for what matters after
+//! a release: a repeat of it is answered until then, and the owner may not take the escrow back
+//! before it — see [`Cosigner::reclaim_horizon`](crate::Cosigner::reclaim_horizon).
+//!
+//! That is still one way for time to run out on a deal, read the same way by every instance: the
+//! deadline moves only earlier, and only at the service's word.
 //!
 //! **Say plainly what holds this up.** Nothing in Bitcoin enforces the line above. Both pairings
 //! sign the same key, so what stops an owner emptying a live escrow is this cosigner declining to
@@ -61,8 +67,8 @@
 //! # Many releases, one escrow
 //!
 //! A card escrow is not one payment. The owner commits an amount, spends against it over days, and
-//! takes back what is left. So a release does **not** close the session; the deadline and the owner
-//! do. [`released_sats`](EscrowSession::released_sats) accumulates, and that running total is what
+//! takes back what is left. So a release does **not** close the session; only its deadline does —
+//! or releasing everything the deal allows, which a payout of one agreed price does in one go. [`released_sats`](EscrowSession::released_sats) accumulates, and that running total is what
 //! [`Policy::ReleasedTotalMax`](crate::policy::Policy::ReleasedTotalMax) is checked against — a
 //! per-transaction cap would bound each tap and not the deal.
 //!
@@ -98,6 +104,24 @@ pub struct EscrowSession {
     pub released_sats: u64,
 }
 
+/// What the escrow's own service is told about the deal it is asking against.
+///
+/// A service fronts money before it is repaid, and it cannot see the seal. Two things it must know
+/// before it does, and neither can come from the owner's app, which is the party a service is
+/// guarding against: **until when** it may be repaid, and **which policy** was sealed. The second is
+/// not idle — `all_of` stops at its first failing term, so a policy with a term appended after the
+/// one the service expects to fail refuses in exactly the same words, and then refuses for ever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DealTerms {
+    /// Unix seconds.
+    pub opened_at: i64,
+    /// Unix seconds. After this nothing is released, and a service that has not been repaid by then
+    /// will not be.
+    pub deadline: i64,
+    /// [`policy_sha256`](crate::policy::policy_sha256) of the sealed policy.
+    pub policy_sha256: String,
+}
+
 /// Why a party may not sign right now. Each is a different thing to tell somebody.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -125,8 +149,8 @@ impl Refusal {
 impl EscrowSession {
     /// Strike a deal that runs until [`deadline`](Self::deadline).
     ///
-    /// There is no matching `close`. See the module note: a commitment the owner can revoke is not
-    /// one, and the deadline she chooses here is the whole of her control over it.
+    /// There is no matching `close` for the owner. See the module note: a commitment the owner can
+    /// revoke is not one, and the deadline she chooses here is the whole of her control over it.
     pub fn open(policy: Policy, now: i64, deadline: i64) -> Result<Self, String> {
         if deadline <= now {
             return Err("a deal that is already over commits nothing to anybody".into());
@@ -170,12 +194,51 @@ impl EscrowSession {
     }
 
     /// Count a release against this deal's allowance. Does not end the deal: an escrow is spent
-    /// against, not spent once, and only the deadline ends it.
+    /// against, not spent once. Only a total that reaches the policy's cap frees the escrow for the
+    /// next deal — see [`spent`](Self::spent).
     ///
     /// Only ever called for a release that was not counted before — a second signature over an
     /// already-answered request adds nothing, because it spends the inputs the first one did.
     pub fn record_release(&mut self, sats: u64) {
         self.released_sats = self.released_sats.saturating_add(sats);
+    }
+
+    /// Has everything this deal allows been released?
+    ///
+    /// Derived, never recorded: the cap is the policy's own `released_total_max` and the total is
+    /// the one [`record_release`](Self::record_release) keeps. A policy with no such cap is never
+    /// spent, and runs to its deadline as it always did.
+    pub fn spent(&self) -> bool {
+        self.policy
+            .released_total_cap()
+            .is_some_and(|cap| self.released_sats >= cap)
+    }
+
+    /// Does this deal still keep the escrow from being committed to another?
+    ///
+    /// A spent deal does not: the service has had everything it could have. Its deadline still
+    /// bounds a reclaim, which reads the release records rather than this — a spent deal whose last
+    /// release has not reached the ASP yet must not be emptied from under it.
+    pub fn holds_the_escrow(&self, now: i64) -> bool {
+        self.is_open(now) && !self.spent()
+    }
+
+    /// The service ends the deal: the deadline comes forward to `now`, and never goes back.
+    ///
+    /// Only the service may ask, because the deal protects the service — this gives up nothing but
+    /// its own claim. What was already released keeps its own deadline in its record, so ending the
+    /// deal early does not let the owner race a release the service has yet to submit.
+    pub fn end_by_service(&mut self, now: i64) {
+        self.deadline = self.deadline.min(now);
+    }
+
+    /// What the service is told about this deal. See [`DealTerms`].
+    pub fn terms(&self) -> DealTerms {
+        DealTerms {
+            opened_at: self.opened_at,
+            deadline: self.deadline,
+            policy_sha256: crate::policy::policy_sha256(&self.policy),
+        }
     }
 }
 
@@ -217,15 +280,17 @@ mod tests {
         assert!(round_tripped.may_reclaim(NOW + HOUR).is_ok());
     }
 
-    /// There is no way to end a deal early, and that is the point rather than an omission.
+    /// The owner has no way to end a deal early, and that is the point rather than an omission.
     ///
     /// A commitment the owner can revoke is not a commitment: a service that had already paid a
     /// merchant against it would be left holding the loss. Her control is the deadline she chose.
+    /// The two things that shorten a deal both belong to the service: ending it, and taking all of
+    /// it.
     #[test]
-    fn a_deal_has_no_ending_but_its_deadline() {
+    fn only_the_service_can_cut_a_deal_short() {
         let s = session();
-        // The whole of a session's mutable surface. If something that ends a deal early is ever
-        // added, this stops compiling — which is the point of writing it down.
+        // The whole of a session's state. If something else that ends a deal early is ever added,
+        // this stops compiling — which is the point of writing it down.
         let EscrowSession {
             policy: _,
             opened_at: _,
@@ -233,7 +298,83 @@ mod tests {
             released_sats: _,
         } = s.clone();
         assert_eq!(deadline, NOW + HOUR);
-        assert!(s.may_release(NOW + HOUR - 1).is_ok(), "nothing can cut this short");
+        assert!(s.may_release(NOW + HOUR - 1).is_ok(), "the owner cannot cut this short");
+    }
+
+    #[test]
+    fn the_service_ending_a_deal_brings_the_deadline_forward_and_never_back() {
+        let mut s = session();
+        s.end_by_service(NOW + 60);
+        assert_eq!(s.deadline, NOW + 60);
+        assert_eq!(s.may_release(NOW + 60), Err(Refusal::DealEnded));
+        assert!(s.may_reclaim(NOW + 60).is_ok());
+
+        // Ending it again later is not a way to extend it.
+        s.end_by_service(NOW + HOUR * 2);
+        assert_eq!(s.deadline, NOW + 60);
+    }
+
+    fn capped(sats: u64) -> EscrowSession {
+        let policy = Policy::AllOf {
+            of: vec![Policy::TotalOutMax { sats }, Policy::ReleasedTotalMax { sats }],
+        };
+        EscrowSession::open(policy, NOW, NOW + HOUR).unwrap()
+    }
+
+    /// A payout of one agreed price releases it all at once, and then the deal has nothing left to
+    /// give: the escrow is free for the next one while the deadline still stands.
+    #[test]
+    fn a_deal_whose_allowance_is_released_no_longer_holds_the_escrow() {
+        let mut s = capped(23_010);
+        assert!(s.holds_the_escrow(NOW));
+        s.record_release(23_000);
+        assert!(!s.spent(), "ten sats short of the cap is not spent");
+        assert!(s.holds_the_escrow(NOW));
+        s.record_release(10);
+        assert!(s.spent());
+        assert!(!s.holds_the_escrow(NOW), "spent, so the next deal may be struck");
+        assert!(s.is_open(NOW), "and its deadline is untouched");
+    }
+
+    /// A cap is only a cap on the deal where it binds unconditionally. One branch of an `any_of`
+    /// may be satisfied without it, so it cannot say the deal is spent.
+    #[test]
+    fn only_an_unconditional_cap_can_spend_a_deal() {
+        let mut uncapped = session();
+        uncapped.record_release(u64::MAX);
+        assert!(!uncapped.spent(), "a deal with no cap runs to its deadline");
+
+        let either = Policy::AnyOf {
+            of: vec![Policy::ReleasedTotalMax { sats: 1 }, Policy::Always],
+        };
+        let mut s = EscrowSession::open(either, NOW, NOW + HOUR).unwrap();
+        s.record_release(1_000);
+        assert!(!s.spent());
+
+        // Nested all_of chains count, and the smallest cap wins.
+        let nested = Policy::AllOf {
+            of: vec![
+                Policy::ReleasedTotalMax { sats: 500 },
+                Policy::AllOf { of: vec![Policy::ReleasedTotalMax { sats: 100 }] },
+            ],
+        };
+        let mut s = EscrowSession::open(nested, NOW, NOW + HOUR).unwrap();
+        s.record_release(100);
+        assert!(s.spent());
+    }
+
+    #[test]
+    fn the_terms_name_the_sealed_policy_and_its_deadline() {
+        let s = capped(1_000);
+        let terms = s.terms();
+        assert_eq!(terms.opened_at, NOW);
+        assert_eq!(terms.deadline, NOW + HOUR);
+        assert_eq!(terms.policy_sha256, crate::policy::policy_sha256(&s.policy));
+        assert_ne!(
+            terms.policy_sha256,
+            capped(1_001).terms().policy_sha256,
+            "a different policy is a different deal"
+        );
     }
 
     /// One escrow, many releases: a card is tapped more than once. This is the ALLOWANCE only —

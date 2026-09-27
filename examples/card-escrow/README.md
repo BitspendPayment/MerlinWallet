@@ -55,9 +55,11 @@ cargo run --bin card-service -- \
     --provider http://127.0.0.1:7100 \
     --provider-from-enclave http://192.168.127.254:7100 \
     --payout-xonly 4444444444444444444444444444444444444444444444444444444444444444 \
-    --store ./service-state.json
+    --store ./service-state.json \
+    --enclave-pins ../../.platform/run/enclave-pins.json
 
-# 3. the walkthrough — boots the enclave itself
+# 3. the walkthrough — boots the enclave itself, and writes that enclave's pins where the service
+#    reads them: the service believes nothing the enclave says until it can check its attestation
 cd ../../e2e && dart pub get
 dart run bin/card_walkthrough.dart
 ```

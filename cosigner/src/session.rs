@@ -60,7 +60,7 @@ impl CosignerService {
     /// One request, routed.
     ///
     /// This is what the generated service trait was for. Matching `:path` by hand is a table of
-    /// fourteen names — clearer than a code generator, and the only part of tonic still in use once
+    /// fifteen names — clearer than a code generator, and the only part of tonic still in use once
     /// the framing and the status had their own modules.
     pub async fn route(&self, req: Request<Body>) -> Response<Body> {
         // Nothing is served without the runtime's word that a passkey approved this request.
@@ -121,12 +121,6 @@ impl CosignerService {
         }
         let body = req.into_body();
         match method {
-            "ContactAdd" => unary!(self.contact_add(body)),
-            "ContactRemove" => unary!(self.contact_remove(body)),
-            "ContactList" => unary!(self.contact_list(body)),
-            "PaymentRequestCreate" => unary!(self.payment_request_create(body)),
-            "PaymentRequestList" => unary!(self.payment_request_list(body)),
-            "PaymentRequestDecline" => unary!(self.payment_request_decline(body)),
             "GetServerInfo" => unary!(self.get_server_info(body)),
             "RegisterDevice" => unary!(self.register_device(body)),
             "ForgetDevice" => unary!(self.forget_device(body)),
@@ -143,57 +137,9 @@ impl CosignerService {
     // The single-round calls.
     // -------------------------------------------------------------------------------------------
 
-    async fn contact_list(&self, body: Body) -> Result<wp::ContactListResponse, Status> {
-        let req: wp::ContactListRequest = grpc::one_message(body).await?;
-        lock(&self.cosigner).contact_list(req)
-    }
-
-    async fn payment_request_list(
-        &self,
-        body: Body,
-    ) -> Result<wp::PaymentRequestListResponse, Status> {
-        let req: wp::PaymentRequestListRequest = grpc::one_message(body).await?;
-        lock(&self.cosigner).payment_request_list(req)
-    }
-
     async fn get_server_info(&self, body: Body) -> Result<wp::GetServerInfoResponse, Status> {
         let _: wp::GetServerInfoRequest = grpc::one_message(body).await?;
         Ok(self.server_info.clone())
-    }
-
-    async fn contact_add(&self, body: Body) -> Result<wp::ContactAddResponse, Status> {
-        let req: wp::ContactAddRequest = grpc::one_message(body).await?;
-        lock(&self.cosigner).contact_add(req)
-    }
-
-    async fn contact_remove(&self, body: Body) -> Result<wp::ContactRemoveResponse, Status> {
-        let req: wp::ContactRemoveRequest = grpc::one_message(body).await?;
-        lock(&self.cosigner).contact_remove(req)
-    }
-
-    async fn payment_request_decline(
-        &self,
-        body: Body,
-    ) -> Result<wp::PaymentRequestDeclineResponse, Status> {
-        let req: wp::PaymentRequestDeclineRequest = grpc::one_message(body).await?;
-        let mut actor = lock(&self.cosigner);
-        actor.decline_intent(&req.id).map_err(Status::invalid_argument)?;
-        actor.seal();
-        Ok(wp::PaymentRequestDeclineResponse { ok: true })
-    }
-
-    /// A request to be paid, delivered by this wallet's owner but written by somebody else.
-    ///
-    /// The runtime authenticated the caller, who is the PAYER — the request travelled out of band
-    /// and the payer's app brought it here. So what is checked is not who is calling but who wrote
-    /// it: `authorship` carries a group-key signature, and the payer's allowlist decides whether that
-    /// author may bill this wallet. See `Cosigner::payment_request_create`.
-    async fn payment_request_create(
-        &self,
-        body: Body,
-    ) -> Result<wp::PaymentRequestCreateResponse, Status> {
-        let req: wp::PaymentRequestCreateRequest = grpc::one_message(body).await?;
-        lock(&self.cosigner).payment_request_create(req)
     }
 
     // --- Devices -------------------------------------------------------------------------------
@@ -326,7 +272,8 @@ pub(crate) fn escrow_summary(e: &crate::types::EscrowRecord, now: i64) -> proto:
             .as_ref()
             .is_some_and(|p| p.wallet_confirmed),
         session: e.session.as_ref().map(|s| proto::EscrowSessionSummary {
-            open: s.is_open(now),
+            // Whether it still holds the escrow: a spent deal lets the next one be struck.
+            open: s.holds_the_escrow(now),
             deadline_secs: s.deadline,
             opened_at: s.opened_at,
             released_sats: s.released_sats,
@@ -1090,15 +1037,10 @@ async fn send(
         proto::send_client_msg::Body::Finalized(_) => {}
         _ => return Err(Status::invalid_argument("expected SendFinalized")),
     }
-    let req = wp::SendVtxoRequest {
-        recipient_ark_address: open.recipient_ark_address.clone(),
-        amount: open.amount,
-        signed_messages: Vec::new(),
-    };
     let resp = {
         let mut c = lock(&cosigner);
         let submitted = c.send_complete((session, change_exit_delay), submitted.ark_txid);
-        let resp = c.apply_send(&req, submitted);
+        let resp = c.apply_send(submitted);
         c.seal();
         resp
     };

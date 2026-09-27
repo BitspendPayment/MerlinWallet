@@ -41,36 +41,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:app_core/sessions/service_delivery.dart';
 import 'package:app_core/threshold_types.dart' as threshold;
-
-/// Delivery from a wallet that is on the other side of the enclave's network.
-///
-/// The cosigner tells the wallet where it delivered, and the wallet sends its own half to the same
-/// origin — which is right, and is what stops the two halves being split between two hosts. But the
-/// origin is *the enclave's* name for the service, and in this dev stack the enclave and the test
-/// process do not share a view of the network: `192.168.127.254` is the QEMU host as the guest sees
-/// it, and nothing on the host itself routes there.
-///
-/// In a real deployment the question does not arise — the service has a public name that the
-/// enclave and the phone both resolve. Here the same endpoint has two names, so the test's
-/// transport says so rather than the wallet pretending one name works everywhere.
-class HostSideDelivery implements DeliverToService {
-  HostSideDelivery({this.guestFacingHost = '192.168.127.254', this.hostFacingHost = '127.0.0.1'});
-
-  final String guestFacingHost;
-  final String hostFacingHost;
-  final HttpServiceDelivery _inner = HttpServiceDelivery();
-
-  /// Every origin this rewrote, so a test can show the wallet was sent where the enclave went.
-  final List<String> asked = [];
-
-  @override
-  Future<void> deliver(String origin, ServiceContribution contribution) {
-    asked.add(origin);
-    return _inner.deliver(origin.replaceFirst(guestFacingHost, hostFacingHost), contribution);
-  }
-}
 
 /// One pairing the service is party to, once both halves have arrived and checked out.
 class ServiceShare {

@@ -33,7 +33,6 @@ That division supports more than interactive payments. A user can sign a bounded
 | **Passkey-based signing and restoration** | A passkey PRF derives the phone's contribution; an approved cosigner stream returns the complementary dealt contribution. The reconstructed share is checked against the wallet's expected verifying share. |
 | **Ark payments** | Boarding deposits, VTXO discovery, sends, settlement, history, and renewed-fund tracking through an ASP. |
 | **Delegated renewal** | The user signs a delegate over a known set of funds; a durable runtime task attempts that renewal when due. Completion or inability to renew can wake the owner. |
-| **Contacts and payment requests** | Tenant-local contacts, signed requests to pay, inbox handling, approval, and fulfillment tracking. |
 | **Policy-controlled escrows** | Escrow creation, service pairing, release checks, allowance/reference tracking, and replies over runtime-held service connections. |
 | **Pre-signed exits** | Exit transaction construction and verification, coverage tracking, export, and ancestry display. The app does not yet broadcast the complete ancestor/exit chain. |
 | **An attested native client** | Nonce-bound verification of runtime/guest measurements and the connection certificate before an approved gRPC interaction is sent. |
@@ -224,7 +223,7 @@ balance
 protect
 ```
 
-Use `help` for sending, contacts, payment requests, and wallet switching. `whoami` displays the verified runtime/guest identity; `balance` reports held VTXOs and delegated protection. [`cli/`](cli/) uses software passkeys and is **regtest tooling**: its passkey files under `~/.merlin-cli` (or `MERLIN_CLI_HOME`) are plaintext capabilities to act as those test wallets. They are distinct from the Android platform-passkey model.
+Use `help` for sending and wallet switching. `whoami` displays the verified runtime/guest identity; `balance` reports held VTXOs and delegated protection. [`cli/`](cli/) uses software passkeys and is **regtest tooling**: its passkey files under `~/.merlin-cli` (or `MERLIN_CLI_HOME`) are plaintext capabilities to act as those test wallets. They are distinct from the Android platform-passkey model.
 
 ### Run the Android app
 
@@ -278,7 +277,7 @@ The smoke command checks attestation, separate wallets, and DKG; its funded path
 | `make proto-check` | Verifies checked-in Dart stubs match the protobuf sources; requires `protoc` and the Dart plugin. |
 | `make crypto-bench` | The repository's cryptography benchmark entry point. |
 
-The end-to-end suite covers measured-guest and certificate refusals, DKG, distinct tenants, boarding/settlement/sends, delegated renewal, payment requests, contribution isolation, reconstructed shares, exits, and service pairing. These tests exist in the source; this README does not imply a fresh successful run of every suite.
+The end-to-end suite covers measured-guest and certificate refusals, DKG, distinct tenants, boarding/settlement/sends, delegated renewal, contribution isolation, reconstructed shares, exits, and service pairing. These tests exist in the source; this README does not imply a fresh successful run of every suite.
 
 For a complete E2E run, let the harness configure its own enclave. An existing one can be selected with:
 
@@ -487,7 +486,7 @@ Keeping VTXOs off-chain does not hide all wallet activity from the services invo
   are available to it through the operations it serves. Treat it as a participant with access to
   sensitive payment metadata.
 - **The cosigner also processes wallet metadata.** Its snapshot includes VTXOs, history,
-  contacts, delegates, and escrow state. Production enclave storage is intended to keep this
+  delegates, and escrow state. Production enclave storage is intended to keep this
   from the host operator; it does not make the data invisible to the approved application or
   eliminate implementation and logging risks.
 - **Exiting is public and linking.** A unilateral exit publishes your branch of the VTXO tree

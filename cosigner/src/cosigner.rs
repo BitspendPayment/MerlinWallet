@@ -19,7 +19,6 @@ use crate::handlers;
 
 use crate::types::{
     ApplyDelegateSigs, BoardingSettleSubmitted, Commitment,
-    Contact, IntentStatus, PaymentIntent,
     SendVtxoStep1, SendVtxoSubmitted, SnapshotState, VtxoEntry, VtxoInput,
 };
 
@@ -37,9 +36,6 @@ use threshold::signing::{self, SignatureShare};
 
 use crate::store::Store;
 
-// Request-to-pay bounds. Contacts + intents live in the sealed snapshot, which is re-serialized
-// in full on every mutation — so an allowlisted peer must not be able to grow it without limit.
-const MAX_CONTACTS: usize = 256;
 /// How many escrow keys one wallet may hold at once. Each is a key to co-sign for and a session to
 /// time out, and the seal is rewritten in full on every change.
 const MAX_ESCROWS: usize = 64;
@@ -50,14 +46,6 @@ const MAX_ESCROWS: usize = 64;
 /// longer tell a replay from a new payment, and the safe end of that is to stop releasing rather
 /// than to forget the oldest — forgetting is exactly what a replay is waiting for.
 const MAX_RELEASED_REFERENCES: usize = 1024;
-const MAX_LABEL_LEN: usize = 64;
-const MAX_MEMO_LEN: usize = 140;
-const MAX_PENDING_INTENTS: usize = 50;
-const MAX_PENDING_INTENTS_PER_CONTACT: usize = 3;
-const DEFAULT_INTENT_TTL_SECS: i64 = 24 * 60 * 60;
-const MAX_INTENT_TTL_SECS: i64 = 7 * 24 * 60 * 60;
-/// How long a declined/fulfilled/expired intent lingers so the payer can still see it.
-const TERMINAL_INTENT_RETENTION_SECS: i64 = 24 * 60 * 60;
 
 /// A compressed key without its parity byte, lowercased. Two keys differing only in parity are the
 /// same x-only key, and an Ark address commits to the x-only form — so a caller naming an escrow by
@@ -89,15 +77,6 @@ mod x_only_tests {
         let k = format!("0\u{20ac}{}", "a".repeat(62));
         assert_eq!(k.len(), 66);
         assert_eq!(x_only(&k), k);
-    }
-}
-
-/// Clamp a peer-supplied string to `max` CHARACTERS (not bytes — never split a UTF-8 sequence).
-fn truncate(s: String, max: usize) -> String {
-    if s.chars().count() <= max {
-        s
-    } else {
-        s.chars().take(max).collect()
     }
 }
 
@@ -163,12 +142,6 @@ pub struct Cosigner {
     escrows: Vec<crate::types::EscrowRecord>,
     /// Payments that have already been released against. See `SnapshotState::released_references`.
     released_references: BTreeMap<String, crate::types::ReleaseRecord>,
-    /// Parties authorized to bill this wallet — the only authorization for an incoming request.
-    contacts: Vec<Contact>,
-    /// Request-to-pay records held for the payer (bounded; see `prune_intents`).
-    payment_intents: Vec<PaymentIntent>,
-    /// See `SnapshotState::seen_request_nonces`.
-    pub(crate) seen_request_nonces: BTreeMap<String, i64>,
     /// Global services (contract gate + ASP url). Held so `command()` is a drop-in for the old
     /// `GuestInstance::command` — no per-call-site `store` threading.
     pub(crate) store: Arc<Store>,
@@ -256,9 +229,6 @@ impl Cosigner {
             wallet_dealt_share_hex: None,
             escrows: Vec::new(),
             released_references: BTreeMap::new(),
-            contacts: Vec::new(),
-            payment_intents: Vec::new(),
-            seen_request_nonces: BTreeMap::new(),
             store,
             host,
             group_key,
@@ -291,9 +261,6 @@ impl Cosigner {
                 .and_then(|s| s.to_persisted().ok())
                 .and_then(|p| serde_json::to_string(&p).ok()),
             delegate_intent_id: self.delegate_intent_id.clone(),
-            contacts: self.contacts.clone(),
-            payment_intents: self.payment_intents.clone(),
-            seen_request_nonces: self.seen_request_nonces.clone(),
             escrows: self.escrows.clone(),
             released_references: self.released_references.clone(),
         };
@@ -321,9 +288,6 @@ impl Cosigner {
         self.ark_cosigner_secret_hex = snap.ark_cosigner_secret_hex.map(Zeroizing::new);
         self.wallet_dealt_share_hex = snap.wallet_dealt_share_hex.map(Zeroizing::new);
         self.owned_vtxos = snap.vtxos;
-        self.contacts = snap.contacts;
-        self.payment_intents = snap.payment_intents;
-        self.seen_request_nonces = snap.seen_request_nonces;
         self.escrows = snap.escrows;
         self.released_references = snap.released_references;
         self.delegate_intent_id = snap.delegate_intent_id;
@@ -458,19 +422,16 @@ impl Cosigner {
         sub.commitment_txid
     }
 
-    /// Record a completed send: mirror it into the owned history, update the host projection for
-    /// live queries, and mark any outstanding request the tx satisfies as paid. Matched on the
-    /// STORED intent's destination + amount, so the seal stays the authority and the client never
-    /// says which request it is paying.
+    /// Record a completed send: mirror it into the owned history and update the host projection for
+    /// live queries.
     pub fn apply_send(
         &mut self,
-        req: &crate::wallet_proto::SendVtxoRequest,
         submitted: SendVtxoSubmitted,
     ) -> crate::wallet_proto::SendVtxoResponse {
         let SendVtxoSubmitted { ark_txid, change } = submitted;
         let resp = crate::handlers::ark_send::apply_send_result(
             &mut self.owned_vtxos,
-            ark_txid.clone(),
+            ark_txid,
             change,
         );
         // The send spent what the sealed delegate was signed over, so it can never settle now.
@@ -482,203 +443,8 @@ impl Cosigner {
         // settle watch would wake the owner about. Dropping it here makes the watch find nothing on
         // its next run and cancel itself, which is the path that already existed for exactly this.
         self.delegate_session = None;
-        if let Some(id) =
-            self.fulfil_matching_intent(&req.recipient_ark_address, req.amount, &ark_txid)
-        {
-            tracing::info!("payment request {id} fulfilled by {ark_txid}");
-        }
         resp
     }
-
-
-
-
-    // -----------------------------------------------------------------------
-    // Request-to-pay: contacts (allowlist) + the payer's payment-request inbox
-    // -----------------------------------------------------------------------
-
-    /// Parties authorized to bill this wallet.
-    pub(crate) fn contacts(&self) -> &[Contact] {
-        &self.contacts
-    }
-
-    /// Allowlist membership — the only authorization for an incoming payment request.
-    pub(crate) fn is_contact(&self, vk_hex: &str) -> bool {
-        self.contacts.iter().any(|c| c.vk_hex == vk_hex)
-    }
-
-    /// Authorize `vk_hex` to send this wallet payment requests (idempotent — re-adding relabels).
-    pub(crate) fn add_contact(
-        &mut self,
-        vk_hex: String,
-        label: String,
-        now: i64,
-    ) -> Result<(), String> {
-        if hex::decode(&vk_hex).map(|b| b.len()) != Ok(33) {
-            return Err("contact verifying key must be 33 bytes (hex)".into());
-        }
-        if let Some(existing) = self.contacts.iter_mut().find(|c| c.vk_hex == vk_hex) {
-            existing.label = truncate(label, MAX_LABEL_LEN);
-            return Ok(());
-        }
-        if self.contacts.len() >= MAX_CONTACTS {
-            return Err(format!("contact list full (max {MAX_CONTACTS})"));
-        }
-        self.contacts.push(Contact {
-            vk_hex,
-            label: truncate(label, MAX_LABEL_LEN),
-            added_at: now,
-        });
-        Ok(())
-    }
-
-    /// Revoke authorization; their pending requests are dropped too.
-    pub(crate) fn remove_contact(&mut self, vk_hex: &str) -> Result<(), String> {
-        let before = self.contacts.len();
-        self.contacts.retain(|c| c.vk_hex != vk_hex);
-        if self.contacts.len() == before {
-            return Err("not a contact".into());
-        }
-        self.payment_intents
-            .retain(|i| !(i.from_vk_hex == vk_hex && i.status == IntentStatus::Pending));
-        Ok(())
-    }
-
-    pub(crate) fn payment_intents(&self) -> &[PaymentIntent] {
-        &self.payment_intents
-    }
-
-    /// Record a request-to-pay. `to_ark_address` must have been DERIVED from `from_vk_hex`, and
-    /// the caller must have checked `is_contact` first.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn create_payment_intent(
-        &mut self,
-        from_vk_hex: String,
-        to_ark_address: String,
-        amount_sats: u64,
-        memo: String,
-        expires_in_secs: i64,
-        now: i64,
-    ) -> Result<PaymentIntent, String> {
-        if !self.is_contact(&from_vk_hex) {
-            return Err("requester is not an authorized contact".into());
-        }
-        if amount_sats == 0 {
-            return Err("amount must be greater than zero".into());
-        }
-        let _ = self.prune_intents(now);
-
-        let pending = |i: &PaymentIntent| i.status == IntentStatus::Pending;
-        if self.payment_intents.iter().filter(|i| pending(i)).count() >= MAX_PENDING_INTENTS {
-            return Err("payment request inbox is full".into());
-        }
-        let from_count = self
-            .payment_intents
-            .iter()
-            .filter(|i| pending(i) && i.from_vk_hex == from_vk_hex)
-            .count();
-        if from_count >= MAX_PENDING_INTENTS_PER_CONTACT {
-            return Err(format!(
-                "too many pending requests from this contact (max {MAX_PENDING_INTENTS_PER_CONTACT})"
-            ));
-        }
-
-        let ttl = if expires_in_secs <= 0 {
-            DEFAULT_INTENT_TTL_SECS
-        } else {
-            expires_in_secs.min(MAX_INTENT_TTL_SECS)
-        };
-        let expires_at = now + ttl;
-        let id = {
-            let mut b = [0u8; 16];
-            rand::RngCore::fill_bytes(&mut OsRng, &mut b);
-            hex::encode(b)
-        };
-        let intent = PaymentIntent {
-            id,
-            from_vk_hex,
-            to_ark_address,
-            amount_sats,
-            memo: truncate(memo, MAX_MEMO_LEN),
-            created_at: now,
-            expires_at,
-            status: IntentStatus::Pending,
-            ark_txid: String::new(),
-        };
-        self.payment_intents.push(intent.clone());
-        Ok(intent)
-    }
-
-    /// Payer declines. Only a pending intent can be declined.
-    pub(crate) fn decline_intent(&mut self, id: &str) -> Result<(), String> {
-        let intent = self
-            .payment_intents
-            .iter_mut()
-            .find(|i| i.id == id)
-            .ok_or("no such payment request")?;
-        if intent.status != IntentStatus::Pending {
-            return Err(format!("request already {}", intent.status.as_str()));
-        }
-        intent.status = IntentStatus::Declined;
-        Ok(())
-    }
-
-    /// Mark an intent paid once the payer's Ark send has settled.
-    pub(crate) fn fulfil_intent(&mut self, id: &str, ark_txid: &str) -> Result<(), String> {
-        let intent = self
-            .payment_intents
-            .iter_mut()
-            .find(|i| i.id == id)
-            .ok_or("no such payment request")?;
-        if intent.status != IntentStatus::Pending {
-            return Err(format!("request already {}", intent.status.as_str()));
-        }
-        intent.status = IntentStatus::Fulfilled;
-        intent.ark_txid = ark_txid.to_string();
-        Ok(())
-    }
-
-    /// Mark a pending request paid after one of the payer's sends settles, matched against the
-    /// STORED intent's destination + amount.
-    pub(crate) fn fulfil_matching_intent(
-        &mut self,
-        to_ark_address: &str,
-        amount_sats: u64,
-        ark_txid: &str,
-    ) -> Option<String> {
-        let id = self
-            .payment_intents
-            .iter()
-            .filter(|i| {
-                i.status == IntentStatus::Pending
-                    && i.to_ark_address == to_ark_address
-                    && i.amount_sats == amount_sats
-            })
-            // Oldest first, so repeated identical requests settle in order.
-            .min_by_key(|i| i.created_at)
-            .map(|i| i.id.clone())?;
-        self.fulfil_intent(&id, ark_txid).ok()?;
-        Some(id)
-    }
-
-
-
-    /// Expire stale pending intents and drop old terminal ones; keeps the sealed list bounded.
-    pub(crate) fn prune_intents(&mut self, now: i64) -> bool {
-        let mut changed = false;
-        for intent in self.payment_intents.iter_mut() {
-            if intent.status == IntentStatus::Pending && now >= intent.expires_at {
-                intent.status = IntentStatus::Expired;
-                changed = true;
-            }
-        }
-        let before = self.payment_intents.len();
-        self.payment_intents.retain(|i| {
-            !i.status.is_terminal() || now - i.expires_at < TERMINAL_INTENT_RETENTION_SECS
-        });
-        changed || self.payment_intents.len() != before
-    }
-
 
     /// The wallet's group x-only pubkey (hex) — the VTXO owner key, from the installed policy's PKP.
     pub fn owner_pk_hex(&self) -> Result<String, String> {
@@ -794,8 +560,8 @@ impl Cosigner {
         &self.escrows
     }
 
-    /// One escrow by its key, comparing x-only so either parity resolves — the same rule contacts
-    /// already use, and the reason a caller can name an escrow by the address it pays.
+    /// One escrow by its key, comparing x-only so either parity resolves — the reason a caller can
+    /// name an escrow by the address it pays.
     pub fn escrow(&self, escrow_key: &str) -> Option<&crate::types::EscrowRecord> {
         let want = x_only(escrow_key);
         self.escrows.iter().find(|e| x_only(&e.escrow_key) == want)
@@ -950,16 +716,68 @@ impl Cosigner {
             }
             Some(crate::types::PairingState::Ready) => {}
         }
-        // A deal can be struck again once the last one's deadline has passed, and not before.
-        // There is no other way for one to end — see `crate::escrow_session`.
-        if record.session.as_ref().is_some_and(|s| s.is_open(now)) {
+        // A deal can be struck again once the last one no longer holds the escrow: its deadline
+        // has passed (or its service brought the deadline forward), or everything it allows has
+        // been released. Not before, and never at the owner's word — see `crate::escrow_session`.
+        if record.session.as_ref().is_some_and(|s| s.holds_the_escrow(now)) {
             return Err(
-                "this escrow is already committed to a deal, and a deal runs until its deadline"
+                "this escrow is already committed to a deal, and a deal runs until its deadline, \
+                 until its service ends it, or until everything it allows has been released"
                     .into(),
             );
         }
         record.session = Some(session);
         Ok(())
+    }
+
+    /// The escrow's service ends the deal it is party to.
+    ///
+    /// `policy_sha256` names the deal, so an end meant for one deal — a retry arriving late, say —
+    /// cannot end the next one struck over the same escrow. Ending a deal that is already over is
+    /// not an error: the service asked for something that is already true.
+    pub fn end_escrow_deal(
+        &mut self,
+        escrow_key: &str,
+        policy_sha256: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        let want = x_only(escrow_key);
+        let session = self
+            .escrows
+            .iter_mut()
+            .find(|e| x_only(&e.escrow_key) == want)
+            .ok_or("this wallet holds no such escrow")?
+            .session
+            .as_mut()
+            .ok_or("this escrow is not committed to a deal")?;
+        if crate::policy::policy_sha256(&session.policy) != policy_sha256 {
+            return Err("that is not the deal this escrow is committed to".into());
+        }
+        session.end_by_service(now);
+        Ok(())
+    }
+
+    /// The earliest moment the owner may take this escrow back.
+    ///
+    /// The later of its current deal's deadline and the deadline of every deal that released
+    /// anything from it. A deal that ended early — spent, or ended by its service — may have
+    /// handed a service signatures it has yet to submit, and a reclaim spends the same VTXOs; so
+    /// the deadline that deal promised still stands for the owner, whatever has been struck since.
+    /// Read from the release ledger, which already outlives any one session.
+    pub fn reclaim_horizon(&self, escrow_key: &str) -> i64 {
+        let want = x_only(escrow_key);
+        let released = self
+            .released_references
+            .values()
+            .filter(|r| r.escrow_key == want)
+            .map(|r| r.deadline)
+            .max()
+            .unwrap_or(0);
+        let current = self
+            .escrow(escrow_key)
+            .and_then(|e| e.session.as_ref())
+            .map_or(0, |s| s.deadline);
+        released.max(current)
     }
 
     /// A reclaim is being opened on [escrow_key]: retire it from deals, for good.

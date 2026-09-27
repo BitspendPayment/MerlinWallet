@@ -219,9 +219,6 @@ void main() {
       for (var i = 0; i < 3; i++) {
         await d.client.sign(message);
       }
-      // A payment request is a signature too, and the one caller `Sign` has in the app.
-      final request = await d.client.writePaymentRequest(d.client.groupKeyHex!, 1000);
-      expect(request.authorship.signature, hasLength(64));
       await expectNothingSecretAtRest(box, seed(2));
     });
 

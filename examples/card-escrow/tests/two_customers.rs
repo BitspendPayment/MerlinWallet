@@ -30,11 +30,15 @@ use card_escrow::service::Service;
 use cosigner::service_stream::FromService;
 use futures_util::StreamExt;
 
-/// The id the enclave opens under — the same for every wallet this service serves.
-const LOCAL: &str = "svc-4444444444444444444444444444444444444444";
+/// The id the enclave opens under — the same for every wallet this service serves, and derived
+/// from this service's identifier, which is how the service knows a connection is meant for it.
+fn local() -> String {
+    let id = threshold::identifier::Identifier::derive(b"merlin-e2e-escrow-service").unwrap();
+    cosigner::service_stream::service_stream_id(&hex::encode(id.serialize()))
+}
 
 fn wire_id(tenant: &str) -> String {
-    format!("{tenant}-{LOCAL}")
+    format!("{tenant}-{}", local())
 }
 
 /// One customer's held connection, and what has arrived on it.
@@ -120,7 +124,7 @@ async fn service() -> (Arc<Wire>, String) {
         "http://127.0.0.1:7070".into(),
         None,
     );
-    let connections = Arc::new(Connections::default());
+    let connections = Arc::new(Connections::new(card_escrow::service::trust::EnclaveTrust::accept_all()));
     let wire = Arc::new(Wire {
         service: Arc::clone(&service),
         connections: Arc::clone(&connections),
@@ -166,7 +170,7 @@ async fn two_customers_receive_only_their_own_events() {
     until(&wire, &alice, true).await;
     until(&wire, &bob, true).await;
     assert_eq!(
-        wire.connections.held_under(LOCAL),
+        wire.connections.held_under(&local()),
         2,
         "two customers, one local name, two connections"
     );
@@ -252,13 +256,13 @@ async fn a_redial_replaces_the_connection_it_is_replacing() {
 
     let first = hold(&base, &alice).await;
     until(&wire, &alice, true).await;
-    assert_eq!(wire.connections.held_under(LOCAL), 1);
+    assert_eq!(wire.connections.held_under(&local()), 1);
 
     // The runtime dials again under the same id, without the old one having been noticed as gone.
     let mut second = hold(&base, &alice).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
-        wire.connections.held_under(LOCAL),
+        wire.connections.held_under(&local()),
         1,
         "one id is one connection, however many times it is dialled"
     );

@@ -55,17 +55,7 @@ pub fn verify_connection(
     now: SystemTime,
 ) -> Result<Attested> {
     let document = verify(cose, &pins.trust_root, now)?;
-
-    for (index, expected) in [(0, &pins.pcr0), (PCR_GUEST, &pins.pcr16)] {
-        let got = document.pcr(index).ok_or(Error::PcrMissing(index))?;
-        if got != expected.as_slice() {
-            return Err(Error::PcrMismatch {
-                index,
-                got: hex::encode(got),
-                expected: hex::encode(expected),
-            });
-        }
-    }
+    check_pcrs(&document, pins)?;
 
     match &document.nonce {
         None => return Err(Error::NonceMissing),
@@ -75,12 +65,7 @@ pub fn verify_connection(
         Some(_) => {}
     }
 
-    let age = now
-        .duration_since(document.timestamp())
-        .unwrap_or_else(|e| e.duration());
-    if age > pins.max_age {
-        return Err(Error::Stale { age_secs: age.as_secs(), max_age_secs: pins.max_age.as_secs() });
-    }
+    check_age(&document, pins, now)?;
 
     let hashes = AttestationHashes::parse(
         document
@@ -109,6 +94,32 @@ pub fn verify_connection(
         certificate_sha256: hashes.tls_certificate,
         guest_sha256: hashes.guest,
     })
+}
+
+/// PCR0 and PCR16 are the pinned ones: this runtime, serving this guest.
+pub(crate) fn check_pcrs(document: &AttestationDocument, pins: &Pins) -> Result<()> {
+    for (index, expected) in [(0, &pins.pcr0), (PCR_GUEST, &pins.pcr16)] {
+        let got = document.pcr(index).ok_or(Error::PcrMissing(index))?;
+        if got != expected.as_slice() {
+            return Err(Error::PcrMismatch {
+                index,
+                got: hex::encode(got),
+                expected: hex::encode(expected),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// No older than the pins allow. A document stamped in the future counts its distance as age.
+pub(crate) fn check_age(document: &AttestationDocument, pins: &Pins, now: SystemTime) -> Result<()> {
+    let age = now
+        .duration_since(document.timestamp())
+        .unwrap_or_else(|e| e.duration());
+    if age > pins.max_age {
+        return Err(Error::Stale { age_secs: age.as_secs(), max_age_secs: pins.max_age.as_secs() });
+    }
+    Ok(())
 }
 
 /// The runtime's `user_data`:

@@ -27,6 +27,7 @@
 	stress-test load-test \
 	mutinynet-deploy mutinynet-smoke \
 	e2e-test e2e-ark-test regtest regtest-ark regtest-down \
+	platform-up platform-down platform-reset send-walkthrough \
 	cli cli-build version \
 	release release-apk release-apk-fat release-testers-add release-testers-remove
 
@@ -153,7 +154,7 @@ ENCLAVE_NAME ?= merlin
 ENCLAVE_PORT ?= 8443
 FRESH        ?=
 
-up-enclave: cosigner-wasm ffi-build arkd-up bitcoin-init arkd-init
+up-enclave: cosigner-wasm ffi-build arkd-up bitcoin-init arkd-init platform-up
 	@ENCLAVE_RUNTIME=$(ENCLAVE_CHECKOUT) ENCLAVE_NAME=$(ENCLAVE_NAME) ENCLAVE_PORT=$(ENCLAVE_PORT) \
 		FRESH=$(FRESH) ./scripts/up-enclave.sh
 
@@ -163,9 +164,30 @@ up: up-enclave
 down-enclave:
 	@ENCLAVE_NAME=$(ENCLAVE_NAME) ./scripts/down-enclave.sh
 
-# Stop everything: the enclave, then regtest + arkd with their volumes.
-down: down-enclave
+# Stop everything: the enclave, the payout platform, then regtest + arkd with their volumes. The
+# platform's state goes too — it is about a chain that is gone. Its build is kept.
+down: down-enclave platform-reset
 	-docker compose -f docker-compose.yml -f docker-compose.ark.yml down -v 2>/dev/null || true
+
+# The payout platform on the regtest stack: MerlinPlatform (from ../MerlinPlatform, or
+# MERLIN_PLATFORM) built against this checkout's crates, paying through a fake Grid. Started by
+# `up-enclave` and `regtest-ark`; without a MerlinPlatform checkout it is skipped with a note.
+# See scripts/platform.sh.
+platform-up:
+	@./scripts/platform.sh up
+
+platform-down:
+	@./scripts/platform.sh down
+
+# Stop the platform and forget its state: the escrows and payouts of enclaves that are gone.
+platform-reset: platform-down
+	rm -rf .platform/run
+
+# Send to banks and mobile money end to end on the fake Grid: the e2e enclave, the platform and
+# the wallet library the app uses. Boots its own enclave, so nothing else may hold one — and starts
+# the platform afresh, since what it held was about enclaves that are gone.
+send-walkthrough: cosigner-wasm $(FFI_DEP) platform-reset regtest-ark
+	cd e2e && dart pub get && ENCLAVE_RUNTIME=$(ENCLAVE_RUNTIME) dart run bin/send_walkthrough.dart
 
 # Bring up Bob — ark-sample wallet that acts as counter-party for the Flutter
 # integration test. Requires arkd already running (call after arkd-init).
@@ -306,9 +328,11 @@ adb-reverse:
 	-adb reverse tcp:8443 tcp:8443
 	-adb reverse tcp:7070 tcp:7070
 	-adb reverse tcp:50001 tcp:50001
+	-adb reverse tcp:7200 tcp:7200
 	@echo "Forwarding active: phone 127.0.0.1:8443 -> dev enclave"
 	@echo "Forwarding active: phone 127.0.0.1:7070 -> arkd"
 	@echo "Forwarding active: phone 127.0.0.1:50001 -> Electrs"
+	@echo "Forwarding active: phone 127.0.0.1:7200 -> MerlinPlatform"
 
 # There is no native server to start any more.
 #
@@ -469,8 +493,8 @@ mutinynet-smoke: ffi-build
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # A wallet REPL for driving a dev enclave by hand: new wallets (each a passkey, so a tenant), fund,
-# board, send, contacts and payment requests. Every call is approved by a passkey and every
-# approval attests the enclave, exactly as in the e2e suite — it is the same wiring.
+# board and send. Every call is approved by a passkey and every approval attests the enclave,
+# exactly as in the e2e suite — it is the same wiring.
 #
 # Needs a dev enclave up (see e2e-enclave) and the regtest stack (arkd-up, bitcoin-init, arkd-init).
 #
@@ -499,7 +523,7 @@ cli-build:
 e2e-test: e2e
 e2e-ark-test: e2e
 regtest: regtest-up bitcoin-init runtime-run
-regtest-ark: runtime-stop arkd-up bitcoin-init arkd-init
+regtest-ark: runtime-stop arkd-up bitcoin-init arkd-init platform-up
 regtest-down: down
 
 # ═══════════════════════════════════════════════════════════════════════════════

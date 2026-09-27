@@ -26,6 +26,7 @@ import 'package:app_core/asp/exit_chain.dart' show ChainKind;
 import 'package:blockchain_utils/blockchain_utils.dart' show SegwitBech32Encoder;
 import 'package:app_core/client.dart';
 import 'package:app_core/threshold_types.dart' as ark_threshold;
+import 'package:app_core/sessions/service_delivery.dart' show RewritingDelivery;
 import 'package:e2e/escrow_service.dart';
 import 'package:app_core/enclave/attestation.dart';
 import 'package:app_core/enclave/authenticator.dart';
@@ -36,7 +37,6 @@ import 'package:app_core/passkey/seed_source.dart';
 import 'package:app_core/passkey/share_reconstruction.dart' show WrongPasskey;
 import 'package:app_core/persistence/wallet_store.dart' show forbiddenStateKeys;
 import 'package:app_core/threshold_types.dart' as threshold;
-import 'package:protocol/protocol.dart' show PaymentIntent, PaymentRequestCreateRequest;
 import 'package:e2e/boarding_poll.dart';
 import 'package:e2e/e2e_profile.dart';
 import 'package:e2e/enclave_harness.dart';
@@ -107,14 +107,12 @@ void main() {
     // one place they are decided, because a prebuilt bundle has to have been packed with them.
     service = EscrowService(identifier: serviceIdentifier);
     await service!.start(port: servicePort);
-    final origins = serviceOrigins;
-
-    harness = await EnclaveHarness.start(serviceOrigins: origins);
+    harness = await startE2eEnclave();
     Log.info('enclave up: pcr16=${harness!.pcr16.substring(0, 16)}…'
         '${harness!.attached ? ' (attached)' : ''}');
     if (harness!.attached) {
       Log.info('attached: escrow pairing needs SERVICE_ORIGINS in that image — '
-          '$origins');
+          '$serviceOrigins');
     }
   });
 
@@ -655,125 +653,6 @@ void main() {
     }, timeout: const Timeout(Duration(minutes: 20)));
   });
 
-  group('contacts', () {
-    test('add, list and remove, on the wallet\'s own cosigner', () async {
-      final alice = await wallet('contacts_alice');
-      final bob = await wallet('contacts_bob');
-      try {
-        await alice.client.doDkg();
-        await bob.client.doDkg();
-        final bobKey = bob.client.groupKeyHex!;
-
-        await alice.client.contactAdd(bobKey, 'Bob');
-        final listed = await alice.client.contactList();
-        expect(listed, hasLength(1));
-        expect(_hex(listed.single.verifyingKey), bobKey);
-        expect(listed.single.label, 'Bob');
-
-        await alice.client.contactRemove(bobKey);
-        expect(await alice.client.contactList(), isEmpty);
-      } finally {
-        await alice.close();
-        await bob.close();
-      }
-    });
-  });
-
-  group('request to pay', () {
-    /// Bob bills Alice, and Alice pays it.
-    ///
-    /// Carried **out of band**, because it has to be: the runtime resolves a tenant from the caller's
-    /// own token and strips any tenant header a client sends, so Bob cannot reach Alice's cosigner.
-    /// So Bob *writes* a request — signed by his group key, with his own cosigner — and Alice's app
-    /// *receives* it into hers. Here the bytes cross in memory; in the app they would be a QR code.
-    test('Bob bills Alice, Alice pays, and the request is fulfilled', () async {
-      final alice = await wallet('rtp_alice');
-      final bob = await wallet('rtp_bob');
-      final carol = await wallet('rtp_carol');
-      try {
-        await alice.client.doDkg();
-        await bob.client.doDkg();
-        await carol.client.doDkg();
-        await boardAndSettle(alice, 0.01);
-        final aliceKey = alice.client.groupKeyHex!;
-        final bobKey = bob.client.groupKeyHex!;
-        final bobArk = await bob.client.getArkAddress();
-
-        // Travel as bytes, the way a request really would.
-        Future<PaymentIntent> deliver(PaymentRequestCreateRequest written) => alice.client
-            .receivePaymentRequest(PaymentRequestCreateRequest.fromBuffer(written.writeToBuffer()));
-
-        // Not a contact yet: refused.
-        await expectLater(
-          deliver(await bob.client.writePaymentRequest(aliceKey, 1000, memo: 'not yet')),
-          throwsA(anything),
-          reason: 'a request from someone not on the allowlist must be refused',
-        );
-
-        await alice.client.contactAdd(bobKey, 'Bob');
-        final written = await bob.client.writePaymentRequest(aliceKey, 5000, memo: 'invoice 1');
-        final intent = await deliver(written);
-        expect(intent.status, 'pending');
-        expect(intent.amountSats.toInt(), 5000);
-        expect(intent.memo, 'invoice 1');
-
-        // The one that matters. Derived by Alice's cosigner from the key that SIGNED — never supplied
-        // by Bob, or a contact could redirect the payment, and never a share key, whose address is
-        // not his wallet's. The old share-key lookup would have failed exactly here.
-        expect(intent.toArkAddress, bobArk,
-            reason: "the payee address must be Bob's own — anything else is funds he cannot spend");
-        expect(_hex(intent.fromVerifyingKey), bobKey);
-
-        // The same request, delivered again, is one request.
-        await expectLater(deliver(written), throwsA(anything),
-            reason: 'a replayed request must be refused');
-
-        // A genuine request Bob wrote to Carol cannot be cashed in at Alice.
-        await expectLater(
-          deliver(await bob.client.writePaymentRequest(carol.client.groupKeyHex!, 2000)),
-          throwsA(anything),
-          reason: 'a request written for another wallet must be refused',
-        );
-
-        final inbox = await alice.client.paymentRequests();
-        expect(inbox.map((i) => i.id), contains(intent.id));
-
-        final bobBefore = (await bob.client.listVtxos()).totalSats;
-        final payTxid = await whileMining(
-            btc, () => alice.client.sendVtxo(intent.toArkAddress, intent.amountSats.toInt()));
-        expect(payTxid, isNotEmpty);
-
-        final paid = (await alice.client.paymentRequests()).firstWhere((i) => i.id == intent.id);
-        expect(paid.status, 'fulfilled',
-            reason: 'the settled send must mark the request fulfilled');
-        expect(paid.arkTxid, payTxid);
-        await eventually('Bob to be paid', bob.client.listVtxos,
-            (List<IndexerVtxo> v) => v.totalSats == bobBefore + 5000);
-
-        // Declined stays visible — the payer refused it; they did not un-know about it.
-        final unwanted =
-            await deliver(await bob.client.writePaymentRequest(aliceKey, 777, memo: 'not today'));
-        await alice.client.declinePaymentRequest(unwanted.id);
-        final afterDecline = await alice.client.paymentRequests();
-        expect(afterDecline.firstWhere((i) => i.id == unwanted.id).status, 'declined');
-
-        // Revoking the contact drops what is pending and shuts the gate.
-        final pending = await deliver(
-            await bob.client.writePaymentRequest(aliceKey, 500, memo: 'will be revoked'));
-        await alice.client.contactRemove(bobKey);
-        expect((await alice.client.paymentRequests()).where((i) => i.id == pending.id), isEmpty);
-        await expectLater(
-          deliver(await bob.client.writePaymentRequest(aliceKey, 100, memo: 'after revoke')),
-          throwsA(anything),
-        );
-      } finally {
-        await alice.close();
-        await bob.close();
-        await carol.close();
-      }
-    }, timeout: const Timeout(Duration(minutes: 15)));
-  });
-
   group('nothing secret at rest', () {
     /// No share is stored: each operation rebuilds one from the passkey's seed and the half the
     /// cosigner returns on the stream it approved. A right seed signs a settle the ASP accepts —
@@ -1013,8 +892,8 @@ void main() {
 
   group('pairing a service into an escrow', () {
     // The wallet sends where the enclave sent — but the enclave's address for this host is not one
-    // the test process can route to. See `HostSideDelivery`.
-    final delivery = HostSideDelivery();
+    // the test process can route to. See `RewritingDelivery`.
+    final delivery = RewritingDelivery();
 
     /// Wait for the cosigner to agree a pairing is finished.
     ///

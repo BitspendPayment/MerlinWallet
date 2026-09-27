@@ -26,38 +26,16 @@ class ArkScreen extends StatelessWidget {
         ),
         centerTitle: true,
         actions: [
-          // Request-to-pay lives with the Ark balance it spends from. The badge counts
-          // requests still awaiting a decision.
-          Stack(
-            alignment: Alignment.center,
-            children: [
-              IconButton(
-                key: const Key('arkRequestsBtn'),
-                icon: const Icon(Icons.call_received),
-                tooltip: 'Payment requests',
-                onPressed: () => context.push('/requests'),
-              ),
-              if (mpcService.pendingPaymentRequests.isNotEmpty)
-                Positioned(
-                  right: 8,
-                  top: 8,
-                  child: Container(
-                    padding: const EdgeInsets.all(4),
-                    decoration: const BoxDecoration(
-                        color: Colors.red, shape: BoxShape.circle),
-                    child: Text(
-                      '${mpcService.pendingPaymentRequests.length}',
-                      style: const TextStyle(color: Colors.white, fontSize: 10),
-                    ),
-                  ),
-                ),
-            ],
-          ),
-          IconButton(
-            key: const Key('arkContactsBtn'),
-            icon: const Icon(Icons.people_outline),
-            tooltip: 'Contacts',
-            onPressed: () => context.push('/contacts'),
+          // To a bank account or a mobile-money wallet, through the payout platform. Sending to
+          // another wallet is the Send button below.
+          TextButton.icon(
+            key: const Key('arkSendMoneyBtn'),
+            onPressed: () => context.push('/send'),
+            icon: const Icon(Icons.account_balance_outlined, size: 18),
+            label: Text(
+              'Send money',
+              style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+            ),
           ),
           IconButton(
             key: const Key('arkRefreshBtn'),

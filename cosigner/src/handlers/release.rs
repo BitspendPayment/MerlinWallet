@@ -64,7 +64,12 @@
 //! is handled on sealed state: a repeat of an answered request is signed again and counted once, a
 //! request id reused for a different proposal is refused, and a payment reference that has already
 //! justified a release is refused whatever id it arrives under. See
-//! [`EscrowSession::admit_release`].
+//! [`Cosigner::admit_release`].
+//!
+//! A repeat is answered from its record, not judged again, and for as long as the deal that
+//! approved it would have lasted — even once the escrow has moved on to another deal, which a deal
+//! whose allowance is all released lets it do at once. The service paid out on the strength of
+//! that approval; losing the reply must not lose it the signature.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -80,7 +85,8 @@ use threshold::{point, scalar, signing};
 use crate::cosigner::x_only;
 use crate::asp::AspApi;
 use crate::cosigner::Cosigner;
-use crate::types::{Admission, ReleaseRecord};
+use crate::escrow_session::{DealTerms, EscrowSession};
+use crate::types::{Admission, ReleaseRecord, ServicePairing};
 use crate::evidence::{FetchEvidence, ReleaseFacts};
 use crate::service_stream::{StreamRefusal, ToService};
 
@@ -209,17 +215,26 @@ impl Cosigner {
         asp: Option<A>,
         fetcher: &F,
     ) -> Result<ToService, String> {
-        let refused = |reason: String| {
-            Ok(ToService::ReleaseRefused {
-                request_id: request.request_id.clone(),
-                reason,
-            })
-        };
         match self.judge_release(stream_id, request, asp, fetcher).await {
             Ok(approval) => Ok(ToService::ReleaseSigned(Box::new(approval))),
-            Err(Denial::Refused(reason)) => refused(reason),
+            Err(Denial::Refused(reason)) => Ok(ToService::ReleaseRefused {
+                request_id: request.request_id.clone(),
+                reason,
+                deal: self.deal_terms_for(stream_id, &request.escrow_key),
+            }),
             Err(Denial::Faulted(e)) => Err(e),
         }
+    }
+
+    /// The terms of the deal an escrow is committed to — for the service paired into it, and for
+    /// nobody else. A refusal is where a service that asks before paying learns them: that the deal
+    /// it offered is the one sealed, and how long it has to be repaid.
+    fn deal_terms_for(&self, stream_id: &str, escrow_key: &str) -> Option<DealTerms> {
+        self.speaks_for(stream_id, escrow_key, "").ok()?;
+        self.escrow(escrow_key)?
+            .session
+            .as_ref()
+            .map(EscrowSession::terms)
     }
 
     async fn judge_release<A: AspApi, F: FetchEvidence>(
@@ -250,12 +265,35 @@ impl Cosigner {
                 pairing.awaiting()
             )));
         }
-        let session = escrow.session.clone().ok_or_else(|| {
+        let session = escrow.session.clone();
+        let escrow_key = escrow.escrow_key.clone();
+
+        // --- 6, asked first: has this payment justified a release already? -------------------
+        //
+        // Before the deal is consulted, because a repeat is not the current deal's business. It is
+        // answered from its own record, under the deal that approved it, until that deal's
+        // deadline — even if the escrow has been committed to another since. A service whose reply
+        // was lost has paid out already, and a deal struck in the meantime must not cost it the
+        // signature it was owed. Pure, and needs no ASP; and a reference that has already been
+        // spent needs no provider to tell us it succeeded.
+        let proposal_hash = request.proposal_hash();
+        let admission = self
+            .admit_release(
+                &escrow_key,
+                &request.request_id,
+                &request.payment_reference,
+                &proposal_hash,
+            )
+            .map_err(Denial::Refused)?;
+        if let Admission::AlreadyAnswered(record) = admission {
+            return answer_again(request, &record, &escrow_key, &pairing, asp).await;
+        }
+
+        let session = session.ok_or_else(|| {
             Denial::Refused(
                 "this escrow is not committed to a deal, so there is nothing to release".into(),
             )
         })?;
-        let escrow_key = escrow.escrow_key.clone();
 
         // --- 2. the escrow permits a release now ---------------------------------------------
         //
@@ -267,71 +305,12 @@ impl Cosigner {
             .map_err(|r| Denial::Refused(r.message().to_string()))?;
 
         // --- the transaction, built here from the proposal ------------------------------------
-        if request.inputs.is_empty() {
-            return Err(Denial::Refused(
-                "a release that spends nothing pays nobody".into(),
-            ));
-        }
-        if request.inputs.len() > MAX_RELEASE_INPUTS {
-            return Err(Denial::Refused(format!(
-                "a release may spend at most {MAX_RELEASE_INPUTS} VTXOs"
-            )));
-        }
-        let mut seen = BTreeSet::new();
-        for input in &request.inputs {
-            if !seen.insert((input.txid.to_ascii_lowercase(), input.vout)) {
-                return Err(Denial::Refused(
-                    "the same VTXO is named twice, which is not a transaction this chain accepts"
-                        .into(),
-                ));
-            }
-        }
-
-        let mut asp = asp.ok_or_else(|| {
-            Denial::Refused(
-                "this deployment names no ASP, so there is nothing to build a release against"
-                    .into(),
-            )
-        })?;
-        let info = asp
-            .get_info()
-            .await
-            .map_err(|e| Denial::Faulted(format!("asking the ASP what it is: {e}")))?;
-
+        let Built {
+            send,
+            sighashes,
+            info,
+        } = build(request, &escrow_key, asp).await?;
         let owner_pk_hex = x_only(&escrow_key);
-        let vtxos: Vec<crate::types::VtxoInput> = request
-            .inputs
-            .iter()
-            .map(|i| crate::types::VtxoInput {
-                txid: i.txid.clone(),
-                vout: i.vout,
-                amount_sats: i.amount_sats,
-                exit_delay: i.exit_delay,
-                expires_at: 0,
-            })
-            .collect();
-        let (send, _change_delay, sighashes) = crate::cosigner::build_send(
-            &owner_pk_hex,
-            &vtxos,
-            &crate::types::SendVtxoStep1 {
-                recipient_ark_address: request.to_ark_address.clone(),
-                amount: request.amount_sats,
-                vtxos: vtxos.clone(),
-            },
-            &info,
-        )
-        .map_err(|e| Denial::Refused(format!("that release does not build: {e}")))?;
-
-        if request.commitments.len() != sighashes.len() {
-            // Before any nonce is made, so nothing of this cosigner's is spent on a mismatch. The
-            // service discards its own unused nonces and asks again with the right count.
-            return Err(Denial::Refused(format!(
-                "this release has {} things to sign and {} commitments arrived; send one \
-                 commitment per signature, in order",
-                sighashes.len(),
-                request.commitments.len()
-            )));
-        }
 
         // What leaves the escrow, and what it costs. Change back to the escrow's own scripts is not
         // a payment to anybody, so it is not egress — the policy is told which scripts are ours.
@@ -369,48 +348,12 @@ impl Cosigner {
             .map(|o| o.sats)
             .sum();
 
-        // --- 6. has this payment justified a release already? --------------------------------
-        //
-        // Before the evidence is fetched, not after: a reference that has already been spent needs
-        // no provider to tell us it succeeded, and asking would only tell the provider about a
-        // release that is not going to happen.
-        let proposal_hash = request.proposal_hash();
-        let admission = self
-            .admit_release(
-                &escrow_key,
-                &request.request_id,
-                &request.payment_reference,
-                &proposal_hash,
-            )
-            .map_err(Denial::Refused)?;
-
         // --- 3, 4 and 5. the policy, over what was built and what was fetched ------------------
-        //
-        // A repeat of a release that was already counted must not be counted again while it is
-        // being judged. Its sats are in `released_sats` already, so adding them a second time
-        // would refuse a repeat of a release that fitted perfectly well when it was made — and a
-        // service whose reply was lost would be locked out of the answer it was owed.
-        let already_released_sats = match &admission {
-            Admission::AlreadyAnswered(record) => {
-                // Answered under THIS deal, or it is not an answer this deal owes. A release signed
-                // under the last deal and never broadcast would otherwise be re-signed here, judged
-                // as a repeat, and never counted against this deal's allowance.
-                if record.at < session.opened_at {
-                    return Err(Denial::Refused(format!(
-                        "request {} was answered under a previous deal; a release from this one \
-                         needs a new request id and a new payment",
-                        request.request_id
-                    )));
-                }
-                session.released_sats.saturating_sub(record.sats)
-            }
-            Admission::New => session.released_sats,
-        };
         let facts = ReleaseFacts {
             reference: request.payment_reference.clone(),
             sats: egress_sats,
             fee_sats,
-            already_released_sats,
+            already_released_sats: session.released_sats,
         };
         let evidence =
             crate::evidence::gather(fetcher, &session.policy.evidence_needed(&facts)).await;
@@ -441,14 +384,7 @@ impl Cosigner {
             .map_err(|r| Denial::Refused(r.message().to_string()))?;
 
         // --- and only now, a signature --------------------------------------------------------
-        let key_package = KeyPackage::from_json(&pairing.key_package_json)
-            .map_err(|e| Denial::Faulted(format!("this pairing's sealed share is unreadable: {e}")))?;
-        let public_key_package = PublicKeyPackage::from_json(&pairing.public_key_package_json)
-            .map_err(|e| {
-                Denial::Faulted(format!("this pairing's sealed package is unreadable: {e}"))
-            })?;
-        let service_id = identifier_from_hex(&pairing.service_identifier_hex)
-            .map_err(|e| Denial::Faulted(format!("this pairing's sealed identifier: {e}")))?;
+        let signer = PairingSigner::of(&pairing)?;
         // --- written down and sealed, and only then signed ------------------------------------
         //
         // In that order, because the ledger is the only thing that stops a payment paying twice,
@@ -457,51 +393,212 @@ impl Cosigner {
         // is refused, and the in-memory record is rolled back so this instance does not go on
         // believing something the seal does not. The service retries; a retry of a release that
         // WAS recorded is answered again from the record, so nothing is lost by refusing here.
-        let already_counted = matches!(admission, Admission::AlreadyAnswered(_));
-        if !already_counted {
-            let before = self.to_snapshot().map_err(Denial::Faulted)?;
-            self.record_escrow_release(
-                &escrow_key,
-                request.payment_reference.clone(),
-                ReleaseRecord {
-                    // The same reduction the ledger compares by: a key named with either parity
-                    // is one escrow. `trim_start_matches` would be wrong here — it strips repeats,
-                    // and an x-only key may itself begin "02".
-                    escrow_key: x_only(&escrow_key),
-                    request_id: request.request_id.clone(),
-                    sats: egress_sats,
-                    at: signing_at,
-                    proposal_hash,
-                },
-            )
-            .map_err(Denial::Faulted)?;
-            if let Err(e) = self.try_seal() {
-                if let Err(undo) = self.restore_snapshot(&before) {
-                    tracing::error!("rolling back an unsealed release failed too: {undo}");
-                }
-                return Err(Denial::Faulted(format!(
-                    "this release could not be written down, so it was not signed: {e}"
-                )));
+        let before = self.to_snapshot().map_err(Denial::Faulted)?;
+        self.record_escrow_release(
+            &escrow_key,
+            request.payment_reference.clone(),
+            ReleaseRecord {
+                // The same reduction the ledger compares by: a key named with either parity is one
+                // escrow. `trim_start_matches` would be wrong here — it strips repeats, and an
+                // x-only key may itself begin "02".
+                escrow_key: x_only(&escrow_key),
+                request_id: request.request_id.clone(),
+                sats: egress_sats,
+                at: signing_at,
+                proposal_hash,
+                // What this release keeps of its deal once the escrow moves on to another: how
+                // long a repeat is answered, and how long the owner must wait to reclaim.
+                deadline: session.deadline,
+            },
+        )
+        .map_err(Denial::Faulted)?;
+        if let Err(e) = self.try_seal() {
+            if let Err(undo) = self.restore_snapshot(&before) {
+                tracing::error!("rolling back an unsealed release failed too: {undo}");
             }
+            return Err(Denial::Faulted(format!(
+                "this release could not be written down, so it was not signed: {e}"
+            )));
         }
 
-        let halves = sign_second(
-            &key_package,
-            &public_key_package,
-            &service_id,
-            &sighashes,
-            &request.commitments,
-        )
-        .map_err(Denial::Refused)?;
-
+        let halves = signer.sign(&sighashes, &request.commitments)?;
         let (ark_tx, checkpoint_txs) = send.unsigned();
         Ok(ReleaseApproval {
             request_id: request.request_id.clone(),
             ark_tx,
             checkpoint_txs,
             halves,
-            already_counted,
+            already_counted: false,
         })
+    }
+}
+
+/// A repeat of a release already approved: the same proposal, signed again over the fresh
+/// commitments a service that lost its reply brings, and counted nothing.
+///
+/// Not judged again. The proposal hash is the same, so the transaction is the one the policy and
+/// the evidence were checked against when it was approved — and a payment that succeeded goes on
+/// having succeeded. What bounds a repeat is the deadline of the deal that approved it, sealed in
+/// its record: until then the owner may not reclaim ([`Cosigner::reclaim_horizon`]), so a
+/// signature over these inputs cannot race her; from then on, a repeat is refused. Asked twice,
+/// like a first answer, because the ASP is asked in between.
+async fn answer_again<A: AspApi>(
+    request: &ReleaseRequest,
+    record: &ReleaseRecord,
+    escrow_key: &str,
+    pairing: &ServicePairing,
+    asp: Option<A>,
+) -> Result<ReleaseApproval, Denial> {
+    let deal_over = |now: i64| {
+        (now >= record.deadline).then(|| {
+            Denial::Refused(format!(
+                "request {} was approved under a deal that ended at {}; a repeat of it could be \
+                 answered until then and not after",
+                request.request_id, record.deadline
+            ))
+        })
+    };
+    if let Some(refused) = deal_over(crate::handlers::helpers::now_secs()) {
+        return Err(refused);
+    }
+    let signer = PairingSigner::of(pairing)?;
+    let built = build(request, escrow_key, asp).await?;
+    if let Some(refused) = deal_over(crate::handlers::helpers::now_secs()) {
+        return Err(refused);
+    }
+    let halves = signer.sign(&built.sighashes, &request.commitments)?;
+    let (ark_tx, checkpoint_txs) = built.send.unsigned();
+    Ok(ReleaseApproval {
+        request_id: request.request_id.clone(),
+        ark_tx,
+        checkpoint_txs,
+        halves,
+        already_counted: true,
+    })
+}
+
+/// What a proposal builds to.
+struct Built {
+    send: ark::client::send::SendSession,
+    sighashes: Vec<Vec<u8>>,
+    info: ark::client::types::ArkInfo,
+}
+
+/// Build the transaction a proposal describes — the same build for a first answer and a repeat,
+/// so a repeat signs exactly what was approved.
+async fn build<A: AspApi>(
+    request: &ReleaseRequest,
+    escrow_key: &str,
+    asp: Option<A>,
+) -> Result<Built, Denial> {
+    if request.inputs.is_empty() {
+        return Err(Denial::Refused(
+            "a release that spends nothing pays nobody".into(),
+        ));
+    }
+    if request.inputs.len() > MAX_RELEASE_INPUTS {
+        return Err(Denial::Refused(format!(
+            "a release may spend at most {MAX_RELEASE_INPUTS} VTXOs"
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for input in &request.inputs {
+        if !seen.insert((input.txid.to_ascii_lowercase(), input.vout)) {
+            return Err(Denial::Refused(
+                "the same VTXO is named twice, which is not a transaction this chain accepts"
+                    .into(),
+            ));
+        }
+    }
+
+    let mut asp = asp.ok_or_else(|| {
+        Denial::Refused(
+            "this deployment names no ASP, so there is nothing to build a release against".into(),
+        )
+    })?;
+    let info = asp
+        .get_info()
+        .await
+        .map_err(|e| Denial::Faulted(format!("asking the ASP what it is: {e}")))?;
+
+    let vtxos: Vec<crate::types::VtxoInput> = request
+        .inputs
+        .iter()
+        .map(|i| crate::types::VtxoInput {
+            txid: i.txid.clone(),
+            vout: i.vout,
+            amount_sats: i.amount_sats,
+            exit_delay: i.exit_delay,
+            expires_at: 0,
+        })
+        .collect();
+    let (send, _change_delay, sighashes) = crate::cosigner::build_send(
+        &x_only(escrow_key),
+        &vtxos,
+        &crate::types::SendVtxoStep1 {
+            recipient_ark_address: request.to_ark_address.clone(),
+            amount: request.amount_sats,
+            vtxos: vtxos.clone(),
+        },
+        &info,
+    )
+    .map_err(|e| Denial::Refused(format!("that release does not build: {e}")))?;
+
+    if request.commitments.len() != sighashes.len() {
+        // Before any nonce is made, so nothing of this cosigner's is spent on a mismatch. The
+        // service discards its own unused nonces and asks again with the right count.
+        return Err(Denial::Refused(format!(
+            "this release has {} things to sign and {} commitments arrived; send one commitment \
+             per signature, in order",
+            sighashes.len(),
+            request.commitments.len()
+        )));
+    }
+    Ok(Built {
+        send,
+        sighashes,
+        info,
+    })
+}
+
+/// This cosigner's side of one pairing, read out of the seal and ready to sign with.
+///
+/// Read before anything is written down, so a pairing whose sealed material is unreadable is a
+/// fault reported before a release is recorded rather than after.
+struct PairingSigner {
+    key_package: KeyPackage,
+    public_key_package: PublicKeyPackage,
+    service_id: Identifier,
+}
+
+impl PairingSigner {
+    fn of(pairing: &ServicePairing) -> Result<Self, Denial> {
+        Ok(Self {
+            key_package: KeyPackage::from_json(&pairing.key_package_json).map_err(|e| {
+                Denial::Faulted(format!("this pairing's sealed share is unreadable: {e}"))
+            })?,
+            public_key_package: PublicKeyPackage::from_json(&pairing.public_key_package_json)
+                .map_err(|e| {
+                    Denial::Faulted(format!("this pairing's sealed package is unreadable: {e}"))
+                })?,
+            service_id: identifier_from_hex(&pairing.service_identifier_hex)
+                .map_err(|e| Denial::Faulted(format!("this pairing's sealed identifier: {e}")))?,
+        })
+    }
+
+    fn sign(
+        &self,
+        sighashes: &[Vec<u8>],
+        commitments: &[WireCommitment],
+    ) -> Result<Vec<SignedHalf>, Denial> {
+        sign_second(
+            &self.key_package,
+            &self.public_key_package,
+            &self.service_id,
+            sighashes,
+            commitments,
+        )
+        .map_err(Denial::Refused)
     }
 }
 

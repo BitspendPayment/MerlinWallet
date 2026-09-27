@@ -13,7 +13,7 @@
 /// ## The seed is handed over, not kept
 ///
 /// The PRF is evaluated **only** for an assertion made inside [SeedSource.seedDuring], and its
-/// output goes to the one caller that asked and nowhere else. Approving a contact list, finding a
+/// output goes to the one caller that asked and nowhere else. Approving an escrow list, finding a
 /// passkey, checking one still works: none of those evaluates the PRF at all.
 ///
 /// It used to be evaluated on every assertion and kept for two minutes, so that the several FROST

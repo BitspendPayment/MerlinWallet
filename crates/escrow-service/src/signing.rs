@@ -87,6 +87,8 @@ pub enum NotPaired {
     /// The halves checked out, but the share could not be written down — so it is not held, and
     /// saying otherwise would be a pairing that a restart quietly loses.
     NotStored(String),
+    /// This service already holds a share of that escrow, and will not swap it for another.
+    AlreadyHeld(String),
 }
 
 impl NotPaired {
@@ -96,6 +98,7 @@ impl NotPaired {
             NotPaired::DoesNotCheckOut(why) => why.clone(),
             NotPaired::Malformed(why) => why.clone(),
             NotPaired::NotStored(why) => why.clone(),
+            NotPaired::AlreadyHeld(why) => why.clone(),
         }
     }
 }

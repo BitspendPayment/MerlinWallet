@@ -13,7 +13,6 @@ pub mod onboarding;
 pub mod settle;
 pub mod watch;
 pub mod parsers;
-pub mod payment_request;
 pub mod escrow;
 pub mod delivery;
 pub mod pairing;

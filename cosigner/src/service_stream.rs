@@ -77,6 +77,13 @@
 //! escrow being named is paired to *that* service. A service cannot speak for an escrow it was not
 //! paired into, because it cannot put its bytes on another service's connection.
 //!
+//! The other direction is the runtime's to prove, not this module's. What this cosigner says to a
+//! service arrives there as a plain POST, which anybody could send; so the runtime attaches an
+//! attestation document to every stream open and every send, binding the wire id and the exact
+//! bytes to the measured image. A service that checks it knows a pairing half, a refusal or a
+//! deal's terms came from this code for this tenant — not from a customer running a cosigner of
+//! their own. See `docs/STREAMING.md` in enclave-runtime.
+//!
 //! # Secrets and logs
 //!
 //! [`ToService::PairingHalf`] carries a scalar that, added to the wallet's half, IS the service's
@@ -126,9 +133,9 @@ pub fn service_stream_id(service_id_hex: &str) -> String {
 pub enum ToService {
     /// This cosigner's half of the service's share in one pairing.
     ///
-    /// The service believes it because the two halves sum to the verifying share the pairing
-    /// publishes, not because of who delivered it — so this carries no authentication of its own
-    /// and needs none.
+    /// The two halves must sum to the verifying share the pairing publishes — but that alone is a
+    /// check any two halves chosen together pass, so a service takes this one only from a send the
+    /// runtime attested (see the module note), and never over a share it already holds.
     PairingHalf {
         escrow_key: String,
         /// Which attempt this half belongs to, hex. The wallet's half arrives separately, by a
@@ -152,7 +159,16 @@ pub enum ToService {
     ReleaseSigned(Box<crate::handlers::release::ReleaseApproval>),
     /// A release the cosigner will not sign, and why. A conclusion, not a fault — the request is
     /// not redelivered.
-    ReleaseRefused { request_id: String, reason: String },
+    ReleaseRefused {
+        request_id: String,
+        reason: String,
+        /// The deal the escrow is committed to — its deadline and which policy was sealed — told
+        /// only to the escrow's own service, and only when there is a deal. What lets a service
+        /// that asks before paying know it will be repaid, and until when, without taking the
+        /// owner's app at its word. See [`DealTerms`](crate::escrow_session::DealTerms).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deal: Option<crate::escrow_session::DealTerms>,
+    },
 }
 
 /// The secret half is redacted. A pairing that ends up in a log is a pairing given away.
@@ -183,10 +199,15 @@ impl fmt::Debug for ToService {
                 .field("halves", &approval.halves.len())
                 .field("already_counted", &approval.already_counted)
                 .finish_non_exhaustive(),
-            ToService::ReleaseRefused { request_id, reason } => f
+            ToService::ReleaseRefused {
+                request_id,
+                reason,
+                deal,
+            } => f
                 .debug_struct("ReleaseRefused")
                 .field("request_id", request_id)
                 .field("reason", reason)
+                .field("deal", deal)
                 .finish(),
         }
     }
@@ -211,6 +232,13 @@ pub enum FromService {
     },
     /// Pay a service out of an escrow. See [`crate::handlers::release`].
     ReleaseRequest(Box<crate::handlers::release::ReleaseRequest>),
+    /// The service is done with this deal and will ask for nothing more from it — a payout that
+    /// failed, say. The deal protects the service, so the service may end it; the owner may not.
+    /// `policy_sha256` names the deal, so a late end cannot close the next one.
+    EndDeal {
+        escrow_key: String,
+        policy_sha256: String,
+    },
 }
 
 /// Why a message could not be acted on. Each is a different thing to tell a service operator.
@@ -356,6 +384,26 @@ impl Cosigner {
                 .release(stream_id, &request, asp, fetcher)
                 .await
                 .map_err(StreamRefusal::Faulted),
+            FromService::EndDeal {
+                escrow_key,
+                policy_sha256,
+            } => {
+                self.speaks_for(stream_id, &escrow_key, "")?;
+                let now = crate::handlers::helpers::now_secs();
+                if let Err(reason) = self.end_escrow_deal(&escrow_key, &policy_sha256, now) {
+                    return Ok(ToService::Refused {
+                        about: policy_sha256,
+                        reason,
+                    });
+                }
+                // Sealed before it is acknowledged: a service told the deal is over, when the seal
+                // still says otherwise, would be wrong on the next invocation. A seal that fails is
+                // a fault, so the runtime redelivers and this runs again.
+                self.try_seal().map_err(StreamRefusal::Faulted)?;
+                Ok(ToService::Ack {
+                    about: policy_sha256,
+                })
+            }
         }
     }
 
@@ -392,6 +440,7 @@ impl FromService {
             FromService::PairingReady { .. } => "pairing-ready",
             FromService::PairingRefused { .. } => "pairing-refused",
             FromService::ReleaseRequest(..) => "release-request",
+            FromService::EndDeal { .. } => "end-deal",
         }
     }
 
@@ -401,6 +450,7 @@ impl FromService {
             FromService::PairingReady { attempt_id, .. }
             | FromService::PairingRefused { attempt_id, .. } => attempt_id.clone(),
             FromService::ReleaseRequest(r) => r.request_id.clone(),
+            FromService::EndDeal { policy_sha256, .. } => policy_sha256.clone(),
         }
     }
 }

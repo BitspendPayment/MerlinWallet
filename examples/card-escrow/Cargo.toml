@@ -39,5 +39,8 @@ clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+# The tests drive the wire with no enclave behind it, so they believe every request. Test builds
+# only: the binaries are built without it and check every request's attestation.
+escrow-service = { path = "../../crates/escrow-service", features = ["test-trust"] }
 # Reading a held SSE stream in a test, the way the runtime reads one.
 futures-util = "0.3"

@@ -20,8 +20,6 @@ import 'package:app_core/sessions/settle_session.dart';
 import 'package:app_core/sessions/sign_session.dart';
 import 'package:app_core/sessions/delegate.dart';
 import 'package:app_core/sessions/exit_plan.dart' show ExitTx;
-import 'package:app_core/requests/authorship.dart';
-import 'package:app_core/threshold/frost/ceremony.dart' show schnorr64;
 import 'package:app_core/passkey/escrow_public_state.dart';
 import 'package:app_core/passkey/seed_source.dart';
 import 'package:app_core/passkey/operation_secrets.dart';
@@ -34,7 +32,6 @@ import 'package:app_core/threshold/threshold.dart' as threshold;
 // the wallet actually passes around. `SendSession.arkInfoToProto` converts at the boundary.
 import 'package:protocol/protocol.dart' hide ArkInfo;
 import 'package:fixnum/fixnum.dart';
-import 'package:protobuf/protobuf.dart' show GeneratedMessageGenericExtensions;
 import 'package:hive/hive.dart';
 import 'package:synchronized/synchronized.dart';
 import 'dart:io';
@@ -44,10 +41,10 @@ import 'package:convert/convert.dart';
 import 'package:app_core/persistence/wallet_store.dart';
 
 class MpcClient {
-  /// The cosigner: four ceremony streams and seven single-round calls.
+  /// The cosigner: seven ceremony streams and eight single-round calls.
   final CosignerConnection _conn;
 
-  /// Nonces for payment requests. A repeated nonce is refused by the payer as a replay.
+  /// Randomness for what must never repeat: an escrow's context, a pairing attempt's id.
   static final _secureRandom = Random.secure();
 
   /// The ASP. The wallet's own now — the cosigner renounced its socket, so whoever calls it drives
@@ -163,11 +160,7 @@ class MpcClient {
   /// The ASP, for a caller that needs to ask it something directly — chiefly polling for receives.
   AspClient get asp => _asp;
 
-  /// The cosigner connection.
-  ///
-  /// Exposed because a payment request is addressed to *somebody else's* cosigner, so a caller has
-  /// to be able to name one — see [writePaymentRequest]. Also what a test harness drives a raw
-  /// stream with.
+  /// The cosigner connection. Exposed for a test harness to drive a raw stream with.
   CosignerConnection get cosigner => _conn;
 
   /// Hang up on both. Neither is usable afterwards.
@@ -1175,104 +1168,6 @@ class MpcClient {
   /// what runs.
   Future<String> settleDelegate({void Function(SettlePhase)? onProgress}) =>
       settle(onProgress: onProgress);
-
-  Future<void> contactAdd(String contactGroupKeyHex, String label) async {
-    await _conn.contactAdd(ContactAddRequest()
-      ..contactVerifyingKey = hex.decode(contactGroupKeyHex)
-      ..label = label);
-  }
-
-  /// Revoke a contact. Their pending requests are dropped too.
-  Future<void> contactRemove(String contactGroupKeyHex) async {
-    await _conn.contactRemove(ContactRemoveRequest()
-      ..contactVerifyingKey = hex.decode(contactGroupKeyHex));
-  }
-
-  Future<List<Contact>> contactList() async {
-    final resp = await _conn.contactList(ContactListRequest());
-    return resp.contacts;
-  }
-
-  /// Write a request for [payerGroupKeyHex] to pay this wallet, signed as this wallet.
-  ///
-  /// The result is the whole of the request — serialize it with `writeToBuffer()` and carry it however
-  /// requests travel: a QR code, a link. It cannot be sent to the payer's cosigner from here: the
-  /// runtime resolves a tenant from the caller's own token, so every connection this wallet opens
-  /// lands in its own instance. The payer's app receives it into theirs — see
-  /// [receivePaymentRequest].
-  ///
-  /// The signature is by this wallet's **group** key, made with this wallet's own cosigner, over a
-  /// digest that names the payer, the amount, the memo, an expiry and a fresh nonce. So it cannot be
-  /// forged by anyone holding only a share, redirected to another payer, altered, or replayed.
-  ///
-  /// `ark_info` is left unset. The payer supplies it from their own view of the ASP, and it is not
-  /// signed: the payee address is derived from the key that signed, so ASP parameters cannot send
-  /// the payment anywhere this wallet does not control.
-  Future<PaymentRequestCreateRequest> writePaymentRequest(
-    String payerGroupKeyHex,
-    int amountSats, {
-    String memo = '',
-    int expiresInSecs = 0,
-    Duration validFor = const Duration(hours: 1),
-  }) async {
-    if (validFor > maxRequestValidity) {
-      throw ArgumentError('a request may be valid for at most ${maxRequestValidity.inHours}h');
-    }
-    final requesterHex = groupKeyHex;
-    if (requesterHex == null) throw StateError('no wallet key yet — run DKG first');
-
-    final payer = hex.decode(payerGroupKeyHex);
-    final requester = hex.decode(requesterHex);
-    final nonce = List<int>.generate(16, (_) => _secureRandom.nextInt(256));
-    final notAfter = DateTime.now().add(validFor).millisecondsSinceEpoch ~/ 1000;
-
-    final digest = requestDigest(
-      payerGroupKey: payer,
-      requesterGroupKey: requester,
-      amountSats: amountSats,
-      expiresInSecs: expiresInSecs,
-      notAfter: notAfter,
-      nonce: nonce,
-      memo: memo,
-    );
-    // Untweaked: this is a statement by the group key, not a taproot key-path spend.
-    final signature = await sign(digest);
-
-    return PaymentRequestCreateRequest()
-      ..amountSats = Int64(amountSats)
-      ..memo = memo
-      ..expiresInSecs = Int64(expiresInSecs)
-      ..authorship = (RequestAuthorship()
-        ..requesterGroupKey = requester
-        ..payerGroupKey = payer
-        ..notAfter = Int64(notAfter)
-        ..nonce = nonce
-        ..signature = schnorr64(signature));
-  }
-
-  /// Take a request somebody wrote and put it in this wallet's inbox.
-  ///
-  /// The other half of [writePaymentRequest]. This wallet's cosigner checks the signature, that the
-  /// request names this wallet, that it is fresh and not seen before, and that its author is an
-  /// allowlisted contact — and derives the payee address from the key that signed.
-  Future<PaymentIntent> receivePaymentRequest(PaymentRequestCreateRequest request) async {
-    // Our own view of the ASP, since the payee address is derived under it and we are the one who
-    // will pay. Copied rather than mutated: the caller's request is left as it was received.
-    final withInfo = request.deepCopy()..arkInfo = arkInfoToProto(await _asp.getInfo());
-    final resp = await _conn.paymentRequestCreate(withInfo);
-    return resp.intent;
-  }
-
-  /// Payment requests addressed to this wallet, newest first.
-  Future<List<PaymentIntent>> paymentRequests() async {
-    final resp = await _conn.paymentRequestList(PaymentRequestListRequest());
-    return resp.intents;
-  }
-
-  Future<void> declinePaymentRequest(String id) async {
-    await _conn.paymentRequestDecline(PaymentRequestDeclineRequest()
-      ..id = id);
-  }
 
   // --- Devices ----------------------------------------------------------------------------------
   //

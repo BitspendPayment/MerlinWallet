@@ -23,7 +23,7 @@
 //! ```
 //!
 //! One directory per tree, one file per key. **Both names are hex**, which is the part doing real
-//! work: trees and keys are arbitrary caller strings — a group key, a contact label, `a:b`, `a*` —
+//! work: trees and keys are arbitrary caller strings — a group key, `a:b`, `a*` —
 //! and hex makes every one of them a legal, unambiguous, case-stable filename with no separator to
 //! smuggle a path in, no `.` or `..`, and no metacharacter left live. The previous RESP backend
 //! flattened `(tree, key)` into `"{tree}:{key}"` and recovered the tree with a `SCAN MATCH` glob,
@@ -283,17 +283,6 @@ pub(crate) fn now_secs() -> i64 {
 /// when the guest port lands — either way the thing storing it cannot read it.
 const SEALED_STATE_TREE: &str = "sealed_state";
 
-/// Re-seal a cosigner whose state changed, using the store it already holds.
-pub(crate) fn seal_snapshot_for(
-    actor: &mut Cosigner,
-    group_key: &str,
-) {
-    let store = actor.store.clone();
-    if let Err(e) = seal_snapshot(actor, &store, group_key) {
-        tracing::warn!("{e}");
-    }
-}
-
 pub(crate) fn seal_snapshot(
     actor: &mut Cosigner,
     store: &Store,
@@ -330,10 +319,6 @@ pub(crate) fn restore_snapshot(
     tracing::info!("restored actor snapshot for {group_key}");
     Ok(true)
 }
-
-// ---------------------------------------------------------------------------
-// Request-to-pay. Each mutates the actor's SEALED state, so each re-persists the snapshot.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
