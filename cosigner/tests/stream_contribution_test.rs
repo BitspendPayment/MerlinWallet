@@ -122,6 +122,7 @@ fn send_open(w: &Wallet, identifier: Vec<u8>) -> proto::SendClientMsg {
             ark_info: Some(ark_info()),
             vtxos: vec![vtxo('a')],
             identifier,
+            escrow_commit: None,
         })),
     }
 }
@@ -341,4 +342,94 @@ fn a_key_path_sign_is_refused_by_name() {
     ));
     assert_eq!(answer.code, Code::InvalidArgument as u32, "{}", answer.message);
     assert!(answer.messages.is_empty(), "no share may go out for a round that will not run");
+}
+
+/// A send that tops an escrow up and commits it to a deal is refused before anything is built when
+/// that deal could not be struck — here, because nothing is paired into the escrow. No sighash goes
+/// out, so no money moves toward a commitment that was never going to hold. With a service paired,
+/// the same send goes ahead exactly as a plain one does.
+#[test]
+fn a_top_up_whose_deal_could_not_be_struck_is_refused_before_anything_is_built() {
+    const ESCROW: &str = "02abababababababababababababababababababababababababababababababab";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    for paired in [false, true] {
+        let Some(w) = wallet(Some(DEALT)) else { return };
+        let mut open = send_open(&w, w.identifier());
+        let Some(proto::send_client_msg::Body::Open(o)) = open.body.as_mut() else {
+            unreachable!()
+        };
+        o.escrow_commit = Some(proto::EscrowOpenSessionRequest {
+            escrow_key: ESCROW.into(),
+            policy_json: r#"{"op":"always"}"#.into(),
+            deadline_secs: now + 3_600,
+        });
+        let c = std::sync::Mutex::new(w.cosigner);
+        common::seed_escrow(&c, ESCROW, paired);
+
+        let answer: Answer<proto::SendServerMsg> = collect(block_on(
+            service(c.into_inner().unwrap()).route(request("Send", &[open], Some(TENANT))),
+        ));
+        if paired {
+            assert_eq!(answer.messages.len(), 1, "{} {}", answer.code, answer.message);
+            assert_eq!(answer.code, Code::Cancelled as u32, "{}", answer.message);
+        } else {
+            assert_eq!(answer.code, Code::FailedPrecondition as u32, "{}", answer.message);
+            assert!(answer.message.contains("no service paired"), "{}", answer.message);
+            assert!(answer.messages.is_empty(), "a sighash went out for a deal that cannot hold");
+        }
+    }
+}
+
+/// A mint that would pair a service into the new escrow checks the service before anything is
+/// dealt, exactly as a pairing on its own does: a service this image does not know, or a malformed
+/// attempt, mints nothing and is told nothing. With no service named, the same open is answered as
+/// a plain mint — the first round goes out.
+#[test]
+fn a_mint_that_names_a_service_checks_it_before_anything_is_dealt() {
+    let cases: [(&[u8], &[u8], Option<Code>); 3] = [
+        (&[], &[], None),
+        // Tests set no `SERVICE_ORIGINS`, so this image knows no service at all.
+        (&[0x44; 32], &[0xaa; 16], Some(Code::FailedPrecondition)),
+        (&[0x44; 32], &[0xaa; 15], Some(Code::InvalidArgument)),
+    ];
+    for (named, attempt, refused) in cases {
+        let Some(w) = wallet(Some(DEALT)) else { return };
+        let mut rng = rand::rngs::OsRng;
+        let (_, round1) = threshold::dkg::dkg_reshare_part1(
+            &w.kps[0].identifier,
+            2,
+            2,
+            &threshold::random::mod_n_random(&mut rng),
+            &[threshold::random::mod_n_random(&mut rng)],
+            &mut rng,
+        )
+        .expect("the wallet's delta dealing");
+        let open = proto::EscrowClientMsg {
+            session_id: "s".into(),
+            seq: 0,
+            body: Some(proto::escrow_client_msg::Body::Open(proto::EscrowOpen {
+                identifier: w.identifier(),
+                round1_package: round1.to_json(),
+                context: vec![0x22; 16],
+                service_identifier: named.to_vec(),
+                attempt_id: attempt.to_vec(),
+            })),
+        };
+        let answer: Answer<proto::EscrowServerMsg> = collect(block_on(
+            service(w.cosigner).route(request("Escrow", &[open], Some(TENANT))),
+        ));
+        match refused {
+            None => {
+                assert_eq!(answer.messages.len(), 1, "{} {}", answer.code, answer.message);
+                assert_eq!(answer.code, Code::Cancelled as u32, "{}", answer.message);
+            }
+            Some(code) => {
+                assert_eq!(answer.code, code as u32, "{}", answer.message);
+                assert!(answer.messages.is_empty(), "dealt before checking the service");
+            }
+        }
+    }
 }

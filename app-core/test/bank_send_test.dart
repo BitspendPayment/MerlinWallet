@@ -28,9 +28,9 @@ void main() {
   });
 
   test('the owner is told how many approvals a send will take', () {
-    expect(BankSend.approvalsNeeded(hasEscrow: false, shortfall: 23010), 5);
-    expect(BankSend.approvalsNeeded(hasEscrow: true, shortfall: 23010), 2);
-    expect(BankSend.approvalsNeeded(hasEscrow: true, shortfall: 0), 1);
+    // Setting the escrow up is one stream, and topping it up and sealing the deal is another.
+    expect(BankSend.approvalsNeeded(hasEscrow: false), 2);
+    expect(BankSend.approvalsNeeded(hasEscrow: true), 1);
   });
 
   test('a deal tag is 16 random bytes, and never the same twice', () {

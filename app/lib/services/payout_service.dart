@@ -34,7 +34,7 @@ const _boxName = 'payouts';
 const _escrowKeyKey = 'escrowKey';
 
 /// A payout's steps, in order. [Payout.step] is the one it has got to; `done` is past them all.
-const payoutSteps = ['policy', 'top_up', 'seal', 'fund', 'pay', 'repay'];
+const payoutSteps = ['policy', 'seal', 'fund', 'pay', 'repay'];
 
 /// One payout as this device remembers it: a JSON map in the `payouts` box, under its deal tag.
 class Payout {
@@ -152,6 +152,9 @@ String formatMinor(int minor, String currency, int decimals) =>
         .format(minor / pow(10, decimals));
 
 String formatSats(int sats) => NumberFormat('#,##0', 'en_US').format(sats);
+
+/// How many passkey approvals, in words: "once", "twice", "3 times".
+String approvalTimes(int n) => switch (n) { 1 => 'once', 2 => 'twice', _ => '$n times' };
 
 /// [e] in words the owner can act on.
 String plainError(Object e) {
@@ -345,7 +348,7 @@ class PayoutService extends ChangeNotifier {
 
   Future<List<String>> banks(String country) => _platformClient().banks(country);
 
-  /// Mint the escrow payouts are paid from, and pair the platform into it. Three approvals, once.
+  /// Mint the escrow payouts are paid from, and pair the platform into it. One approval, once.
   Future<void> setUp() async {
     await _open();
     final key = await _need().ensureEscrow(known: escrowKey);
@@ -431,7 +434,6 @@ class PayoutService extends ChangeNotifier {
               tag,
               (p) => p['step'] = switch (step) {
                     CommitStep.policy => 'policy',
-                    CommitStep.topUp => 'top_up',
                     CommitStep.seal => 'seal',
                   })),
         );

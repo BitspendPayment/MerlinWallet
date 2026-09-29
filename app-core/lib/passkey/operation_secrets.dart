@@ -242,8 +242,19 @@ class WalletOperation {
     return _escrowKeyPackage = rebuilt;
   }
 
-  /// The slope this operation deals a service pairing on. Derived under the escrow key and the
-  /// attempt id, so retrying one attempt's delivery reproduces the same contribution.
+  /// The escrow share the operation that mints an escrow has just made — held here so it is let go
+  /// with the operation, for the pairing that follows on the same stream. Nothing is rebuilt: the
+  /// reshare produced it. One per operation.
+  threshold.KeyPackage holdEscrowKeyPackage(threshold.KeyPackage minted) {
+    _ensureLive();
+    if (_escrowKeyPackage != null) {
+      throw ContributionProtocolException('two escrow shares on one stream');
+    }
+    return _escrowKeyPackage = minted;
+  }
+
+  /// The slope this operation deals a service pairing on. Derived under the escrow's context and
+  /// the attempt id, so retrying one attempt's delivery reproduces the same contribution.
   BigInt takePairingSlope() {
     _ensureLive();
     final slope = _pairingSlope;

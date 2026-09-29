@@ -12,41 +12,10 @@ use cosigner::escrow_session::{EscrowSession, Refusal};
 use cosigner::policy::Policy;
 use cosigner::types::{EscrowRecord, ServicePairing};
 
+use common::seed_escrow;
+
 const NOW: i64 = 1_700_000_000;
 const HOUR: i64 = 3_600;
-
-/// An escrow on a wallet, optionally with a service paired into it.
-fn seed_escrow(
-    cosigner: &std::sync::Mutex<cosigner::Cosigner>,
-    escrow_key: &str,
-    paired: bool,
-) {
-    let mut c = cosigner.lock().unwrap();
-    c.install_escrow(EscrowRecord {
-        escrow_key: escrow_key.to_string(),
-        key_package_json: "{}".into(),
-        public_key_package_json: "{}".into(),
-        wallet_identifier_hex: "11".repeat(32),
-        context_hex: "22".repeat(16),
-        wallet_delta_share_hex: "33".repeat(32),
-        created_at: NOW,
-        pairing: paired.then(|| ServicePairing {
-            service_identifier_hex: "44".repeat(32),
-            key_package_json: "{}".into(),
-            public_key_package_json: "{}".into(),
-            service_verifying_share_hex: "55".repeat(33),
-            paired_at: NOW,
-            attempt_id_hex: "aa".repeat(16),
-            // Seeded finished: these tests are about the DEAL, and a pending pairing is refused a
-            // deal for reasons of its own — proved separately below.
-            service_confirmed: true,
-            wallet_confirmed: true,
-        }),
-        session: None,
-        reclaim_opened_at: None,
-    })
-    .expect("install escrow");
-}
 
 /// A wallet whose runtime is a fake, so a test can see what was asked of it — and what was not.
 fn open(

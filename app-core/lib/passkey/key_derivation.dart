@@ -94,11 +94,15 @@ Future<WalletPolynomial> escrowPolynomial(Uint8List seed, Uint8List context) asy
 /// A drawn slope could not be, so "retry" would mean throwing away the cosigner's half as well and
 /// pairing from scratch.
 ///
-/// [context] is the escrow key and the attempt id together, so one attempt reproduces and a second
-/// attempt is a different line. Reusing a context across two *pairings* would put two of this
-/// wallet's dealings on one slope — what `crates/threshold/src/service_poly.rs` exists to warn
-/// about — which is why the attempt id is in it, and why the cosigner refuses a confirmation
-/// naming an attempt other than the one it sealed.
+/// [context] is the escrow's own context — what its delta was derived under — and the attempt id
+/// together, so one attempt reproduces and a second attempt is a different line. Reusing a context
+/// across two *pairings* would put two of this wallet's dealings on one slope — what
+/// `crates/threshold/src/service_poly.rs` exists to warn about — which is why the attempt id is in
+/// it, and why the cosigner refuses a confirmation naming an attempt other than the one it sealed.
+///
+/// The escrow's context rather than its key, because both halves are drawn before the operation
+/// begins: the operation that mints an escrow also pairs it, and reads the passkey once, before the
+/// key exists. It is as unique — the cosigner refuses a context a wallet has used before.
 Future<BigInt> pairingSlope(Uint8List seed, Uint8List context) =>
     _scalar(seed, _pairingSlopeLabel, context);
 

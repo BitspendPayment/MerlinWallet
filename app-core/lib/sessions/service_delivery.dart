@@ -101,11 +101,15 @@ class HttpServiceDelivery implements DeliverToService {
       request.write(jsonEncode(contribution.toJson()));
       final response = await request.close().timeout(_timeout);
       final body = await utf8.decodeStream(response);
-      if (response.statusCode >= 200 && response.statusCode < 300) return;
+      // 200 is "ready": the service holds both halves and the share they sum to checks out, which
+      // is the only thing worth confirming. The cosigner's half always arrives first, so anything
+      // else — a 202 "waiting" included — means the service does not have it, and never will for
+      // this attempt.
+      if (response.statusCode == 200) return;
       throw ServiceDeliveryException(
         'the service refused this wallet\'s contribution (${response.statusCode}): $body',
-        // 4xx is a decision; 5xx and anything else may be transient.
-        refused: response.statusCode >= 400 && response.statusCode < 500,
+        // An answer is a decision; a 5xx may be transient.
+        refused: response.statusCode < 500,
       );
     } on ServiceDeliveryException {
       rethrow;

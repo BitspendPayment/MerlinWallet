@@ -1,13 +1,16 @@
 /// Sending to a bank account or a mobile-money wallet, paid for out of an escrow.
 ///
 /// ```text
-///   ensureEscrow   an escrow the platform is paired into          first time: 3 approvals
+///   ensureEscrow   an escrow the platform is paired into          first time: 1 approval
 ///   quote          the platform prices the payout, writes the policy
-///   commit         check the policy · top the escrow up to the price · seal the deal
-///                                                                  1 approval, +1 to top up
+///   commit         check the policy · top the escrow up to the price and seal the deal
+///                                                                  1 approval
 ///   fund           the platform asks the cosigner, then pays       none
 ///   follow         the platform's word on how it is going          none
 /// ```
+///
+/// One approval per cosigner call, so each step that needs the cosigner is one call: minting the
+/// escrow and pairing the platform into it are one stream, and so are the top-up and the seal.
 ///
 /// The app and the e2e walkthrough drive these same steps, so what the walkthrough proves is what
 /// the app does. Nothing here keeps state: each step returns what the caller should remember.
@@ -71,8 +74,7 @@ class BankSend {
   }
 
   /// How many times the owner will be asked to approve, so the app can say so before it starts.
-  static int approvalsNeeded({required bool hasEscrow, required int shortfall}) =>
-      (hasEscrow ? 0 : 3) + (shortfall > 0 ? 1 : 0) + 1;
+  static int approvalsNeeded({required bool hasEscrow}) => (hasEscrow ? 0 : 1) + 1;
 
   /// The escrow payouts are paid from: [known] if this wallet still holds it, otherwise a new one,
   /// minted and paired with the platform.
@@ -80,13 +82,8 @@ class BankSend {
   /// The caller forgets [known] once it reclaims from it — a reclaim retires an escrow for good.
   Future<String> ensureEscrow({String? known}) async {
     if (known != null && wallet.escrows.any((e) => _same(e.escrowKeyHex, known))) return known;
-    final escrow = await wallet.createEscrow();
-    await wallet.pairService(
-      escrowKeyHex: escrow.escrowKeyHex,
-      serviceIdentifier: platformId,
-      delivery: delivery,
-    );
-    return escrow.escrowKeyHex;
+    final set = await wallet.setUpEscrow(serviceIdentifier: platformId, delivery: delivery);
+    return set.escrow.escrowKeyHex;
   }
 
   /// What the escrow holds right now, from the indexer.
@@ -140,25 +137,44 @@ class BankSend {
 
     final info = await wallet.getArkInfo();
     final topUp = shortfall(quote.sats, await held(escrowKeyHex), dust: info.dust);
-    String? topUpTxid;
-    if (topUp > 0) {
-      onStep?.call(CommitStep.topUp);
-      topUpTxid = await wallet.sendVtxo(await wallet.escrowArkAddress(escrowKeyHex, info: info), topUp);
-    }
     onStep?.call(CommitStep.seal);
 
     final deadline = DateTime.now().add(Duration(seconds: quote.dealSeconds));
-    // A pairing is usable once the platform's confirmation has reached the cosigner, which follows
-    // the pairing itself by a moment. By the time an owner has read a quote it almost always has;
-    // if not, the cosigner says so and this asks again, rather than polling for it beforehand.
+    String? topUpTxid;
+    String? agreed;
+    if (topUp > 0) {
+      final funded = await _untilPaired(() => wallet.fundEscrowDeal(
+            escrowKeyHex: escrowKeyHex,
+            amountSats: topUp,
+            policy: quote.policy,
+            deadline: deadline,
+          ));
+      topUpTxid = funded.arkTxid;
+      agreed = funded.agreed;
+    }
+    // Nothing to top up — or a cosigner from before a send could commit, which topped up only.
+    final sealed = agreed ??
+        await _untilPaired<String>(() => wallet.openEscrowSession(
+              escrowKeyHex: escrowKeyHex,
+              policy: quote.policy,
+              deadline: deadline,
+            ));
+    return Commitment(agreed: sealed, deadline: deadline, topUpSats: topUp, topUpTxid: topUpTxid);
+  }
+
+  /// [commit], asked again while the pairing is not yet usable.
+  ///
+  /// A pairing is usable once the platform's confirmation has reached the cosigner, which follows
+  /// the pairing itself by a moment. By the time an owner has read a quote it almost always has;
+  /// if not, the cosigner says so and this asks again, rather than polling for it beforehand.
+  ///
+  /// Safe to repeat because the cosigner refuses that way only before anything is built: a send
+  /// that commits is checked when it opens, and whatever fails once its money has moved says so in
+  /// other words. Each ask is one more approval.
+  static Future<T> _untilPaired<T>(Future<T> Function() commit) async {
     for (var attempt = 1;; attempt++) {
       try {
-        final agreed = await wallet.openEscrowSession(
-          escrowKeyHex: escrowKeyHex,
-          policy: quote.policy,
-          deadline: deadline,
-        );
-        return Commitment(agreed: agreed, deadline: deadline, topUpSats: topUp, topUpTxid: topUpTxid);
+        return await commit();
       } catch (e) {
         if (attempt >= 3 || !'$e'.contains('pairing is not finished')) rethrow;
         await Future<void>.delayed(const Duration(seconds: 2));
@@ -210,10 +226,8 @@ enum CommitStep {
   /// Reading the policy against what the owner was shown.
   policy,
 
-  /// Sending the escrow what it is short of the price: one approval.
-  topUp,
-
-  /// Committing the escrow to the deal: one approval.
+  /// Sending the escrow what it is short of the price, if anything, and committing it to the deal:
+  /// one approval.
   seal,
 }
 

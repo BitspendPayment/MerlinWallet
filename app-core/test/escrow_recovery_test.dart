@@ -2,6 +2,7 @@
 library;
 
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:protocol/cosigner_v1.dart' as cs;
 import 'package:test/test.dart';
@@ -80,6 +81,46 @@ void main() {
       ]) {
         expect(isLocalDevelopmentHost(host), isFalse, reason: host);
       }
+    });
+  });
+
+  group('what counts as delivered', () {
+    /// A service on this machine that answers every delivery with [status].
+    Future<HttpServer> answering(int status, String body) async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      server.listen((request) async {
+        await request.drain<void>();
+        request.response
+          ..statusCode = status
+          ..write(body);
+        await request.response.close();
+      });
+      return server;
+    }
+
+    const contribution = ServiceContribution(
+      escrowKeyHex: '02ab',
+      attemptIdHex: 'aa',
+      serviceIdentifierHex: '44',
+      contributionHex: '55',
+    );
+
+    test('"ready" — the service holds both halves and they check out', () async {
+      final server = await answering(200, '{"state":"ready"}');
+      addTearDown(() => server.close(force: true));
+      await HttpServiceDelivery().deliver('http://127.0.0.1:${server.port}', contribution);
+    });
+
+    test('"waiting" is not delivered: the half that should be there first is not', () async {
+      // The cosigner's half always reaches the service before the wallet learns where to send its
+      // own, so a service still waiting for it has lost it — and confirming would vouch for a
+      // pairing that can never finish.
+      final server = await answering(202, '{"state":"waiting"}');
+      addTearDown(() => server.close(force: true));
+      await expectLater(
+        HttpServiceDelivery().deliver('http://127.0.0.1:${server.port}', contribution),
+        throwsA(isA<ServiceDeliveryException>().having((e) => e.refused, 'refused', isTrue)),
+      );
     });
   });
 }

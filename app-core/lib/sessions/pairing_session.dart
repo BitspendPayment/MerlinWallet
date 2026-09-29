@@ -31,13 +31,17 @@
 /// ```
 ///
 /// Steps 2-4 are retryable for one attempt, because the wallet's slope is *derived* from its
-/// passkey under the escrow key and the attempt id — so redelivering reproduces the same
+/// passkey under the escrow's context and the attempt id — so redelivering reproduces the same
 /// contribution rather than a second, incompatible one. A failure at step 1 is different: the
 /// cosigner's half is never retained, so that attempt is dead and the wallet pairs again under a
 /// fresh attempt id.
 ///
 /// A stream rather than one call, because the wallet has to rebuild its escrow share before it can
 /// deal, and it keeps no share: the halves it needs arrive on the first server message.
+///
+/// An escrow minted for a service is paired on the stream that mints it instead — the wallet holds
+/// the share it just made, so there is nothing to rebuild — and confirmed there too. Both streams
+/// deal through [dealPairing].
 library;
 
 import 'dart:convert';
@@ -97,10 +101,6 @@ class PairingSession {
         resolveEscrow,
     CancelSignal? cancel,
   }) async {
-    // The delivery is an HTTP call carrying a secret, and the confirmation is what makes the
-    // pairing usable: neither may go on after the owner has cancelled. See `CancelSignal`.
-    Future<T> guarded<T>(Future<T> work) => cancel?.guard(work) ?? work;
-
     // The escrow's other holder: the one identifier in its package that is not this wallet's. A
     // 2-of-2 has exactly one, and anything else is not the escrow this wallet thinks it is.
     final others = escrowPkp.verifyingShares.keys.where((id) => id != walletIdentifier).toList();
@@ -133,84 +133,113 @@ class PairingSession {
         ready.ready.escrowDeltaShare,
       );
 
-      // Deal onto {service, cosigner}. The slope is drawn, not derived: it is used once and never
-      // needed again — unlike the escrow delta, nothing later has to reproduce it.
-      // The slope is derived, not drawn — see `pairingSlope`. That is what makes step 2 below
-      // retryable: the same attempt reproduces the same contribution.
-      final (atService, atCosigner) = threshold.refreshShareToId(
-        escrowKp,
-        [walletIdentifier, cosignerId],
-        serviceIdentifier,
-        cosignerId,
-        slope,
+      return await dealPairing(
+        escrowKp: escrowKp,
+        escrowKeyHex: escrowKeyHex,
+        walletIdentifier: walletIdentifier,
+        cosignerId: cosignerId,
+        serviceIdentifier: serviceIdentifier,
+        slope: slope,
+        delivery: _delivery,
+        cancel: cancel,
+        exchange: (deal) async {
+          duplex.send(cs.PairServiceClientMsg(sessionId: '', seq: Int64(1), deal: deal));
+          final done = await duplex.next('the pairing');
+          if (!done.hasDone()) {
+            throw CosignerException('expected the pairing, got ${done.whichBody()}');
+          }
+          return done.done;
+        },
+        // A call of its own: the cosigner ended this stream when it sent `Done`, so the tenant is
+        // free for it.
+        confirm: (attemptId) => _conn.pairServiceConfirm(cs.PairServiceConfirmRequest(
+          escrowKey: escrowKeyHex,
+          attemptId: attemptId,
+        )),
       );
-
-      duplex.send(cs.PairServiceClientMsg(
-        sessionId: '',
-        seq: Int64(1),
-        deal: cs.PairServiceDeal(
-          contributionToCosigner: threshold.bigIntToBytes(atCosigner),
-          // A point, never the scalar behind it.
-          contributionToService: Uint8List.fromList(
-            threshold.elemSerializeCompressed(threshold.elemBaseMul(atService)),
-          ),
-        ),
-      ));
-
-      final done = await duplex.next('the pairing');
-      if (!done.hasDone()) {
-        throw CosignerException('expected the pairing, got ${done.whichBody()}');
-      }
-      final pkp = threshold.PublicKeyPackage.fromJson(
-          jsonDecode(done.done.publicKeyPackageJson) as Map<String, dynamic>);
-
-      // A refresh preserves the key. If this one did not, the pairing signs for something that is
-      // not the escrow — and money already in the escrow would be unreachable through it.
-      final derived = threshold
-          .elemSerializeCompressed(pkp.verifyingKey.E)
-          .map((b) => b.toRadixString(16).padLeft(2, '0'))
-          .join();
-      if (derived.toLowerCase() != escrowKeyHex.toLowerCase()) {
-        throw CosignerException(
-          'the pairing moved the escrow key: it was $escrowKeyHex and the pairing signs for '
-          '$derived',
-        );
-      }
-
-      // --- The wallet's own half, to the origin the enclave resolved ---------------------------
-      //
-      // Directly, and not through the cosigner: one that held both terms could sign as the service.
-      final attemptHex = _hex(done.done.attemptId);
-      final origin = done.done.serviceOrigin;
-      if (origin.isEmpty) {
-        throw CosignerException(
-          'the cosigner delivered its half but did not say where, so this wallet cannot send its '
-          'own to the same place',
-        );
-      }
-      await guarded(_delivery.deliver(
-        origin,
-        ServiceContribution(
-          escrowKeyHex: escrowKeyHex,
-          attemptIdHex: attemptHex,
-          serviceIdentifierHex: _hex(serviceIdentifier.serialize()),
-          contributionHex: _hex(threshold.bigIntToBytes(atService)),
-        ),
-      ));
-
-      // The service has both and has checked the share they sum to — it answered 2xx, which is what
-      // that means. Only now is the pairing usable, and only now does the cosigner agree.
-      await guarded(_conn.pairServiceConfirm(cs.PairServiceConfirmRequest(
-        escrowKey: escrowKeyHex,
-        attemptId: done.done.attemptId,
-      )));
-
-      return PairingResult(pkp, done.done.serviceVerifyingShare, attemptHex, origin);
     } finally {
       await duplex.close();
     }
   }
-
-  static String _hex(List<int> bytes) =>
-      bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 }
+
+/// Steps 1-4 above, from the wallet's side, once it holds its escrow share [escrowKp]: deal onto
+/// `{service, cosigner}`, let the cosigner deliver its half, deliver this wallet's half to the
+/// origin the cosigner resolved, and confirm.
+///
+/// [exchange] sends the dealing and returns the cosigner's `PairServiceDone`; [confirm] tells the
+/// cosigner this wallet's half was taken. Each stream that pairs says how, on its own messages.
+Future<PairingResult> dealPairing({
+  required threshold.KeyPackage escrowKp,
+  required String escrowKeyHex,
+  required threshold.Identifier walletIdentifier,
+  required threshold.Identifier cosignerId,
+  required threshold.Identifier serviceIdentifier,
+  required BigInt slope,
+  required DeliverToService delivery,
+  required Future<cs.PairServiceDone> Function(cs.PairServiceDeal deal) exchange,
+  required Future<void> Function(List<int> attemptId) confirm,
+  CancelSignal? cancel,
+}) async {
+  // The delivery is an HTTP call carrying a secret, and the confirmation is what makes the pairing
+  // usable: neither may go on after the owner has cancelled. See `CancelSignal`.
+  Future<T> guarded<T>(Future<T> work) => cancel?.guard(work) ?? work;
+
+  // Deal onto {service, cosigner}. The slope is derived, not drawn — see `pairingSlope`. That is
+  // what makes step 2 retryable: the same attempt reproduces the same contribution.
+  final (atService, atCosigner) = threshold.refreshShareToId(
+    escrowKp,
+    [walletIdentifier, cosignerId],
+    serviceIdentifier,
+    cosignerId,
+    slope,
+  );
+
+  final done = await exchange(cs.PairServiceDeal(
+    contributionToCosigner: threshold.bigIntToBytes(atCosigner),
+    // A point, never the scalar behind it.
+    contributionToService: Uint8List.fromList(
+      threshold.elemSerializeCompressed(threshold.elemBaseMul(atService)),
+    ),
+  ));
+  final pkp = threshold.PublicKeyPackage.fromJson(
+      jsonDecode(done.publicKeyPackageJson) as Map<String, dynamic>);
+
+  // A refresh preserves the key. If this one did not, the pairing signs for something that is not
+  // the escrow — and money already in the escrow would be unreachable through it.
+  final derived = _hex(threshold.elemSerializeCompressed(pkp.verifyingKey.E));
+  if (derived.toLowerCase() != escrowKeyHex.toLowerCase()) {
+    throw CosignerException(
+      'the pairing moved the escrow key: it was $escrowKeyHex and the pairing signs for $derived',
+    );
+  }
+
+  // --- The wallet's own half, to the origin the enclave resolved -------------------------------
+  //
+  // Directly, and not through the cosigner: one that held both terms could sign as the service.
+  final attemptHex = _hex(done.attemptId);
+  final origin = done.serviceOrigin;
+  if (origin.isEmpty) {
+    throw CosignerException(
+      'the cosigner delivered its half but did not say where, so this wallet cannot send its own '
+      'to the same place',
+    );
+  }
+  await guarded(delivery.deliver(
+    origin,
+    ServiceContribution(
+      escrowKeyHex: escrowKeyHex,
+      attemptIdHex: attemptHex,
+      serviceIdentifierHex: _hex(serviceIdentifier.serialize()),
+      contributionHex: _hex(threshold.bigIntToBytes(atService)),
+    ),
+  ));
+
+  // The service has both and has checked the share they sum to — it answered "ready", which is
+  // what that means. Only now is the pairing usable, and only now does the cosigner agree.
+  await guarded(confirm(done.attemptId));
+
+  return PairingResult(pkp, done.serviceVerifyingShare, attemptHex, origin);
+}
+
+String _hex(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();

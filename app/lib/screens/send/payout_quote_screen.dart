@@ -125,8 +125,8 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
   }
 
   Widget _waiting() {
-    final setUpApprovals = BankSend.approvalsNeeded(hasEscrow: false, shortfall: 0) -
-        BankSend.approvalsNeeded(hasEscrow: true, shortfall: 0);
+    final setUpApprovals =
+        BankSend.approvalsNeeded(hasEscrow: false) - BankSend.approvalsNeeded(hasEscrow: true);
     return Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -146,7 +146,7 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
           Text(
             _settingUp
                 ? 'Once only: an escrow your payouts are paid from, with the payout service '
-                    'paired into it. Approve $setUpApprovals times with your passkey.'
+                    'paired into it. Approve ${approvalTimes(setUpApprovals)} with your passkey.'
                 : 'Asking the payout service what this costs.',
             textAlign: TextAlign.center,
             style: GoogleFonts.inter(color: Colors.white54, fontSize: 14),
@@ -181,7 +181,7 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
   Widget _review() {
     final d = widget.draft, q = _quote!, f = _funding!;
     final balance = context.watch<MpcService>().arkBalance.toInt();
-    final approvals = BankSend.approvalsNeeded(hasEscrow: true, shortfall: f.topUp);
+    final approvals = BankSend.approvalsNeeded(hasEscrow: true);
     final matched = q.nameCheck == 'MATCHED';
     final affordable = f.topUp <= balance;
     final expired = DateTime.now().isAfter(q.expiresAt);
@@ -223,8 +223,8 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
               ]),
               const SizedBox(height: 12),
               Text(
-                "You'll approve ${approvals == 1 ? 'once' : '$approvals times'} with your "
-                'passkey: ${f.topUp > 0 ? 'to top up your escrow, then ' : ''}to seal the deal.',
+                "You'll approve ${approvalTimes(approvals)} with your passkey: "
+                '${f.topUp > 0 ? 'to top up your escrow and seal the deal' : 'to seal the deal'}.',
                 style: GoogleFonts.inter(color: Colors.white54, fontSize: 13),
               ),
               if (!affordable) ...[

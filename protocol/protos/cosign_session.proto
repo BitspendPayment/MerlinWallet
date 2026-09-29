@@ -475,6 +475,10 @@ message SendOpen {
   // public, so this authenticates nobody — the runtime did that, per tenant. What it catches is a
   // wallet that is not this one: a wrong passkey, or a PRF that answers differently.
   bytes identifier = 8;
+  // Set when this send tops an escrow up: commit that escrow to this deal once the send is final,
+  // on the same approval. The recipient is then the escrow's address. Checked before anything is
+  // built — a deal that could not be struck now is refused while no money has moved.
+  EscrowOpenSessionRequest escrow_commit = 9;
 }
 
 message SendSigned {
@@ -544,6 +548,9 @@ message SendComplete {
   string ark_txid = 1;
   // The change VTXO the send produced, absent when it spent the inputs exactly.
   ChangeVtxo change = 2;
+  // The deal `SendOpen.escrow_commit` asked for, sealed. Absent means NOT committed — which is
+  // also what a cosigner from before this field answers.
+  EscrowOpenSessionResponse committed = 3;
 }
 
 message ChangeVtxo {
@@ -716,6 +723,10 @@ message EscrowClientMsg {
   oneof body {
     EscrowOpen open = 3;
     EscrowRound2 round2 = 4;
+    // After `EscrowComplete`, when `EscrowOpen` named a service: pair it into the new escrow on
+    // this same approval — the wallet's dealing, then word that its own half was delivered.
+    PairServiceDeal deal = 5;
+    PairServiceConfirmRequest delivered = 6;
   }
 }
 
@@ -729,6 +740,10 @@ message EscrowOpen {
   // so a repeat is refused: two escrows dealt on one delta are two points on one line, and two
   // points determine it. 16 bytes, drawn fresh by the wallet.
   bytes context = 3;
+  // Optionally, a service to pair into the escrow once it is minted — as `PairServiceOpen` names
+  // one, and checked as it is, before anything is dealt. Both empty: mint only.
+  bytes service_identifier = 4;
+  bytes attempt_id = 5;
 }
 
 // JSON: the wallet's share of its own delta, addressed to the cosigner.
@@ -740,6 +755,11 @@ message EscrowServerMsg {
   oneof body {
     EscrowRound1Out round1 = 3;
     EscrowComplete complete = 4;
+    // The pairing that follows, when one was asked for: the cosigner's half delivered and sealed
+    // pending, then the wallet's confirmation taken. No `PairServiceReady` — the wallet already
+    // holds the escrow share it just minted.
+    PairServiceDone paired = 5;
+    PairServiceConfirmResponse confirmed = 6;
   }
 }
 

@@ -28,6 +28,7 @@ import 'package:app_core/passkey/seed_source.dart';
 import 'package:app_core/passkey/share_reconstruction.dart';
 import 'package:app_core/passkey/wallet_public_state.dart';
 import 'package:app_core/persistence/wallet_store.dart';
+import 'package:app_core/sessions/service_delivery.dart';
 import 'package:app_core/threshold_types.dart' as threshold;
 
 import 'support/ceremony.dart' show seed;
@@ -66,6 +67,26 @@ class ObservedSeedSource implements SeedSource {
     } finally {
       _capturing = false;
     }
+  }
+}
+
+/// A service's pairing endpoint, as far as the wallet can tell: it takes the half, turns it down,
+/// or never answers.
+class ScriptedDelivery implements DeliverToService {
+  ScriptedDelivery({this.refuse = false, this.hang = false});
+  final bool refuse;
+  final bool hang;
+  final List<ServiceContribution> taken = [];
+
+  /// Completes when the wallet first tries to deliver.
+  final Completer<void> asked = Completer<void>();
+
+  @override
+  Future<void> deliver(String origin, ServiceContribution contribution) async {
+    if (!asked.isCompleted) asked.complete();
+    if (hang) return Completer<void>().future;
+    if (refuse) throw ServiceDeliveryException('the service turned it down', refused: true);
+    taken.add(contribution);
   }
 }
 
@@ -703,6 +724,66 @@ void main() {
 
       dismiss = false;
       await d.client.sign(message);
+    });
+  });
+
+  group('setting an escrow up for a service', () {
+    final platform = threshold.Identifier.derive(Uint8List.fromList('the platform'.codeUnits));
+
+    test('mints and pairs on one approval, and the operation is over when it returns', () async {
+      final box = newBox();
+      final d = device(seed(40), box);
+      await d.client.doDkg();
+      d.approvals.clear();
+      final delivery = ScriptedDelivery();
+
+      final set = await d.client.setUpEscrow(serviceIdentifier: platform, delivery: delivery);
+      expect(d.approvals, ['/cosigner.v1.Cosigner/Escrow']);
+      expect(delivery.taken, hasLength(1), reason: "the wallet's half went to the service");
+      expect(cosigner.pairingsConfirmed, 1);
+      expect(d.client.escrows.map((e) => e.escrowKeyHex), [set.escrow.escrowKeyHex]);
+      expect(d.operations.last.isDisposed, isTrue);
+      expect(d.operations.last.holdsSecrets, isFalse,
+          reason: 'the escrow share it minted went with the operation');
+      expect(d.seeds.handedOut, everyElement(everyElement(0)));
+      await expectNothingSecretAtRest(box, seed(40));
+    });
+
+    test('a delivery that fails is not confirmed, and the escrow it minted is kept', () async {
+      final d = device(seed(41), newBox());
+      await d.client.doDkg();
+      final delivery = ScriptedDelivery(refuse: true);
+
+      await expectLater(
+        d.client.setUpEscrow(serviceIdentifier: platform, delivery: delivery),
+        throwsA(isA<ServiceDeliveryException>()),
+      );
+      expect(cosigner.pairingsConfirmed, 0,
+          reason: 'a pairing whose wallet half never arrived must not be vouched for');
+      expect(d.client.escrows, hasLength(1),
+          reason: 'the escrow exists at the cosigner, so this wallet remembers it');
+      expect(d.operations.last.holdsSecrets, isFalse);
+      expect(d.client.operationInProgress, isFalse);
+    });
+
+    test('a delivery that never ends is cancelled, and takes the escrow share with it', () async {
+      final d = device(seed(42), newBox());
+      await d.client.doDkg();
+      final delivery = ScriptedDelivery(hang: true);
+
+      final setting = d.client.setUpEscrow(serviceIdentifier: platform, delivery: delivery);
+      await delivery.asked.future;
+      expect(d.operations.last.holdsSecrets, isTrue,
+          reason: 'the minted share is held while the service is waited on');
+
+      // Listened to before cancelling, so the error it ends with is caught when it arrives.
+      final outcome = expectLater(setting, throwsA(isA<OperationCancelled>()));
+      await d.client.cancelOperation();
+      await outcome;
+      expect(cosigner.pairingsConfirmed, 0);
+      expect(d.operations.last.isDisposed, isTrue);
+      expect(d.operations.last.holdsSecrets, isFalse);
+      expect(d.client.operationInProgress, isFalse, reason: 'its turn is released');
     });
   });
 

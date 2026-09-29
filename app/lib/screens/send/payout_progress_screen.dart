@@ -166,8 +166,7 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
   List<Widget> _steps(Payout p) {
     final steps = [
       if (p.setUp) 'set_up',
-      for (final s in payoutSteps)
-        if (s != 'top_up' || p.topUpSats > 0) s,
+      ...payoutSteps,
     ];
     final at = p.step == 'done' ? steps.length : max(0, steps.indexOf(p.step));
     return [
@@ -176,8 +175,9 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
           title: switch (s) {
             'set_up' => 'Set up sending',
             'policy' => "Check the platform's terms",
-            'top_up' => 'Top up your escrow · ${formatSats(p.topUpSats)} sats',
-            'seal' => 'Seal the deal',
+            'seal' => p.topUpSats > 0
+                ? 'Top up your escrow and seal the deal · ${formatSats(p.topUpSats)} sats'
+                : 'Seal the deal',
             'fund' => 'The platform pays',
             'pay' => 'Paid out to ${p.fullName}',
             _ => 'The platform is repaid · ${formatSats(p.sats)} sats',
@@ -195,7 +195,7 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
                   ? p.failure ?? 'It did not go through.'
                   : switch (s) {
                       'policy' => 'That it holds the platform to what you agreed',
-                      'top_up' || 'seal' => 'Approve with your passkey',
+                      'seal' => 'Approve with your passkey',
                       'fund' => p.note ?? 'It checks it will be repaid, then pays',
                       'pay' => p.gridStatus == null
                           ? 'Waiting for the money to arrive'

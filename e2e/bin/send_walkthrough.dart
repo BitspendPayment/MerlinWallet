@@ -6,7 +6,8 @@
 ///
 /// Alice pays a Nigerian bank, a Kenyan M-PESA wallet, Ghanaian mobile money, a Ghanaian bank and a
 /// South African bank, through the same wallet library the app uses (`BankSend`): quote, check the
-/// policy, top the escrow up to the price, seal, and let MerlinPlatform pay and be repaid. Then the
+/// policy, top the escrow up to the price and seal, and let MerlinPlatform pay and be repaid — each
+/// payout counting the passkey approvals it really took. Then the
 /// cases that must not work: a payout that fails, a payee the bank does not know, messages the
 /// enclave did not send, a policy sealed with a term added, a deal too short to be repaid in.
 ///
@@ -20,6 +21,7 @@ import 'dart:io';
 
 import 'package:app_core/asp/asp_client.dart' show IndexerVtxo;
 import 'package:app_core/client.dart';
+import 'package:app_core/enclave/authenticator.dart' show SoftwareAuthenticator;
 import 'package:app_core/platform/bank_send.dart';
 import 'package:app_core/platform/platform_client.dart';
 import 'package:app_core/sessions/service_delivery.dart' show RewritingDelivery;
@@ -71,25 +73,25 @@ Future<void> main() async {
       return out;
     }
 
-    final flow = _Flow(send, alice.client, btc);
+    final flow = _Flow(send, alice.client, alice.gate.authenticator as SoftwareAuthenticator, btc);
 
     _step('1. ₦30,000 to a Nigerian bank — the first send also sets up the escrow');
     await flow.pay('NG', 'bank', await fields('NG', 'bank', '0123456789'), 3000000,
-        approvals: 5);
+        approvals: 2);
 
     _step('2. Straight after: KSh 1,500 to M-PESA — the last deal was spent, so the escrow is free');
     await flow.pay('KE', 'mobile_money', await fields('KE', 'mobile_money', '+254712345678'), 150000,
-        approvals: 2);
+        approvals: 1);
 
     _step('3. Ghana, mobile money and then a bank; then a South African bank');
     await flow.pay('GH', 'mobile_money', await fields('GH', 'mobile_money', '+233241234567'), 20000,
-        approvals: 2);
-    await flow.pay('GH', 'bank', await fields('GH', 'bank', '1234567890'), 20000, approvals: 2);
-    await flow.pay('ZA', 'bank', await fields('ZA', 'bank', '1234567890'), 50000, approvals: 2);
+        approvals: 1);
+    await flow.pay('GH', 'bank', await fields('GH', 'bank', '1234567890'), 20000, approvals: 1);
+    await flow.pay('ZA', 'bank', await fields('ZA', 'bank', '1234567890'), 50000, approvals: 1);
 
     _step('4. R 500 to a South African account the bank cannot pay (…002)');
     await flow.pay('ZA', 'bank', await fields('ZA', 'bank', '1234567002'), 50000,
-        approvals: 2, fails: true);
+        approvals: 1, fails: true);
     _say('the platform ended the deal it gave up on, so the escrow still holds that price — and the '
         'next send of the same amount needs no top-up');
     await flow.pay('ZA', 'bank', await fields('ZA', 'bank', '1234567890'), 50000, approvals: 1);
@@ -173,17 +175,22 @@ Future<void> main() async {
   }
 }
 
-/// One payout after another through the same escrow, checking that exactly the price moves.
+/// One payout after another through the same escrow, checking that exactly the price moves — and
+/// that the owner was asked exactly as often as the app says they will be.
 class _Flow {
-  _Flow(this.send, this.wallet, this.btc);
+  _Flow(this.send, this.wallet, this.passkey, this.btc);
   final BankSend send;
   final MpcClient wallet;
+
+  /// Counts its assertions, and every approval is one: what the owner was really asked.
+  final SoftwareAuthenticator passkey;
   final RegtestHelper btc;
   String? escrow;
 
   Future<void> pay(String country, String rail, Map<String, String> fields, int amountMinor,
       {required int approvals, bool fails = false}) async {
     final hadEscrow = escrow != null;
+    final askedBefore = passkey.counter;
     escrow = await send.ensureEscrow(known: escrow);
     final quote = await send.quote(
       escrowKeyHex: escrow!,
@@ -196,8 +203,7 @@ class _Flow {
     _say('${quote.currency} ${amountMinor / 100} to ${fields.values.join(' ')} '
         'for ${quote.sats} sats; the bank says ${quote.nameAtBank ?? '—'} (${quote.nameCheck ?? 'no check'})');
 
-    final short = BankSend.shortfall(quote.sats, await send.held(escrow!));
-    final needed = BankSend.approvalsNeeded(hasEscrow: hadEscrow, shortfall: short);
+    final needed = BankSend.approvalsNeeded(hasEscrow: hadEscrow);
     if (needed != approvals) {
       throw StateError('expected $approvals approvals, the flow needs $needed');
     }
@@ -205,6 +211,10 @@ class _Flow {
     final treasuryBefore = await _treasurySats();
     final committed = await _whileMining(
         btc, () => send.commit(quote, escrowKeyHex: escrow!, fields: fields));
+    final asked = passkey.counter - askedBefore;
+    if (asked != approvals) {
+      throw StateError('the owner was asked $asked times, not the $approvals the app says');
+    }
     final escrowBefore = _sats(await send.held(escrow!));
     _say('sealed: ${committed.agreed}');
     await send.fund(quote);

@@ -622,39 +622,81 @@ class MpcClient {
   /// failure to draw properly is loud rather than silent.
   ///
   /// One approval, which is also where the seed comes from.
-  Future<EscrowPublicState> createEscrow() async {
-    final context = Uint8List.fromList(
-      List<int>.generate(16, (_) => _secureRandom.nextInt(256)),
-    );
-    return _withOperation<void, EscrowPublicState>(
+  Future<EscrowPublicState> createEscrow() async => (await _mintEscrow()).escrow;
+
+  /// Mint an escrow and pair [serviceIdentifier] into it, on ONE approval — what [createEscrow]
+  /// and then [pairService] do, on one stream.
+  ///
+  /// The escrow is saved the moment it exists, before anything is dealt on it, so a pairing that
+  /// fails leaves an escrow this wallet knows it holds; pairing it again is [pairService].
+  ///
+  /// Returns once the service has both halves and this wallet has confirmed. The pairing is usable
+  /// a moment later, when the service's own confirmation reaches the cosigner — it cannot while
+  /// this stream holds the tenant. See [pairService].
+  Future<({EscrowPublicState escrow, PairingResult pairing})> setUpEscrow({
+    required threshold.Identifier serviceIdentifier,
+    DeliverToService? delivery,
+  }) async {
+    final set = await _mintEscrow(pairWith: serviceIdentifier, delivery: delivery);
+    return (escrow: set.escrow, pairing: set.pairing!);
+  }
+
+  Future<({EscrowPublicState escrow, PairingResult? pairing})> _mintEscrow({
+    threshold.Identifier? pairWith,
+    DeliverToService? delivery,
+  }) async {
+    final context = _random16();
+    // Both drawn before the approval: the operation reads the passkey once, before the escrow key
+    // exists, so the slope is derived under the escrow's context — see `pairingSlope`.
+    final attempt = pairWith == null ? null : _random16();
+    return _withOperation<void, ({EscrowPublicState escrow, PairingResult? pairing})>(
       'Escrow',
       escrowContext: context,
+      pairingContext: attempt == null ? null : Uint8List.fromList([...context, ...attempt]),
       prepare: _nothingToPrepare,
       run: (operation, _) async {
         final wallet = _wallet!;
+        EscrowPublicState? escrow;
         final result = await EscrowSession(_conn).run(
           walletId: operation.identifier,
           walletPkp: wallet.publicKeyPackage,
           resolveWallet: operation.keyPackage,
           delta: operation.takeEscrowDelta(),
           context: context,
-        );
-        final escrow = EscrowPublicState(
-          escrowKeyHex: result.escrowKeyHex,
-          wallet: WalletPublicState.fromPublicKeyPackage(
-            result.publicKeyPackage,
-            result.keyPackage.identifier,
-            minSigners: _minSigners,
-          ),
-          contextHex: hex.encode(context),
+          pair: pairWith == null
+              ? null
+              : (
+                  service: pairWith,
+                  attemptId: attempt!,
+                  slope: operation.takePairingSlope(),
+                  delivery: delivery ?? HttpServiceDelivery(),
+                  cancel: operation.cancel,
+                ),
+          onMinted: (minted) async {
+            // The share lives in the operation, so it is let go with it — never in this frame.
+            operation.holdEscrowKeyPackage(minted.keyPackage);
+            escrow = EscrowPublicState(
+              escrowKeyHex: minted.escrowKeyHex,
+              wallet: WalletPublicState.fromPublicKeyPackage(
+                minted.publicKeyPackage,
+                minted.keyPackage.identifier,
+                minSigners: _minSigners,
+              ),
+              contextHex: hex.encode(context),
+            );
+            _stillRunning(operation);
+            _escrows.add(escrow!);
+            await _saveState();
+          },
         );
         _stillRunning(operation);
-        _escrows.add(escrow);
-        await _saveState();
-        return escrow;
+        return (escrow: escrow!, pairing: result.pairing);
       },
     );
   }
+
+  static Uint8List _random16() =>
+      Uint8List.fromList(List<int>.generate(16, (_) => _secureRandom.nextInt(256)));
 
   /// Pair a service into an escrow: a second 2-of-2 over the same key.
   ///
@@ -694,10 +736,10 @@ class MpcClient {
     if (attempt.length != 16) {
       throw ArgumentError('a pairing attempt id is 16 bytes');
     }
-    // The escrow key and the attempt together: one attempt reproduces, and a second attempt deals a
-    // different line. Two pairings on one slope are two points on it.
+    // The escrow's context and the attempt together: one attempt reproduces, and a second attempt
+    // deals a different line. Two pairings on one slope are two points on it.
     final pairingContext = Uint8List.fromList([
-      ...hex.decode(escrow.escrowKeyHex),
+      ...hex.decode(escrow.contextHex),
       ...attempt,
     ]);
 
@@ -1030,7 +1072,41 @@ class MpcClient {
   /// The wallet no longer builds the transaction — the cosigner does, and hands back sighashes to
   /// FROST-sign. What the wallet does instead is talk to the ASP: `SubmitTx`, then `FinalizeTx`,
   /// then tell the cosigner it was accepted so the send is recorded only once it is real.
-  Future<String> sendVtxo(String recipientArkAddress, int amountSats) {
+  Future<String> sendVtxo(String recipientArkAddress, int amountSats) async =>
+      (await _send(recipientArkAddress, amountSats)).arkTxid;
+
+  /// Top an escrow up by [amountSats] and commit it to a deal, on ONE approval — [sendVtxo] to
+  /// the escrow's address and then [openEscrowSession], on one stream.
+  ///
+  /// A deal the cosigner could not strike right now — no service ready in the escrow, a deal still
+  /// holding it — is refused before anything is built, so a refusal moves no money.
+  ///
+  /// `agreed` is the policy as the cosigner renders it, which is what the owner agreed to. Null
+  /// means the escrow was topped up but NOT committed — a cosigner from before sends could commit
+  /// one — and [openEscrowSession] commits it.
+  Future<({String arkTxid, String? agreed})> fundEscrowDeal({
+    required String escrowKeyHex,
+    required int amountSats,
+    required Map<String, dynamic> policy,
+    required DateTime deadline,
+  }) async {
+    final result = await _send(
+      await escrowArkAddress(escrowKeyHex),
+      amountSats,
+      escrowCommit: cs.EscrowOpenSessionRequest(
+        escrowKey: escrowKeyHex,
+        policyJson: jsonEncode(policy),
+        deadlineSecs: Int64(deadline.millisecondsSinceEpoch ~/ 1000),
+      ),
+    );
+    return (arkTxid: result.arkTxid, agreed: result.committed?.policyDescription);
+  }
+
+  Future<SendResult> _send(
+    String recipientArkAddress,
+    int amountSats, {
+    cs.EscrowOpenSessionRequest? escrowCommit,
+  }) {
     return _withOperation('Send',
         prepare: () async => (info: await _asp.getInfo(), vtxos: await listVtxos()),
         run: (operation, prepared) async {
@@ -1047,13 +1123,14 @@ class MpcClient {
         deviceToken: _deviceToken ?? '',
         exitScriptPubkeyHex: exitScriptPubkeyHex,
         ownerXOnlyHex: _ownerXOnly,
+        escrowCommit: escrowCommit,
       );
       _stillRunning(operation);
       _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
       // A send spends what the old delegate covered, so the cosigner dropped it: what is sealed
       // now is whatever this send sealed, or nothing.
       await _recordDelegate(result.delegate);
-      return result.arkTxid;
+      return result;
     });
   }
 

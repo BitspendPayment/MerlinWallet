@@ -1,9 +1,10 @@
 /// A cosigner that lives in the test process.
 ///
 /// The real one is a wasm component inside an enclave, and proving what `MpcClient` does with its
-/// secrets should not need one. This speaks the same three parts of `cosigner.v1.Cosigner` the
-/// wallet's own lifecycle needs — `Dkg`, `Sign`, `Recover` — over real gRPC on a loopback port,
-/// playing the cosigner's half of each ceremony with the same threshold library the wallet uses.
+/// secrets should not need one. This speaks the parts of `cosigner.v1.Cosigner` the wallet's own
+/// lifecycle needs — `Dkg`, `Sign`, `Recover`, and `Escrow` as far as minting — over real gRPC on a
+/// loopback port, playing the cosigner's half of each ceremony with the same threshold library the
+/// wallet uses.
 /// `Send` and `Settle` need an ASP and are the e2e suite's.
 ///
 /// It keeps the contract the real one keeps (`cosigner/src/handlers/recover.rs`,
@@ -246,16 +247,78 @@ class FakeCosigner extends cs.CosignerServiceBase {
 
   // --- Escrow ------------------------------------------------------------------------------------
 
-  /// Not implemented here. The escrow reshare is proved against the real handler in
-  /// `cosigner/tests/escrow_test.rs` and the derivation in `escrow_derivation_test.dart`; this fake
-  /// exists for the operation lifecycle — locks, cancellation, what a stream may ask for — and a
-  /// half-built reshare would test the fake rather than the wallet.
+  /// Where a pairing on the `Escrow` stream says the cosigner delivered its half. Nothing listens:
+  /// the wallet's half goes wherever the test's `DeliverToService` sends it.
+  String pairingOrigin = 'http://127.0.0.1:9';
+
+  /// How many times a wallet said, on an `Escrow` stream, that its half was delivered.
+  int pairingsConfirmed = 0;
+
+  /// The reshare, as the real cosigner plays it — so a wallet mints a real escrow key and rebuilds
+  /// its share for real — and, when the open names a service, the pairing that follows **in shape
+  /// only**: its decisions are proved against the real handler (`cosigner/tests/pairing_test.rs`)
+  /// and in the e2e suite. This fake is for the operation around it: one approval, what the
+  /// operation holds, and what a delivery that fails or never ends leaves behind.
   @override
   Stream<cs.EscrowServerMsg> escrow(
     ServiceCall call,
     Stream<cs.EscrowClientMsg> request,
   ) async* {
-    throw GrpcError.unimplemented('this fake does not mint escrow keys');
+    final inbound = StreamIterator(request);
+    if (!await inbound.moveNext() || !inbound.current.hasOpen()) {
+      throw GrpcError.invalidArgument('a session must open with EscrowOpen');
+    }
+    final open = inbound.current.open;
+    final dealt = _dealtShareFor(open.identifier);
+    final keyPackage = _keyPackage!;
+    final walletId = _walletIdentifier!;
+    final ownId = keyPackage.identifier;
+    final walletR1 = threshold.Round1Package.fromJson(jsonDecode(open.round1Package));
+
+    final (r1Secret, r1Package) = threshold.dkgResharePart1From(
+        ownId, 2, 2, threshold.newSecretKey(), [threshold.modNRandom()]);
+    yield cs.EscrowServerMsg(
+      seq: Int64(1),
+      round1: cs.EscrowRound1Out(
+        round1Package: jsonEncode(r1Package.toJson()),
+        walletDealtShare: dealt,
+      ),
+    );
+
+    if (!await inbound.moveNext() || !inbound.current.hasRound2()) {
+      throw GrpcError.invalidArgument('expected EscrowRound2');
+    }
+    final fromWallet =
+        threshold.Round2Package.fromJson(jsonDecode(inbound.current.round2.round2Package));
+    final (r2Secret, shares) = threshold.dkgPart2(r1Secret, {walletId: walletR1});
+    final (_, escrowPkp) = threshold.dkgResharePart3(r2Secret, {walletId: walletR1},
+        {walletId: fromWallet}, _publicKeyPackage!, keyPackage, [walletId, ownId]);
+    yield cs.EscrowServerMsg(
+      seq: Int64(2),
+      complete: cs.EscrowComplete(
+        round2Package: jsonEncode(shares[walletId]!.toJson()),
+        escrowKey: _hex(threshold.elemSerializeCompressed(escrowPkp.verifyingKey.E)),
+      ),
+    );
+    if (open.serviceIdentifier.isEmpty) return;
+
+    if (!await inbound.moveNext() || !inbound.current.hasDeal()) {
+      throw GrpcError.invalidArgument('expected PairServiceDeal');
+    }
+    yield cs.EscrowServerMsg(
+      seq: Int64(3),
+      paired: cs.PairServiceDone(
+        // The driver checks only that the pairing signs for the escrow key, which this does.
+        publicKeyPackageJson: jsonEncode(escrowPkp.toJson()),
+        serviceOrigin: pairingOrigin,
+        attemptId: open.attemptId,
+      ),
+    );
+    if (!await inbound.moveNext() || !inbound.current.hasDelivered()) {
+      throw GrpcError.invalidArgument('expected word that the wallet delivered its half');
+    }
+    pairingsConfirmed++;
+    yield cs.EscrowServerMsg(seq: Int64(4), confirmed: cs.PairServiceConfirmResponse());
   }
 
   /// Not implemented here either — and for the same reason. Pairing's decisions are proved against

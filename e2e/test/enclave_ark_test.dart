@@ -1063,6 +1063,96 @@ void main() {
       }
     }, timeout: const Timeout(Duration(minutes: 15)));
 
+    /// Setting an escrow up for a service is ONE approval: the mint and the pairing are one stream,
+    /// and the wallet's word that its half arrived rides it too. Nothing else changes — the service
+    /// still assembles and checks for itself, and the cosigner still waits for the service's word,
+    /// which can only land once the stream that paired it has closed.
+    test('an escrow is minted and a service paired into it on one approval', () async {
+      final frank = await wallet('setup_frank');
+      try {
+        await frank.client.doDkg();
+        final passkey = frank.gate.authenticator as SoftwareAuthenticator;
+        final before = passkey.counter;
+
+        final set = await frank.client.setUpEscrow(
+          serviceIdentifier: serviceIdentifier,
+          delivery: delivery,
+        );
+        expect(passkey.counter - before, 1, reason: 'minting and pairing are one approval');
+        expect(service!.isReady(set.escrow.escrowKeyHex, set.pairing.attemptIdHex), isTrue,
+            reason: 'the service must hold a finished share, not one half of one');
+        expect(frank.client.escrows.map((e) => e.escrowKeyHex), [set.escrow.escrowKeyHex]);
+        expect(await readyWithin(frank, set.escrow.escrowKeyHex), 'ready');
+      } finally {
+        await frank.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 15)));
+
+    /// Topping an escrow up and committing it to a deal is ONE approval: the send that funds it
+    /// commits it once final. And a deal the cosigner could not strike is refused before the send
+    /// is built, so a refusal moves no money at all.
+    test('an escrow is topped up and committed on one approval, and a refusal moves nothing',
+        () async {
+      final grace = await wallet('fund_grace');
+      try {
+        await grace.client.doDkg();
+        await boardAndSettle(grace, 0.005);
+        final passkey = grace.gate.authenticator as SoftwareAuthenticator;
+        const policy = {'op': 'always'};
+        final deadline = DateTime.now().add(const Duration(hours: 1));
+        Future<int> heldBy(String escrowKeyHex) async =>
+            (await grace.client.vtxosAtArkAddress(escrowKeyHex.substring(2)))
+                .where((v) => !v.isSpent)
+                .toList()
+                .totalSats;
+
+        // Nothing paired into it: nobody could ever release from it, so there is no deal to strike.
+        final bare = await grace.client.createEscrow();
+        final balance = (await grace.client.listVtxos()).totalSats;
+        await expectLater(
+          whileMining(
+              btc,
+              () => grace.client.fundEscrowDeal(
+                    escrowKeyHex: bare.escrowKeyHex,
+                    amountSats: 20000,
+                    policy: policy,
+                    deadline: deadline,
+                  )),
+          throwsA(predicate((e) => '$e'.contains('no service paired'))),
+        );
+        expect((await grace.client.listVtxos()).totalSats, balance,
+            reason: 'refused before the send was built, so nothing left the wallet');
+        expect(await heldBy(bare.escrowKeyHex), 0);
+
+        final set = await grace.client.setUpEscrow(
+          serviceIdentifier: serviceIdentifier,
+          delivery: delivery,
+        );
+        final key = set.escrow.escrowKeyHex;
+        expect(await readyWithin(grace, key), 'ready');
+
+        final before = passkey.counter;
+        final funded = await whileMining(
+            btc,
+            () => grace.client.fundEscrowDeal(
+                  escrowKeyHex: key,
+                  amountSats: 20000,
+                  policy: policy,
+                  deadline: deadline,
+                ));
+        expect(passkey.counter - before, 1, reason: 'the top-up and the seal are one approval');
+        expect(funded.agreed, isNotNull, reason: 'this cosigner commits on the send');
+
+        final row = (await grace.client.escrowStatus())
+            .firstWhere((e) => e.escrowKey.toLowerCase() == key.toLowerCase());
+        expect(row.session.open, isTrue, reason: 'the escrow is committed to the deal');
+        expect(row.session.deadlineSecs.toInt(), deadline.millisecondsSinceEpoch ~/ 1000);
+        await eventually('the escrow to hold the top-up', () => heldBy(key), (int s) => s == 20000);
+      } finally {
+        await grace.close();
+      }
+    }, timeout: const Timeout(Duration(minutes: 15)));
+
     /// A release, the whole way round: the service asks over the connection the runtime holds, the
     /// cosigner judges it against sealed policy and sealed accounting, signs, and answers on the
     /// same connection.

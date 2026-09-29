@@ -162,5 +162,24 @@ void main() {
           throwsA(isA<ContributionProtocolException>()));
       operation.dispose();
     });
+
+    test('a share the operation minted is held once, and released with the rest', () async {
+      final c = await ceremony(await walletPolynomial(seed(26)));
+      final ctx = context(5);
+      final e = reshare(c, await escrowPolynomial(seed(26), ctx));
+      // The operation that mints: begun with the escrow's context, and no escrow to rebuild.
+      final operation = await WalletOperation.begin(seed(26), wallet: c.wallet, escrowContext: ctx);
+      operation.takeEscrowDelta();
+      operation.keyPackage(bytesOf(c.dealtToWallet));
+
+      expect(identical(operation.holdEscrowKeyPackage(e.walletKp), e.walletKp), isTrue);
+      expect(() => operation.holdEscrowKeyPackage(e.walletKp),
+          throwsA(isA<ContributionProtocolException>()));
+      expect(operation.holdsSecrets, isTrue);
+
+      operation.dispose();
+      expect(operation.holdsSecrets, isFalse, reason: 'the minted share goes with the operation');
+      expect(() => operation.holdEscrowKeyPackage(e.walletKp), throwsStateError);
+    });
   });
 }

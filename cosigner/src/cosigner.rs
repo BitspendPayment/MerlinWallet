@@ -677,10 +677,29 @@ impl Cosigner {
         session: crate::escrow_session::EscrowSession,
         now: i64,
     ) -> Result<(), String> {
+        self.may_commit_escrow(escrow_key, now)?;
         let want = x_only(escrow_key);
         let record = self
             .escrows
             .iter_mut()
+            .find(|e| x_only(&e.escrow_key) == want)
+            .ok_or("this wallet holds no such escrow")?;
+        record.session = Some(session);
+        Ok(())
+    }
+
+    /// Whether [`open_escrow_session`](Self::open_escrow_session) would commit this escrow at
+    /// `now`, without committing it.
+    ///
+    /// A send that tops an escrow up and commits it asks this before anything is built: a deal that
+    /// could not be struck is refused while no money has moved. Nothing else can write between the
+    /// question and the commit — the stream holds the tenant — so with the same `now` the answer
+    /// still holds when the send is final.
+    pub fn may_commit_escrow(&self, escrow_key: &str, now: i64) -> Result<(), String> {
+        let want = x_only(escrow_key);
+        let record = self
+            .escrows
+            .iter()
             .find(|e| x_only(&e.escrow_key) == want)
             .ok_or("this wallet holds no such escrow")?;
         // Before anything else. Signatures a reclaim handed out are valid for as long as the
@@ -726,7 +745,6 @@ impl Cosigner {
                     .into(),
             );
         }
-        record.session = Some(session);
         Ok(())
     }
 

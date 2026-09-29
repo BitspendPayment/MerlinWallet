@@ -293,12 +293,12 @@ class _PayoutFormScreenState extends State<PayoutFormScreen> {
     );
   }
 
-  /// A new escrow holds nothing, so a first send always tops it up.
   String _firstTime() {
-    final all = BankSend.approvalsNeeded(hasEscrow: false, shortfall: 1);
-    final send = BankSend.approvalsNeeded(hasEscrow: true, shortfall: 1);
-    return 'Your first send sets up your escrow first: you approve ${all - send} times with your '
-        'passkey before you see the price, and $send more to send. You only set up once.';
+    final all = BankSend.approvalsNeeded(hasEscrow: false);
+    final send = BankSend.approvalsNeeded(hasEscrow: true);
+    return 'Your first send sets up your escrow first: you approve ${approvalTimes(all - send)} '
+        'with your passkey before you see the price, and ${approvalTimes(send)} more to send. You '
+        'only set up once.';
   }
 
   Widget _field(RailField f) {
