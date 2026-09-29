@@ -42,15 +42,26 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
 
   Future<void> _load() async {
     final payouts = context.read<PayoutService>();
+    Future<void> setUp() async {
+      if (mounted) setState(() => _settingUp = true);
+      await payouts.setUp();
+      _didSetUp = true;
+      if (mounted) setState(() => _settingUp = false);
+    }
+
     try {
       await payouts.ready;
-      if (!payouts.hasEscrow) {
-        if (mounted) setState(() => _settingUp = true);
-        await payouts.setUp();
-        _didSetUp = true;
-        if (mounted) setState(() => _settingUp = false);
+      if (!payouts.hasEscrow) await setUp();
+      PayoutQuote quote;
+      try {
+        quote = await payouts.quote(widget.draft);
+      } catch (e) {
+        // The platform lost its share of the escrow this device remembered, and `quote` forgot
+        // it: set up a new one and ask once more.
+        if (!platformHoldsNoShare(e)) rethrow;
+        await setUp();
+        quote = await payouts.quote(widget.draft);
       }
-      final quote = await payouts.quote(widget.draft);
       final funding = await payouts.funding(quote);
       if (!mounted) return;
       setState(() {

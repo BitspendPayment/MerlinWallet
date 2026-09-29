@@ -156,6 +156,12 @@ String formatSats(int sats) => NumberFormat('#,##0', 'en_US').format(sats);
 /// How many passkey approvals, in words: "once", "twice", "3 times".
 String approvalTimes(int n) => switch (n) { 1 => 'once', 2 => 'twice', _ => '$n times' };
 
+/// Whether [e] is the platform saying it holds no share of the escrow it was asked to quote against
+/// — in the words its quote route refuses with. Its store lost the share, so that escrow can never
+/// pay it again: a new one has to be set up.
+bool platformHoldsNoShare(Object e) =>
+    e is PlatformException && e.refused && e.message.contains('holds no share of that escrow');
+
 /// [e] in words the owner can act on.
 String plainError(Object e) {
   if (e is PolicyRefused) {
@@ -357,17 +363,30 @@ class PayoutService extends ChangeNotifier {
   }
 
   /// The platform's price for [d], and the policy it asks to have sealed. Commits nothing.
+  ///
+  /// An escrow the platform no longer holds a share of is forgotten here — see
+  /// [platformHoldsNoShare] — so the next [setUp] mints a new one.
+  // ponytail: what a forgotten escrow still holds is returned only from a failed payout that used
+  // it; a sweep of forgotten escrows is the upgrade if a platform ever loses shares for real.
   Future<PayoutQuote> quote(PayoutDraft d) async {
     final key = escrowKey;
     if (key == null) throw StateError('Set up sending first.');
-    return _need().quote(
-      escrowKeyHex: key,
-      country: d.corridor.country,
-      rail: d.rail.kind,
-      fields: d.fields,
-      fullName: d.fullName,
-      amountMinor: d.amountMinor,
-    );
+    try {
+      return await _need().quote(
+        escrowKeyHex: key,
+        country: d.corridor.country,
+        rail: d.rail.kind,
+        fields: d.fields,
+        fullName: d.fullName,
+        amountMinor: d.amountMinor,
+      );
+    } catch (e) {
+      if (platformHoldsNoShare(e) && escrowKey == key) {
+        await _box!.delete(_escrowKeyKey);
+        notifyListeners();
+      }
+      rethrow;
+    }
   }
 
   /// What the escrow holds, and what has to be sent to it from the balance for it to hold [q]'s

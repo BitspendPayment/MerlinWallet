@@ -104,4 +104,16 @@ void main() {
       expect(nameError('a' * 251), isNotNull);
     });
   });
+
+  /// A platform that lost its share of the escrow is the one refusal that means "set up again":
+  /// told apart from a refusal about the payee, and from a platform that is merely down.
+  test('the platform losing its share of the escrow is told apart from other refusals', () {
+    const lost = 'this platform holds no share of that escrow, so it is not paired into it';
+    expect(platformHoldsNoShare(PlatformException(lost, status: 400)), isTrue);
+    expect(platformHoldsNoShare(PlatformException(lost, status: 503)), isFalse);
+    expect(
+        platformHoldsNoShare(PlatformException('the account belongs to someone else', status: 400)),
+        isFalse);
+    expect(platformHoldsNoShare(StateError(lost)), isFalse);
+  });
 }
