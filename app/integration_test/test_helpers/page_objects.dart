@@ -95,8 +95,6 @@ class ExitPage {
 }
 
 class ArkPage {
-  static Future<void> tapSend(WidgetTester tester) =>
-      _tapKey(tester, 'arkSendBtn');
   /// Receiving IS boarding: on-chain to the boarding address, then settle.
   static Future<void> tapReceive(WidgetTester tester) =>
       _tapKey(tester, 'arkReceiveBtn');
@@ -117,16 +115,5 @@ class ArkBoardPage {
       find.text('Board Now'),
       timeout: timeout,
     );
-  }
-}
-
-class ArkSendPage {
-  static Future<void> enterAddress(WidgetTester tester, String address) =>
-      _enterText(tester, 'arkSendAddressField', address);
-  static Future<void> enterAmount(WidgetTester tester, String sats) =>
-      _enterText(tester, 'arkSendAmountField', sats);
-  static Future<void> tapSend(WidgetTester tester) async {
-    await _dismissKeyboard(tester);
-    await _tapKey(tester, 'arkSendVtxoBtn');
   }
 }

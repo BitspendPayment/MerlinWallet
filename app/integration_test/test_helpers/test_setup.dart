@@ -120,7 +120,7 @@ Future<void> waitForArkBalance(
 }) async {
   Element resolveCtx() {
     for (final keyName in const [
-      'arkSendBtn',
+      'arkSendMoneyBtn',
       'arkRefreshBtn',
     ]) {
       final f = find.byKey(Key(keyName));

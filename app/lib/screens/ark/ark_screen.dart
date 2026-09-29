@@ -26,17 +26,6 @@ class ArkScreen extends StatelessWidget {
         ),
         centerTitle: true,
         actions: [
-          // To a bank account or a mobile-money wallet, through the payout platform. Sending to
-          // another wallet is the Send button below.
-          TextButton.icon(
-            key: const Key('arkSendMoneyBtn'),
-            onPressed: () => context.push('/send'),
-            icon: const Icon(Icons.account_balance_outlined, size: 18),
-            label: Text(
-              'Send money',
-              style: GoogleFonts.inter(fontWeight: FontWeight.w600),
-            ),
-          ),
           IconButton(
             key: const Key('arkRefreshBtn'),
             icon: const Icon(Icons.refresh),
@@ -373,10 +362,10 @@ class ArkScreen extends StatelessWidget {
               Expanded(
                 child: _buildActionButton(
                   context,
-                  widgetKey: const Key('arkSendBtn'),
+                  widgetKey: const Key('arkSendMoneyBtn'),
                   icon: Icons.arrow_upward,
                   label: 'Send',
-                  onTap: () => context.push('/ark/send'),
+                  onTap: () => context.push('/send'),
                   isPrimary: true,
                 ),
               ),

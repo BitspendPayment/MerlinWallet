@@ -33,9 +33,9 @@ void main() {
       await bootApp(tester);
       final exitAddress = await btc.getNewAddress();
       await Flows.completeOnboarding(tester, exitAddress: exitAddress);
-      await pumpUntilFound(tester, find.byKey(const Key('arkSendBtn')));
+      await pumpUntilFound(tester, find.byKey(const Key('arkSendMoneyBtn')));
 
-      final ctxOnboard = tester.element(find.byKey(const Key('arkSendBtn')));
+      final ctxOnboard = tester.element(find.byKey(const Key('arkSendMoneyBtn')));
       final service = Provider.of<MpcService>(ctxOnboard, listen: false);
       expect(service.exitAddress, exitAddress,
           reason: 'the address given at onboarding is what exits will pay');
@@ -66,7 +66,7 @@ void main() {
           timeout: const Duration(minutes: 2),
         );
         await ArkBoardPage.tapDone(tester);
-        await pumpUntilFound(tester, find.byKey(const Key('arkSendBtn')));
+        await pumpUntilFound(tester, find.byKey(const Key('arkSendMoneyBtn')));
         expect(svcBoard.arkBalance > BigInt.zero, isTrue,
             reason: 'ark balance should be non-zero after boarding');
 
@@ -102,40 +102,7 @@ void main() {
         expect(boardedExit.sequence, greaterThan(0),
             reason: 'an exit waits out its VTXO\'s exit delay');
 
-        // ── Ark send (App → Bob, an external ark-sample wallet) ─────
         final bob = BobClient();
-        final bobArkAddress = await bob.arkAddress();
-        final bobBalanceBefore = await bob.spendableSats();
-        final appArkBalanceBefore = svcBoard.arkBalance;
-
-        await ArkPage.tapSend(tester);
-        await pumpUntilFound(tester, find.byKey(const Key('arkSendVtxoBtn')));
-        await ArkSendPage.enterAddress(tester, bobArkAddress);
-        await ArkSendPage.enterAmount(tester, '5000');
-        await ArkSendPage.tapSend(tester);
-        await pumpUntilFound(
-          tester,
-          find.byKey(const Key('arkSendBtn')),
-          timeout: const Duration(seconds: 90),
-        );
-        expect(svcBoard.arkBalance < appArkBalanceBefore, isTrue,
-            reason: 'app ark balance should drop after sending to Bob');
-        expect(svcBoard.exits.map((e) => e.outpoint),
-            isNot(contains(boardedExit.outpoint)),
-            reason: 'the send spent the boarded VTXO, so its exit is replaced by the change\'s');
-        expect(svcBoard.vtxosWithoutExit, isEmpty,
-            reason: "a send seals on its way out, and that seal signs the change's exit");
-
-        // Poll Bob's balance — the off-chain transfer settles in <30s.
-        final bobDeadline = DateTime.now().add(const Duration(seconds: 30));
-        var bobNow = await bob.spendableSats();
-        while (bobNow < bobBalanceBefore + 5000 &&
-            DateTime.now().isBefore(bobDeadline)) {
-          await tester.pump(const Duration(seconds: 2));
-          bobNow = await bob.spendableSats();
-        }
-        expect(bobNow, greaterThanOrEqualTo(bobBalanceBefore + 5000),
-            reason: 'Bob should have received the 5000-sat VTXO');
 
         // ── Ark receive (Bob → App) ─────────────────────────────────
         // Send small (3000 sats) — Bob's boarding-output settle into VTXO is

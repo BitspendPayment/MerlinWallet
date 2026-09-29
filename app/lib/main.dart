@@ -7,13 +7,11 @@ import 'screens/onboarding/dkg_progress_screen.dart';
 import 'screens/onboarding/passkey_setup_screen.dart';
 import 'screens/onboarding/restore_wallet_screen.dart';
 import 'screens/onboarding/wallet_ready_screen.dart';
-import 'screens/spending/signing_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/exit/exit_screen.dart';
 import 'screens/onboarding/exit_address_screen.dart';
 import 'screens/splash_screen.dart';
 import 'screens/ark/ark_screen.dart';
-import 'screens/ark/ark_send_screen.dart';
 import 'screens/ark/ark_board_screen.dart';
 import 'screens/send/send_hub_screen.dart';
 import 'screens/send/payout_form_screen.dart';
@@ -75,7 +73,7 @@ class _MerlinWalletAppState extends State<MerlinWalletApp> {
   @override
   Widget build(BuildContext context) {
     // Keep one router instance across app rebuilds.
-    _router ??= _buildRouter(context.read<MpcService>());
+    _router ??= _buildRouter();
     return MaterialApp.router(
       title: 'Merlin Wallet',
       theme: AppTheme.darkTheme,
@@ -85,9 +83,10 @@ class _MerlinWalletAppState extends State<MerlinWalletApp> {
   }
 }
 
-GoRouter _buildRouter(MpcService mpc) => GoRouter(
+// No `refreshListenable`: nothing here redirects, and a refresh rebuilds every pushed page from the
+// route alone — dropping an object passed as `extra`, which the send screens are opened with.
+GoRouter _buildRouter() => GoRouter(
       initialLocation: '/splash',
-      refreshListenable: mpc,
       routes: [
         GoRoute(
           path: '/splash',
@@ -131,23 +130,12 @@ GoRouter _buildRouter(MpcService mpc) => GoRouter(
           builder: (context, state) => const ExitAddressScreen(),
         ),
         GoRoute(
-          path: '/spending/signing',
-          builder: (context, state) {
-            final extras = state.extra as Map<String, dynamic>? ?? {};
-            return SigningScreen(extras: extras);
-          },
-        ),
-        GoRoute(
           path: '/ark',
           builder: (context, state) => const ArkScreen(),
         ),
         GoRoute(
           path: '/ark/receive',
           builder: (context, state) => const ArkBoardScreen(),
-        ),
-        GoRoute(
-          path: '/ark/send',
-          builder: (context, state) => const ArkSendScreen(),
         ),
         // Sending to bank accounts and mobile money, through the payout platform.
         GoRoute(
