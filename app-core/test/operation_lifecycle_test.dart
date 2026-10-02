@@ -10,6 +10,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -733,18 +734,24 @@ void main() {
 
   group('setting an escrow up for a service', () {
     final platform = threshold.Identifier.derive(Uint8List.fromList('the platform'.codeUnits));
+    const policy = {'op': 'always'};
+    final deadline = DateTime.now().add(const Duration(hours: 1));
 
-    test('mints and pairs on one approval, and the operation is over when it returns', () async {
+    test('mints, pairs and strikes the deal on one approval, and the operation is over when it '
+        'returns', () async {
       final box = newBox();
       final d = device(seed(40), box);
       await d.client.doDkg();
       d.approvals.clear();
       final delivery = ScriptedDelivery();
 
-      final set = await d.client.setUpEscrow(serviceIdentifier: platform, delivery: delivery);
+      final set = await d.client.setUpEscrow(
+            serviceIdentifier: platform, policy: policy, deadline: deadline, delivery: delivery);
       expect(d.approvals, ['/cosigner.v1.Cosigner/Escrow']);
       expect(delivery.taken, hasLength(1), reason: "the wallet's half went to the service");
       expect(cosigner.pairingsConfirmed, 1);
+      expect(cosigner.dealsStruck, [jsonEncode(policy)], reason: 'the deal rode the open');
+      expect(set.agreed, 'the deal ${jsonEncode(policy)}', reason: 'and came back as agreed');
       expect(d.client.escrows.map((e) => e.escrowKeyHex), [set.escrow.escrowKeyHex]);
       expect(d.operations.last.isDisposed, isTrue);
       expect(d.operations.last.holdsSecrets, isFalse,
@@ -759,7 +766,8 @@ void main() {
       final delivery = ScriptedDelivery(refuse: true);
 
       await expectLater(
-        d.client.setUpEscrow(serviceIdentifier: platform, delivery: delivery),
+        d.client.setUpEscrow(
+            serviceIdentifier: platform, policy: policy, deadline: deadline, delivery: delivery),
         throwsA(isA<ServiceDeliveryException>()),
       );
       expect(cosigner.pairingsConfirmed, 0,
@@ -775,7 +783,8 @@ void main() {
       await d.client.doDkg();
       final delivery = ScriptedDelivery(hang: true);
 
-      final setting = d.client.setUpEscrow(serviceIdentifier: platform, delivery: delivery);
+      final setting = d.client.setUpEscrow(
+            serviceIdentifier: platform, policy: policy, deadline: deadline, delivery: delivery);
       await delivery.asked.future;
       expect(d.operations.last.holdsSecrets, isTrue,
           reason: 'the minted share is held while the service is waited on');

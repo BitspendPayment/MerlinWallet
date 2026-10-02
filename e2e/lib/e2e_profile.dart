@@ -71,8 +71,8 @@ Future<EnclaveHarness> startE2eEnclave() => EnclaveHarness.start(
 String _hex(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
 /// Where the dev enclave that is up is described for the services that must believe it —
-/// MerlinPlatform's and card-escrow's `--enclave-pins`, in `deployment.json`'s shape. Relative to
-/// `e2e/`. One file, because one enclave runs at a time.
+/// MerlinPlatform's `--enclave-pins`, in `deployment.json`'s shape. Relative to `e2e/`. One file,
+/// because one enclave runs at a time.
 const enclavePinsPath = '../.platform/run/enclave-pins.json';
 
 /// Describe [harness]'s enclave to the services. After every boot: a dev enclave's root is new each

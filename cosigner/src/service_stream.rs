@@ -165,9 +165,9 @@ pub enum ToService {
         /// The deal the escrow is committed to — its deadline and which policy was sealed — told
         /// only to the escrow's own service, and only when there is a deal. What lets a service
         /// that asks before paying know it will be repaid, and until when, without taking the
-        /// owner's app at its word. See [`DealTerms`](crate::escrow_session::DealTerms).
+        /// owner's app at its word. See [`SealedTerms`](crate::escrow_session::SealedTerms).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        deal: Option<crate::escrow_session::DealTerms>,
+        deal: Option<crate::escrow::SealedTerms>,
     },
 }
 
@@ -359,7 +359,8 @@ impl Cosigner {
                 attempt_id,
             } => {
                 self.speaks_for(stream_id, &escrow_key, &attempt_id)?;
-                self.confirm_pairing_by_service(&escrow_key, &attempt_id)
+                self.escrow_mut(&escrow_key)
+                    .and_then(|e| e.confirm_by_service(&attempt_id))
                     .map_err(|_| StreamRefusal::StaleAttempt)?;
                 self.seal();
                 Ok(ToService::Ack { about: attempt_id })
@@ -390,7 +391,10 @@ impl Cosigner {
             } => {
                 self.speaks_for(stream_id, &escrow_key, "")?;
                 let now = crate::handlers::helpers::now_secs();
-                if let Err(reason) = self.end_escrow_deal(&escrow_key, &policy_sha256, now) {
+                let ended = self
+                    .escrow_mut(&escrow_key)
+                    .and_then(|e| e.end_by_service(&policy_sha256, now));
+                if let Err(reason) = ended {
                     return Ok(ToService::Refused {
                         about: policy_sha256,
                         reason,
@@ -459,6 +463,27 @@ fn encode(message: &ToService) -> Result<Vec<u8>, String> {
     serde_json::to_vec(message).map_err(|e| format!("encoding a reply: {e}"))
 }
 
+/// A service to pair into an escrow: who it is, and where the image says it is.
+pub(crate) struct Service {
+    pub(crate) id: threshold::identifier::Identifier,
+    pub(crate) origin: String,
+}
+
+impl Service {
+    /// The service [identifier] names, checked before anything is dealt.
+    pub(crate) fn named(identifier: &[u8]) -> Result<Self, crate::grpc::Status> {
+        // Where this service is, according to the IMAGE. Resolved before anything is dealt, so
+        // naming a service this enclave does not know costs nothing and reveals nothing.
+        let origin = crate::handlers::delivery::ServiceRegistry::from_env()
+            .origin_of(&hex::encode(identifier))?
+            .to_string();
+        let id = threshold::identifier::Identifier::try_from(identifier).map_err(|e| {
+            crate::grpc::Status::invalid_argument(format!("bad service identifier: {e}"))
+        })?;
+        Ok(Self { id, origin })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,3 +530,4 @@ mod tests {
         assert_eq!(back.kind(), "pairing-ready");
     }
 }
+

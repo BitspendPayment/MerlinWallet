@@ -17,13 +17,13 @@ use cosigner::session::proto;
 use cosigner::types::VtxoInput;
 use cosigner::wallet_proto as wp;
 use cosigner::asp::AspApi;
-use cosigner::escrow_session::Escrow;
+use cosigner::escrow::{DealTerms, EscrowSession};
 use cosigner::evidence::{Evidence, EvidenceRequest, FetchEvidence, HttpGet, OnUnavailable, Predicate};
 use cosigner::handlers::helpers::block_on_ready;
 use cosigner::handlers::release::{ProposedInput, ReleaseRequest, WireCommitment};
 use cosigner::policy::Policy;
 use cosigner::service_stream::{service_stream_id, ToService};
-use cosigner::types::{EscrowRecord, ServicePairing};
+use cosigner::types::ServicePairing;
 
 use ark::client::types::ArkInfo;
 use rand::rngs::OsRng;
@@ -229,7 +229,7 @@ fn paired_with(
 
     let now = now();
     cosigner
-        .install_escrow(EscrowRecord {
+        .install_escrow(EscrowSession {
             escrow_key: escrow_key.clone(),
             key_package_json: cosigner_kp.to_json(),
             public_key_package_json: pkp.to_json(),
@@ -247,24 +247,16 @@ fn paired_with(
                 service_confirmed: finished,
                 wallet_confirmed: true,
             }),
-            // An unfinished pairing cannot be committed to a deal through `open_escrow_session` —
-            // it is refused there, and rightly. It reaches a release only from a seal that carries
-            // both, which `serde(default)` makes possible for anything written before the
-            // confirmation existed. So that case is installed rather than opened.
-            session: (!finished).then(|| {
-                Escrow::validate(&escrow_key, policy.clone(), now, now + lasts).expect("a deal")
-            }),
-            reclaim_opened_at: None,
+            terms: None,
+            releases: Default::default(),
         })
         .expect("install escrow");
-    if finished {
-        cosigner
-            .open_escrow_session(
-                Escrow::validate(&escrow_key, policy, now, now + lasts).expect("a deal"),
-                now,
-            )
-            .expect("commit it");
-    }
+    // Struck as the `Escrow` stream strikes it: once the wallet has confirmed, whether or not the
+    // service has yet.
+    cosigner
+        .escrow_mut(&escrow_key)
+        .and_then(|e| e.strike_deal(DealTerms::validate(policy, now, now + lasts).expect("a deal")))
+        .expect("commit it");
 
     let info = ark_info();
     let service_address = ark::client::ark_address(
@@ -294,19 +286,20 @@ fn second_escrow(p: &mut Paired) -> String {
     let key = "02".to_string() + &"be".repeat(32);
     let now = now();
     p.cosigner
-        .install_escrow(EscrowRecord {
+        .install_escrow(EscrowSession {
             escrow_key: key.clone(),
             context_hex: "99".repeat(16),
-            // Its own deal, not a copy of the first one's.
-            session: None,
+            // Its own deal and its own payments, not copies of the first one's.
+            terms: None,
+            releases: Default::default(),
             ..first
         })
         .expect("a second escrow");
     p.cosigner
-        .open_escrow_session(
-            Escrow::validate(&key, permissive(), now, now + HOUR).expect("a deal"),
-            now,
-        )
+        .escrow_mut(&key)
+        .and_then(|e| {
+            e.strike_deal(DealTerms::validate(permissive(), now, now + HOUR).expect("a deal"))
+        })
         .expect("commit it");
     key
 }
@@ -928,47 +921,10 @@ fn a_release_against_an_unfinished_pairing_is_refused() {
 // could be made to disappear.
 // ===============================================================================================
 
-/// Reopening a deal must not forget what the last one already paid against.
+/// The next escrow along may not spend it.
 ///
-/// The obvious place to keep this ledger is the session, and that is exactly wrong: a session can
-/// be replaced, and replacing it would hand back every payment the previous one had spent.
-#[test]
-fn reopening_an_escrow_does_not_hand_back_the_payments_it_already_spent() {
-    let Some(store) = common::try_store() else { return };
-    let mut p = paired_for(&store, permissive(), 1);
-
-    let (_, commitments) = service_commits(2);
-    let first = request(&p, commitments);
-    assert!(matches!(ask(&mut p, &first, &Provider::default()), ToService::ReleaseSigned(_)));
-
-    // The deal runs out and a new one is struck over the same escrow. Waiting it out rather than
-    // ending it: a deal has no ending but its deadline.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    let key = p.escrow_key.clone();
-    let now = now();
-    p.cosigner
-        .open_escrow_session(
-            Escrow::validate(&key, permissive(), now, now + HOUR).expect("a new deal"),
-            now,
-        )
-        .expect("a new deal can be struck once the last one is over");
-    p.cosigner.seal();
-
-    // The same payment, under a new request id. It was spent, and it stays spent.
-    let (_, commitments) = service_commits(2);
-    let mut again = request(&p, commitments);
-    again.request_id = "req-after-reopen".into();
-    let reply = ask(&mut p, &again, &Provider::default());
-    assert!(
-        refusal(&reply).contains("already been released against"),
-        "a new deal is a new allowance, not a fresh set of payments: {reply:?}"
-    );
-}
-
-/// Nor may the next escrow along spend it.
-///
-/// One wallet may hold several escrows with the same service. A ledger scoped to one of them would
-/// let a payment be spent once per escrow.
+/// One wallet holds an escrow per payment, often with the same service. A ledger scoped to one of
+/// them would let a payment be spent once per escrow.
 #[test]
 fn a_second_escrow_cannot_spend_a_payment_the_first_one_did() {
     let Some(store) = common::try_store() else { return };
@@ -1054,7 +1010,7 @@ fn a_deadline_that_passes_during_the_fetch_still_refuses() {
         "the deadline passed while the provider was answering: {reply:?}"
     );
     assert!(
-        p.cosigner.released_references().is_empty(),
+        p.cosigner.release_count() == 0,
         "nothing was signed, so nothing may be written down"
     );
 }
@@ -1168,14 +1124,14 @@ fn a_release_the_seal_cannot_record_is_not_signed() {
 
     // Nothing was recorded either — in this instance, which rolled the record back, or in the
     // seal, which never got it. The two agree, which is the point.
-    assert!(p.cosigner.released_references().is_empty(), "the in-memory ledger was not rolled back");
+    assert!(p.cosigner.release_count() == 0, "the in-memory ledger was not rolled back");
     let reopened = cosigner::Cosigner::open_with_host(
         store.clone(),
         group_key,
         Arc::new(Recorder::default()),
     )
     .expect("the old seal is still readable");
-    assert!(reopened.released_references().is_empty());
+    assert_eq!(reopened.release_count(), 0);
 
     // With the store writable again, the same release is answered — and recorded.
     std::fs::remove_dir(&writing).unwrap();
@@ -1183,7 +1139,7 @@ fn a_release_the_seal_cannot_record_is_not_signed() {
     let req = request(&p, commitments);
     let reply = ask(&mut p, &req, &Provider::default());
     assert!(matches!(reply, ToService::ReleaseSigned(_)), "{reply:?}");
-    assert_eq!(p.cosigner.released_references().len(), 1);
+    assert_eq!(p.cosigner.release_count(), 1);
 }
 
 
@@ -1213,53 +1169,6 @@ fn escrow_vtxo() -> VtxoInput {
     }
 }
 
-/// The bypass: reclaim signatures taken while no deal is live, kept, and spent under a deal struck
-/// afterwards. Nothing in Bitcoin stops it — both pairings sign the same key and the signatures
-/// stay valid — so what has to stop it is the cosigner refusing the deal: an escrow a reclaim was
-/// ever opened on is done with deals.
-#[test]
-fn an_escrow_a_reclaim_was_opened_on_cannot_be_committed_again() {
-    let Some(store) = common::try_store() else { return };
-    // A finished pairing and a deal that has already ended: exactly the state the owner would
-    // reclaim from, and the state a second deal would be struck from.
-    let mut p = paired_for(&store, permissive(), 1);
-    let later = now() + HOUR;
-    p.cosigner
-        .reclaim_open(&p.escrow_key, vec![escrow_vtxo()], &ark_info(), later)
-        .expect("the deal is over, so the owner may take the money back");
-    // What the handler does between opening the reclaim and making a nonce.
-    p.cosigner
-        .mark_escrow_reclaim_opened(&p.escrow_key, later)
-        .expect("marked");
-    p.cosigner.try_seal().expect("sealed");
-
-    let refusal = p
-        .cosigner
-        .open_escrow_session(
-            Escrow::validate(&p.escrow_key, permissive(), later, later + HOUR).expect("a deal"),
-            later,
-        )
-        .expect_err("a deal over an escrow with reclaim signatures out is a deal the owner can empty");
-    assert!(refusal.contains("reclaim"), "{refusal}");
-
-    // Durably: the next request reopens from the seal and refuses the same way.
-    let group_key = p.cosigner.group_key().to_string();
-    let mut reopened =
-        cosigner::Cosigner::open_with_host(store, group_key, Arc::new(Recorder::default()))
-            .expect("reopen");
-    let refusal = reopened
-        .open_escrow_session(
-            Escrow::validate(&p.escrow_key, permissive(), later, later + HOUR).expect("a deal"),
-            later,
-        )
-        .expect_err("the mark must survive the seal");
-    assert!(refusal.contains("reclaim"), "{refusal}");
-    assert!(
-        reopened.escrows()[0].reclaim_opened_at.is_some(),
-        "and it is what the wallet is told about"
-    );
-}
-
 /// A reclaim of [p]'s escrow, as a `Send` opens one — [adjust] changes it before it goes.
 fn reclaim_open(p: &Paired, adjust: impl FnOnce(&mut proto::SendOpen)) -> proto::SendClientMsg {
     let wallet_id = &p.cosigner.escrow(&p.escrow_key).expect("the escrow").wallet_identifier_hex;
@@ -1285,15 +1194,13 @@ fn reclaim_open(p: &Paired, adjust: impl FnOnce(&mut proto::SendOpen)) -> proto:
 }
 
 /// A reclaim goes to this wallet's own address, derived by the cosigner, and takes everything the
-/// escrow holds. One that names a recipient or an amount is refused before anything happens — the
-/// escrow is not even retired from deals.
+/// escrow holds. One that names a recipient or an amount is refused before anything happens.
 #[test]
 fn a_reclaim_that_names_where_it_goes_is_refused_before_anything_happens() {
     let Some(store) = common::try_store() else { return };
     // A deal already over, so nothing but the guard stands between this and the first sighashes.
     let p = paired_for(&store, permissive(), 1);
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let group_key = p.cosigner.group_key().to_string();
 
     let open = reclaim_open(&p, |o| o.recipient_ark_address = "tark1somewhere-else".into());
     let answer = collect::<proto::SendServerMsg>(block_on(
@@ -1301,29 +1208,17 @@ fn a_reclaim_that_names_where_it_goes_is_refused_before_anything_happens() {
     ));
     assert_eq!(answer.code, Code::InvalidArgument as u32, "{}", answer.message);
     assert!(answer.messages.is_empty(), "nothing may go out");
-
-    let reopened =
-        cosigner::Cosigner::open_with_host(store, group_key, Arc::new(Recorder::default()))
-            .expect("reopen");
-    // Nothing is sealed here unless a reclaim began: it seals its mark before the first sighashes.
-    assert!(
-        reopened.escrows().iter().all(|e| e.reclaim_opened_at.is_none()),
-        "a refused reclaim retires nothing"
-    );
 }
 
-/// Over the wire, and cut off: the stream is abandoned after the cosigner's first message, before
-/// the wallet answers — the case where nobody can say whether signatures left. The mark has to be
-/// in the seal by then.
+/// Over the wire: once its deal is over, a `Send` naming the escrow opens its reclaim, and the
+/// escrow's sighashes go out on the first message.
 #[test]
-fn a_reclaim_abandoned_after_its_first_message_has_already_retired_the_escrow() {
+fn a_reclaim_opens_on_send_once_the_deal_is_over() {
     let Some(store) = common::try_store() else { return };
     // A finished pairing whose deal ends in a second — the handler reads the real clock, so the
-    // deal has to be over by the time the stream opens. Exactly the state the bypass starts from.
+    // deal has to be over by the time the stream opens.
     let p = paired_for(&store, permissive(), 1);
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let group_key = p.cosigner.group_key().to_string();
-    let escrow_key = p.escrow_key.clone();
 
     let open = reclaim_open(&p, |_| {});
     let answer = collect::<proto::SendServerMsg>(block_on(
@@ -1340,19 +1235,6 @@ fn a_reclaim_abandoned_after_its_first_message_has_already_retired_the_escrow() 
         answer.messages[0].body,
         Some(proto::send_server_msg::Body::Sighashes(_))
     ));
-
-    // The next request, from the seal alone.
-    let mut reopened =
-        cosigner::Cosigner::open_with_host(store, group_key, Arc::new(Recorder::default()))
-            .expect("reopen");
-    let later = now();
-    let refusal = reopened
-        .open_escrow_session(
-            Escrow::validate(&escrow_key, permissive(), later, later + HOUR).expect("a deal"),
-            later,
-        )
-        .expect_err("retired before the first message went out");
-    assert!(refusal.contains("reclaim"), "{refusal}");
 }
 
 // ===============================================================================================
@@ -1366,42 +1248,21 @@ fn one_price() -> Policy {
     }
 }
 
-fn open_next_deal(p: &mut Paired, at: i64) -> Result<(), String> {
+/// The lost-reply case, after the deal has ended. The service paid out on the strength of an
+/// approval; its deal ending in the meantime must not cost it the signature.
+#[test]
+fn a_repeat_is_still_answered_after_its_deal_was_ended() {
+    let Some(store) = common::try_store() else { return };
+    let mut p = paired(&store, one_price());
+
+    let (_, commitments) = service_commits(2);
+    let req = request(&p, commitments);
+    assert!(matches!(ask(&mut p, &req, &Provider::default()), ToService::ReleaseSigned(_)));
     let key = p.escrow_key.clone();
-    p.cosigner.open_escrow_session(
-        Escrow::validate(&key, permissive(), at, at + HOUR).expect("a deal"),
-        at,
-    )
-}
-
-/// Once everything a deal allows has been released, the escrow is free for the next one — no
-/// waiting out a deadline that may be hours away.
-#[test]
-fn a_spent_deal_lets_the_next_one_be_struck_at_once() {
-    let Some(store) = common::try_store() else { return };
-    let mut p = paired(&store, one_price());
-
-    // Before anything is released, the deal holds the escrow.
-    assert!(open_next_deal(&mut p, now()).is_err(), "an unspent deal still holds the escrow");
-
-    let (_, commitments) = service_commits(2);
-    let req = request(&p, commitments);
-    assert!(matches!(ask(&mut p, &req, &Provider::default()), ToService::ReleaseSigned(_)));
-
-    open_next_deal(&mut p, now()).expect("spent, so the next deal may be struck straight away");
-}
-
-/// The lost-reply case, after the escrow has moved on. The service paid out on the strength of an
-/// approval; a new deal struck in the meantime must not cost it the signature.
-#[test]
-fn a_repeat_is_still_answered_after_a_newer_deal_replaced_its_own() {
-    let Some(store) = common::try_store() else { return };
-    let mut p = paired(&store, one_price());
-
-    let (_, commitments) = service_commits(2);
-    let req = request(&p, commitments);
-    assert!(matches!(ask(&mut p, &req, &Provider::default()), ToService::ReleaseSigned(_)));
-    open_next_deal(&mut p, now()).expect("the next deal");
+    p.cosigner
+        .escrow_mut(&key)
+        .and_then(|e| e.end_by_service(&cosigner::policy::policy_sha256(&one_price()), now()))
+        .expect("its service ends the deal");
 
     let (nonces, commitments) = service_commits(2);
     let mut retry = req.clone();
@@ -1452,7 +1313,7 @@ fn a_deal_ended_after_a_release_still_keeps_the_owner_waiting_for_its_deadline()
     let Some(store) = common::try_store() else { return };
     let policy = one_price();
     let mut p = paired(&store, policy.clone());
-    let promised = p.cosigner.escrow(&p.escrow_key).unwrap().session.as_ref().unwrap().deadline;
+    let promised = p.cosigner.escrow(&p.escrow_key).unwrap().terms.as_ref().unwrap().deadline;
 
     let (_, commitments) = service_commits(2);
     let req = request(&p, commitments);
@@ -1460,7 +1321,8 @@ fn a_deal_ended_after_a_release_still_keeps_the_owner_waiting_for_its_deadline()
 
     let key = p.escrow_key.clone();
     p.cosigner
-        .end_escrow_deal(&key, &cosigner::policy::policy_sha256(&policy), now())
+        .escrow_mut(&key)
+        .and_then(|e| e.end_by_service(&cosigner::policy::policy_sha256(&policy), now()))
         .expect("the service may end its own deal");
 
     let Err(early) = p
@@ -1477,7 +1339,7 @@ fn a_deal_ended_after_a_release_still_keeps_the_owner_waiting_for_its_deadline()
 }
 
 /// A payout that failed: the service is owed nothing, ends the deal, and the escrow is the owner's
-/// at once — to reclaim, or to commit to the next deal.
+/// to take back at once.
 #[test]
 fn a_deal_its_service_ended_before_any_release_frees_the_escrow_at_once() {
     let Some(store) = common::try_store() else { return };
@@ -1487,15 +1349,16 @@ fn a_deal_its_service_ended_before_any_release_frees_the_escrow_at_once() {
     let at = now();
 
     p.cosigner
-        .end_escrow_deal(&key, &cosigner::policy::policy_sha256(&policy), at)
+        .escrow_mut(&key)
+        .and_then(|e| e.end_by_service(&cosigner::policy::policy_sha256(&policy), at))
         .expect("ended");
     p.cosigner
         .reclaim_open(&key, vec![escrow_vtxo()], &ark_info(), at)
         .expect("nothing was released, so nothing holds the escrow");
-    open_next_deal(&mut p, at).expect("and it may be committed again");
 }
 
-/// Only the deal named may be ended: a late end for one deal must not close the next.
+/// Only the deal named may be ended: an end meant for another escrow's deal must not close this
+/// one.
 #[test]
 fn an_end_that_names_another_deal_ends_nothing() {
     let Some(store) = common::try_store() else { return };
@@ -1503,10 +1366,11 @@ fn an_end_that_names_another_deal_ends_nothing() {
     let key = p.escrow_key.clone();
     let refusal = p
         .cosigner
-        .end_escrow_deal(&key, &cosigner::policy::policy_sha256(&permissive()), now())
+        .escrow_mut(&key)
+        .and_then(|e| e.end_by_service(&cosigner::policy::policy_sha256(&permissive()), now()))
         .expect_err("that is not this escrow's deal");
     assert!(refusal.contains("not the deal"), "{refusal}");
-    assert!(open_next_deal(&mut p, now()).is_err(), "the deal still holds the escrow");
+    assert!(p.cosigner.escrow(&key).unwrap().may_release(now()).is_ok(), "the deal still runs");
 }
 
 /// Over the wire: `end-deal` is heard from the escrow's own service and from nobody else.
@@ -1526,14 +1390,16 @@ fn only_the_escrows_own_service_can_end_its_deal() {
         serde_json::from_slice(&p.cosigner.on_service_message(&elsewhere, "m1", &message).unwrap())
             .unwrap();
     assert!(matches!(reply, ToService::Refused { .. }), "{reply:?}");
-    assert!(open_next_deal(&mut p, now()).is_err(), "another service ended nothing");
+    let key = p.escrow_key.clone();
+    let running = |p: &Paired| p.cosigner.escrow(&key).unwrap().may_release(now()).is_ok();
+    assert!(running(&p), "another service ended nothing");
 
     let stream = p.stream.clone();
     let reply: ToService =
         serde_json::from_slice(&p.cosigner.on_service_message(&stream, "m2", &message).unwrap())
             .unwrap();
     assert!(matches!(reply, ToService::Ack { .. }), "{reply:?}");
-    open_next_deal(&mut p, now()).expect("its own service ended it");
+    assert!(!running(&p), "its own service ended it");
 }
 
 /// A service that asks before paying learns the terms it is fronting money against — the sealed
@@ -1542,7 +1408,7 @@ fn only_the_escrows_own_service_can_end_its_deal() {
 fn a_refusal_tells_the_escrows_own_service_the_terms_of_the_deal() {
     let Some(store) = common::try_store() else { return };
     let mut p = paired(&store, condition());
-    let deadline = p.cosigner.escrow(&p.escrow_key).unwrap().session.as_ref().unwrap().deadline;
+    let deadline = p.cosigner.escrow(&p.escrow_key).unwrap().terms.as_ref().unwrap().deadline;
     let (_, commitments) = service_commits(2);
     let req = request(&p, commitments);
 

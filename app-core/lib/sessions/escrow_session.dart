@@ -18,9 +18,10 @@
 /// see `passkey/key_derivation.dart`. Without that, escrowed money would be the one thing a lost
 /// phone could not recover.
 ///
-/// An escrow minted for a service can have that service paired into it on the same stream — one
-/// approval for both — and the pairing is then the one `pairing_session.dart` describes, without
-/// its first round: the wallet already holds the escrow share it just made.
+/// An escrow minted for a service has that service paired into it on the same stream, and its deal
+/// struck — one approval for all three — and the pairing is then the one `pairing_session.dart`
+/// describes, without its first round: the wallet already holds the escrow share it just made. One
+/// escrow, one deal: nothing commits an escrow but the stream that minted it.
 library;
 
 import 'dart:convert';
@@ -37,7 +38,8 @@ import 'service_delivery.dart';
 
 /// What a completed reshare hands back.
 class EscrowResult {
-  EscrowResult(this.keyPackage, this.publicKeyPackage, this.escrowKeyHex, {this.pairing});
+  EscrowResult(this.keyPackage, this.publicKeyPackage, this.escrowKeyHex,
+      {this.pairing, this.agreed});
 
   /// The wallet's share of `V'` — held for this operation only, never stored.
   final threshold.KeyPackage keyPackage;
@@ -48,16 +50,22 @@ class EscrowResult {
 
   /// The service paired into it on the same stream, when one was asked for.
   final PairingResult? pairing;
+
+  /// Its deal as the cosigner sealed it, rendered for consent — what the owner agreed to. Null
+  /// when no service was paired, and so no deal struck.
+  final String? agreed;
 }
 
-/// A service to pair into the escrow a stream mints, and what pairing it takes — see
-/// `MpcClient.setUpEscrow`.
+/// A service to pair into the escrow a stream mints, what pairing it takes, and the deal it is
+/// paired in for — see `MpcClient.setUpEscrow`.
 typedef EscrowPairing = ({
   threshold.Identifier service,
   List<int> attemptId,
   BigInt slope,
   DeliverToService delivery,
   CancelSignal? cancel,
+  Map<String, dynamic> policy,
+  DateTime deadline,
 });
 
 class EscrowSession {
@@ -75,9 +83,9 @@ class EscrowSession {
   /// must never be used twice for one wallet: two escrows on one delta are two points on one line.
   /// The cosigner records it and refuses a repeat.
   ///
-  /// With [pair], the stream goes on to pair that service into the escrow once it is minted, and
-  /// [onMinted] is told of the escrow first — before anything is dealt on it — so a pairing that
-  /// fails leaves an escrow the caller knows it holds.
+  /// With [pair], the stream goes on to pair that service into the escrow once it is minted and
+  /// strike its deal, and [onMinted] is told of the escrow first — before anything is dealt on it —
+  /// so a pairing that fails leaves an escrow the caller knows it holds.
   ///
   /// The cosigner's identifier is taken from [walletPkp] — the one holder in the wallet key that
   /// is not this wallet — and **not** derived from the dealing it sends back.
@@ -117,9 +125,13 @@ class EscrowSession {
           identifier: walletId.serialize(),
           round1Package: jsonEncode(r1Pkg.toJson()),
           context: context,
-          // Checked by the cosigner before anything is dealt, as a pairing on its own is.
+          // Checked by the cosigner before anything is dealt, as a pairing on its own is — and the
+          // deal with them, so terms it could never strike mint nothing.
           serviceIdentifier: pair?.service.serialize(),
           attemptId: pair?.attemptId,
+          policyJson: pair == null ? null : jsonEncode(pair.policy),
+          deadlineSecs:
+              pair == null ? null : Int64(pair.deadline.millisecondsSinceEpoch ~/ 1000),
         ),
       ));
 
@@ -187,6 +199,7 @@ class EscrowSession {
       await onMinted?.call(minted);
       if (pair == null) return minted;
 
+      String? agreed;
       final pairing = await dealPairing(
         escrowKp: keyPkg,
         escrowKeyHex: derived,
@@ -205,7 +218,8 @@ class EscrowSession {
           }
           return paired.paired;
         },
-        // On this stream: it still holds the tenant, so a call of its own would wait for it.
+        // On this stream: it still holds the tenant, so a call of its own would wait for it. The
+        // answer is the deal, struck now that both halves are with the service.
         confirm: (attemptId) async {
           duplex.send(cs.EscrowClientMsg(
             sessionId: '',
@@ -216,9 +230,10 @@ class EscrowSession {
           if (!confirmed.hasConfirmed()) {
             throw CosignerException('expected the confirmation, got ${confirmed.whichBody()}');
           }
+          agreed = confirmed.confirmed.policyDescription;
         },
       );
-      return EscrowResult(keyPkg, pkp, derived, pairing: pairing);
+      return EscrowResult(keyPkg, pkp, derived, pairing: pairing, agreed: agreed);
     } finally {
       await duplex.close();
     }

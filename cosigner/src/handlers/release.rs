@@ -85,7 +85,7 @@ use threshold::{point, scalar, signing};
 use crate::cosigner::x_only;
 use crate::asp::AspApi;
 use crate::cosigner::Cosigner;
-use crate::escrow_session::{DealTerms, Escrow};
+use crate::escrow::SealedTerms;
 use crate::types::{Admission, ReleaseRecord, ServicePairing};
 use crate::evidence::{FetchEvidence, ReleaseFacts};
 use crate::service_stream::{StreamRefusal, ToService};
@@ -229,12 +229,9 @@ impl Cosigner {
     /// The terms of the deal an escrow is committed to — for the service paired into it, and for
     /// nobody else. A refusal is where a service that asks before paying learns them: that the deal
     /// it offered is the one sealed, and how long it has to be repaid.
-    fn deal_terms_for(&self, stream_id: &str, escrow_key: &str) -> Option<DealTerms> {
+    fn deal_terms_for(&self, stream_id: &str, escrow_key: &str) -> Option<SealedTerms> {
         self.speaks_for(stream_id, escrow_key, "").ok()?;
-        self.escrow(escrow_key)?
-            .session
-            .as_ref()
-            .map(Escrow::terms)
+        self.escrow(escrow_key)?.sealed_terms()
     }
 
     async fn judge_release<A: AspApi, F: FetchEvidence>(
@@ -254,6 +251,7 @@ impl Cosigner {
 
         let escrow = self
             .escrow(&request.escrow_key)
+            .cloned()
             .ok_or_else(|| Denial::Refused(StreamRefusal::UnknownEscrow.message()))?;
         let pairing = escrow
             .pairing
@@ -265,17 +263,16 @@ impl Cosigner {
                 pairing.awaiting()
             )));
         }
-        let session = escrow.session.clone();
         let escrow_key = escrow.escrow_key.clone();
 
         // --- 6, asked first: has this payment justified a release already? -------------------
         //
         // Before the deal is consulted, because a repeat is not the current deal's business. It is
         // answered from its own record, under the deal that approved it, until that deal's
-        // deadline — even if the escrow has been committed to another since. A service whose reply
-        // was lost has paid out already, and a deal struck in the meantime must not cost it the
-        // signature it was owed. Pure, and needs no ASP; and a reference that has already been
-        // spent needs no provider to tell us it succeeded.
+        // deadline — even if its service has ended the deal since. A service whose reply was lost
+        // has paid out already, and must not lose the signature it was owed. Pure, and needs no
+        // ASP; and a reference that has already been spent needs no provider to tell us it
+        // succeeded.
         let proposal_hash = request.proposal_hash();
         let admission = self
             .admit_release(
@@ -289,7 +286,7 @@ impl Cosigner {
             return answer_again(request, &record, &escrow_key, &pairing, asp).await;
         }
 
-        let session = session.ok_or_else(|| {
+        let terms = escrow.terms.clone().ok_or_else(|| {
             Denial::Refused(
                 "this escrow is not committed to a deal, so there is nothing to release".into(),
             )
@@ -300,7 +297,7 @@ impl Cosigner {
         // Asked here to refuse early — a closed escrow needs no transaction built and no provider
         // told about a release that is not going to happen. It is asked AGAIN before signing, and
         // that is the one that decides; see below.
-        session
+        escrow
             .may_release(crate::handlers::helpers::now_secs())
             .map_err(|r| Denial::Refused(r.message().to_string()))?;
 
@@ -353,12 +350,12 @@ impl Cosigner {
             reference: request.payment_reference.clone(),
             sats: egress_sats,
             fee_sats,
-            already_released_sats: session.released_sats,
+            already_released_sats: escrow.released_sats(),
         };
         let evidence =
-            crate::evidence::gather(fetcher, &session.policy.evidence_needed(&facts)).await;
+            crate::evidence::gather(fetcher, &terms.policy.evidence_needed(&facts)).await;
         crate::policy::enforce_release(
-            &session.policy,
+            &terms.policy,
             Some(&outputs),
             &owned,
             &facts,
@@ -379,7 +376,7 @@ impl Cosigner {
         // this cosigner declining to co-sign, and a decision made on a clock reading from before
         // the wait is not a decision about now.
         let signing_at = crate::handlers::helpers::now_secs();
-        session
+        escrow
             .may_release(signing_at)
             .map_err(|r| Denial::Refused(r.message().to_string()))?;
 
@@ -394,24 +391,19 @@ impl Cosigner {
         // believing something the seal does not. The service retries; a retry of a release that
         // WAS recorded is answered again from the record, so nothing is lost by refusing here.
         let before = self.to_snapshot().map_err(Denial::Faulted)?;
-        self.record_escrow_release(
-            &escrow_key,
+        // Kept with the escrow, for as long as the wallet holds it: the payment is spent for good.
+        self.escrow_mut(&escrow_key).map_err(Denial::Faulted)?.record_release(
             request.payment_reference.clone(),
             ReleaseRecord {
-                // The same reduction the ledger compares by: a key named with either parity is one
-                // escrow. `trim_start_matches` would be wrong here — it strips repeats, and an
-                // x-only key may itself begin "02".
-                escrow_key: x_only(&escrow_key),
                 request_id: request.request_id.clone(),
                 sats: egress_sats,
                 at: signing_at,
                 proposal_hash,
-                // What this release keeps of its deal once the escrow moves on to another: how
-                // long a repeat is answered, and how long the owner must wait to reclaim.
-                deadline: session.deadline,
+                // What this release keeps of its deal once its service ends it early: how long a
+                // repeat is answered, and how long the owner must wait to reclaim.
+                deadline: terms.deadline,
             },
-        )
-        .map_err(Denial::Faulted)?;
+        );
         if let Err(e) = self.try_seal() {
             if let Err(undo) = self.restore_snapshot(&before) {
                 tracing::error!("rolling back an unsealed release failed too: {undo}");

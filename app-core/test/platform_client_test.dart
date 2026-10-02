@@ -31,7 +31,6 @@ void main() {
       );
     }));
     final quote = await platform.quote(
-      escrowKeyHex: '02aa',
       country: 'NG',
       rail: 'bank',
       fields: const {'accountNumber': '0123456789', 'bankName': 'OPay'},
@@ -41,6 +40,7 @@ void main() {
     );
     expect(sent['fields'], {'accountNumber': '0123456789', 'bankName': 'OPay'});
     expect(sent['amount_minor'], 3000000);
+    expect(sent.containsKey('escrow_key'), isFalse, reason: 'a quote comes before any escrow');
     expect(quote.sats, 23010);
     expect(quote.nameAtBank, 'ADA OBI');
     expect(quote.nameCheck, 'MATCHED');

@@ -8,6 +8,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::escrow::EscrowSession;
 use crate::grpc::Status;
 
 use crate::types::{
@@ -33,8 +34,12 @@ use crate::host::valid_task_id;
 use crate::renew::{AspCall, RenewSession, RenewStep};
 use crate::store::Store;
 
-/// How many escrow keys one wallet may hold at once. Each is a key to co-sign for and a session to
-/// time out, and the seal is rewritten in full on every change.
+/// How many escrows one wallet may hold. Each is a key to co-sign for and a pairing to answer for,
+/// and the seal is rewritten in full on every change.
+///
+/// ponytail: for the wallet's life — one escrow per payment, and none is forgotten, because the
+/// cosigner cannot see one emptied and what is left in it stays its owner's to take back. Forget an
+/// escrow once a reclaim of it has finalized when this bites.
 const MAX_ESCROWS: usize = 64;
 /// How many spent payments a wallet remembers, across every escrow it holds.
 ///
@@ -181,10 +186,8 @@ pub struct Cosigner {
     /// In-flight boarding settle, held across the commitment-FROST pause. Transient — never
     /// snapshotted.
     pub(crate) boarding_session: Option<BoardingSettleSession>,
-    /// The escrow keys this wallet has minted. See `SnapshotState::escrows`.
-    escrows: Vec<crate::types::EscrowRecord>,
-    /// Payments that have already been released against. See `SnapshotState::released_references`.
-    released_references: BTreeMap<String, crate::types::ReleaseRecord>,
+    /// The escrows this wallet has minted, each with its deal. See `SnapshotState::escrows`.
+    escrows: Vec<EscrowSession>,
     /// Where the seal lives.
     pub(crate) store: Arc<Store>,
     /// The runtime this cosigner runs inside: its task queue and its push channel. `Detached` when
@@ -243,7 +246,6 @@ impl Cosigner {
             renew_session: None,
             boarding_session: None,
             escrows: Vec::new(),
-            released_references: BTreeMap::new(),
             store,
             host,
             group_key,
@@ -283,7 +285,6 @@ impl Cosigner {
                 .and_then(|p| serde_json::to_string(&p).ok()),
             delegate_intent_id: None,
             escrows: self.escrows.clone(),
-            released_references: self.released_references.clone(),
         };
         serde_json::to_vec(&snap).map_err(|e| format!("snapshot serialize: {e}"))
     }
@@ -310,7 +311,6 @@ impl Cosigner {
         };
         self.vtxos = snap.vtxos;
         self.escrows = snap.escrows;
-        self.released_references = snap.released_references;
         // A delegate carries its own tree-signing key and its registration's id. Older seals kept
         // both beside it — a wallet-wide key, and `delegate_intent_id` — which are read here for
         // that and nothing else: the next seal writes them inside the delegate, and not beside it.
@@ -759,7 +759,7 @@ impl Cosigner {
             dealt_share,
             public_key_package_json,
             group_key,
-            escrows: self.escrows().iter().map(|e| e.summary(now)).collect(),
+            escrows: self.escrows.iter().map(|e| e.summary(now)).collect(),
         })
     }
 
@@ -819,10 +819,12 @@ impl Cosigner {
             })
     }
 
-    // --- Escrow keys -----------------------------------------------------------------------------
+    // --- Escrows ---------------------------------------------------------------------------------
     //
     // A second 2-of-2 over a key of its own, minted by a reshare so a service can be paired into
-    // escrowed money without being paired into the wallet. See `crate::handlers::escrow`.
+    // escrowed money without being paired into the wallet. See `crate::handlers::escrow`. What is
+    // done to one escrow is its `EscrowSession`'s; what is here looks across all of them — the
+    // release ledger, and the cap.
 
     /// The wallet key material a reshare is dealt against: this cosigner's own share and the
     /// group's public package. `None` before onboarding, when there is nothing to reshare.
@@ -840,260 +842,23 @@ impl Cosigner {
     }
 
     /// The escrows this wallet holds, oldest first.
-    pub fn escrows(&self) -> &[crate::types::EscrowRecord] {
+    pub fn escrows(&self) -> &[EscrowSession] {
         &self.escrows
     }
 
-    /// One escrow by its key, comparing x-only so either parity resolves — the reason a caller can
-    /// name an escrow by the address it pays.
-    pub fn escrow(&self, escrow_key: &str) -> Option<&crate::types::EscrowRecord> {
+    /// One escrow, comparing x-only so either parity resolves.
+    pub fn escrow(&self, escrow_key: &str) -> Option<&EscrowSession> {
         let want = x_only(escrow_key);
         self.escrows.iter().find(|e| x_only(&e.escrow_key) == want)
     }
 
-    /// One escrow's key material, to deal a pairing or sign a reclaim against. `None` when the
-    /// escrow is unknown or its sealed material does not parse.
-    pub(crate) fn escrow_details(&self, escrow_key: &str) -> Option<crate::escrow::EscrowDetails> {
-        let record = self.escrow(escrow_key)?;
-        let id_bytes: [u8; 32] = hex::decode(&record.wallet_identifier_hex).ok()?.try_into().ok()?;
-        Some(crate::escrow::EscrowDetails {
-            key: record.escrow_key.clone(),
-            key_package: KeyPackage::from_json(&record.key_package_json).ok()?,
-            public_key_package: PublicKeyPackage::from_json(&record.public_key_package_json).ok()?,
-            wallet_id: Identifier::deserialize(&id_bytes).ok()?,
-        })
-    }
-
-    /// Record a service pairing against one escrow.
-    ///
-    /// One service per escrow, and refused if there is already one: a second pairing would be a
-    /// second way to be paid out of money committed to a single deal, and the escrow has no way to
-    /// say which of them the deal was with.
-    pub fn pair_escrow_service(
-        &mut self,
-        escrow_key: &str,
-        pairing: crate::types::ServicePairing,
-    ) -> Result<(), String> {
+    /// One escrow, to act on — see [`EscrowSession`] for what it does.
+    pub fn escrow_mut(&mut self, escrow_key: &str) -> Result<&mut EscrowSession, String> {
         let want = x_only(escrow_key);
-        let record = self
-            .escrows
+        self.escrows
             .iter_mut()
             .find(|e| x_only(&e.escrow_key) == want)
-            .ok_or("this wallet holds no such escrow")?;
-        // Replaceable only while unfinished — see the note at the call site in `session.rs`. A
-        // retry deals fresh halves, so the record it replaces is one nothing could have used.
-        if record
-            .pairing
-            .as_ref()
-            .is_some_and(|p| p.state() == crate::types::PairingState::Ready)
-        {
-            return Err("this escrow already has a service paired into it".into());
-        }
-        record.pairing = Some(pairing);
-        Ok(())
-    }
-
-    /// The WALLET's half of the confirmation: it delivered its own half and the service took it.
-    ///
-    /// Not enough on its own. A pairing becomes usable when the service has *also* said the share
-    /// checks out — see [`ServicePairing::state`](crate::types::ServicePairing::state) — because
-    /// the wallet cannot see the half it is vouching for.
-    ///
-    /// Idempotent: confirming one that is already confirmed is what a retry looks like, and the
-    /// answer to it is yes.
-    pub fn confirm_escrow_pairing(
-        &mut self,
-        escrow_key: &str,
-        attempt_id_hex: &str,
-    ) -> Result<(), String> {
-        self.confirm_pairing(escrow_key, attempt_id_hex, |p| p.wallet_confirmed = true)
-    }
-
-    /// The SERVICE's half: it holds both halves and the share they sum to matches the published
-    /// verifying share. Arrives over the connection the runtime holds — see
-    /// [`crate::service_stream`].
-    pub fn confirm_pairing_by_service(
-        &mut self,
-        escrow_key: &str,
-        attempt_id_hex: &str,
-    ) -> Result<(), String> {
-        self.confirm_pairing(escrow_key, attempt_id_hex, |p| p.service_confirmed = true)
-    }
-
-    fn confirm_pairing(
-        &mut self,
-        escrow_key: &str,
-        attempt_id_hex: &str,
-        set: impl FnOnce(&mut crate::types::ServicePairing),
-    ) -> Result<(), String> {
-        let want = x_only(escrow_key);
-        let record = self
-            .escrows
-            .iter_mut()
-            .find(|e| x_only(&e.escrow_key) == want)
-            .ok_or("this wallet holds no such escrow")?;
-        let pairing = record
-            .pairing
-            .as_mut()
-            .ok_or("this escrow has no service paired into it")?;
-        if pairing.attempt_id_hex != attempt_id_hex {
-            // Confirming attempt A on the strength of attempt B's delivery would mark a pairing
-            // usable that nobody has shown to work.
-            return Err(
-                "that confirmation is for a different pairing attempt than the one this escrow \
-                 holds"
-                    .into(),
-            );
-        }
-        set(pairing);
-        Ok(())
-    }
-
-    /// Commit an escrow to a deal. Refuses an escrow with no service, and refuses a second
-    /// session over a live one.
-    ///
-    /// No service means nobody could ever release, so a session over such an escrow would lock the
-    /// owner out of their own money until a deadline for no one's benefit.
-    pub fn open_escrow_session(
-        &mut self,
-        escrow: crate::escrow_session::Escrow,
-        now: i64,
-    ) -> Result<(), String> {
-        self.may_commit_escrow(&escrow.escrow_key, now)?;
-        let want = x_only(&escrow.escrow_key);
-        let record = self
-            .escrows
-            .iter_mut()
-            .find(|e| x_only(&e.escrow_key) == want)
-            .ok_or("this wallet holds no such escrow")?;
-        record.session = Some(escrow);
-        Ok(())
-    }
-
-    /// Whether [`open_escrow_session`](Self::open_escrow_session) would commit this escrow at
-    /// `now`, without committing it.
-    ///
-    /// A send that tops an escrow up and commits it asks this before anything is built: a deal that
-    /// could not be struck is refused while no money has moved. Nothing else can write between the
-    /// question and the commit — the stream holds the tenant — so with the same `now` the answer
-    /// still holds when the send is final.
-    pub fn may_commit_escrow(&self, escrow_key: &str, now: i64) -> Result<(), String> {
-        let want = x_only(escrow_key);
-        let record = self
-            .escrows
-            .iter()
-            .find(|e| x_only(&e.escrow_key) == want)
-            .ok_or("this wallet holds no such escrow")?;
-        // Before anything else. Signatures a reclaim handed out are valid for as long as the
-        // outpoints they spend exist, and this cosigner can see neither whether they left the
-        // device nor whether those outpoints are still there. A deal struck over them would be
-        // one the owner could empty at will — so an escrow a reclaim was ever opened on is done
-        // with deals, and the next deal gets a new escrow.
-        if let Some(at) = record.reclaim_opened_at {
-            return Err(format!(
-                "a reclaim was opened on this escrow at {at}, so signatures that empty it may \
-                 exist; it cannot be committed to a deal again — mint a new escrow"
-            ));
-        }
-        match record.pairing.as_ref().map(|p| p.state()) {
-            None => {
-                return Err(
-                    "this escrow has no service paired into it: committing it would lock the money \
-                     away until the deadline with nobody able to take it"
-                        .into(),
-                )
-            }
-            // Delivered but not shown to work. The service holds one half of two, so it could not
-            // take its side of the deal — which is the same problem as having no service at all.
-            Some(crate::types::PairingState::Pending) => {
-                return Err(format!(
-                    "this escrow's service pairing is not finished: {}",
-                    record
-                        .pairing
-                        .as_ref()
-                        .map(|p| p.awaiting())
-                        .unwrap_or("nobody has confirmed it"),
-                ))
-            }
-            Some(crate::types::PairingState::Ready) => {}
-        }
-        // A deal can be struck again once the last one no longer holds the escrow: its deadline
-        // has passed (or its service brought the deadline forward), or everything it allows has
-        // been released. Not before, and never at the owner's word — see `crate::escrow_session`.
-        if record.session.as_ref().is_some_and(|s| s.holds_the_escrow(now)) {
-            return Err(
-                "this escrow is already committed to a deal, and a deal runs until its deadline, \
-                 until its service ends it, or until everything it allows has been released"
-                    .into(),
-            );
-        }
-        Ok(())
-    }
-
-    /// The escrow's service ends the deal it is party to.
-    ///
-    /// `policy_sha256` names the deal, so an end meant for one deal — a retry arriving late, say —
-    /// cannot end the next one struck over the same escrow. Ending a deal that is already over is
-    /// not an error: the service asked for something that is already true.
-    pub fn end_escrow_deal(
-        &mut self,
-        escrow_key: &str,
-        policy_sha256: &str,
-        now: i64,
-    ) -> Result<(), String> {
-        let want = x_only(escrow_key);
-        let session = self
-            .escrows
-            .iter_mut()
-            .find(|e| x_only(&e.escrow_key) == want)
-            .ok_or("this wallet holds no such escrow")?
-            .session
-            .as_mut()
-            .ok_or("this escrow is not committed to a deal")?;
-        if crate::policy::policy_sha256(&session.policy) != policy_sha256 {
-            return Err("that is not the deal this escrow is committed to".into());
-        }
-        session.end_by_service(now);
-        Ok(())
-    }
-
-    /// The earliest moment the owner may take this escrow back.
-    ///
-    /// The later of its current deal's deadline and the deadline of every deal that released
-    /// anything from it. A deal that ended early — spent, or ended by its service — may have
-    /// handed a service signatures it has yet to submit, and a reclaim spends the same VTXOs; so
-    /// the deadline that deal promised still stands for the owner, whatever has been struck since.
-    /// Read from the release ledger, which already outlives any one session.
-    pub fn reclaim_horizon(&self, escrow_key: &str) -> i64 {
-        let want = x_only(escrow_key);
-        let released = self
-            .released_references
-            .values()
-            .filter(|r| r.escrow_key == want)
-            .map(|r| r.deadline)
-            .max()
-            .unwrap_or(0);
-        let current = self
-            .escrow(escrow_key)
-            .and_then(|e| e.session.as_ref())
-            .map_or(0, |s| s.deadline);
-        released.max(current)
-    }
-
-    /// A reclaim is being opened on [escrow_key]: retire it from deals, for good.
-    ///
-    /// Called before the reclaim's round begins, and sealed by the caller before any nonce is
-    /// made, so an abandoned stream is as final as a finished one. The first time is kept; a
-    /// second reclaim on the same escrow — after an ASP failure, say — changes nothing.
-    pub fn mark_escrow_reclaim_opened(&mut self, escrow_key: &str, now: i64) -> Result<(), String> {
-        let want = x_only(escrow_key);
-        let record = self
-            .escrows
-            .iter_mut()
-            .find(|e| x_only(&e.escrow_key) == want)
-            .ok_or("this wallet holds no such escrow")?;
-        record.reclaim_opened_at.get_or_insert(now);
-        Ok(())
+            .ok_or_else(|| "this wallet holds no such escrow".into())
     }
 
     /// May this release be answered at all, and has it been answered already?
@@ -1102,8 +867,8 @@ impl Cosigner {
     ///
     /// 1. **Has this payment already justified a release?** A replayed authorization verifies every
     ///    time, because it really did succeed — so what stops it paying twice is this ledger. It is
-    ///    the wallet's, not the deal's: reopening an escrow must not empty it, and a second escrow
-    ///    paired to the same service must not be able to spend what the first already did.
+    ///    the wallet's, over every escrow: a wallet holds one escrow per payment, often with the
+    ///    same service, and the next one must not be able to spend what an earlier one already did.
     /// 2. **Is this a repeat of the request we answered for it?** Then the answer must be the same
     ///    answer — [`Admission::AlreadyAnswered`], sign again and count nothing. A repeat that is a
     ///    *different* release, or that comes from a different escrow, is refused.
@@ -1121,13 +886,18 @@ impl Cosigner {
         proposal_hash: &str,
     ) -> Result<crate::types::Admission, String> {
         use crate::types::Admission;
-        if let Some(record) = self.released_references.get(reference) {
-            if record.escrow_key != x_only(escrow_key) {
-                return Err(format!(
+        let released = self
+            .escrows
+            .iter()
+            .find_map(|e| e.releases.get(reference).map(|record| (e, record)));
+        if let Some((escrow, record)) = released {
+            if x_only(&escrow.escrow_key) != x_only(escrow_key) {
+                return Err(
                     "that payment has already been released against, by another escrow of this \
                      wallet: evidence that a payment succeeded stays true, so it may justify one \
                      release and no more"
-                ));
+                        .into(),
+                );
             }
             if record.request_id != request_id {
                 return Err(format!(
@@ -1151,16 +921,19 @@ impl Cosigner {
         // A scan rather than a second map, deliberately. The ledger is capped, this runs once per
         // release, and one source of truth cannot drift out of step with itself — which is exactly
         // what an index maintained beside it could do.
-        if let Some((reference, record)) = self.released_references.iter().find(|(_, r)| {
-            r.escrow_key == x_only(escrow_key) && r.request_id == request_id
-        }) {
+        if let Some((reference, record)) = self
+            .escrow(escrow_key)
+            .into_iter()
+            .flat_map(|e| &e.releases)
+            .find(|(_, r)| r.request_id == request_id)
+        {
             return Err(format!(
                 "request {request_id} was already answered, against payment {reference}, and that \
                  answer paid {} sats; a different release needs a different request id",
                 record.sats
             ));
         }
-        if self.released_references.len() >= MAX_RELEASED_REFERENCES {
+        if self.release_count() >= MAX_RELEASED_REFERENCES {
             return Err(format!(
                 "this wallet has released against {MAX_RELEASED_REFERENCES} payments and cannot \
                  remember another; past that it could not tell a repeat from a new one, so it \
@@ -1170,46 +943,17 @@ impl Cosigner {
         Ok(Admission::New)
     }
 
-    /// Write down a release this escrow made.
-    ///
-    /// Sealed by the caller, because a release that was signed and not recorded is a release that
-    /// can be asked for again — see [`crate::handlers::release`].
-    pub fn record_escrow_release(
-        &mut self,
-        escrow_key: &str,
-        reference: String,
-        record: crate::types::ReleaseRecord,
-    ) -> Result<(), String> {
-        let want = x_only(escrow_key);
-        let session = self
-            .escrows
-            .iter_mut()
-            .find(|e| x_only(&e.escrow_key) == want)
-            .ok_or("this wallet holds no such escrow")?
-            .session
-            .as_mut()
-            .ok_or("this escrow is not committed to anything")?;
-        // Two different lifetimes, on purpose. The allowance belongs to the deal and resets when a
-        // new one is struck; the payment is spent for as long as this wallet exists.
-        session.record_release(record.sats);
-        self.released_references.insert(reference, record);
-        Ok(())
-    }
-
-    /// What this wallet has already released against, for a caller that wants to show it.
-    pub fn released_references(&self) -> &BTreeMap<String, crate::types::ReleaseRecord> {
-        &self.released_references
+    /// How many payments this wallet has released against, across every escrow.
+    pub fn release_count(&self) -> usize {
+        self.escrows.iter().map(|e| e.releases.len()).sum()
     }
 
     /// Record a freshly minted escrow. Refuses a duplicate key and refuses past the cap.
     ///
-    /// The cap is not ceremony: every escrow is a standing obligation — a key to co-sign for, a
-    /// session to time out — and the seal is re-serialized in full on every mutation, so an
-    /// unbounded run of ceremonies would cost a wallet its own storage.
-    pub fn install_escrow(
-        &mut self,
-        record: crate::types::EscrowRecord,
-    ) -> Result<(), String> {
+    /// The cap is not ceremony: every escrow is a standing obligation — a pairing to answer for, a
+    /// deal to time out — and the seal is re-serialized in full on every mutation, so an unbounded
+    /// run of ceremonies would cost a wallet its own storage.
+    pub fn install_escrow(&mut self, record: EscrowSession) -> Result<(), String> {
         if self.escrow(&record.escrow_key).is_some() {
             return Err("this escrow key already exists on this wallet".into());
         }
@@ -1228,7 +972,7 @@ impl Cosigner {
             );
         }
         if self.escrows.len() >= MAX_ESCROWS {
-            return Err(format!("a wallet may hold at most {MAX_ESCROWS} escrows at once"));
+            return Err(format!("a wallet may hold at most {MAX_ESCROWS} escrows"));
         }
         self.escrows.push(record);
         Ok(())
@@ -1689,3 +1433,4 @@ pub fn build_arktx_sighash(checkpoint_tx: &[u8], ark_tx: &[u8]) -> Result<[u8; 3
 impl Cosigner {
 
 }
+

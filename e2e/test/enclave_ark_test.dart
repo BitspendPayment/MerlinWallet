@@ -936,10 +936,13 @@ void main() {
 
         final set = await alice.client.setUpEscrow(
           serviceIdentifier: serviceIdentifier,
+          policy: const {'op': 'always'},
+          deadline: DateTime.now().add(const Duration(hours: 1)),
           delivery: delivery,
         );
         final escrow = set.escrow, pairing = set.pairing;
-        expect(passkey.counter - before, 1, reason: 'minting and pairing are one approval');
+        expect(passkey.counter - before, 1,
+            reason: 'minting, pairing and striking the deal are one approval');
 
         // The service has both halves and checked the share they sum to. Nothing about that came
         // from the wallet's say-so — it assembled and verified for itself.
@@ -971,6 +974,7 @@ void main() {
             .firstWhere((e) => e.escrowKey.toLowerCase() == escrow.escrowKeyHex.toLowerCase());
         expect(
             row.serviceIdentifier.toLowerCase(), _hex(serviceIdentifier.serialize()).toLowerCase());
+        expect(row.hasSession(), isTrue, reason: 'the deal was struck with the pairing');
 
         // The connection outlives the call that opened it. That is the whole reason the half went
         // on a stream rather than in a POST: the service has to be able to speak first later.
@@ -989,7 +993,12 @@ void main() {
 
         service!.rejectWalletDeliveries = true;
         await expectLater(
-          bob.client.setUpEscrow(serviceIdentifier: serviceIdentifier, delivery: delivery),
+          bob.client.setUpEscrow(
+            serviceIdentifier: serviceIdentifier,
+            policy: const {'op': 'always'},
+            deadline: DateTime.now().add(const Duration(hours: 1)),
+            delivery: delivery,
+          ),
           throwsA(anything),
           reason: 'a pairing the service cannot complete must not report success',
         );
@@ -997,38 +1006,32 @@ void main() {
         // Minted before the pairing failed, so this wallet still knows it holds it.
         final escrow = bob.client.escrows.single;
 
-        // The cosigner sealed it pending, not ready — so nothing may be committed to it. Given
-        // time to converge rather than checked instantly, so this cannot pass merely by being
-        // quick: neither party has anything to say, and after the wait it is still not ready.
+        // The cosigner sealed it pending, not ready. Given time to converge rather than checked
+        // instantly, so this cannot pass merely by being quick: neither party has anything to say,
+        // and after the wait it is still not ready.
         expect(await readyWithin(bob, escrow.escrowKeyHex, limit: const Duration(seconds: 3)),
             isNot('ready'),
             reason: 'one half is not a pairing, and must not be reported as one');
 
-        await expectLater(
-          bob.client.openEscrowSession(
-            escrowKeyHex: escrow.escrowKeyHex,
-            policy: {'op': 'always'},
-            deadline: DateTime.now().add(const Duration(hours: 1)),
-          ),
-          throwsA(anything),
-          reason: 'an escrow whose service cannot sign must not be committed to a deal',
-        );
+        // And no deal: it is struck only once the wallet's half is delivered, and nothing else
+        // ever commits an escrow — so this one is its owner's, and never anybody's to be paid from.
+        final row = (await bob.client.escrowStatus()).firstWhere(
+            (e) => e.escrowKey.toLowerCase() == escrow.escrowKeyHex.toLowerCase());
+        expect(row.hasSession(), isFalse,
+            reason: 'an escrow whose service cannot sign must not be committed to a deal');
       } finally {
         await bob.close();
       }
     }, timeout: const Timeout(Duration(minutes: 15)));
 
-    /// Topping an escrow up and committing it to a deal is ONE approval: the send that funds it
-    /// commits it once final. And a deal the cosigner could not strike is refused before the send
-    /// is built, so a refusal moves no money at all.
-    test('an escrow is topped up and committed on one approval, and a refusal moves nothing',
-        () async {
+    /// An escrow is set up with its deal on ONE approval — minted, paired, committed — and funded
+    /// by an ordinary send to its address, on one more.
+    test('an escrow is set up with its deal on one approval and funded by a plain send', () async {
       final grace = await wallet('fund_grace');
       try {
         await grace.client.doDkg();
         await boardAndRenew(grace, 0.005);
         final passkey = grace.gate.authenticator as SoftwareAuthenticator;
-        const policy = {'op': 'always'};
         final deadline = DateTime.now().add(const Duration(hours: 1));
         Future<int> heldBy(String escrowKeyHex) async =>
             (await grace.client.vtxosAtArkAddress(escrowKeyHex.substring(2)))
@@ -1036,48 +1039,29 @@ void main() {
                 .toList()
                 .totalSats;
 
-        // Nothing paired into it: nobody could ever release from it, so there is no deal to strike.
-        final bare = await grace.client.createEscrow();
-        final balance = (await grace.client.listVtxos()).totalSats;
-        await expectLater(
-          whileMining(
-              btc,
-              () => grace.client.fundEscrowDeal(
-                    escrowKeyHex: bare.escrowKeyHex,
-                    amountSats: 20000,
-                    policy: policy,
-                    deadline: deadline,
-                  )),
-          throwsA(predicate((e) => '$e'.contains('no service paired'))),
-        );
-        expect((await grace.client.listVtxos()).totalSats, balance,
-            reason: 'refused before the send was built, so nothing left the wallet');
-        expect(await heldBy(bare.escrowKeyHex), 0);
-
+        var before = passkey.counter;
         final set = await grace.client.setUpEscrow(
           serviceIdentifier: serviceIdentifier,
+          policy: const {'op': 'always'},
+          deadline: deadline,
           delivery: delivery,
         );
+        expect(passkey.counter - before, 1, reason: 'the escrow and its deal are one approval');
+        expect(set.agreed, isNotEmpty, reason: 'the owner is told what she agreed to');
         final key = set.escrow.escrowKeyHex;
         expect(await readyWithin(grace, key), 'ready');
-
-        final before = passkey.counter;
-        final funded = await whileMining(
-            btc,
-            () => grace.client.fundEscrowDeal(
-                  escrowKeyHex: key,
-                  amountSats: 20000,
-                  policy: policy,
-                  deadline: deadline,
-                ));
-        expect(passkey.counter - before, 1, reason: 'the top-up and the seal are one approval');
-        expect(funded.agreed, isNotNull, reason: 'this cosigner commits on the send');
 
         final row = (await grace.client.escrowStatus())
             .firstWhere((e) => e.escrowKey.toLowerCase() == key.toLowerCase());
         expect(row.session.open, isTrue, reason: 'the escrow is committed to the deal');
         expect(row.session.deadlineSecs.toInt(), deadline.millisecondsSinceEpoch ~/ 1000);
-        await eventually('the escrow to hold the top-up', () => heldBy(key), (int s) => s == 20000);
+
+        before = passkey.counter;
+        final address = await grace.client.escrowArkAddress(key);
+        await whileMining(btc, () => grace.client.sendVtxo(address, 20000));
+        expect(passkey.counter - before, 1, reason: 'funding it is a send like any other');
+        await eventually(
+            'the escrow to hold what was sent', () => heldBy(key), (int s) => s == 20000);
       } finally {
         await grace.close();
       }
@@ -1096,8 +1080,13 @@ void main() {
       final erin = await wallet('release_erin');
       try {
         await erin.client.doDkg();
+        // The deal: what the service may take, and until when. Short, because this test waits it
+        // out — the only way a deal ends — and long enough to be paired and asked within.
+        final deadline = DateTime.now().add(const Duration(seconds: 45));
         final set = await erin.client.setUpEscrow(
           serviceIdentifier: serviceIdentifier,
+          policy: const {'op': 'always'},
+          deadline: deadline,
           delivery: delivery,
         );
         final escrow = set.escrow, pairing = set.pairing;
@@ -1113,15 +1102,6 @@ void main() {
             reason: 'one connection per wallet, all announcing the same local id');
         expect(share.streamId, endsWith('-${_streamIdFor(serviceIdentifier)}'),
             reason: 'the wire name is the tenant and then the id the guest chose');
-
-        // The deal: what the service may take, and until when. Short, because this test waits it
-        // out — the only way a deal ends.
-        final deadline = DateTime.now().add(const Duration(seconds: 20));
-        await erin.client.openEscrowSession(
-          escrowKeyHex: escrow.escrowKeyHex,
-          policy: {'op': 'always'},
-          deadline: deadline,
-        );
 
         // One VTXO in, one payout and change out — so two things to sign, and two commitments.
         final inputs = [
@@ -1203,8 +1183,8 @@ void main() {
         expect(afterwards['reason'], contains('deal is over'));
 
         // The other half of the same swap — the owner being able to take it back — needs an escrow
-        // that actually holds something. This one spends synthetic inputs, so reclaim is proved
-        // where the money is real: `bin/card_walkthrough.dart`, which funds, lapses and reclaims.
+        // that actually holds something. This one spends synthetic inputs, so a reclaim of real
+        // money is not proved end to end yet.
       } finally {
         await erin.close();
       }
@@ -1219,7 +1199,12 @@ void main() {
             ark_threshold.Identifier.derive(Uint8List.fromList('nobody-the-image-knows'.codeUnits));
 
         await expectLater(
-          dave.client.setUpEscrow(serviceIdentifier: stranger, delivery: delivery),
+          dave.client.setUpEscrow(
+            serviceIdentifier: stranger,
+            policy: const {'op': 'always'},
+            deadline: DateTime.now().add(const Duration(hours: 1)),
+            delivery: delivery,
+          ),
           throwsA(predicate((e) => '$e'.contains('does not know that service'))),
         );
         expect(dave.client.escrows, isEmpty, reason: 'refused before an escrow was minted');

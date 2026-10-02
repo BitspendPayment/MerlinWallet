@@ -1,36 +1,10 @@
-import 'package:app_core/asp/ark_info.dart';
 import 'package:app_core/platform/bank_send.dart';
 import 'package:test/test.dart';
 
-IndexerVtxo vtxo(int sats, {bool spent = false}) => IndexerVtxo(
-      txid: '11' * 32,
-      vout: 0,
-      amountSats: sats,
-      script: '',
-      isSpent: spent,
-      createdAt: 0,
-      expiresAt: 0,
-    );
-
 void main() {
-  test('an empty escrow is topped up by the whole price', () {
-    expect(BankSend.shortfall(23010, const []), 23010);
-  });
-
-  test('what the escrow already holds counts toward the price, and spent coins do not', () {
-    expect(BankSend.shortfall(23010, [vtxo(20000)]), 3010);
-    expect(BankSend.shortfall(23010, [vtxo(20000), vtxo(5000, spent: true)]), 3010);
-    expect(BankSend.shortfall(23010, [vtxo(30000)]), 0);
-  });
-
-  test('a top-up is never smaller than the ASP accepts', () {
-    expect(BankSend.shortfall(23010, [vtxo(23000)], dust: 330), 330);
-  });
-
   test('the owner is told how many approvals a send will take', () {
-    // Setting the escrow up is one stream, and topping it up and sealing the deal is another.
-    expect(BankSend.approvalsNeeded(hasEscrow: false), 2);
-    expect(BankSend.approvalsNeeded(hasEscrow: true), 1);
+    // Setting the payout's escrow up is one stream, and funding it is another.
+    expect(BankSend.approvals, 2);
   });
 
   test('a deal tag is 16 random bytes, and never the same twice', () {

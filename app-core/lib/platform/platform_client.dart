@@ -142,7 +142,6 @@ class PlatformClient {
   }
 
   Future<PayoutQuote> quote({
-    required String escrowKeyHex,
     required String country,
     required String rail,
     required Map<String, String> fields,
@@ -151,7 +150,6 @@ class PlatformClient {
     required String dealTag,
   }) async =>
       PayoutQuote(await _post('/payouts', {
-        'escrow_key': escrowKeyHex,
         'country': country,
         'rail': rail,
         'fields': fields,
@@ -160,10 +158,11 @@ class PlatformClient {
         'deal_tag': dealTag,
       }) as Map<String, dynamic>);
 
-  /// The go-ahead: the escrow is committed, so the platform may pay. It checks that for itself —
-  /// asking the cosigner before it spends anything — so this is a request, not a promise.
-  Future<void> fund(String requestId) =>
-      _send(() => _http.post(base.resolve('/payouts/$requestId/fund')), 'POST /fund');
+  /// The go-ahead: [escrowKeyHex] is committed to this payout, so the platform may pay. It checks
+  /// that for itself — asking the cosigner before it spends anything — so this is a request, not a
+  /// promise.
+  Future<void> fund(String requestId, {required String escrowKeyHex}) =>
+      _post('/payouts/$requestId/fund', {'escrow_key': escrowKeyHex});
 
   Future<PayoutStatus> status(String dealTag) async =>
       PayoutStatus(await _get('/payouts/$dealTag') as Map<String, dynamic>);

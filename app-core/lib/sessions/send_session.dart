@@ -25,16 +25,12 @@ import '../threshold_types.dart' as threshold;
 
 /// What a send produced.
 class SendResult {
-  SendResult(this.arkTxid, this.delegate, {this.committed});
+  SendResult(this.arkTxid, this.delegate);
   final String arkTxid;
 
   /// The delegate renewed over the wallet's set after the send, when [SendSession.send] was asked
   /// to and could. See `delegate.dart`.
   final DelegateStatus? delegate;
-
-  /// The deal an `escrowCommit` asked for, as the cosigner sealed it. Null means NOT committed —
-  /// none was asked for, or the cosigner is from before sends could commit one.
-  final cs.EscrowOpenSessionResponse? committed;
 }
 
 class SendSession {
@@ -50,10 +46,6 @@ class SendSession {
   /// [vtxos] is what this wallet holds, from the indexer. The cosigner validates every one against
   /// the scriptPubKey it derives from its own owner key before selecting from them, so naming a
   /// VTXO here cannot widen what the wallet owns.
-  ///
-  /// With [escrowCommit], this send tops up that escrow — [recipientArkAddress] is its address —
-  /// and the cosigner commits the escrow to the deal once the send is final. A deal it could not
-  /// strike is refused before anything is built, so no money moves.
   Future<SendResult> send({
     required String recipientArkAddress,
     required int amountSats,
@@ -67,7 +59,6 @@ class SendSession {
     String deviceToken = '',
     String exitScriptPubkeyHex = '',
     String ownerXOnlyHex = '',
-    cs.EscrowOpenSessionRequest? escrowCommit,
   }) async {
     // Every wait on the ASP or the indexer goes through this: the share is a local of this frame
     // from the first sighashes on, and a cancel has to be able to unwind it — see `CancelSignal`.
@@ -84,7 +75,6 @@ class SendSession {
           arkInfo: arkInfoToProto(info),
           vtxos: vtxosToProto(vtxos),
           identifier: identifier,
-          escrowCommit: escrowCommit,
         ),
       ));
 
@@ -153,7 +143,6 @@ class SendSession {
         throw CosignerException('expected the result, got ${complete.whichBody()}');
       }
       final arkTxid = complete.complete.arkTxid;
-      final committed = complete.complete.hasCommitted() ? complete.complete.committed : null;
 
       // --- Renew the delegate over what is held now, before closing --------------------------
       final delegate = readHeld == null
@@ -185,7 +174,7 @@ class SendSession {
                   cs.SendClientMsg(sessionId: '', seq: Int64(5), signed: cs.SendSigned(rounds: rounds)),
               renewedOf: (r) => r.hasDelegateRenewed() ? r.delegateRenewed : null,
             );
-      return SendResult(arkTxid, delegate, committed: committed);
+      return SendResult(arkTxid, delegate);
     } finally {
       await duplex.close();
     }

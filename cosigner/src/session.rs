@@ -28,7 +28,6 @@ use wstd::http::{Body, Request, Response};
 
 use crate::cosigner::Cosigner;
 use crate::renew::DelegateRenew;
-use crate::escrow_session::Escrow;
 use crate::grpc::{self, Duplex, SessionBody, Status};
 use crate::wallet_proto as wp;
 
@@ -112,7 +111,6 @@ impl Session {
             "DeviceCount" => unary!(self.device_count(body)),
             "Recover" => unary!(self.recover(body)),
             "EscrowList" => unary!(self.escrow_list(body)),
-            "EscrowOpenSession" => unary!(self.escrow_open_session(body)),
             other => grpc::failed(Status::unimplemented(format!("no such method: {other}"))),
         }
     }
@@ -162,33 +160,7 @@ impl Session {
         lock(&self.cosigner).recover(req)
     }
 
-    /// Commit an escrow to a deal: what the paired service may take, and until when.
-    async fn escrow_open_session(
-        &self,
-        body: Body,
-    ) -> Result<proto::EscrowOpenSessionResponse, Status> {
-        let req: proto::EscrowOpenSessionRequest = grpc::one_message(body).await?;
-        let now = crate::handlers::helpers::now_secs();
-        let escrow = Escrow::from_request(&req, now)?;
-        let description = escrow.policy.describe();
-        let deadline = escrow.deadline;
-
-        let mut c = lock(&self.cosigner);
-        c.open_escrow_session(escrow, now).map_err(Status::failed_precondition)?;
-        c.seal();
-        // Nothing is scheduled for the deadline, and nothing needs to be. A deadline is a fact
-        // about the clock that every decision reads out of the seal — `may_release` and
-        // `may_reclaim` reach the same answer whether or not anything ran when it passed. What
-        // used to be here was a task that woke the owner, and it bought a notification at the cost
-        // of a scheduler; the owner learns the same thing from `EscrowList` the next time they
-        // look. See `crate::escrow_session`.
-        Ok(proto::EscrowOpenSessionResponse {
-            policy_description: description,
-            deadline_secs: deadline,
-        })
-    }
-
-    /// The escrow keys this wallet holds — public projection only, so a device that keeps nothing
+    /// The escrows this wallet holds — public projection only, so a device that keeps nothing
     /// can ask what exists instead of remembering.
     async fn escrow_list(&self, body: Body) -> Result<proto::EscrowListResponse, Status> {
         let _: proto::EscrowListRequest = grpc::one_message(body).await?;
@@ -310,23 +282,19 @@ async fn sign(
     Ok(())
 }
 
-/// DKG as one session.
-///
-/// The unary form needed a `sessions` map keyed by user, with a TTL and an eviction loop, purely to
-/// hold round-1 and round-2 material between three requests — and that material is how the key is
-/// born. Here the session is a LOCAL: created at open, dropped when the stream ends. There is no
-/// map to evict from, no TTL to tune, and an abandoned ceremony leaves nothing behind rather than
-/// key material sitting in a map until a sweep notices.
-/// Minting an escrow key: one reshare, two exchanges, nothing parked.
+/// Minting an escrow: one reshare, two exchanges, nothing parked — then pairing a service into it
+/// and striking its deal.
 ///
 /// The same shape as [`dkg`] and for the same reason — the round-1 and round-2 secrets are what the
 /// key is born from, so they live on this frame and die with it. What differs is that both parties
 /// already have keys: the reshare is dealt under the identifiers they hold in the wallet key, and
 /// neither side's wallet share changes. See [`crate::handlers::escrow`].
 ///
-/// When the open names a service, the stream goes on to pair it into the new escrow, and the
-/// wallet confirms on this stream — so an escrow is set up for a service on one approval. The
-/// pairing is usable once the service confirms too, which can only arrive after this stream ends.
+/// When the open names a service, the stream goes on to pair it into the new escrow, the wallet
+/// confirms on this stream, and the deal the open names is struck — so an escrow is set up for a
+/// payment on one approval. One escrow, one deal: nothing commits an escrow but this stream, so
+/// the next payment mints the next escrow. The pairing is usable once the service confirms too,
+/// which can only arrive after this stream ends.
 async fn escrow(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<proto::EscrowClientMsg, proto::EscrowServerMsg>,
@@ -350,9 +318,24 @@ async fn escrow(
         if open.attempt_id.len() != 16 {
             return Err(Status::invalid_argument("a pairing attempt id is 16 bytes"));
         }
-        Some(crate::escrow::Service::named(&open.service_identifier)?)
+        Some(crate::service_stream::Service::named(&open.service_identifier)?)
     };
     let attempt_id_hex = hex::encode(&open.attempt_id);
+    // And its deal, with it and only with it — checked here too, so terms that could never be
+    // struck mint nothing. A deal nobody can release under would lock the money away until the
+    // deadline for no one's benefit; a service with no deal is a pairing nothing could ever use.
+    let terms = match &service {
+        Some(_) => Some(crate::escrow::DealTerms::from_request(
+            &open,
+            crate::handlers::helpers::now_secs(),
+        )?),
+        None if open.policy_json.is_empty() && open.deadline_secs == 0 => None,
+        None => {
+            return Err(Status::invalid_argument(
+                "a deal needs a service paired into its escrow to release under",
+            ))
+        }
+    };
 
     // There is nothing to reshare before there is a wallet. Taken once, up front, so the ceremony
     // runs against one consistent view of the key it is derived from.
@@ -406,7 +389,7 @@ async fn escrow(
     // would be a wallet that funds a key only half of which exists.
     {
         let mut c = lock(&cosigner);
-        c.install_escrow(crate::types::EscrowRecord {
+        c.install_escrow(crate::escrow::EscrowSession {
             escrow_key: material.escrow_key,
             key_package_json: material.key_package_json,
             public_key_package_json: material.public_key_package_json,
@@ -415,8 +398,8 @@ async fn escrow(
             wallet_delta_share_hex: material.wallet_delta_share_hex,
             created_at: crate::handlers::helpers::now_secs(),
             pairing: None,
-            session: None,
-            reclaim_opened_at: None,
+            terms: None,
+            releases: Default::default(),
         })
         .map_err(Status::failed_precondition)?;
         c.seal();
@@ -432,7 +415,7 @@ async fn escrow(
             },
         )),
     });
-    let Some(service) = service else { return Ok(()) };
+    let (Some(service), Some(terms)) = (service, terms) else { return Ok(()) };
 
     // --- Pairing the service in ----------------------------------------------------------------
     let deal = match duplex.next_body("the wallet's dealing").await? {
@@ -440,9 +423,68 @@ async fn escrow(
         _ => return Err(Status::invalid_argument("expected PairServiceDeal")),
     };
     let escrow = lock(&cosigner)
-        .escrow_details(&escrow_key)
+        .escrow(&escrow_key)
+        .and_then(crate::escrow::EscrowSession::details)
         .ok_or_else(|| Status::internal("this escrow's sealed key material is unreadable"))?;
-    let paired = escrow.deal_and_deliver(&cosigner, &service, &attempt_id_hex, deal).await?;
+    // This cosigner's half, dealt from the wallet's dealing, handed to the service, and only then
+    // sealed pending — as `handlers::delivery` explains: this cosigner never keeps the service's
+    // half, so a pairing sealed before a failed delivery could never be completed.
+    let material = crate::handlers::pairing::pair_service(
+        &escrow.key_package,
+        &escrow.public_key_package,
+        &escrow.wallet_id,
+        &service.id,
+        &deal.contribution_to_cosigner,
+        &deal.contribution_to_service,
+    )?;
+    // Over the connection the runtime will go on holding after this call ends — that is what lets
+    // the service speak first later, when it asks for a release. See `handlers::delivery`.
+    let host = lock(&cosigner).host();
+    crate::handlers::delivery::deliver_pairing_half(
+        host.as_ref(),
+        &material.service_identifier_hex,
+        &service.origin,
+        &crate::service_stream::ToService::PairingHalf {
+            escrow_key: escrow_key.clone(),
+            attempt_id: attempt_id_hex.clone(),
+            service_identifier: material.service_identifier_hex.clone(),
+            half: hex::encode(&material.service_half),
+            public_key_package_json: material.public_key_package_json.clone(),
+            service_verifying_share: material.service_verifying_share_hex.clone(),
+        },
+    )
+    .await
+    .map_err(|e| {
+        Status::unavailable(format!(
+            "the service did not take its half, so nothing was paired: {e}"
+        ))
+    })?;
+    let paired = proto::PairServiceDone {
+        public_key_package_json: material.public_key_package_json.clone(),
+        service_verifying_share: material.service_verifying_share_hex.clone(),
+        // So the wallet delivers its own half to the same place. It does not choose an origin, and
+        // could not: the list lives in the image.
+        service_origin: service.origin.clone(),
+    };
+    let pairing = crate::types::ServicePairing {
+        service_identifier_hex: material.service_identifier_hex,
+        key_package_json: material.key_package_json,
+        public_key_package_json: material.public_key_package_json,
+        service_verifying_share_hex: material.service_verifying_share_hex,
+        paired_at: crate::handlers::helpers::now_secs(),
+        attempt_id_hex: attempt_id_hex.clone(),
+        // Delivered, not yet shown to work: the service has one half of two, and neither party has
+        // vouched for it. See `handlers::delivery`.
+        service_confirmed: false,
+        wallet_confirmed: false,
+    };
+    {
+        let mut c = lock(&cosigner);
+        c.escrow_mut(&escrow_key)
+            .and_then(|e| e.record_pairing(pairing))
+            .map_err(Status::failed_precondition)?;
+        c.seal();
+    }
     duplex.send(proto::EscrowServerMsg {
         session_id: session_id.clone(),
         seq: 3,
@@ -456,22 +498,41 @@ async fn escrow(
     if !matches!(delivered, proto::escrow_client_msg::Body::Delivered(_)) {
         return Err(Status::invalid_argument("expected PairServiceConfirmRequest"));
     }
+    // And the deal, with it: both halves are with the service now. Sealed before it is announced,
+    // because the app goes on to fund the escrow and ask the service to pay against it.
+    let confirmed = proto::PairServiceConfirmResponse {
+        policy_description: terms.policy.describe(),
+        deadline_secs: terms.deadline,
+    };
     {
         let mut c = lock(&cosigner);
-        c.confirm_escrow_pairing(&escrow_key, &attempt_id_hex)
+        c.escrow_mut(&escrow_key)
+            .and_then(|e| {
+                e.confirm_by_wallet(&attempt_id_hex)?;
+                e.strike_deal(terms)
+            })
             .map_err(Status::failed_precondition)?;
-        c.seal();
+        c.try_seal().map_err(|e| {
+            Status::unavailable(format!("the deal could not be saved ({e}); nothing was struck"))
+        })?;
     }
+    // Nothing is scheduled for the deadline, and nothing needs to be. A deadline is a fact about
+    // the clock that every decision reads out of the seal — see `crate::escrow_session`.
     duplex.send(proto::EscrowServerMsg {
         session_id,
         seq: 4,
-        body: Some(proto::escrow_server_msg::Body::Confirmed(
-            proto::PairServiceConfirmResponse {},
-        )),
+        body: Some(proto::escrow_server_msg::Body::Confirmed(confirmed)),
     });
     Ok(())
 }
 
+/// DKG as one session.
+///
+/// The unary form needed a `sessions` map keyed by user, with a TTL and an eviction loop, purely to
+/// hold round-1 and round-2 material between three requests — and that material is how the key is
+/// born. Here the session is a LOCAL: created at open, dropped when the stream ends. There is no
+/// map to evict from, no TTL to tune, and an abandoned ceremony leaves nothing behind rather than
+/// key material sitting in a map until a sweep notices.
 async fn dkg(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<proto::DkgClientMsg, proto::DkgServerMsg>,
@@ -571,10 +632,10 @@ async fn reclaim(
     open: proto::SendOpen,
 ) -> Result<(), Status> {
     // Where it goes is derived, never named, and it takes everything the escrow holds.
-    if !open.recipient_ark_address.is_empty() || open.amount != 0 || open.escrow_commit.is_some() {
+    if !open.recipient_ark_address.is_empty() || open.amount != 0 {
         return Err(Status::invalid_argument(
-            "a reclaim names no recipient, amount or deal: it returns what the escrow holds to \
-             this wallet",
+            "a reclaim names no recipient or amount: it returns what the escrow holds to this \
+             wallet",
         ));
     }
     let info = open
@@ -590,18 +651,8 @@ async fn reclaim(
         now,
     )?;
 
-    // From here on the owner may come to hold signatures that empty this escrow, and nothing
-    // that happens later on this stream — or fails to — tells the cosigner whether they did. So
-    // the escrow is retired from deals now, and durably, before a single nonce exists: a seal
-    // that cannot be written means no round at all. See `Cosigner::open_escrow_session`.
-    {
-        let mut c = lock(&cosigner);
-        c.mark_escrow_reclaim_opened(&open.reclaim_escrow, now)
-            .map_err(Status::failed_precondition)?;
-        c.try_seal().map_err(|e| {
-            Status::unavailable(format!("could not record the reclaim, so it does not begin: {e}"))
-        })?;
-    }
+    // Nothing to retire before the round. Signatures it hands out can only empty this escrow, and
+    // it is never committed to a deal again — the session that minted it struck its one deal.
 
     // Round one, on this stream, as a send does it: the cosigner commits first so the whole batch
     // costs one round trip — but with the ESCROW's share, not the wallet's.
@@ -691,7 +742,6 @@ async fn reclaim(
         body: Some(proto::send_server_msg::Body::Complete(proto::SendComplete {
             ark_txid: submitted.ark_txid,
             change: None,
-            committed: None,
         })),
     });
     Ok(())
@@ -730,23 +780,6 @@ async fn send(
         .ark_info
         .map(ark::client::types::ArkInfo::from)
         .ok_or_else(|| Status::invalid_argument("SendOpen carried no ark_info"))?;
-
-    // A top-up that also commits its escrow to a deal. Asked now, before anything is built: a deal
-    // that could not be struck is refused while no money has moved. Nothing else can write until
-    // this stream ends — it holds the tenant — so the same answer holds once the send is final.
-    // Where the money goes is the caller's to say, as for any send: an owner could always fund an
-    // escrow one way and commit it another, and a service pays against what the escrow holds.
-    let commit = match open.escrow_commit.as_ref() {
-        None => None,
-        Some(req) => {
-            let now = crate::handlers::helpers::now_secs();
-            let deal = Escrow::from_request(req, now)?;
-            lock(&cosigner)
-                .may_commit_escrow(&deal.escrow_key, now)
-                .map_err(Status::failed_precondition)?;
-            Some((deal, now))
-        }
-    };
 
     // The caller names its inputs, and the cosigner validates every one against the scriptPubKey it
     // derives from its own owner key before selecting — so naming a VTXO here cannot widen what the
@@ -826,43 +859,12 @@ async fn send(
         proto::send_client_msg::Body::Finalized(_) => {}
         _ => return Err(Status::invalid_argument("expected SendFinalized")),
     }
-    let (resp, committed) = {
+    let resp = {
         let mut c = lock(&cosigner);
         let submitted = c.send_complete((session, change_exit_delay), submitted.ark_txid);
         let resp = c.apply_send(submitted);
-        match commit {
-            None => {
-                c.seal();
-                (resp, None)
-            }
-            // The money is in the escrow now, so no failure below may read like the refusal at
-            // open: an app retries that one, and a retry here would send the money twice.
-            Some((deal, now)) => {
-                let committed = proto::EscrowOpenSessionResponse {
-                    policy_description: deal.policy.describe(),
-                    deadline_secs: deal.deadline,
-                };
-                // Checked at open with this same `now`, and nothing wrote since, so this does not
-                // fail. If it ever did, its reason stays in the log: said here, it could read
-                // like the refusal an app retries.
-                c.open_escrow_session(deal, now).map_err(|e| {
-                    tracing::error!("a deal checked at open was refused after the send: {e}");
-                    Status::internal(
-                        "the send went through but the deal was not committed; commit it on its \
-                         own",
-                    )
-                })?;
-                // Sealed before it is announced: the app goes on to ask the service to pay
-                // against this deal.
-                c.try_seal().map_err(|e| {
-                    Status::unavailable(format!(
-                        "the send went through but the deal could not be saved ({e}); commit it \
-                         on its own"
-                    ))
-                })?;
-                (resp, Some(committed))
-            }
-        }
+        c.seal();
+        resp
     };
 
     duplex.send(proto::SendServerMsg {
@@ -871,7 +873,6 @@ async fn send(
         body: Some(proto::send_server_msg::Body::Complete(proto::SendComplete {
             ark_txid: resp.ark_txid,
             change: None,
-            committed,
         })),
     });
 

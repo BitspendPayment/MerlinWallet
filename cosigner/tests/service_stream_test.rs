@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use common::Recorder;
 use cosigner::handlers::helpers::block_on_ready;
 use cosigner::service_stream::{service_stream_id, FromService, ToService};
-use cosigner::types::{EscrowRecord, PairingState, ServicePairing};
+use cosigner::types::{PairingState, ServicePairing};
 
 const NOW: i64 = 1_700_000_000;
 const SERVICE: &str = "44";
@@ -43,7 +43,7 @@ fn service_id() -> String {
 
 /// An escrow with a service paired into it, delivered but not yet vouched for by anybody.
 fn seed(c: &mut cosigner::Cosigner, escrow_key: &str, attempt: &str) {
-    c.install_escrow(EscrowRecord {
+    c.install_escrow(cosigner::escrow::EscrowSession {
         escrow_key: escrow_key.to_string(),
         key_package_json: "{}".into(),
         public_key_package_json: "{}".into(),
@@ -61,8 +61,8 @@ fn seed(c: &mut cosigner::Cosigner, escrow_key: &str, attempt: &str) {
             service_confirmed: false,
             wallet_confirmed: false,
         }),
-        session: None,
-        reclaim_opened_at: None,
+        terms: None,
+        releases: Default::default(),
     })
     .expect("install escrow");
 }
@@ -358,7 +358,7 @@ fn a_pairing_is_usable_once_both_parties_have_said_so() {
             attempt_id: attempt.clone(),
         },
     );
-    c.lock().unwrap().confirm_escrow_pairing(&key, &attempt).unwrap();
+    c.lock().unwrap().escrow_mut(&key).and_then(|e| e.confirm_by_wallet(&attempt)).unwrap();
 
     let guard = c.lock().unwrap();
     let pairing = guard.escrow(&key).unwrap().pairing.as_ref().unwrap();

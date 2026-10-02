@@ -221,7 +221,7 @@ pub fn seed_escrow(
     paired: bool,
 ) {
     let mut c = cosigner.lock().unwrap();
-    c.install_escrow(cosigner::types::EscrowRecord {
+    c.install_escrow(cosigner::escrow::EscrowSession {
         escrow_key: escrow_key.to_string(),
         key_package_json: "{}".into(),
         public_key_package_json: "{}".into(),
@@ -241,8 +241,8 @@ pub fn seed_escrow(
             service_confirmed: true,
             wallet_confirmed: true,
         }),
-        session: None,
-        reclaim_opened_at: None,
+        terms: None,
+        releases: Default::default(),
     })
     .expect("install escrow");
 }

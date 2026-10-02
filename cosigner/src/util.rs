@@ -5,7 +5,7 @@ use crate::grpc::Status;
 use crate::session::proto;
 use crate::wallet_proto as wp;
 
-impl crate::types::EscrowRecord {
+impl crate::escrow::EscrowSession {
     /// This escrow as a caller may see it: the public projection, as of [now]. What `EscrowList`
     /// returns, and what `Recover` hands a new device so it can rebuild its escrows the way it
     /// rebuilt the wallet.
@@ -34,16 +34,15 @@ impl crate::types::EscrowRecord {
                 .pairing
                 .as_ref()
                 .is_some_and(|p| p.wallet_confirmed),
-            session: self.session.as_ref().map(|s| proto::EscrowSessionSummary {
-                // Whether it still holds the escrow: a spent deal lets the next one be struck.
-                open: s.holds_the_escrow(now),
-                deadline_secs: s.deadline,
-                opened_at: s.opened_at,
-                released_sats: s.released_sats,
-                policy_description: s.policy.describe(),
+            session: self.terms.as_ref().map(|t| proto::EscrowSessionSummary {
+                // Whether it can still release: running, and not yet spent.
+                open: self.holds_the_escrow(now),
+                deadline_secs: t.deadline,
+                opened_at: t.opened_at,
+                released_sats: self.released_sats(),
+                policy_description: t.policy.describe(),
             }),
             context: hex::decode(&self.context_hex).unwrap_or_default(),
-            reclaim_opened: self.reclaim_opened_at.is_some(),
         }
     }
 }

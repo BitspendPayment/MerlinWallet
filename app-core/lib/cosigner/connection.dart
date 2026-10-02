@@ -255,10 +255,5 @@ class CosignerConnection {
   Future<cs.EscrowListResponse> escrowList() async =>
       _stub.escrowList(cs.EscrowListRequest(), options: await _approved('EscrowList'));
 
-  /// Commit an escrow to a deal: what the paired service may take, and until when.
-  Future<cs.EscrowOpenSessionResponse> escrowOpenSession(
-          cs.EscrowOpenSessionRequest r) async =>
-      _stub.escrowOpenSession(r, options: await _approved('EscrowOpenSession'));
-
   Future<void> shutdown() => _channel.shutdown();
 }

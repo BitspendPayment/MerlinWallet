@@ -254,6 +254,9 @@ class FakeCosigner extends cs.CosignerServiceBase {
   /// How many times a wallet said, on an `Escrow` stream, that its half was delivered.
   int pairingsConfirmed = 0;
 
+  /// The deals struck, as each open named its policy.
+  final dealsStruck = <String>[];
+
   /// The reshare, as the real cosigner plays it — so a wallet mints a real escrow key and rebuilds
   /// its share for real — and, when the open names a service, the pairing that follows **in shape
   /// only**: its decisions are proved against the real handler (`cosigner/tests/pairing_test.rs`)
@@ -317,15 +320,16 @@ class FakeCosigner extends cs.CosignerServiceBase {
       throw GrpcError.invalidArgument('expected word that the wallet delivered its half');
     }
     pairingsConfirmed++;
-    yield cs.EscrowServerMsg(seq: Int64(4), confirmed: cs.PairServiceConfirmResponse());
+    // The deal the open named, struck with the wallet's word, as the cosigner strikes it.
+    dealsStruck.add(open.policyJson);
+    yield cs.EscrowServerMsg(
+      seq: Int64(4),
+      confirmed: cs.PairServiceConfirmResponse(
+        policyDescription: 'the deal ${open.policyJson}',
+        deadlineSecs: open.deadlineSecs,
+      ),
+    );
   }
-
-  @override
-  Future<cs.EscrowOpenSessionResponse> escrowOpenSession(
-    ServiceCall call,
-    cs.EscrowOpenSessionRequest request,
-  ) async =>
-      throw GrpcError.unimplemented('this fake mints no escrows to commit');
 
   @override
   Future<cs.EscrowListResponse> escrowList(

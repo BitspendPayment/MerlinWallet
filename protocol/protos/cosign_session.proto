@@ -49,8 +49,8 @@ service Cosigner {
   // A send, with the wallet driving the ASP: the cosigner builds it and signs its half, the wallet
   // submits and finalizes, and the cosigner records it only once it is final.
   //
-  // The same steps move money into and out of an escrow: a send may commit the escrow it tops up
-  // to a deal (`SendOpen.escrow_commit`), or take back what is left of one (`reclaim_escrow`).
+  // The same steps fund an escrow — a plain send to its address — and take back what is left of
+  // one (`reclaim_escrow`).
   rpc Send(stream SendClientMsg) returns (stream SendServerMsg);
 
   // Renewing, with the client driving the ASP round.
@@ -111,23 +111,16 @@ service Cosigner {
   // of that share goes straight to the service, over an origin THIS IMAGE names; the wallet sends
   // its own half to the same origin, then confirms here. The pairing is usable only once the
   // service has confirmed as well. See `cosigner/src/handlers/delivery.rs`.
+  //
+  // And with the pairing, the deal: what the service may take, and until when — struck once the
+  // wallet has delivered its half, on the same approval. One escrow, one deal: an escrow is never
+  // committed again, so the next payment mints the next escrow. See
+  // `cosigner/src/escrow_session.rs`.
   rpc Escrow(stream EscrowClientMsg) returns (stream EscrowServerMsg);
 
   // The escrow keys this wallet holds. Public projection only — a device that keeps nothing asks
   // what exists rather than remembering.
   rpc EscrowList(EscrowListRequest) returns (EscrowListResponse);
-
-  // Committing an escrow to a deal: what the paired service may take, and until when.
-  //
-  // Both pairings sign the same key, so which of them gets a signature is a DECISION this cosigner
-  // makes on sealed state — not something the key enforces. Until the deadline the service may
-  // release and the owner may not reclaim; afterwards those swap, with nothing written down in
-  // between. See `cosigner/src/escrow_session.rs`, which says plainly what that does and does not
-  // guarantee.
-  // There is deliberately no way to END one. A commitment the owner can revoke is not a
-  // commitment: a service that had already paid a merchant against it would be left holding the
-  // loss. Her control is the deadline she chooses here.
-  rpc EscrowOpenSession(EscrowOpenSessionRequest) returns (EscrowOpenSessionResponse);
 }
 
 // 32-512 characters of [A-Za-z0-9_:.-], as `notify.wit` specifies.
@@ -472,10 +465,9 @@ message SendOpen {
   // public, so this authenticates nobody — the runtime did that, per tenant. What it catches is a
   // wallet that is not this one: a wrong passkey, or a PRF that answers differently.
   bytes identifier = 8;
-  // Set when this send tops an escrow up: commit that escrow to this deal once the send is final,
-  // on the same approval. The recipient is then the escrow's address. Checked before anything is
-  // built — a deal that could not be struck now is refused while no money has moved.
-  EscrowOpenSessionRequest escrow_commit = 9;
+  // Once committed the escrow a send topped up to a deal. The deal is struck on `Escrow` now.
+  reserved 9;
+  reserved "escrow_commit";
   // Set, to take back what is left of this escrow (compressed hex) instead of sending: the
   // `{wallet, cosigner}` pairing over the escrow's key, refused while a deal holds it. `vtxos` are
   // then the escrow's — named by the wallet, which is safe because a taproot sighash commits to
@@ -558,9 +550,8 @@ message SendComplete {
   string ark_txid = 1;
   // The change VTXO the send produced, absent when it spent the inputs exactly.
   ChangeVtxo change = 2;
-  // The deal `SendOpen.escrow_commit` asked for, sealed. Absent means NOT committed — which is
-  // also what a cosigner from before this field answers.
-  EscrowOpenSessionResponse committed = 3;
+  reserved 3;
+  reserved "committed";
 }
 
 message ChangeVtxo {
@@ -757,6 +748,21 @@ message EscrowOpen {
   bytes service_identifier = 4;
   // What ties the two halves together at the service, 16 bytes, drawn fresh for each attempt.
   bytes attempt_id = 5;
+  // The deal, struck once the service is paired in and the wallet has delivered its half. Named
+  // with a service and only with one: a deal nobody can release under would lock the money away
+  // until the deadline for no one's benefit. Validated before anything is dealt.
+  //
+  // Both pairings sign the same key, so which of them gets a signature is a DECISION this cosigner
+  // makes on sealed state — not something the key enforces. Until the deadline the service may
+  // release and the owner may not reclaim; afterwards those swap. There is deliberately no way for
+  // the owner to END one: a service that had already paid against it would be left holding the
+  // loss. Her control is the deadline she chooses here.
+  //
+  // What a release must satisfy, as the policy IR's JSON — `cosigner/src/policy.rs`. An absent or
+  // unparseable policy releases NOTHING: the IR's default is `never`.
+  string policy_json = 6;
+  // Unix seconds. After this the service may no longer take and the owner may reclaim.
+  int64 deadline_secs = 7;
 }
 
 // JSON: the wallet's share of its own delta, addressed to the cosigner.
@@ -832,25 +838,13 @@ message PairServiceConfirmRequest {
   bytes attempt_id = 5;
 }
 
-message PairServiceConfirmResponse {}
-
-message EscrowOpenSessionRequest {
-  // Authentication is the runtime's — see the note at the top of this file.
-  reserved 1, 2, 3;
-  reserved "user_id", "signature", "timestamp_ms";
-  string escrow_key = 4;
-  // What a release must satisfy, as the policy IR's JSON — `cosigner/src/policy.rs`. An absent or
-  // unparseable policy releases NOTHING: the IR's default is `never`.
-  string policy_json = 5;
-  // Unix seconds. After this the service may no longer take and the owner may reclaim.
-  int64 deadline_secs = 6;
-}
-
-message EscrowOpenSessionResponse {
-  // What the owner is agreeing to, rendered for consent — `Policy::describe`.
+// The wallet's confirmation taken, and the deal `EscrowOpen` named struck and sealed.
+message PairServiceConfirmResponse {
+  // What the owner agreed to, rendered for consent — `Policy::describe`.
   string policy_description = 1;
   int64 deadline_secs = 2;
 }
+
 message EscrowListRequest {
   // Authentication is the runtime's — see the note at the top of this file.
   reserved 1, 2, 3;
@@ -872,7 +866,7 @@ message EscrowSummary {
   string service_identifier = 5;
   // Whether that pairing is finished. BOTH parties have to say so, and each can answer only for
   // itself — so the two are reported separately as well as together. A pending pairing is not
-  // usable and nothing may be committed to it.
+  // usable: nothing is released through it, so an escrow is funded only once it is ready.
   bool service_ready = 7;
   // The service said, over the connection the cosigner's runtime holds to it, that it has both
   // halves and that the share they sum to matches the published verifying share. Only the service
@@ -881,14 +875,13 @@ message EscrowSummary {
   // The wallet said it delivered its own half and the service took it. Only the wallet can know
   // this: its half travels device-to-service and never through the cosigner.
   bool wallet_confirmed = 9;
-  // The live deal, when there is one.
+  // The escrow's deal, absent when the session that minted it ended before striking one.
   EscrowSessionSummary session = 6;
   // The derivation context the wallet's delta was minted under — what a new device needs to
   // re-derive it. Not a secret: it is meaningless without the PRF, and the cosigner holds it.
   bytes context = 10;
-  // A reclaim was opened on this escrow. It is retired from deals for good — the owner may hold
-  // signatures that empty it — and the next deal needs a new escrow.
-  bool reclaim_opened = 11;
+  reserved 11;
+  reserved "reclaim_opened";
 }
 
 message EscrowSessionSummary {

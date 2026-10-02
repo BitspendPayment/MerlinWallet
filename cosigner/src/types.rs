@@ -78,30 +78,18 @@ pub struct SnapshotState {
     /// Read only to restore a delegate sealed before it did, and never written.
     #[serde(default, skip_serializing)]
     pub delegate_intent_id: Option<String>,
-    /// The escrow keys this wallet has minted, newest last. `default` for seals written before
-    /// escrow existed — a wallet with none simply has none.
+    /// The escrows this wallet has minted, oldest first, each with its one deal and the payments
+    /// it released. `default` for seals written before escrow existed — a wallet with none simply
+    /// has none. An older seal's escrows load without their deals, and its wallet-wide release
+    /// ledger is not read: they are taken back, never paid from again.
     #[serde(default)]
-    pub escrows: Vec<EscrowRecord>,
-    /// Every external payment that has already justified a release, by the reference its provider
-    /// knows it by.
-    ///
-    /// **On the wallet, deliberately, and not on the session that spent it.** A payment that
-    /// succeeded goes on being true for ever, so what stops it being paid against twice is this
-    /// record and nothing else — which means it has to outlive everything a service could arrange
-    /// to have replaced. A ledger kept inside an [`Escrow`](crate::escrow_session::Escrow)
-    /// would be emptied by reopening the deal, and would not be consulted at all by a second escrow
-    /// paired to the same service. Both are ways to spend one payment twice.
-    ///
-    /// `default` for seals written before releases existed.
-    #[serde(default)]
-    pub released_references: std::collections::BTreeMap<String, ReleaseRecord>,
+    pub escrows: Vec<crate::escrow::EscrowSession>,
 }
 
-/// One release this wallet has made, filed under the payment that justified it.
+/// One release an escrow made, filed under the payment that justified it — see
+/// [`EscrowSession::releases`](crate::escrow_session::EscrowSession::releases).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseRecord {
-    /// Which escrow paid it, x-only so either parity resolves.
-    pub escrow_key: String,
     /// The service's idempotency key for the request that asked.
     pub request_id: String,
     /// What it paid out, in sats.
@@ -114,10 +102,8 @@ pub struct ReleaseRecord {
     /// The deadline of the deal that approved it, unix seconds.
     ///
     /// Until then a repeat of this request is signed again, and the owner may not take the escrow
-    /// back — the service may still hold these signatures unsubmitted, even if a newer deal has
-    /// since been struck over the same escrow. `0` on a record written before this was kept: it
-    /// answers no repeat and holds up no reclaim.
-    #[serde(default)]
+    /// back — the service may still hold these signatures unsubmitted, even if its service has
+    /// since ended the deal.
     pub deadline: i64,
 }
 
@@ -132,49 +118,6 @@ pub enum Admission {
     /// service whose reply was lost has to be able to ask a second time, and two signatures over
     /// one transaction spend the same inputs, so only one of them can ever confirm.
     AlreadyAnswered(Box<ReleaseRecord>),
-}
-
-/// One escrow key this cosigner co-holds, sealed.
-///
-/// An escrow is a *second* 2-of-2 over a key of its own — `V' = V + Δ_wallet + Δ_cosigner`, minted
-/// by a reshare so the wallet's own key is untouched and a service can be paired into the escrow
-/// without being paired into the wallet. See `handlers::escrow`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EscrowRecord {
-    /// `V'`, compressed hex. The escrow's identity, and the owner key of the Ark address it holds.
-    pub escrow_key: String,
-    /// This cosigner's share of `V'`.
-    pub key_package_json: String,
-    /// `V'`'s public package: the group key and both verifying shares.
-    pub public_key_package_json: String,
-    /// The wallet's FROST identifier in this escrow, as the reshare recorded it.
-    pub wallet_identifier_hex: String,
-    /// The derivation context the wallet dealt its delta under, hex. Kept so a repeat can be
-    /// refused — two escrows on one delta are two points on one line.
-    pub context_hex: String,
-    /// `Δ_cosigner(id_wallet)`, hex: this cosigner's delta share for the wallet.
-    ///
-    /// The wallet keeps nothing; it rebuilds its escrow share per operation as
-    /// `±[ s_wallet + Δ_wallet(id) + this ]`, where `s_wallet` is the wallet share it already
-    /// rebuilds and `Δ_wallet` comes from its passkey. Kept as its own term and never pre-summed
-    /// with `wallet_dealt_share_hex`: an even-Y normalisation sits between them, so a sum would be
-    /// wrong for every wallet whose key came out with odd Y. See `handlers::escrow`.
-    pub wallet_delta_share_hex: String,
-    /// Unix seconds. Escrow is a session with a deadline, and this is where it started.
-    pub created_at: i64,
-    /// The service paired into this escrow, once one is. `None` until then — an escrow with no
-    /// service is a key the wallet and this cosigner hold and nobody else can be paid from.
-    #[serde(default)]
-    pub pairing: Option<ServicePairing>,
-    /// The live deal: what the service may take, and until when. `None` before a session is opened
-    /// — a minted escrow is a key, not yet a commitment. See `crate::escrow_session`.
-    #[serde(default)]
-    pub session: Option<crate::escrow_session::Escrow>,
-    /// When a reclaim was first opened on this escrow, if one ever was. From that moment the owner
-    /// may hold signatures that empty it — whether the stream finished or not, the cosigner cannot
-    /// see — so it may never again be committed to a deal. See `Cosigner::open_escrow_session`.
-    #[serde(default)]
-    pub reclaim_opened_at: Option<i64>,
 }
 
 /// Whether a pairing is finished.
@@ -201,7 +144,7 @@ pub enum PairingState {
 /// kept is this cosigner's own half of the pairing and the public package the service's share is
 /// checked against. **Never the service's half**: it is handed over once at pairing and not
 /// retained, because a party holding both halves holds the service's share.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServicePairing {
     /// The service's FROST identifier in this pairing, hex.
     pub service_identifier_hex: String,

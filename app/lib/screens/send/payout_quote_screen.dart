@@ -12,8 +12,8 @@ import 'send_widgets.dart';
 
 /// The platform's price for a payout, and what to check before agreeing to it.
 ///
-/// A first send sets the escrow up here, before the price: the platform only prices a payout from
-/// an escrow it is paired into.
+/// Getting a price sets nothing up and costs no approval: the payout's escrow is minted when the
+/// owner confirms.
 class PayoutQuoteScreen extends StatefulWidget {
   const PayoutQuoteScreen({super.key, required this.draft});
   final PayoutDraft draft;
@@ -24,12 +24,7 @@ class PayoutQuoteScreen extends StatefulWidget {
 
 class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
   bool _loading = true;
-  bool _settingUp = false;
-
-  /// This visit set the escrow up, so the payout's steps start with that.
-  bool _didSetUp = false;
   PayoutQuote? _quote;
-  ({int held, int topUp})? _funding;
   Object? _error;
   bool _understood = false;
   bool _sending = false;
@@ -42,31 +37,12 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
 
   Future<void> _load() async {
     final payouts = context.read<PayoutService>();
-    Future<void> setUp() async {
-      if (mounted) setState(() => _settingUp = true);
-      await payouts.setUp();
-      _didSetUp = true;
-      if (mounted) setState(() => _settingUp = false);
-    }
-
     try {
       await payouts.ready;
-      if (!payouts.hasEscrow) await setUp();
-      PayoutQuote quote;
-      try {
-        quote = await payouts.quote(widget.draft);
-      } catch (e) {
-        // The platform lost its share of the escrow this device remembered, and `quote` forgot
-        // it: set up a new one and ask once more.
-        if (!platformHoldsNoShare(e)) rethrow;
-        await setUp();
-        quote = await payouts.quote(widget.draft);
-      }
-      final funding = await payouts.funding(quote);
+      final quote = await payouts.quote(widget.draft);
       if (!mounted) return;
       setState(() {
         _quote = quote;
-        _funding = funding;
         _understood = false;
         _loading = false;
       });
@@ -75,7 +51,6 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
       setState(() {
         _error = e;
         _loading = false;
-        _settingUp = false;
       });
     }
   }
@@ -102,9 +77,7 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
       _error = null;
     });
     try {
-      final tag = await context
-          .read<PayoutService>()
-          .start(widget.draft, quote, setUp: _didSetUp, topUp: _funding!.topUp);
+      final tag = await context.read<PayoutService>().start(widget.draft, quote);
       if (mounted) context.pop(tag);
     } catch (e) {
       if (!mounted) return;
@@ -136,8 +109,6 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
   }
 
   Widget _waiting() {
-    final setUpApprovals =
-        BankSend.approvalsNeeded(hasEscrow: false) - BankSend.approvalsNeeded(hasEscrow: true);
     return Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -149,16 +120,13 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
           ),
           const SizedBox(height: 24),
           Text(
-            _settingUp ? 'Setting up sending' : 'Getting a price…',
+            'Getting a price…',
             style:
                 GoogleFonts.inter(fontSize: 18, fontWeight: FontWeight.w600, color: Colors.white),
           ),
           const SizedBox(height: 12),
           Text(
-            _settingUp
-                ? 'Once only: an escrow your payouts are paid from, with the payout service '
-                    'paired into it. Approve ${approvalTimes(setUpApprovals)} with your passkey.'
-                : 'Asking the payout service what this costs.',
+            'Asking the payout service what this costs.',
             textAlign: TextAlign.center,
             style: GoogleFonts.inter(color: Colors.white54, fontSize: 14),
           ),
@@ -190,11 +158,10 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
   }
 
   Widget _review() {
-    final d = widget.draft, q = _quote!, f = _funding!;
+    final d = widget.draft, q = _quote!;
     final balance = context.watch<MpcService>().arkBalance.toInt();
-    final approvals = BankSend.approvalsNeeded(hasEscrow: true);
     final matched = q.nameCheck == 'MATCHED';
-    final affordable = f.topUp <= balance;
+    final affordable = q.sats <= balance;
     final expired = DateTime.now().isAfter(q.expiresAt);
 
     return Column(
@@ -227,15 +194,13 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
               const SizedBox(height: 12),
               SendCard(children: [
                 DetailRow('Price', '${formatSats(q.sats)} sats'),
-                if (f.held > 0) DetailRow('Already in your escrow', '${formatSats(f.held)} sats'),
-                DetailRow('From your balance', '${formatSats(f.topUp)} sats'),
                 DetailRow('Your balance', '${formatSats(balance)} sats'),
                 DetailRow('Price good until', DateFormat.Hm().format(q.expiresAt.toLocal())),
               ]),
               const SizedBox(height: 12),
               Text(
-                "You'll approve ${approvalTimes(approvals)} with your passkey: "
-                '${f.topUp > 0 ? 'to top up your escrow and seal the deal' : 'to seal the deal'}.',
+                "You'll approve ${approvalTimes(BankSend.approvals)} with your passkey: to set up "
+                'an escrow for this payment and seal the deal, then to send it the price.',
                 style: GoogleFonts.inter(color: Colors.white54, fontSize: 13),
               ),
               if (!affordable) ...[
@@ -243,7 +208,7 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
                 SendNotice(
                   icon: Icons.account_balance_wallet_outlined,
                   color: Colors.redAccent,
-                  text: 'Not enough in your wallet: this takes ${formatSats(f.topUp)} sats '
+                  text: 'Not enough in your wallet: this takes ${formatSats(q.sats)} sats '
                       'from your balance.',
                 ),
               ],

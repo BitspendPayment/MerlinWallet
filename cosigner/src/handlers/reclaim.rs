@@ -34,7 +34,7 @@ use ark::client::send::SendSession;
 use ark::client::types::ArkInfo;
 
 use crate::cosigner::Cosigner;
-use crate::escrow_session::Refusal;
+use crate::escrow::Refusal;
 use crate::grpc::Status;
 use crate::types::VtxoInput;
 
@@ -68,22 +68,20 @@ impl Cosigner {
             .escrow(escrow_key)
             .ok_or_else(|| Status::not_found("this wallet holds no such escrow"))?;
 
-        // The deal first. An escrow with no session was never committed to anything, so there is
+        // The deal first. An escrow with no deal was never committed to anything, so there is
         // nothing holding it and the owner may take it back whenever they like.
-        if let Some(session) = escrow.session.as_ref() {
-            if let Err(refusal) = session.may_reclaim(now) {
-                return Err(match refusal {
-                    Refusal::StillOpen => Status::failed_precondition(refusal.message()),
-                    // `may_reclaim` returns nothing else, and a new variant should be decided
-                    // about rather than folded into the nearest existing answer.
-                    other => Status::failed_precondition(other.message()),
-                });
-            }
+        if let Err(refusal) = escrow.may_reclaim(now) {
+            return Err(match refusal {
+                Refusal::StillOpen => Status::failed_precondition(refusal.message()),
+                // `may_reclaim` returns nothing else, and a new variant should be decided about
+                // rather than folded into the nearest existing answer.
+                other => Status::failed_precondition(other.message()),
+            });
         }
-        // And every deal before it that released anything. A deal can end early — spent, or ended
-        // by its service — and the service may still be holding that release's signatures; it was
-        // promised until that deal's deadline to submit them. See `Cosigner::reclaim_horizon`.
-        let horizon = self.reclaim_horizon(escrow_key);
+        // And every release it made. A deal can end early — spent, or ended by its service — and
+        // the service may still be holding a release's signatures; it was promised until that
+        // deal's deadline to submit them. See `EscrowSession::horizon`.
+        let horizon = escrow.horizon();
         if now < horizon {
             return Err(Status::failed_precondition(format!(
                 "a release from this escrow may still be on its way to the ASP until {horizon}; \
@@ -130,9 +128,8 @@ impl Cosigner {
             key_package,
             public_key_package,
             wallet_id: wallet_identifier,
-            ..
-        } = self
-            .escrow_details(escrow_key)
+        } = escrow
+            .details()
             .ok_or_else(|| Status::internal("this escrow's sealed key material is unreadable"))?;
 
         // Where it goes: the wallet's own address, from the wallet's own key. Not on the wire.

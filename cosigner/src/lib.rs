@@ -15,7 +15,6 @@ pub mod handlers;
 pub mod host;
 pub mod onboarding;
 pub mod escrow;
-pub mod escrow_session;
 pub mod evidence;
 pub mod policy;
 pub mod renew;

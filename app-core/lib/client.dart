@@ -31,7 +31,6 @@ import 'package:app_core/threshold/threshold.dart' as threshold;
 // `ArkInfo` is hidden: the proto one is the wire shape, and `asp/ark_info.dart` has the value type
 // the wallet actually passes around. `SendSession.arkInfoToProto` converts at the boundary.
 import 'package:protocol/protocol.dart' hide ArkInfo;
-import 'package:fixnum/fixnum.dart';
 import 'package:hive/hive.dart';
 import 'package:synchronized/synchronized.dart';
 import 'dart:io';
@@ -625,12 +624,23 @@ class MpcClient {
   /// One approval, which is also where the seed comes from.
   Future<EscrowPublicState> createEscrow() async => (await _mintEscrow()).escrow;
 
-  /// Mint an escrow and pair [serviceIdentifier] into it, on ONE approval.
+  /// Mint an escrow, pair [serviceIdentifier] into it and commit it to a deal, on ONE approval.
   ///
   /// Pairing is a second 2-of-2 over the same key: afterwards `{service, cosigner}` can sign the
   /// escrow as well as `{wallet, cosigner}`. The wallet and the service share no pairing, so they
   /// cannot sign together; the cosigner is in both, which is what makes its policy the thing an
   /// escrow rests on.
+  ///
+  /// The deal: until [deadline] the service may release from the escrow, judged against [policy],
+  /// and this wallet may **not** take it back; afterwards those swap. There is no way to end it
+  /// early: a commitment the owner can revoke is not one, and [deadline] is the whole of her
+  /// control. Nothing in Bitcoin enforces that — both pairings sign the same key — so what holds it
+  /// up is the cosigner declining to co-sign with the wrong party at the wrong time, in attested
+  /// code. See `cosigner/src/escrow_session.rs`. One escrow, one deal: the next deal mints the next
+  /// escrow. `agreed` is the policy rendered as a sentence — what the owner actually agreed to.
+  ///
+  /// Nothing is escrowed yet: money goes in by an ordinary send to [escrowArkAddress]. Fund it once
+  /// the pairing is ready — the service can release nothing before.
   ///
   /// [serviceIdentifier] names a service the **image** knows. The wallet never names a URL: the
   /// cosigner resolves one from its measured image, delivers its own half there, and returns the
@@ -643,23 +653,33 @@ class MpcClient {
   /// Returns once the service has both halves and this wallet has confirmed. The pairing is usable
   /// a moment later, when the service's own confirmation reaches the cosigner — it cannot while
   /// this stream holds the tenant.
-  Future<({EscrowPublicState escrow, PairingResult pairing})> setUpEscrow({
+  Future<({EscrowPublicState escrow, PairingResult pairing, String agreed})> setUpEscrow({
     required threshold.Identifier serviceIdentifier,
+    required Map<String, dynamic> policy,
+    required DateTime deadline,
     DeliverToService? delivery,
   }) async {
-    final set = await _mintEscrow(pairWith: serviceIdentifier, delivery: delivery);
-    return (escrow: set.escrow, pairing: set.pairing!);
+    final set = await _mintEscrow(
+      pairWith: (service: serviceIdentifier, policy: policy, deadline: deadline),
+      delivery: delivery,
+    );
+    return (escrow: set.escrow, pairing: set.pairing!, agreed: set.agreed!);
   }
 
-  Future<({EscrowPublicState escrow, PairingResult? pairing})> _mintEscrow({
-    threshold.Identifier? pairWith,
+  Future<({EscrowPublicState escrow, PairingResult? pairing, String? agreed})> _mintEscrow({
+    ({
+      threshold.Identifier service,
+      Map<String, dynamic> policy,
+      DateTime deadline,
+    })? pairWith,
     DeliverToService? delivery,
   }) async {
     final context = _random16();
     // Both drawn before the approval: the operation reads the passkey once, before the escrow key
     // exists, so the slope is derived under the escrow's context — see `pairingSlope`.
     final attempt = pairWith == null ? null : _random16();
-    return _withOperation<void, ({EscrowPublicState escrow, PairingResult? pairing})>(
+    return _withOperation<void,
+        ({EscrowPublicState escrow, PairingResult? pairing, String? agreed})>(
       'Escrow',
       escrowContext: context,
       pairingContext: attempt == null ? null : Uint8List.fromList([...context, ...attempt]),
@@ -676,11 +696,13 @@ class MpcClient {
           pair: pairWith == null
               ? null
               : (
-                  service: pairWith,
+                  service: pairWith.service,
                   attemptId: attempt!,
                   slope: operation.takePairingSlope(),
                   delivery: delivery ?? HttpServiceDelivery(),
                   cancel: operation.cancel,
+                  policy: pairWith.policy,
+                  deadline: pairWith.deadline,
                 ),
           onMinted: (minted) async {
             // The share lives in the operation, so it is let go with it — never in this frame.
@@ -700,7 +722,7 @@ class MpcClient {
           },
         );
         _stillRunning(operation);
-        return (escrow: escrow!, pairing: result.pairing);
+        return (escrow: escrow!, pairing: result.pairing, agreed: result.agreed);
       },
     );
   }
@@ -783,28 +805,6 @@ class MpcClient {
       exitDelay: arkInfo.unilateralExitDelay,
       network: arkInfo.network,
     );
-  }
-
-  /// Commit an escrow to a deal.
-  ///
-  /// Until [deadline] the paired service may release from it, judged against [policy], and this
-  /// wallet may **not** take it back; afterwards those swap. There is no way to end it early:
-  /// a commitment the owner can revoke is not one, and [deadline] is the whole of her control. Nothing in Bitcoin enforces that —
-  /// both pairings sign the same key — so what holds it up is the cosigner declining to co-sign
-  /// with the wrong party at the wrong time, in attested code. See `cosigner/src/escrow_session.rs`.
-  ///
-  /// Returns the policy rendered as a sentence, which is what an owner is actually agreeing to.
-  Future<String> openEscrowSession({
-    required String escrowKeyHex,
-    required Map<String, dynamic> policy,
-    required DateTime deadline,
-  }) async {
-    final response = await _conn.escrowOpenSession(cs.EscrowOpenSessionRequest(
-      escrowKey: escrowKeyHex,
-      policyJson: jsonEncode(policy),
-      deadlineSecs: Int64(deadline.millisecondsSinceEpoch ~/ 1000),
-    ));
-    return response.policyDescription;
   }
 
   /// What the cosigner holds for this wallet's escrows, including any live deal. Asked rather than
@@ -1021,38 +1021,7 @@ class MpcClient {
   Future<String> sendVtxo(String recipientArkAddress, int amountSats) async =>
       (await _send(recipientArkAddress, amountSats)).arkTxid;
 
-  /// Top an escrow up by [amountSats] and commit it to a deal, on ONE approval — [sendVtxo] to
-  /// the escrow's address and then [openEscrowSession], on one stream.
-  ///
-  /// A deal the cosigner could not strike right now — no service ready in the escrow, a deal still
-  /// holding it — is refused before anything is built, so a refusal moves no money.
-  ///
-  /// `agreed` is the policy as the cosigner renders it, which is what the owner agreed to. Null
-  /// means the escrow was topped up but NOT committed — a cosigner from before sends could commit
-  /// one — and [openEscrowSession] commits it.
-  Future<({String arkTxid, String? agreed})> fundEscrowDeal({
-    required String escrowKeyHex,
-    required int amountSats,
-    required Map<String, dynamic> policy,
-    required DateTime deadline,
-  }) async {
-    final result = await _send(
-      await escrowArkAddress(escrowKeyHex),
-      amountSats,
-      escrowCommit: cs.EscrowOpenSessionRequest(
-        escrowKey: escrowKeyHex,
-        policyJson: jsonEncode(policy),
-        deadlineSecs: Int64(deadline.millisecondsSinceEpoch ~/ 1000),
-      ),
-    );
-    return (arkTxid: result.arkTxid, agreed: result.committed?.policyDescription);
-  }
-
-  Future<SendResult> _send(
-    String recipientArkAddress,
-    int amountSats, {
-    cs.EscrowOpenSessionRequest? escrowCommit,
-  }) {
+  Future<SendResult> _send(String recipientArkAddress, int amountSats) {
     return _withOperation('Send',
         prepare: () async => (info: await _asp.getInfo(), vtxos: await listVtxos()),
         run: (operation, prepared) async {
@@ -1069,7 +1038,6 @@ class MpcClient {
         deviceToken: _deviceToken ?? '',
         exitScriptPubkeyHex: exitScriptPubkeyHex,
         ownerXOnlyHex: _ownerXOnly,
-        escrowCommit: escrowCommit,
       );
       _stillRunning(operation);
       _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
