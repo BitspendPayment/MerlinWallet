@@ -2,8 +2,8 @@
 //!
 //! The wallet keeps no share between operations. Each one re-derives the wallet's own half from its
 //! passkey and adds the half the cosigner dealt it at DKG — which used to come back from `Recover`
-//! alone, and now rides the first round of `Sign`, `Send` and `Renew`, under the approval the
-//! stream already has. These tests are about what may come back, to whom, and how often:
+//! alone, and now rides the first round of `Sign`, `Send`, `Renew` and `Board`, under the approval
+//! the stream already has. These tests are about what may come back, to whom, and how often:
 //!
 //!  * to the identifier the ceremony recorded, and to no other;
 //!  * once per stream, on its first round;
@@ -191,7 +191,20 @@ impl First {
     }
 }
 
-const STREAMS: &[&str] = &["Sign", "Send", "Renew"];
+const STREAMS: &[&str] = &["Sign", "Send", "Renew", "Board"];
+
+/// A boarding of one on-chain output: its first round is the intent proof, which needs no ASP.
+fn board_open(identifier: Vec<u8>) -> proto::RenewClientMsg {
+    proto::RenewClientMsg {
+        session_id: "s".into(),
+        seq: 0,
+        body: Some(proto::renew_client_msg::Body::Board(proto::BoardOpen {
+            utxo: Some(proto::BoardingUtxo { txid: "b".repeat(64), vout: 0, amount_sats: 50_000 }),
+            ark_info: Some(ark_info()),
+            identifier,
+        })),
+    }
+}
 
 /// Open [stream] on [w]'s instance as the wallet [identifier] claims to be, and read what comes back.
 fn open(stream: &str, w: Wallet, identifier: Vec<u8>) -> First {
@@ -207,6 +220,10 @@ fn open(stream: &str, w: Wallet, identifier: Vec<u8>) -> First {
         }
         "Renew" => First::Renew(collect(block_on(
             service(w.cosigner).route(request("Renew", &[renew_open(identifier)])),
+        ))),
+        // `Board` speaks `Renew`'s messages; only its open differs.
+        "Board" => First::Renew(collect(block_on(
+            service(w.cosigner).route(request("Board", &[board_open(identifier)])),
         ))),
         other => panic!("no such stream: {other}"),
     }

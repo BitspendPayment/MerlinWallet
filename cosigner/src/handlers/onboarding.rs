@@ -31,7 +31,6 @@ use threshold::identifier::Identifier;
 use threshold::random;
 use threshold::scalar::{scalar_from_bytes, scalar_to_bytes};
 
-use crate::handlers::parsers;
 use crate::wallet_proto::{DkgStep1Request, DkgStep1Response, DkgStep3Request, DkgStep3Response};
 
 /// Freshly-minted DKG key material, captured when round 3 finalizes so the caller can install it
@@ -384,7 +383,7 @@ pub fn dkg_finish(
         let kp_json = kp.to_json();
         let pkp_json = pkp.to_json();
 
-        let group_key = parsers::extract_verifying_key(&pkp_json)?;
+        let group_key = crate::serde::extract_verifying_key(&pkp_json)?;
 
         let user_signing_identifier_hex = Some(wallet_identifier_hex);
 

@@ -208,7 +208,7 @@ class Cli {
     // One per renewal: the cosigner builds its boarding intent proof for a single outpoint.
     for (final d in deposits) {
       print('settling ${d.amountSats} sats from ${d.txid}:${d.vout}…');
-      final commitment = await bitcoind.whileMining(() => client.renew(boardingUtxos: [d]));
+      final commitment = await bitcoind.whileMining(() => client.board(d));
       print('  commitment $commitment');
     }
   }

@@ -7,9 +7,10 @@
 //! is the host's. What is left talks to its [`store`] and to its caller.
 
 pub mod asp;
+pub mod boarding;
 pub mod config;
 pub mod cosigner;
-pub mod delegate;
+
 pub mod grpc;
 pub mod handlers;
 pub mod host;
@@ -17,10 +18,12 @@ pub mod escrow;
 pub mod escrow_session;
 pub mod evidence;
 pub mod policy;
+pub mod renew;
 pub mod service_stream;
 pub mod session;
 pub mod store;
 pub mod types;
+mod serde;
 mod util;
 
 pub use cosigner::Cosigner;

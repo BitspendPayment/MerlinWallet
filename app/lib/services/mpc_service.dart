@@ -892,7 +892,7 @@ class MpcService extends ChangeNotifier {
     }
     String? txid;
     for (final utxo in utxos) {
-      txid = await _client!.renew(boardingUtxos: [utxo]);
+      txid = await _client!.board(utxo);
     }
     await refreshVtxos();
     await refreshBoardingBalance();

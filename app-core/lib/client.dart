@@ -1139,25 +1139,22 @@ class MpcClient {
     await _saveState();
   }
 
-  /// Board an on-chain output into Ark, or refresh what is already held.
-  ///
-  /// One boarding output at a time: a longer list used to be silently truncated to its first
-  /// element, boarding one deposit and stranding the rest while the caller was told the whole batch
-  /// settled.
-  Future<String> renew({
-    List<cs.BoardingUtxo> boardingUtxos = const [],
+  /// Board one on-chain output into Ark, on the `Board` stream. One per call: the cosigner builds
+  /// its boarding intent proof for a single outpoint.
+  Future<String> board(cs.BoardingUtxo utxo, {void Function(RenewPhase)? onProgress}) =>
+      _renewOrBoard(boardingUtxo: utxo, onProgress: onProgress);
+
+  /// The round boarding and a refresh share: [boardingUtxo] boards it, its absence refreshes what is
+  /// held.
+  Future<String> _renewOrBoard({
+    cs.BoardingUtxo? boardingUtxo,
     void Function(RenewPhase)? onProgress,
-  }) async {
-    if (boardingUtxos.length > 1) {
-      throw ArgumentError(
-        'renew takes one boarding UTXO at a time, got ${boardingUtxos.length} — '
-        'renew them individually',
-      );
-    }
-    return _withOperation('Renew',
+  }) {
+    // Named for the stream it opens: an approval obtained ahead is for one method's path.
+    return _withOperation(boardingUtxo == null ? 'Renew' : 'Board',
         prepare: () async => (
               info: await _asp.getInfo(),
-              vtxos: boardingUtxos.isEmpty ? await listVtxos() : const <IndexerVtxo>[],
+              vtxos: boardingUtxo == null ? await listVtxos() : const <IndexerVtxo>[],
             ),
         run: (operation, prepared) async {
       final result = await RenewSession(_conn, _asp).renew(
@@ -1165,7 +1162,7 @@ class MpcClient {
         identifier: operation.identifier.serialize(),
         resolve: operation.keyPackage,
         groupPubKey: _wallet!.publicKeyPackage,
-        boardingUtxo: boardingUtxos.isEmpty ? null : boardingUtxos.first,
+        boardingUtxo: boardingUtxo,
         vtxos: prepared.vtxos,
         cancel: operation.cancel,
         onProgress: onProgress,
@@ -1178,7 +1175,7 @@ class MpcClient {
       _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
       // A refresh spends the old delegate's inputs; boarding leaves it standing. Either way the
       // delegate this renewal renewed, when it did, supersedes it.
-      if (result.delegate != null || boardingUtxos.isEmpty) {
+      if (result.delegate != null || boardingUtxo == null) {
         await _recordDelegate(result.delegate);
       }
       return result.commitmentTxid;
@@ -1187,12 +1184,12 @@ class MpcClient {
 
   /// Refresh the held VTXOs before they expire.
   ///
-  /// The same `Renew` stream with no boarding output. There is no `storeOnly` any more: renewing
+  /// The `Renew` stream. There is no `storeOnly` any more: renewing
   /// the delegate arms a durable watch, and when its deadline arrives the cosigner either executes
   /// the delegate itself — where its image allowlists the ASP — or wakes this device, and then this
   /// is what runs.
   Future<String> renewHeld({void Function(RenewPhase)? onProgress}) =>
-      renew(onProgress: onProgress);
+      _renewOrBoard(onProgress: onProgress);
 
   // --- Devices ----------------------------------------------------------------------------------
   //

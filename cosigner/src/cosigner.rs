@@ -1,11 +1,5 @@
 //! The cosigner: the signing keys, the FROST ceremony, the Ark sessions and the ASP connection for
 //! the one wallet this process serves.
-//!
-//! It was an actor — a struct behind a mailbox, driven by a `run_cosigner` task that processed
-//! `CosignerCommand`s serially for one of many tenants. Nothing routes to it any more, so the
-//! channel, the commands and the loop are gone and callers hold it directly. What that removes is
-//! not only indirection: a ceremony no longer has to be split across two messages to avoid blocking
-//! the loop, so a FROST nonce can live on a stream handler's stack instead of being parked here.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,10 +9,8 @@ use zeroize::Zeroizing;
 
 use crate::grpc::Status;
 
-use crate::handlers;
-
 use crate::types::{
-    ApplyDelegateSigs, BoardingSettleSubmitted, Commitment,
+    BoardingSettleSubmitted, Commitment,
     SendVtxoStep1, SendVtxoSubmitted, SnapshotState, VtxoEntry, VtxoInput,
 };
 
@@ -34,6 +26,8 @@ use threshold::point;
 use threshold::scalar::scalar_from_bytes;
 use threshold::signing::{self, SignatureShare};
 
+use crate::boarding::BoardingSettleSession;
+use crate::renew::RenewSession;
 use crate::store::Store;
 
 /// How many escrow keys one wallet may hold at once. Each is a key to co-sign for and a session to
@@ -80,18 +74,18 @@ mod x_only_tests {
     }
 }
 
-/// The key material one group installed: the cosigner's own share + the group public key, plus the
-/// client's FROST identifier (the other half of the 2-of-2).
-///
-/// Named for what it holds rather than what it decides. It used to be `Policy`, which was the only
-/// meaning that word had here; `crate::policy::Policy` now carries the other one — what a signature
-/// is *allowed* to authorize — and a single name for both would be a running invitation to confuse
-/// "which key" with "may I".
-struct GroupKeys {
-    group_key: String,
-    key_package: KeyPackage,
-    public_key_package: PublicKeyPackage,
+/// The key material one group installed: the cosigner's own share + the group public key, the
+/// client's FROST identifier (the other half of the 2-of-2), and the share dealt to the wallet.
+/// Every field is `None` until DKG installs it or a seal restores it.
+#[derive(Default)]
+struct GroupKey {
+    group_key: Option<String>,
+    key_package: Option<KeyPackage>,
+    public_key_package: Option<PublicKeyPackage>,
     user_signing_identifier: Option<Identifier>,
+    /// See `SnapshotState::wallet_dealt_share_hex`. Zeroized on drop: it is half of the owner's
+    /// signing key, and the other half is one passkey away.
+    wallet_dealt_share_hex: Option<Zeroizing<String>>,
 }
 
 /// In-flight FROST ceremony state (cleared between rounds).
@@ -121,108 +115,34 @@ pub struct WalletHalf {
 }
 
 pub struct Cosigner {
-    policy: Option<GroupKeys>,
+    policy: GroupKey,
     /// The wallet's delegate, and whether its round is running.
-    pub(crate) delegate_session: Option<DelegateSession>,
-    /// In-flight GUEST-style boarding settle, held across the commitment-FROST pause (the client
-    /// must FROST-sign the commitment sighashes between step 2 and step 3). Native: no held stream
-    /// (step 3 finalizes optimistically). Transient — never snapshotted.
+    pub(crate) renew_session: Option<RenewSession>,
+    /// In-flight boarding settle, held across the commitment-FROST pause. Transient — never
+    /// snapshotted.
     pub(crate) boarding_session: Option<BoardingSettleSession>,
-    /// See `SnapshotState::wallet_dealt_share_hex`. Zeroized on drop: it is half of the owner's
-    /// signing key, and the other half is one passkey away.
-    wallet_dealt_share_hex: Option<Zeroizing<String>>,
     /// The escrow keys this wallet has minted. See `SnapshotState::escrows`.
     escrows: Vec<crate::types::EscrowRecord>,
     /// Payments that have already been released against. See `SnapshotState::released_references`.
     released_references: BTreeMap<String, crate::types::ReleaseRecord>,
-    /// Global services (contract gate + ASP url). Held so `command()` is a drop-in for the old
-    /// `GuestInstance::command` — no per-call-site `store` threading.
+    /// Where the seal lives.
     pub(crate) store: Arc<Store>,
     /// The runtime this cosigner runs inside: its task queue and its push channel. `Detached` when
     /// it runs as a plain process, where every call fails rather than quietly doing nothing.
     pub(crate) host: Arc<dyn crate::host::Host>,
-    /// This user's public projection (VTXOs / history / device tokens / policy metadata). The
-    /// non-signing query + stream + inbox handlers are `impl Cosigner` methods over it.
-    /// The group key this cosigner serves. Configuration, not something a caller names.
+    /// The name the seal is filed under — configuration, and not the wallet's group key, which is
+    /// `policy.group_key`. See `main.rs`.
     pub(crate) group_key: String,
-    /// The owned VTXO set — the ONE set.
-    ///
-    /// There were two until recently: a `Vec<VtxoInput>` in the seal that `send_open` selected
-    /// from, and this one, loaded from storage and written by boarding and sending. They never
-    /// synced, so a freshly boarded VTXO was invisible to a send. `VtxoEntry` is the superset —
-    /// it carries the expiry a delegate's renewal deadline is computed from — so it is the one
-    /// that survives, and callers wanting the ark-facing shape go through [`Self::vtxos`].
-    pub(crate) owned_vtxos: Vec<VtxoEntry>,
-}
-
-/// In-flight boarding settle, held across the commitment-FROST pause — the caller FROST-signs the
-/// commitment sighashes between one relayed ASP event and the next, and this is what waits.
-///
-/// It used to carry the ASP event stream too. It does not now: boarding is interactive, so the
-/// caller subscribes and relays each event in, and the field had one writer, no readers and a doc
-/// comment describing a design that was already gone. The cosigner does hold an ASP connection of
-/// its own (`crate::asp`) — but for the unattended case, executing a sealed delegate, not for a
-/// round the app is already driving.
-pub struct BoardingSettleSession {
-    pub session: ark::client::batch::SettleSession,
-    pub signer: ark::client::batch::BoardingTreeSigner,
-    pub amount_sats: u64,
-    /// Boarding exit delay, carried through to the finalized VTXO entry the host persists.
-    pub exit_delay: u32,
-    /// Which FROST round the caller's next signatures answer.
-    pub phase: crate::handlers::renew::Phase,
-    /// The ASP's id for this round's registration, once the caller reports it. Empty until then.
-    pub intent_id: String,
-}
-
-/// The wallet's delegate, and whether a round is running for it.
-pub(crate) enum DelegateSession {
-    /// Waiting: for the wallet's signatures, or, signed and sealed, for its deadline.
-    Awaiting(DelegateSettleSession),
-    /// Its round is running: a refresh the owner asked for, or the watch running it.
-    InFlight {
-        session: DelegateSettleSession,
-        /// The ASP's exit delay, which the VTXO the round produces is held under.
-        exit_delay: u32,
-    },
-}
-
-impl DelegateSession {
-    pub(crate) fn session(&self) -> &DelegateSettleSession {
-        match self {
-            Self::Awaiting(session) | Self::InFlight { session, .. } => session,
-        }
-    }
-
-    pub(crate) fn session_mut(&mut self) -> &mut DelegateSettleSession {
-        match self {
-            Self::Awaiting(session) | Self::InFlight { session, .. } => session,
-        }
-    }
-
-    /// Its round starts, under the ASP's current `exit_delay`.
-    pub(crate) fn in_flight(self, exit_delay: u32) -> Self {
-        Self::InFlight { session: self.into_session(), exit_delay }
-    }
-
-    /// Its round stopped short of finishing, so it waits again.
-    pub(crate) fn awaiting(self) -> Self {
-        Self::Awaiting(self.into_session())
-    }
-
-    fn into_session(self) -> DelegateSettleSession {
-        match self {
-            Self::Awaiting(session) | Self::InFlight { session, .. } => session,
-        }
-    }
+    /// The owned VTXO set. `VtxoEntry` carries the expiry a delegate's renewal deadline is
+    /// computed from; callers wanting the ark-facing shape go through [`Self::vtxos()`].
+    pub(crate) vtxos: Vec<VtxoEntry>,
 }
 
 impl Cosigner {
     /// Load this cosigner's state, then hand back something callable.
     ///
-    /// Eagerly, not on first use. A lazy restore amortises the read across a process that outlives
-    /// many requests, which is the shape being removed: per-request there is no later use to
-    /// amortise into. Storage is the whole of the state — read on entry, sealed on mutation.
+    /// Eagerly, not on first use: per-request there is no later use to amortise a lazy restore
+    /// into. Storage is the whole of the state — read on entry, sealed on mutation.
     ///
     /// No seal yet is not an error. Before onboarding there is nothing to read, and DKG is what
     /// writes the first one.
@@ -259,40 +179,45 @@ impl Cosigner {
 
     fn new(store: Arc<Store>, group_key: String, host: Arc<dyn crate::host::Host>) -> Self {
         Self {
-            policy: None,
-            delegate_session: None,
+            policy: GroupKey::default(),
+            renew_session: None,
             boarding_session: None,
-            wallet_dealt_share_hex: None,
             escrows: Vec::new(),
             released_references: BTreeMap::new(),
             store,
             host,
             group_key,
-            owned_vtxos: Vec::new(),
+            vtxos: Vec::new(),
         }
     }
 
-    /// Serialize durable state (policy + Ark secret + VTXOs + history) into the sealed-snapshot blob.
-    /// In-flight sessions are excluded (transient; MuSig2 nonces must never persist).
+    /// Serialize durable state (policy, VTXOs, delegate, escrows, release ledger) into the
+    /// sealed-snapshot blob. In-flight sessions are excluded (transient; MuSig2 nonces must never
+    /// persist).
     pub fn to_snapshot(&self) -> Result<Vec<u8>, String> {
-        let policy = self.policy.as_ref().ok_or("no policy to snapshot")?;
+        let policy = &self.policy;
+        let (Some(group_key), Some(key_package), Some(public_key_package)) =
+            (&policy.group_key, &policy.key_package, &policy.public_key_package)
+        else {
+            return Err("no policy to snapshot".into());
+        };
         let snap = SnapshotState {
-            group_key: policy.group_key.clone(),
-            key_package_json: policy.key_package.to_json(),
-            public_key_package_json: policy.public_key_package.to_json(),
+            group_key: group_key.clone(),
+            key_package_json: key_package.to_json(),
+            public_key_package_json: public_key_package.to_json(),
             user_signing_identifier_hex: policy
                 .user_signing_identifier
                 .as_ref()
                 .map(|id| hex::encode(id.serialize())),
             ark_cosigner_secret_hex: None,
-            wallet_dealt_share_hex: self
+            wallet_dealt_share_hex: policy
                 .wallet_dealt_share_hex
                 .as_ref()
                 .map(|z| z.to_string()),
-            vtxos: self.owned_vtxos.clone(),
+            vtxos: self.vtxos.clone(),
             // Persist a ReadyToSettle delegate (to_persisted errors for other phases → None).
             delegate_json: self
-                .delegate_session
+                .renew_session
                 .as_ref()
                 .and_then(|d| d.session().to_persisted().ok())
                 .and_then(|p| serde_json::to_string(&p).ok()),
@@ -303,7 +228,7 @@ impl Cosigner {
         serde_json::to_vec(&snap).map_err(|e| format!("snapshot serialize: {e}"))
     }
 
-    /// Restore durable state from a snapshot blob (on actor spawn / reseat).
+    /// Restore durable state from a snapshot blob, on open.
     pub fn restore_snapshot(&mut self, blob: &[u8]) -> Result<(), String> {
         let snap: SnapshotState =
             serde_json::from_slice(blob).map_err(|e| format!("snapshot deserialize: {e}"))?;
@@ -316,20 +241,20 @@ impl Cosigner {
             .map(|h| h.parse::<Identifier>())
             .transpose()
             .map_err(|e| format!("bad identifier: {e}"))?;
-        self.policy = Some(GroupKeys {
-            group_key: snap.group_key,
-            key_package,
-            public_key_package,
+        self.policy = GroupKey {
+            group_key: Some(snap.group_key),
+            key_package: Some(key_package),
+            public_key_package: Some(public_key_package),
             user_signing_identifier,
-        });
-        self.wallet_dealt_share_hex = snap.wallet_dealt_share_hex.map(Zeroizing::new);
-        self.owned_vtxos = snap.vtxos;
+            wallet_dealt_share_hex: snap.wallet_dealt_share_hex.map(Zeroizing::new),
+        };
+        self.vtxos = snap.vtxos;
         self.escrows = snap.escrows;
         self.released_references = snap.released_references;
         // A delegate carries its own tree-signing key and its registration's id. Older seals kept
         // both beside it — a wallet-wide key, and `delegate_intent_id` — which are read here for
         // that and nothing else: the next seal writes them inside the delegate, and not beside it.
-        self.delegate_session = match snap.delegate_json {
+        self.renew_session = match snap.delegate_json {
             Some(dj) => {
                 let mut persisted: PersistedDelegate = serde_json::from_str(&dj)
                     .map_err(|e| format!("parse persisted delegate: {e}"))?;
@@ -340,7 +265,7 @@ impl Cosigner {
                 if persisted.intent_id.is_none() {
                     persisted.intent_id = snap.delegate_intent_id;
                 }
-                Some(DelegateSession::Awaiting(DelegateSettleSession::from_persisted(&persisted)?))
+                Some(RenewSession::Awaiting(DelegateSettleSession::from_persisted(&persisted)?))
             }
             None => None,
         };
@@ -350,14 +275,11 @@ impl Cosigner {
     /// The share this cosigner dealt the wallet at DKG, hex, if this wallet was onboarded after
     /// recovery existed. See `SnapshotState::wallet_dealt_share_hex`.
     pub(crate) fn wallet_dealt_share_hex(&self) -> Option<&str> {
-        self.wallet_dealt_share_hex.as_ref().map(|z| z.as_str())
+        self.policy.wallet_dealt_share_hex.as_ref().map(|z| z.as_str())
     }
 
-    /// Take the caller's account of what this wallet holds.
-    ///
-    /// The cosigner learned its VTXO set from an ASP subscription it no longer runs, so a VTXO
-    /// received from another wallet had no way in and could never be spent. The caller supplies
-    /// them now, which means saying exactly what is and is not trusted here.
+    /// Take the caller's account of what this wallet holds, which means saying exactly what is and
+    /// is not trusted here.
     ///
     /// NOT trusted: ownership. Every VTXO this wallet can spend sits under a scriptPubKey derived
     /// from the cosigner's OWN owner key and one of the two exit delays the ASP published — so an
@@ -389,7 +311,7 @@ impl Cosigner {
                 return Err(format!("vtxo {}:{} named twice", v.txid, v.vout));
             }
             // Expiry is the indexer's, relayed by the caller; 0 reads as "unknown" downstream, which
-            // `build_delegate_step1` skips conservatively rather than scheduling against a guess.
+            // `settle_deadline` skips conservatively rather than scheduling against a guess.
             accepted.push(VtxoEntry {
                 txid: v.txid,
                 vout: v.vout,
@@ -399,13 +321,13 @@ impl Cosigner {
                 expires_at: v.expires_at.max(0),
             });
         }
-        self.owned_vtxos = accepted;
+        self.vtxos = accepted;
         Ok(())
     }
 
     /// The owned set in the shape ark's session builders take.
     pub fn vtxos(&self) -> Vec<VtxoInput> {
-        self.owned_vtxos
+        self.vtxos
             .iter()
             .map(|e| VtxoInput {
                 txid: e.txid.clone(),
@@ -417,15 +339,40 @@ impl Cosigner {
             .collect()
     }
 
-    /// The VTXO set to refresh and the renewal deadline the delegate becomes valid at.
-    pub fn prepare_delegate(
-        &self,
-    ) -> Result<(Vec<VtxoInput>, Option<u64>), Status> {
-        handlers::ark_send::build_delegate_step1(&self.owned_vtxos, &self.store)
+    /// When a delegate over the held set becomes valid: the earliest known expiry minus the safety
+    /// margin. `None` when nothing is held, or no held VTXO has a known expiry — the ASP had not
+    /// indexed them yet.
+    pub(crate) fn settle_deadline(&self) -> Option<u64> {
+        if self.vtxos.is_empty() {
+            return None;
+        }
+        let earliest = self
+            .vtxos
+            .iter()
+            .filter_map(|e| (e.expires_at > 0).then_some(e.expires_at))
+            .min()
+            .unwrap_or(0);
+        let margin = self.store.auto_settle_safety_margin_secs;
+        (earliest > margin).then(|| (earliest - margin) as u64)
     }
 
-    /// Seal this actor's state. Storage is the whole of the persistence now, so a method that
-    /// mutates durable state seals here rather than trusting its caller to remember.
+    /// Build a delegate over everything held and keep it as this wallet's [`RenewSession`], handing
+    /// back the sighashes the wallet must FROST-sign. `deferred`: valid from
+    /// [`Self::settle_deadline`] (a sealed delegate), or from now (a refresh the owner is asking
+    /// for in person — the ASP refuses an intent valid in the future until then).
+    pub fn generate_delegate_for(
+        &mut self,
+        info: &ArkInfo,
+        deferred: bool,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        let valid_at = if deferred { self.settle_deadline() } else { None };
+        let (session, sighashes) =
+            RenewSession::generate(&self.owner_pk_hex()?, &self.vtxos(), info, valid_at)?;
+        self.renew_session = Some(session);
+        Ok(sighashes)
+    }
+
+    /// Seal this cosigner's state, logging a failure rather than returning it.
     pub fn seal(&mut self) {
         if let Err(e) = self.try_seal() {
             tracing::warn!("{e}");
@@ -444,9 +391,9 @@ impl Cosigner {
     /// hand back the commitment txid.
     pub fn apply_boarding_settle(&mut self, sub: BoardingSettleSubmitted) -> String {
         let now = crate::store::now_secs();
-        self.owned_vtxos
+        self.vtxos
             .retain(|e| !(e.txid == sub.vtxo_txid && e.vout == sub.vtxo_vout));
-        self.owned_vtxos.push(VtxoEntry {
+        self.vtxos.push(VtxoEntry {
             txid: sub.vtxo_txid.clone(),
             vout: sub.vtxo_vout,
             amount: sub.amount_sats,
@@ -457,65 +404,30 @@ impl Cosigner {
         sub.commitment_txid
     }
 
-    /// Record a completed send: mirror it into the owned history and update the host projection for
-    /// live queries.
+    /// Record a completed send: drop the delegate, and answer the caller. The owned set was already
+    /// replaced with the change by [`Self::send_complete`].
     pub fn apply_send(
         &mut self,
         submitted: SendVtxoSubmitted,
     ) -> crate::wallet_proto::SendVtxoResponse {
-        let SendVtxoSubmitted { ark_txid, change } = submitted;
-        let resp = crate::handlers::ark_send::apply_send_result(
-            &mut self.owned_vtxos,
-            ark_txid,
-            change,
-        );
         // The send spent what the sealed delegate was signed over, so it can never settle now.
-        //
-        // This used to be attempted in `apply_send_result` by deleting `delegate_sessions` and
-        // `guest_delegate_thresholds` rows keyed by the caller's id — two store trees nothing has
-        // written since the delegate moved into the seal. The deletes did nothing, and the real
-        // delegate outlived every send: still sealed, still over spent inputs, and still what the
-        // settle watch would wake the owner about. Dropping it here makes the watch find nothing on
-        // its next run and cancel itself, which is the path that already existed for exactly this.
-        self.delegate_session = None;
-        resp
+        // Dropping it makes the settle watch find nothing on its next run and cancel itself.
+        self.renew_session = None;
+        crate::wallet_proto::SendVtxoResponse {
+            status: crate::wallet_proto::send_vtxo_response::Status::Settled as i32,
+            messages_to_sign: vec![],
+            script_path_spend: false,
+            ark_txid: submitted.ark_txid,
+            error_message: String::new(),
+        }
     }
 
     /// The wallet's group x-only pubkey (hex) — the VTXO owner key, from the installed policy's PKP.
     pub fn owner_pk_hex(&self) -> Result<String, String> {
-        let policy = self.policy.as_ref().ok_or("no policy installed")?;
-        let vk = policy.public_key_package.verifying_key.serialize(); // [u8; 33]
+        let pkp = self.policy.public_key_package.as_ref().ok_or("no policy installed")?;
+        let vk = pkp.verifying_key.serialize(); // [u8; 33]
         Ok(hex::encode(&vk[1..]))
     }
-
-    pub(crate) fn apply_delegate_sigs(&mut self, req: ApplyDelegateSigs) -> Result<(), String> {
-        // Auth (OP_SETTLE_DELEGATE) ran at the REST boundary.
-        let signatures: Vec<[u8; 64]> = req
-            .signed_messages
-            .iter()
-            .map(|m| {
-                m.as_slice()
-                    .try_into()
-                    .map_err(|_| "signature must be 64 bytes".to_string())
-            })
-            .collect::<Result<_, _>>()?;
-        let session = self
-            .delegate_session
-            .as_mut()
-            .ok_or("no delegate session")?
-            .session_mut();
-        session.sign_with_frost(signatures)?;
-        // Arming the watch is renewing's business (`renew_delegate_finish`), not signing's: a
-        // delegate signed for a refresh the owner asked for now is spent in the same round.
-        Ok(())
-    }
-
-    /// When the delegate's intent becomes valid: earliest covered expiry minus the safety margin.
-    /// `None` when no covered VTXO has a known expiry — the ASP had not indexed them yet.
-    pub(crate) fn settle_deadline(&self) -> Option<u64> {
-        self.prepare_delegate().ok().and_then(|(_, valid_at)| valid_at)
-    }
-
 
     #[allow(clippy::too_many_arguments)]
     pub fn install_policy(
@@ -534,13 +446,13 @@ impl Cosigner {
             .map(|h| h.parse::<Identifier>())
             .transpose()
             .map_err(|e| format!("bad identifier: {e}"))?;
-        self.policy = Some(GroupKeys {
-            group_key,
-            key_package,
-            public_key_package,
+        self.policy = GroupKey {
+            group_key: Some(group_key),
+            key_package: Some(key_package),
+            public_key_package: Some(public_key_package),
             user_signing_identifier,
-        });
-        self.wallet_dealt_share_hex = wallet_dealt_share_hex.map(Zeroizing::new);
+            wallet_dealt_share_hex: wallet_dealt_share_hex.map(Zeroizing::new),
+        };
         Ok(())
     }
 
@@ -548,18 +460,133 @@ impl Cosigner {
 
     /// This wallet's group key, hex, once it has one.
     pub(crate) fn policy_group_key(&self) -> Option<String> {
-        self.policy.as_ref().map(|p| p.group_key.clone())
+        self.policy.group_key.clone()
     }
 
     /// The ceremony's public key package, JSON: the group key and both verifying shares. Public by
     /// construction — it is what a recovering wallet checks its rebuilt share against.
     pub(crate) fn policy_public_key_package_json(&self) -> Option<String> {
-        self.policy.as_ref().map(|p| p.public_key_package.to_json())
+        self.policy.public_key_package.as_ref().map(PublicKeyPackage::to_json)
     }
 
     /// The owner's FROST identifier, as the ceremony recorded it.
     pub(crate) fn user_signing_identifier(&self) -> Option<Identifier> {
-        self.policy.as_ref().and_then(|p| p.user_signing_identifier.clone())
+        self.policy.user_signing_identifier.clone()
+    }
+
+    /// Rebuild a wallet on a new device, from nothing but its passkey: hand back the half of its
+    /// share this cosigner dealt, with the public material to check it against.
+    ///
+    /// # Why half a key is sitting here
+    ///
+    /// A FROST share is the sum of every dealer's polynomial evaluated at the participant's
+    /// identifier. For this 2-of-2 that is two terms:
+    ///
+    /// ```text
+    ///   s_wallet = f_wallet(id_wallet) + f_cosigner(id_wallet)
+    /// ```
+    ///
+    /// The wallet's own dealer is no longer random: it is derived from the passkey's PRF output,
+    /// which the platform syncs with the passkey, so a new phone that can use the passkey can
+    /// reproduce `f_wallet` exactly — and with it `id_wallet`, which is derived from `a0·G`. The
+    /// second term it cannot reproduce: the cosigner's polynomial was destroyed when the ceremony
+    /// ended. So the cosigner keeps the one scalar it dealt out, and hands it back here.
+    ///
+    /// # What this is not
+    ///
+    /// It is not a key escrow. The scalar returned is one term of a sum whose other term exists
+    /// only behind the owner's biometric; alone it signs nothing and identifies nothing. And it is
+    /// not a ceremony: nothing is installed, no policy is written, no share is re-keyed. A recovery
+    /// that re-keyed would strand the VTXOs, the delegate and the escrows the seal already holds —
+    /// which is exactly the accident `refuse_if_onboarded` exists to prevent, and this is its mirror
+    /// image: that one refuses when a policy exists, this one refuses when none does.
+    ///
+    /// # Who may call it
+    ///
+    /// The runtime resolved the tenant from the caller's passkey before this was reached; there is
+    /// no second authentication to do here and none is invented. What is checked instead is that
+    /// the passkey used is the *right* one: the caller sends the identifier it derived, and a
+    /// mismatch is refused rather than answered. A wallet whose PRF output changed is a wallet that
+    /// can no longer sign, and it is far better to say so than to hand back a share that will not
+    /// add up.
+    pub fn recover(
+        &self,
+        req: crate::session::proto::RecoverRequest,
+    ) -> Result<crate::session::proto::RecoverResponse, Status> {
+        let dealt_share = self.dealt_share_for(&req.identifier)?;
+        // `dealt_share_for` has already refused a wallet with no key, so these are there.
+        let (group_key, public_key_package_json) =
+            match (self.policy_group_key(), self.policy_public_key_package_json()) {
+                (Some(g), Some(p)) => (g, p),
+                _ => {
+                    return Err(Status::internal("the wallet has a dealt share and no key package"))
+                }
+            };
+
+        let now = crate::store::now_secs();
+        tracing::info!("Recover: returning the dealt share to the wallet's own identifier");
+        Ok(crate::session::proto::RecoverResponse {
+            dealt_share,
+            public_key_package_json,
+            group_key,
+            escrows: self.escrows().iter().map(|e| e.summary(now)).collect(),
+        })
+    }
+
+    /// The half of the wallet's share the cosigner dealt at DKG, for the wallet that is
+    /// [identifier].
+    ///
+    /// `Recover` hands it to a device that has nothing. `Sign`, `Send` and `Renew` hand it back on
+    /// their first round, every time, because the wallet keeps no share between operations any
+    /// more: it re-derives its own half from the passkey and adds this one, under the approval the
+    /// stream already has. One rule for all four, so there is one place it can be wrong.
+    ///
+    /// What this guards, and what it does not. The caller was authenticated by the runtime as this
+    /// tenant before any of this ran, and a tenant's seal is the only one this instance can read —
+    /// that is what keeps one tenant's half from another, and it is not re-implemented here. The
+    /// identifier is public (it is in the key package and on the wire), so matching it proves
+    /// nothing about who is asking. It proves the wallet asking is *this* wallet: a wrong passkey,
+    /// or a PRF that answers differently, derives another identifier and is told so instead of
+    /// being handed a share that would not add up.
+    ///
+    /// Never the cosigner's own share — that is `key_package.secret_share`, and nothing returns it.
+    pub(crate) fn dealt_share_for(&self, identifier: &[u8]) -> Result<Vec<u8>, Status> {
+        // The mirror of `refuse_if_onboarded`: there is nothing to hand back before a ceremony.
+        if self.policy_group_key().is_none() {
+            return Err(Status::failed_precondition(
+                "this wallet has no key yet: there is nothing to recover, create one instead",
+            ));
+        }
+
+        let expected = self.user_signing_identifier().ok_or_else(|| {
+            Status::failed_precondition("this wallet's ceremony recorded no owner identifier")
+        })?;
+        let asked: [u8; 32] = identifier
+            .try_into()
+            .map_err(|_| Status::invalid_argument("identifier must be 32 bytes"))?;
+        let asked = Identifier::deserialize(&asked)
+            .map_err(|e| Status::invalid_argument(format!("bad identifier: {e}")))?;
+        if asked != expected {
+            // Not "wrong passkey" necessarily — a PRF that answers differently on this device
+            // looks exactly the same from here. Either way the share would not add up, so say so
+            // now.
+            return Err(Status::permission_denied(
+                "that passkey does not derive this wallet's owner key: the share it rebuilt would \
+                 not be able to sign",
+            ));
+        }
+
+        self.wallet_dealt_share_hex()
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "this wallet was created before recovery existed: the cosigner did not keep \
+                     the share it dealt, and it cannot be recomputed",
+                )
+            })
+            .and_then(|h| {
+                hex::decode(h)
+                    .map_err(|e| Status::internal(format!("sealed share is not hex: {e}")))
+            })
     }
 
     // --- Escrow keys -----------------------------------------------------------------------------
@@ -570,9 +597,7 @@ impl Cosigner {
     /// The wallet key material a reshare is dealt against: this cosigner's own share and the
     /// group's public package. `None` before onboarding, when there is nothing to reshare.
     pub(crate) fn wallet_key_material(&self) -> Option<(KeyPackage, PublicKeyPackage)> {
-        self.policy
-            .as_ref()
-            .map(|p| (p.key_package.clone(), p.public_key_package.clone()))
+        Some((self.policy.key_package.clone()?, self.policy.public_key_package.clone()?))
     }
 
     /// The runtime this instance is running inside.
@@ -983,14 +1008,12 @@ impl Cosigner {
     ///
     /// `install_policy` overwrites unconditionally, so without this a second ceremony on the same
     /// tenant silently replaces the wallet's key — and everything held under the old one becomes
-    /// unspendable, because 2-of-2 has no other way back. The e2e suite did exactly that, repeatedly,
-    /// and only got away with it because nothing was funded in between.
+    /// unspendable, because 2-of-2 has no other way back.
     ///
-    /// It used to take a stranger to trigger it, since DKG was the one stream with no check at all.
-    /// Now the runtime authenticates it, so the risk is the owner's own app — a re-run onboarding, a
+    /// The runtime authenticates DKG, so the risk is the owner's own app — a re-run onboarding, a
     /// wiped local store — which is exactly the case where a refusal beats a quiet success.
     pub fn refuse_if_onboarded(&self) -> Result<(), Status> {
-        if self.policy.is_some() {
+        if self.policy.key_package.is_some() {
             return Err(Status::failed_precondition(
                 "this wallet already has a key; a second DKG would replace it and strand its funds",
             ));
@@ -1039,8 +1062,8 @@ impl Cosigner {
         &self,
         messages: &[Vec<u8>],
     ) -> Result<(InBandRound, Vec<Commitment>), String> {
-        let policy = self.policy.as_ref().ok_or("no policy installed")?;
-        Ok(in_band_begin(&policy.key_package, messages))
+        let key_package = self.policy.key_package.as_ref().ok_or("no policy installed")?;
+        Ok(in_band_begin(key_package, messages))
     }
 
     /// The same round one, for a key this cosigner holds that is NOT the wallet's.
@@ -1068,18 +1091,17 @@ impl Cosigner {
         round: InBandRound,
         wallet: Vec<WalletHalf>,
     ) -> Result<Vec<Vec<u8>>, String> {
-        let policy = self.policy.as_ref().ok_or("no policy installed")?;
+        let policy = &self.policy;
+        let (Some(key_package), Some(public_key_package)) =
+            (&policy.key_package, &policy.public_key_package)
+        else {
+            return Err("no policy installed".into());
+        };
         let user_identifier = policy
             .user_signing_identifier
-            .clone()
+            .as_ref()
             .ok_or("policy has no user_signing_identifier")?;
-        in_band_finish(
-            &policy.key_package,
-            &policy.public_key_package,
-            &user_identifier,
-            round,
-            wallet,
-        )
+        in_band_finish(key_package, public_key_package, user_identifier, round, wallet)
     }
 
     /// Round two for a key that is not the wallet's. See [`Self::sign_in_band_begin_as`].
@@ -1206,168 +1228,6 @@ struct Shares<'a> {
 }
 
 impl Cosigner {
-
-    /// Boarding settle START: derive the owner key (from the installed policy), the ASP info, and
-    /// the boarding address ourselves, then build the session from the wallet-scanned `boarding_utxo`
-    /// `(txid, vout, amount_sats)`. Returns the intent-proof sighashes to FROST-sign.
-    pub(crate) fn boarding_settle_start(
-        &mut self,
-        boarding_utxo: Option<(String, u32, u64)>,
-        info: &ArkInfo,
-    ) -> Result<Vec<Vec<u8>>, String> {
-        let owner_pk_hex = match self.owner_pk_hex() {
-            Ok(o) => o,
-            Err(e) => return Err(e),
-        };
-        let network = match ark::client::parse_network(&info.network) {
-            Ok(n) => n,
-            Err(e) => return Err(e),
-        };
-        let boarding_exit_delay = info.boarding_exit_delay as u32;
-        let boarding_address = match ark::client::boarding_address(
-            &owner_pk_hex,
-            &info.signer_pubkey,
-            boarding_exit_delay,
-            network,
-        ) {
-            Ok(a) => a,
-            Err(e) => return Err(format!("boarding_address: {e}")),
-        };
-        let (txid, vout, amount) = match boarding_utxo {
-            Some(u) => u,
-            None => return Err("no boarding UTXO supplied".into()),
-        };
-        self.boarding_settle_step1(
-            &owner_pk_hex,
-            &info.signer_pubkey,
-            &info.forfeit_pubkey,
-            &boarding_address,
-            &txid,
-            vout,
-            amount,
-            boarding_exit_delay,
-            &info.network,
-        )
-    }
-
-    /// Boarding settle step 1: build the boarding session + tree-signer from the (caller-derived)
-    /// owner-pk + ASP params, hold it in flight, and return the intent-proof sighashes to sign.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn boarding_settle_step1(
-        &mut self,
-        owner_pk_hex: &str,
-        signer_pubkey: &str,
-        forfeit_pubkey: &str,
-        boarding_address: &str,
-        boarding_txid: &str,
-        boarding_vout: u32,
-        boarding_amount_sats: u64,
-        boarding_exit_delay: u32,
-        network: &str,
-    ) -> Result<Vec<Vec<u8>>, String> {
-        let signer = ark::client::batch::BoardingTreeSigner::generate();
-        let cosigner_pk_hex = signer.cosigner_pubkey_hex();
-        let (session, sighashes) = ark::client::batch::SettleSession::new_boarding(
-            owner_pk_hex,
-            signer_pubkey,
-            forfeit_pubkey,
-            boarding_address,
-            boarding_txid,
-            boarding_vout,
-            boarding_amount_sats,
-            boarding_exit_delay,
-            network,
-            &cosigner_pk_hex,
-        )
-        .map_err(|e| format!("new_boarding: {e}"))?;
-        self.boarding_session = Some(BoardingSettleSession {
-            session,
-            signer,
-            amount_sats: boarding_amount_sats,
-            exit_delay: boarding_exit_delay,
-            phase: crate::handlers::renew::Phase::Intent,
-            intent_id: String::new(),
-        });
-        Ok(sighashes.iter().map(|s| s.to_vec()).collect())
-    }
-
-    /// Delegate phase 1: build the pre-authorized intent + forfeit PSBTs (after `GetInfo`) and return
-    /// the sighashes the client must FROST-sign.
-    /// `deferred`: valid from the renewal deadline (a sealed delegate), or from now (a refresh the
-    /// owner is asking for in person — the ASP refuses an intent valid in the future until then).
-    pub fn generate_delegate_for(
-        &mut self,
-        info: &ArkInfo,
-        deferred: bool,
-    ) -> Result<Vec<Vec<u8>>, String> {
-        let req = GenerateDelegate {
-            intent_valid_at: if deferred {
-                self.prepare_delegate().map(|(_, v)| v).unwrap_or(None)
-            } else {
-                None
-            },
-        };
-        let owner_pk_hex = self.owner_pk_hex()?;
-        let vtxos = self.vtxos().to_vec();
-
-        if vtxos.is_empty() {
-            return Err("no VTXOs to settle".into());
-        }
-        let vtxo_inputs: Vec<DelegateVtxoInput> = vtxos
-            .iter()
-            .map(|v| DelegateVtxoInput {
-                txid: v.txid.clone(),
-                vout: v.vout,
-                amount_sats: v.amount_sats,
-                is_swept: false,
-                exit_delay: v.exit_delay,
-            })
-            .collect();
-
-        let network = match ark::client::parse_network(&info.network) {
-            Ok(n) => n,
-            Err(e) => return Err(e),
-        };
-        let total: u64 = vtxos.iter().map(|v| v.amount_sats).sum();
-        let owner_ark_address = match ark::client::ark_address(
-            &owner_pk_hex,
-            &info.signer_pubkey,
-            info.unilateral_exit_delay as u32,
-            network,
-        ) {
-            Ok(a) => a,
-            Err(e) => return Err(format!("ark_address: {e}")),
-        };
-        let outputs = vec![DelegateOutput {
-            address: owner_ark_address,
-            amount_sats: total,
-        }];
-
-        match DelegateSettleSession::generate_delegate(
-            &owner_pk_hex,
-            &info.signer_pubkey,
-            &info.forfeit_pubkey,
-            &vtxo_inputs,
-            &outputs,
-            &info.forfeit_address,
-            info.dust as u64,
-            &info.network,
-            req.intent_valid_at,
-        ) {
-            Ok((session, sighashes)) => {
-                self.delegate_session = Some(DelegateSession::Awaiting(session));
-                Ok(sighashes.iter().map(|s| s.to_vec()).collect())
-            }
-            Err(e) => Err(format!("generate_delegate: {e}")),
-        }
-    }
-
-
-
-
-
-
-
     /// Open a send: build the off-chain send tx (after `GetInfo`) and hand back the session
     /// alongside the sighashes the client must FROST-sign. Nothing about it is stored here.
     pub fn send_open(
@@ -1392,9 +1252,8 @@ impl Cosigner {
         build_send(&owner_pk_hex, &req.vtxos, &req, info).map_err(|e| format!("build send: {e}"))
     }
 
-    /// Insert the caller's signatures and hand back the transactions it must submit.
-    ///
-    /// The cosigner used to call `SubmitTx` itself. It signs; the caller submits.
+    /// Insert the caller's signatures and hand back the transactions it must submit. It signs; the
+    /// caller submits.
     pub fn send_prepare(
         &mut self,
         session: &mut SendSession,
@@ -1434,12 +1293,12 @@ impl Cosigner {
             .map(|(txid, vout, amount)| (txid, vout, amount, change_exit_delay));
         session.mark_done();
         // The send spent all current VTXOs; re-add the change VTXO to the owned set, if any.
-        // Expiry is unknown until the ASP indexes it, so 0 — `build_delegate_step1` reads that as
+        // Expiry is unknown until the ASP indexes it, so 0 — `settle_deadline` reads that as
         // "unknown" and skips it conservatively rather than settling against a made-up deadline.
         let now = crate::store::now_secs();
-        self.owned_vtxos.clear();
+        self.vtxos.clear();
         if let Some((txid, vout, amount, exit_delay)) = change.clone() {
-            self.owned_vtxos.push(VtxoEntry {
+            self.vtxos.push(VtxoEntry {
                 txid,
                 vout,
                 amount,
@@ -1517,9 +1376,7 @@ pub(crate) fn build_send(
     ))
 }
 
-use ark::client::batch::{DelegateOutput, DelegateVtxoInput};
-
-use crate::types::{GenerateDelegate, SendVtxoStep2};
+use crate::types::SendVtxoStep2;
 
 pub(crate) fn sigs_from_wire(wire: &[Vec<u8>]) -> Result<Vec<[u8; 64]>, String> {
     wire.iter()

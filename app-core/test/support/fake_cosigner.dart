@@ -358,32 +358,36 @@ class FakeCosigner extends cs.CosignerServiceBase {
 
   @override
   Stream<cs.SendServerMsg> send(ServiceCall call, Stream<cs.SendClientMsg> request) => _no('send');
-  // --- Renew, as far as the wait -----------------------------------------------------------------
+  @override
+  Stream<cs.RenewServerMsg> renew(ServiceCall call, Stream<cs.RenewClientMsg> request) =>
+      _no('renew');
+
+  // --- Board, as far as the wait -----------------------------------------------------------------
   //
-  // Not a renewal: there is no transaction here and no ASP round. It is the *shape* of one up to
+  // Not a boarding: there is no transaction here and no ASP round. It is the *shape* of one up to
   // the point that matters for cancellation — the intent proof signed in-band, so the wallet has
   // rebuilt its share, then the intent registered, then `Idle`: "relay me the ASP's next event".
   // A real renewal sits exactly there for minutes. What happens if the ASP never speaks again is
   // the test's business.
 
-  int renewsOpened = 0;
+  int boardsOpened = 0;
 
-  /// Completes when a renewal has signed its intent proof and been told to wait on the ASP.
-  Completer<void> renewWaitingOnAsp = Completer<void>();
+  /// Completes when a boarding has signed its intent proof and been told to wait on the ASP.
+  Completer<void> boardWaitingOnAsp = Completer<void>();
 
-  /// Completes when that renewal's stream ends, however it ends.
-  Completer<void> renewEnded = Completer<void>();
+  /// Completes when that boarding's stream ends, however it ends.
+  Completer<void> boardEnded = Completer<void>();
 
   @override
-  Stream<cs.RenewServerMsg> renew(
+  Stream<cs.RenewServerMsg> board(
       ServiceCall call, Stream<cs.RenewClientMsg> request) async* {
-    renewsOpened++;
+    boardsOpened++;
     try {
       final inbound = StreamIterator(request);
-      if (!await inbound.moveNext() || !inbound.current.hasOpen()) {
-        throw GrpcError.invalidArgument('a session must open with RenewOpen');
+      if (!await inbound.moveNext() || !inbound.current.hasBoard()) {
+        throw GrpcError.invalidArgument('a session must open with BoardOpen');
       }
-      final dealt = _dealtShareFor(inbound.current.open.identifier);
+      final dealt = _dealtShareFor(inbound.current.board.identifier);
 
       final keyPackage = _keyPackage!;
       final message = Uint8List.fromList(List<int>.generate(32, (i) => 0x51 ^ i));
@@ -435,12 +439,12 @@ class FakeCosigner extends cs.CosignerServiceBase {
         throw GrpcError.invalidArgument('expected IntentRegistered');
       }
       yield cs.RenewServerMsg(seq: Int64(3), idle: cs.RenewIdle());
-      if (!renewWaitingOnAsp.isCompleted) renewWaitingOnAsp.complete();
+      if (!boardWaitingOnAsp.isCompleted) boardWaitingOnAsp.complete();
 
       // The wallet is now waiting on the ASP, not on this. Nothing more is said.
       while (await inbound.moveNext()) {}
     } finally {
-      if (!renewEnded.isCompleted) renewEnded.complete();
+      if (!boardEnded.isCompleted) boardEnded.complete();
     }
   }
   @override

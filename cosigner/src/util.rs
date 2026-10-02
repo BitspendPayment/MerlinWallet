@@ -148,9 +148,9 @@ impl From<wp::ArkInfo> for ark::client::types::ArkInfo {
     }
 }
 
-impl From<crate::handlers::renew::AspCall> for proto::AspSubmit {
-    fn from(call: crate::handlers::renew::AspCall) -> Self {
-        use crate::handlers::renew::AspCall;
+impl From<crate::renew::AspCall> for proto::AspSubmit {
+    fn from(call: crate::renew::AspCall) -> Self {
+        use crate::renew::AspCall;
         use proto::asp_submit::Call;
         let call = match call {
             AspCall::ConfirmRegistration { intent_id } => {

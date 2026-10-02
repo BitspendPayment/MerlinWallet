@@ -187,7 +187,7 @@ escrow tests — the branch's first end-to-end run since the escrow commits.
 ## ACCEPTED BY DESIGN (recorded so it is not re-raised as a finding)
 
 - **[RC-1] The passkey is now the single factor.** `app-core/lib/passkey/key_derivation.dart`,
-  `cosigner/src/handlers/recover.rs`. The wallet's FROST dealer polynomial is derived from the
+  `cosigner/src/cosigner.rs`. The wallet's FROST dealer polynomial is derived from the
   passkey's PRF, and the cosigner seals `f_cosigner(wallet_id)` — the half it dealt — so `Recover`
   plus the passkey reconstructs the share on any device. Before this, an attacker needed the
   device's Hive box **and** the PRF; now the passkey alone is enough. That is the stated goal
@@ -213,7 +213,7 @@ escrow tests — the branch's first end-to-end run since the escrow commits.
   loudly (`WrongPasskey`), where it used to stop only the unblinding.
 - **[RC-3] The device stores no private-key material; the share is rebuilt per operation.**
   `app-core/lib/client.dart` (`_withOperation`), `app-core/lib/passkey/operation_secrets.dart`,
-  `app-core/lib/passkey/share_reconstruction.dart`, `cosigner/src/handlers/recover.rs`
+  `app-core/lib/passkey/share_reconstruction.dart`, `cosigner/src/cosigner.rs`
   (`dealt_share_for`), `cosigner/src/session.rs`. Development architecture; not production-ready.
   - *What changed.* The phone used to persist a blinded share (δ) and — in the clear — the DKG
     dealer secret `a0` as `onchainSecret`, in an unencrypted append-only Hive box, and kept the PRF

@@ -58,9 +58,13 @@ service Cosigner {
   // The cosigner used to hold the ASP connection: it registered the intent, opened the event
   // stream, and reacted to each event itself. That made it the Ark client as well as the signer.
   // Here the client drives the round and relays each event; the cosigner answers with what to
-  // submit next, and never opens a socket. One RPC covers both shapes — a boarding output settles
-  // when `boarding_utxo` is set, a self-refresh when it is not.
+  // submit next, and never opens a socket.
   rpc Renew(stream RenewClientMsg) returns (stream RenewServerMsg);
+
+  // Boarding: settling one on-chain output into Ark, through the same round as `Renew`. A ceremony
+  // of its own rather than a flag on `Renew`'s open, but every message after the open is the same,
+  // so it carries `Renew`'s messages and opens with `RenewClientMsg.board`.
+  rpc Board(stream RenewClientMsg) returns (stream RenewServerMsg);
 
   // The rest. Not ceremonies — one round each, with nothing to hold between messages, so a stream
   // would buy nothing.
@@ -186,11 +190,13 @@ message RenewClientMsg {
     AspEvent event = 6;
     // After `RenewComplete`, optionally: renew the delegate over the wallet's set as it now stands.
     RenewDelegate renew_delegate = 7;
+    // Opens a `Board` stream, where `open` opens a `Renew` one.
+    BoardOpen board = 8;
   }
 }
 
-// Opens the renewal. `boarding_utxo` set settles that one output; absent refreshes the VTXOs the
-// cosigner already holds.
+// Opens a renewal of the VTXOs the wallet holds. Boarding opens a stream of its own — see
+// `BoardOpen`.
 //
 // `ark_info` comes from the caller because the caller is the one talking to the ASP. Lying about it
 // yields a transaction the ASP will not accept, or an address the liar cannot spend from — the
@@ -200,9 +206,11 @@ message RenewOpen {
   // Authentication is the runtime's — see the note at the top of this file.
   reserved 1, 2, 3;
   reserved "user_id", "signature", "timestamp_ms";
-  BoardingUtxo boarding_utxo = 4;
+  // Boarding has its own stream now: see `Board`.
+  reserved 4;
+  reserved "boarding_utxo";
   mpc_wallet.ArkInfo ark_info = 5;
-  // The set to refresh, when `boarding_utxo` is absent. Ignored for a boarding settle.
+  // The set to refresh.
   repeated VtxoInput vtxos = 6;
   // Refresh nothing now: renew the delegate over `vtxos` and close. The in-band exchange
   // `RenewDelegate` describes — `sighashes`, `signed`, `delegate_renewed` — with no round before
@@ -221,6 +229,13 @@ message RenewOpen {
   bytes identifier = 10;
 }
 
+// Opens a `Board` stream: settle `utxo`, an on-chain output paying this wallet's boarding address,
+// into Ark. `ark_info` and `identifier` are as in `RenewOpen`.
+message BoardOpen {
+  BoardingUtxo utxo = 1;
+  mpc_wallet.ArkInfo ark_info = 2;
+  bytes identifier = 3;
+}
 
 message BoardingUtxo {
   string txid = 1;

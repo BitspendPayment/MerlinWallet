@@ -27,10 +27,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use wstd::http::{Body, Request, Response};
 
 use crate::cosigner::Cosigner;
-use crate::delegate::DelegateRenew;
+use crate::renew::DelegateRenew;
 use crate::escrow_session::Escrow;
 use crate::grpc::{self, Duplex, SessionBody, Status};
-use crate::handlers::recover::dealt_share_for;
 use crate::wallet_proto as wp;
 
 pub mod proto {
@@ -89,6 +88,7 @@ impl Session {
             "Dkg" => ceremony!(dkg),
             "Send" => ceremony!(send),
             "Renew" => ceremony!(renew),
+            "Board" => ceremony!(board),
             "Escrow" => ceremony!(escrow),
             _ => {}
         }
@@ -156,10 +156,10 @@ impl Session {
         Ok(proto::DeviceCountResponse { devices })
     }
 
-    /// See [`crate::handlers::recover`]. Reads the seal; installs nothing.
+    /// See [`Cosigner::recover`]. Reads the seal; installs nothing.
     async fn recover(&self, body: Body) -> Result<proto::RecoverResponse, Status> {
         let req: proto::RecoverRequest = grpc::one_message(body).await?;
-        crate::handlers::recover::recover(&lock(&self.cosigner), req)
+        lock(&self.cosigner).recover(req)
     }
 
     /// Commit an escrow to a deal: what the paired service may take, and until when.
@@ -253,7 +253,7 @@ async fn sign(
 
     // The wallet's half of its own share, before any nonce exists: a caller that is not this
     // wallet is refused with nothing to abandon.
-    let dealt = dealt_share_for(&lock(&cosigner), &open.identifier)?;
+    let dealt = lock(&cosigner).dealt_share_for(&open.identifier)?;
 
     // The round is OURS, as an ordinary local. The lock is released before we wait on the client —
     // a slow client blocks nobody.
@@ -375,16 +375,11 @@ async fn escrow(
 
     // The wallet's half of its own share, before anything is dealt — see `dealt_share_for`. A
     // reshare builds on the wallet share, so the wallet needs this to finalize its own side.
-    let dealt = dealt_share_for(&lock(&cosigner), &open.identifier)?;
+    let dealt = lock(&cosigner).dealt_share_for(&open.identifier)?;
 
     let mut sess = esc::EscrowSession::new();
-    let our_round1 = esc::escrow_open(
-        &mut sess,
-        &old_kp,
-        &open.identifier,
-        &open.round1_package,
-        &open.context,
-    )?;
+    let our_round1 =
+        sess.begin(&old_kp, &open.identifier, &open.round1_package, &open.context)?;
     duplex.send(proto::EscrowServerMsg {
         session_id: session_id.clone(),
         seq: 1,
@@ -400,7 +395,7 @@ async fn escrow(
         proto::escrow_client_msg::Body::Round2(r) => r,
         _ => return Err(Status::invalid_argument("expected EscrowRound2")),
     };
-    let for_wallet = esc::escrow_finish(&mut sess, &old_kp, &old_pkp, &round2.round2_package)?;
+    let for_wallet = sess.finalise(&old_kp, &old_pkp, &round2.round2_package)?;
     let material = sess
         .material
         .take()
@@ -727,7 +722,7 @@ async fn send(
     // The wallet's half of its own share, before anything is built — see `dealt_share_for`. It
     // rides the first sighashes and nothing after: a trailing delegate renewal reuses what the
     // wallet rebuilt.
-    let dealt = dealt_share_for(&lock(&cosigner), &open.identifier)?;
+    let dealt = lock(&cosigner).dealt_share_for(&open.identifier)?;
 
     // Taking back what is left of an escrow is a send too, on this same stream — see [`reclaim`].
     if !open.reclaim_escrow.is_empty() {
@@ -901,17 +896,15 @@ async fn send(
     Ok(())
 }
 
-/// Renewing a boarding output into Ark, or the VTXOs held, with the caller driving the ASP round.
+/// Renewing the VTXOs held, with the caller driving the ASP round.
 ///
 /// The cosigner answers each relayed event with what to send the ASP next and never opens a socket
 /// of its own. `ark_info` arrives from the caller for the same reason: it is the one talking to the
-/// ASP. See `handlers/renew.rs` for why that cannot redirect funds.
+/// ASP. See `Cosigner::renew_begin` for why that cannot redirect funds.
 async fn renew(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
 ) -> Result<(), Status> {
-    use crate::handlers::renew::RenewStep;
-
     let first = duplex.expect("it opened").await?;
     let session_id = first.session_id.clone();
     let open = match first.body {
@@ -923,7 +916,7 @@ async fn renew(
     // The wallet's half of its own share — see `dealt_share_for`. Taken by the FIRST sighashes this
     // stream sends, whichever path sends them, and gone after: a renewal signs two or three rounds
     // and the wallet rebuilds its share once.
-    let mut dealt = Some(dealt_share_for(&lock(&cosigner), &open.identifier)?);
+    let mut dealt = Some(lock(&cosigner).dealt_share_for(&open.identifier)?);
     tracing::info!("Renew: returning the dealt share to the wallet's own identifier");
 
     let info = open
@@ -941,12 +934,52 @@ async fn renew(
         let dealt = dealt.take().unwrap_or_default();
         return DelegateRenew::run(&cosigner, &duplex, request, &session_id, 1, dealt).await;
     }
-    let boarding_utxo = open.boarding_utxo.map(|u| (u.txid, u.vout, u.amount_sats));
-    let vtxos: Vec<crate::types::VtxoInput> = open.vtxos.into_iter().map(Into::into).collect();
+    let vtxos = open.vtxos.into_iter().map(Into::into).collect();
+    let sighashes = lock(&cosigner).renew_begin(vtxos, info).map_err(Status::internal)?;
+    drive_round(&cosigner, &duplex, &session_id, dealt, sighashes).await
+}
 
-    let sighashes = lock(&cosigner)
-        .renew_open(boarding_utxo, vtxos, info)
-        .map_err(Status::internal)?;
+/// Boarding one on-chain output into Ark: the round `renew` drives, opened with `BoardOpen` on a
+/// stream of its own.
+async fn board(
+    cosigner: Arc<Mutex<Cosigner>>,
+    duplex: Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
+) -> Result<(), Status> {
+    let first = duplex.expect("it opened").await?;
+    let session_id = first.session_id.clone();
+    let open = match first.body {
+        Some(proto::renew_client_msg::Body::Board(o)) => o,
+        _ => return Err(Status::invalid_argument("a session must open with BoardOpen")),
+    };
+    // Authenticated by the runtime at open — see `sign` above.
+
+    // The wallet's half of its own share, as `renew` hands it out: with the first sighashes.
+    let dealt = lock(&cosigner).dealt_share_for(&open.identifier)?;
+    tracing::info!("Board: returning the dealt share to the wallet's own identifier");
+
+    let info = open
+        .ark_info
+        .map(ark::client::types::ArkInfo::from)
+        .ok_or_else(|| Status::invalid_argument("BoardOpen carried no ark_info"))?;
+    let utxo = open
+        .utxo
+        .map(|u| (u.txid, u.vout, u.amount_sats))
+        .ok_or_else(|| Status::invalid_argument("BoardOpen carried no utxo"))?;
+    let sighashes = lock(&cosigner).board_begin(utxo, &info).map_err(Status::internal)?;
+    drive_round(&cosigner, &duplex, &session_id, Some(dealt), sighashes).await
+}
+
+/// The round `renew` and `board` share: from the first sighashes to `RenewComplete`, and the
+/// delegate's renewal the caller may ask for after it. [dealt] goes out with the first sighashes,
+/// unless the stream already spent it.
+async fn drive_round(
+    cosigner: &Arc<Mutex<Cosigner>>,
+    duplex: &Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
+    session_id: &str,
+    mut dealt: Option<Vec<u8>>,
+    sighashes: Vec<Vec<u8>>,
+) -> Result<(), Status> {
+    use crate::renew::RenewStep;
 
     let mut seq = 1u64;
     let mut step = RenewStep::Sighashes(sighashes);
@@ -964,7 +997,7 @@ async fn renew(
             RenewStep::Sighashes(messages_to_sign) => {
                 // Round one, on this stream — see `Cosigner::sign_in_band_begin` for why it cannot
                 // be a nested `Sign` any more.
-                let (round, commitments) = lock(&cosigner)
+                let (round, commitments) = lock(cosigner)
                     .sign_in_band_begin(&messages_to_sign)
                     .map_err(Status::internal)?;
                 pending_round = Some(round);
@@ -993,12 +1026,12 @@ async fn renew(
                     exit_delay: sub.exit_delay,
                 };
                 {
-                    let mut c = lock(&cosigner);
+                    let mut c = lock(cosigner);
                     c.apply_boarding_settle(sub);
                     c.seal();
                 }
                 duplex.send(proto::RenewServerMsg {
-                    session_id: session_id.clone(),
+                    session_id: session_id.to_string(),
                     seq,
                     body: Some(proto::renew_server_msg::Body::Complete(complete)),
                 });
@@ -1015,7 +1048,7 @@ async fn renew(
                     };
                     // No share with it: the renewal's first round already carried one.
                     let next = seq + 1;
-                    DelegateRenew::run(&cosigner, &duplex, request, &session_id, next, vec![])
+                    DelegateRenew::run(cosigner, duplex, request, session_id, next, vec![])
                         .await?;
                 }
                 return Ok(());
@@ -1023,7 +1056,7 @@ async fn renew(
         };
 
         duplex.send(proto::RenewServerMsg {
-            session_id: session_id.clone(),
+            session_id: session_id.to_string(),
             seq,
             body,
         });
@@ -1035,7 +1068,7 @@ async fn renew(
         // `recv().await`. That used to matter because the caller opened a nested `Sign` on its own
         // connection while this stream was parked; signing is in-band now, so nothing else takes
         // this lock mid-renewal — but holding a guard across an await is still the wrong habit.
-        let mut c = lock(&cosigner);
+        let mut c = lock(cosigner);
         step = match body {
             proto::renew_client_msg::Body::Signed(s) => {
                 let round = pending_round.take().ok_or_else(|| {
@@ -1054,7 +1087,7 @@ async fn renew(
                 Some(ev) => c.renew_on_event(ev).map_err(Status::internal)?,
                 None => RenewStep::Idle,
             },
-            proto::renew_client_msg::Body::Open(_) => {
+            proto::renew_client_msg::Body::Open(_) | proto::renew_client_msg::Body::Board(_) => {
                 return Err(Status::invalid_argument("the session is already open"))
             }
             proto::renew_client_msg::Body::RenewDelegate(_) => {

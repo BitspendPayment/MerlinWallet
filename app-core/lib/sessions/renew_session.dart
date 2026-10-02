@@ -5,8 +5,8 @@
 /// signer. It has no socket now, so the loop inverts — the wallet relays each event and the
 /// cosigner answers with what to send the ASP next.
 ///
-/// One RPC covers both shapes: a boarding output settles when [boardingUtxo] is given, a
-/// self-refresh of the held VTXOs when it is not.
+/// Boarding and a refresh run the same round on two streams: `Board` settles a boarding output when
+/// [boardingUtxo] is given, `Renew` refreshes the held VTXOs when it is not.
 ///
 /// **Every server message must be answered.** The cosigner reads after every yield, so a driver
 /// that skips a reply deadlocks the round rather than failing it.
@@ -126,7 +126,8 @@ class RenewSession {
         )
       : null;
 
-  /// Renew. Returns when the batch finalizes.
+  /// Board [boardingUtxo] on the `Board` stream, or without one refresh [vtxos] on `Renew`. Returns
+  /// when the batch finalizes.
   Future<RenewResult> renew({
     required ArkInfo info,
     required List<int> identifier,
@@ -141,7 +142,7 @@ class RenewSession {
     String exitScriptPubkeyHex = '',
     String ownerXOnlyHex = '',
   }) async {
-    final duplex = _conn.openRenew();
+    final duplex = boardingUtxo == null ? _conn.openRenew() : _conn.openBoard();
     StreamQueue<ark.GetEventStreamResponse>? events;
     var seq = 0;
 
@@ -155,16 +156,21 @@ class RenewSession {
 
     try {
       report(RenewPhase.registering);
-      duplex.send(cs.RenewClientMsg(
-        sessionId: '',
-        seq: Int64(seq++),
-        open: cs.RenewOpen(
-          boardingUtxo: boardingUtxo,
+      final open = cs.RenewClientMsg(sessionId: '', seq: Int64(seq++));
+      if (boardingUtxo == null) {
+        open.open = cs.RenewOpen(
           arkInfo: arkInfoToProto(info),
           vtxos: vtxosToProto(vtxos),
           identifier: identifier,
-        ),
-      ));
+        );
+      } else {
+        open.board = cs.BoardOpen(
+          utxo: boardingUtxo,
+          arkInfo: arkInfoToProto(info),
+          identifier: identifier,
+        );
+      }
+      duplex.send(open);
 
       while (true) {
         final msg = await duplex.next('the next step');

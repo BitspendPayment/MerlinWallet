@@ -283,22 +283,6 @@ pub struct SendVtxoStep2 {
     pub signed_messages: Vec<Vec<u8>>,
 }
 
-/// Delegate phase 1 — build the pre-authorized intent + forfeit PSBTs and return sighashes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerateDelegate {
-    // VTXOs come from the guest's own store (SetVtxos); the settle output is a self-refresh
-    // to the owner's own ark address, which the guest computes from GetInfo. Neither is on
-    // the wire. Only the host-computed renewal deadline is passed in.
-    /// Renewal time (Unix secs) the delegate becomes valid; `None` keeps the legacy window.
-    pub intent_valid_at: Option<u64>,
-}
-
-/// Delegate phase 2 — the client's FROST signatures over the phase-1 sighashes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplyDelegateSigs {
-    pub signed_messages: Vec<Vec<u8>>,
-}
-
 /// One participant's signing commitments, keyed by FROST identifier (hex).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commitment {

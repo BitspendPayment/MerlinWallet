@@ -7,12 +7,14 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ark::client::types::ArkInfo;
 use cosigner::handlers::watch::{Outcome, Task, CATEGORY_SETTLE_DUE, WATCH_TASK_ID};
 use common::Recorder;
+use cosigner::renew::DelegateRenew;
 use cosigner::host::valid_label;
+use cosigner::session::proto;
 use cosigner::types::VtxoInput;
 
 fn payload(deadline_secs: u64) -> Vec<u8> {
@@ -395,22 +397,22 @@ fn renewing_without_a_known_expiry_is_refused() {
     let Some(store) = common::try_store() else {
         return;
     };
-    let mut c = open_with(&store, Arc::new(Recorder::default()), "unindexed");
-    let err = c
-        .renew_delegate_open(
-            vec![VtxoInput {
-                txid: "a".repeat(64),
-                vout: 0,
-                amount_sats: 50_000,
-                exit_delay: 512,
-                expires_at: 0,
-            }],
-            &ark_info(),
-            &[],
-        )
+    let c = Arc::new(Mutex::new(open_with(&store, Arc::new(Recorder::default()), "unindexed")));
+    let request = proto::RenewDelegate {
+        vtxos: vec![proto::VtxoInput {
+            txid: "a".repeat(64),
+            vout: 0,
+            amount_sats: 50_000,
+            exit_delay: 512,
+            expires_at: 0,
+        }],
+        ark_info: Some((&ark_info()).into()),
+        ..Default::default()
+    };
+    let err = DelegateRenew::build(&c, request)
         .map(|_| ())
         .expect_err("nothing to schedule against");
-    assert!(err.contains("known expiry"), "unhelpful error: {err}");
+    assert!(err.message().contains("known expiry"), "unhelpful error: {err}");
 }
 
 /// Renewing the delegate re-arms the watch for its own deadline. The runtime refuses an id reused

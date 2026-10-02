@@ -469,14 +469,15 @@ void main() {
       final asp = SilentAsp();
       final d = device(seed(20), newBox(), asp: asp);
       await d.client.doDkg();
+      d.approvals.clear();
 
-      final renewing = d.client.renew(boardingUtxos: [
+      final renewing = d.client.board(
         cs.BoardingUtxo(txid: 'ab' * 32, vout: 0, amountSats: Int64(50000)),
-      ]);
+      );
       // Whatever becomes of it is looked at below; until then it is not an unhandled error.
       renewing.ignore();
 
-      await cosigner.renewWaitingOnAsp.future.timeout(const Duration(seconds: 10));
+      await cosigner.boardWaitingOnAsp.future.timeout(const Duration(seconds: 10));
       // Give the driver its turn to go from `Idle` to the event stream.
       await Future<void>.delayed(const Duration(milliseconds: 200));
       expect(asp.intentsRegistered, 1);
@@ -484,6 +485,9 @@ void main() {
       final operation = d.operations.last;
       expect(operation.holdsSecrets, isTrue, reason: 'the intent proof was signed: a share exists');
       expect(d.client.operationInProgress, isTrue);
+      // One fingerprint, approved for the stream boarding opens: the seed rides it, so an approval
+      // asked for under any other method would be a second prompt.
+      expect(d.approvals, ['/cosigner.v1.Cosigner/Board']);
 
       // A second operation, queued behind it. It must not be stuck there.
       final queued = d.client.sign(message);
@@ -497,7 +501,7 @@ void main() {
 
       // The driver really unwound, rather than being left parked with the share in its frame:
       // it let go of the ASP's stream and the cosigner saw its own end.
-      await cosigner.renewEnded.future.timeout(const Duration(seconds: 10));
+      await cosigner.boardEnded.future.timeout(const Duration(seconds: 10));
       expect(asp.listenerLeft, isTrue);
 
       // And the turn passed on: the operation that was waiting runs, and signs.

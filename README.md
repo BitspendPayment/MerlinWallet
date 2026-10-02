@@ -88,7 +88,7 @@ Merlin is a concrete consumer of the runtime's capabilities. Its [`Host` trait](
 | Carry multiple signing rounds under one approved interaction | Passkey-minted interaction token, HTTP/2, bidirectional request/response bodies | [`connection.dart`](app-core/lib/cosigner/connection.dart), [`session.rs`](cosigner/src/session.rs), [`grpc/`](cosigner/src/grpc/) |
 | Keep each wallet's files and execution separate | Tenant-scoped preopen and per-tenant execution lock | [`open_cosigner`](cosigner/src/main.rs), [`store.rs`](cosigner/src/store.rs) |
 | Preserve state beyond an invocation or restart | Copy-on-write encrypted filesystem and durable sync/rename operations | [`SnapshotState`](cosigner/src/types.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
-| Execute an already authorized renewal later | `enclave:tasks/queue` and the `run-task` callback | [`delegate.rs`](cosigner/src/handlers/delegate.rs), [`watch.rs`](cosigner/src/handlers/watch.rs) |
+| Execute an already authorized renewal later | `enclave:tasks/queue` and the `run-task` callback | [`renew.rs`](cosigner/src/renew.rs), [`watch.rs`](cosigner/src/handlers/watch.rs) |
 | Reach the ASP during unattended work | Exact-origin guest egress policy | [`asp/`](cosigner/src/asp/), [`up-enclave.sh`](scripts/up-enclave.sh) |
 | Let a paired service initiate an exchange | `enclave:streams/connection` and `on-message` | [`service_stream.rs`](cosigner/src/service_stream.rs), [`release.rs`](cosigner/src/handlers/release.rs) |
 | Notify the owner without putting private details in a push | Runtime-owned device enrollment and FCM wake queue | [`host.rs`](cosigner/src/host.rs), [`watch.rs`](cosigner/src/handlers/watch.rs) |
@@ -349,7 +349,7 @@ sealed at DKG. Neither is the key. An operation that signs goes like this
    that does not derive this wallet's identifier is refused here, before anything is opened.
 4. **Open the stream.** Its open names the wallet's identifier; the cosigner's first answer carries
    `wallet_dealt_share`, on `Sign`, `Send` and `Renew` alike — once per stream, and never the
-   cosigner's own share (`cosigner/src/handlers/recover.rs`, `dealt_share_for`). No second call, so
+   cosigner's own share (`cosigner/src/cosigner.rs`, `dealt_share_for`). No second call, so
    no second approval.
 5. **Add, fix the sign, check.** The sum is accepted only if `s·G` is the verifying share this
    device stored when the wallet was made — not one that arrived with the contribution
@@ -525,7 +525,7 @@ funds not yet settled — is not in the app yet; the exit is the last hop, and t
 obtained later.
 
 Implementation: [`exit.rs`](crates/ark/src/exit.rs) (shared transaction construction),
-[`FFI exit verification`](ffi/src/ark/exit.rs), [`delegate.rs`](cosigner/src/handlers/delegate.rs),
+[`FFI exit verification`](ffi/src/ark/exit.rs), [`renew.rs`](cosigner/src/renew.rs),
 [`exit_plan.dart`](app-core/lib/sessions/exit_plan.dart), and
 [`exit_screen.dart`](app/lib/screens/exit/exit_screen.dart).
 

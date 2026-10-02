@@ -124,7 +124,7 @@ impl Cosigner {
             .map_err(|e| Status::internal(format!("sealed wallet identifier is not hex: {e}")))?;
         // Answered only to the identifier the ceremony recorded — the same rule every other stream
         // applies, reached through the same function.
-        let wallet_dealt_share = crate::handlers::recover::dealt_share_for(self, &wallet_id_bytes)?;
+        let wallet_dealt_share = self.dealt_share_for(&wallet_id_bytes)?;
 
         let crate::escrow::EscrowDetails {
             key_package,

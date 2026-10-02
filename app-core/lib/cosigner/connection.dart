@@ -1,6 +1,6 @@
 /// The wallet's connection to its cosigner.
 ///
-/// One service, `cosigner.v1.Cosigner`: seven bidirectional streams for the ceremonies and eight
+/// One service, `cosigner.v1.Cosigner`: six bidirectional streams for the ceremonies and seven
 /// single-round calls beside them. This owns the channel and the generated stub, and hands the
 /// session drivers a duplex to work over.
 ///
@@ -218,6 +218,13 @@ class CosignerConnection {
   Duplex<cs.RenewClientMsg, cs.RenewServerMsg> openRenew() {
     final out = StreamController<cs.RenewClientMsg>();
     return _track(out, _stream('Renew', (o) => _stub.renew(out.stream, options: o)));
+  }
+
+  /// Boarding one on-chain output: [openRenew]'s round and messages, on a stream of its own that
+  /// opens with `BoardOpen`. See `sessions/renew_session.dart`.
+  Duplex<cs.RenewClientMsg, cs.RenewServerMsg> openBoard() {
+    final out = StreamController<cs.RenewClientMsg>();
+    return _track(out, _stream('Board', (o) => _stub.board(out.stream, options: o)));
   }
 
   // --- The single-round calls -------------------------------------------------------------------

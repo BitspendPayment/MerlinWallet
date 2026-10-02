@@ -1,7 +1,7 @@
 //! The settle watch: when a sealed delegate comes due, the cosigner runs it.
 //!
 //! A VTXO expires. The wallet signs a delegate to refresh it while it is here — see
-//! `handlers/delegate.rs` — and the cosigner seals it and enqueues this watch for the moment it
+//! `crate::renew` — and the cosigner seals it and enqueues this watch for the moment it
 //! becomes valid. Then, with no request in flight and nobody connected, the task opens the wallet,
 //! registers the sealed intent with the ASP over the enclave's one allowed origin, follows the round,
 //! and signs the tree with the cosigner's own key.
@@ -13,8 +13,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::asp::AspApi;
+use crate::asp::{AspApi, EventSource};
 use crate::cosigner::Cosigner;
+use crate::renew::{AspCall, RenewSession, RenewStep};
+use crate::types::VtxoEntry;
 use crate::host::{valid_label, valid_task_id};
 
 /// The id the watch is enqueued under. Tenant-local, and an idempotency key: re-arming replaces
@@ -104,7 +106,7 @@ impl Cosigner {
         // No sealed delegate: it was run, or spent by a send, or replaced — nothing is owed. The
         // cancel is best-effort (a background run may not mutate the queue); the next renewal
         // re-arms.
-        if self.delegate_session.is_none() {
+        if self.renew_session.is_none() {
             self.host.cancel(WATCH_TASK_ID).ok();
             return Ok(Outcome::NothingToSettle);
         }
@@ -118,7 +120,102 @@ impl Cosigner {
         }
 
         if let Some(asp) = asp {
-            match self.execute_delegate(asp).await {
+            // Run the sealed delegate's round against the ASP, for its commitment txid. Safe to
+            // run again after a failure: the registered intent's id is sealed as soon as the ASP
+            // assigns it, so a retry follows the same registration rather than making a second
+            // one, and a failed batch clears it so the next attempt registers afresh.
+            let run: Result<String, String> = async {
+                let delegate =
+                    self.renew_session.as_ref().ok_or("no sealed delegate")?.session();
+                let (proof, message, topics) = delegate.register_payload()?;
+                let registered = delegate.intent_id.is_some();
+                let info = asp.get_info().await?;
+
+                if !registered {
+                    let id = asp.register_intent(&proof, &message).await?;
+                    if let Some(delegate) = self.renew_session.as_mut() {
+                        delegate.session_mut().intent_id = Some(id);
+                    }
+                    self.seal();
+                }
+
+                let mut events = asp.events(&topics).await?;
+                let held: u64 = self.vtxos.iter().map(|v| v.amount).sum();
+                let exit_delay = info.unilateral_exit_delay as u32;
+                self.renew_session =
+                    self.renew_session.take().map(|d| d.in_flight(exit_delay));
+
+                let outcome: Result<crate::types::BoardingSettleSubmitted, String> = async {
+                    loop {
+                        let event = events
+                            .next()
+                            .await?
+                            .ok_or("the ASP's event stream ended before the batch finalized")?;
+                        match self.renew_on_event(event)? {
+                            RenewStep::Idle => {}
+                            RenewStep::Submit(AspCall::ConfirmRegistration { intent_id }) => {
+                                asp.confirm_registration(&intent_id).await?
+                            }
+                            RenewStep::Submit(AspCall::TreeNonces { batch_id, pubkey, nonces }) => {
+                                asp.submit_tree_nonces(&batch_id, &pubkey, &nonces).await?
+                            }
+                            RenewStep::Submit(AspCall::TreeSignatures {
+                                batch_id,
+                                pubkey,
+                                signatures,
+                            }) => {
+                                asp.submit_tree_signatures(&batch_id, &pubkey, &signatures).await?
+                            }
+                            RenewStep::Submit(AspCall::ForfeitTxs {
+                                signed_txs,
+                                signed_commitment_b64,
+                            }) => asp.submit_forfeits(&signed_txs, &signed_commitment_b64).await?,
+                            RenewStep::Complete(sub) => return Ok(sub),
+                            RenewStep::Sighashes(_) | RenewStep::Register { .. } => {
+                                return Err(
+                                    "a delegate round asked for a signature it should not need"
+                                        .into(),
+                                )
+                            }
+                        }
+                    }
+                }
+                .await;
+
+                // A round that stopped short leaves the delegate waiting again; a finished one took
+                // it.
+                self.renew_session =
+                    self.renew_session.take().map(RenewSession::awaiting);
+                match outcome {
+                    Ok(sub) => {
+                        // Everything the delegate covered was spent into the one VTXO it produced,
+                        // and the delegate went with its round.
+                        self.vtxos = vec![VtxoEntry {
+                            txid: sub.vtxo_txid,
+                            vout: sub.vtxo_vout,
+                            amount: held,
+                            exit_delay: sub.exit_delay,
+                            created_at: crate::store::now_secs(),
+                            expires_at: 0,
+                        }];
+                        self.seal();
+                        Ok(sub.commitment_txid)
+                    }
+                    Err(e) => {
+                        if e.contains("batch failed") {
+                            // The ASP dropped the registration with the batch; register again next
+                            // time.
+                            if let Some(delegate) = self.renew_session.as_mut() {
+                                delegate.session_mut().intent_id = None;
+                            }
+                            self.seal();
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            .await;
+            match run {
                 Ok(commitment_txid) => {
                     // Best-effort: the refresh happened either way.
                     self.host.wake(CATEGORY_DELEGATE_SETTLED, None).ok();

@@ -59,7 +59,7 @@ Future<String> renewBoarding(MpcClient client, List<BoardingUtxo> utxos) async {
   if (utxos.isEmpty) throw StateError('no boarding UTXOs to settle');
   String commitment = '';
   for (final u in utxos) {
-    commitment = await client.renew(boardingUtxos: [u]);
+    commitment = await client.board(u);
   }
   return commitment;
 }

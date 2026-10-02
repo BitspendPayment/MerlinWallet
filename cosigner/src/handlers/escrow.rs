@@ -56,8 +56,6 @@ use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::random;
 use threshold::scalar::scalar_to_bytes;
 
-use crate::handlers::parsers;
-
 /// A 2-of-2 reshare is degree 1: one constant term and one coefficient above it.
 const THRESHOLD_COUNT: usize = 2;
 const TOTAL_PARTICIPANTS: usize = 2;
@@ -111,127 +109,128 @@ impl EscrowSession {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-/// Round one: take the wallet's dealing, deal ours, and hand ours back.
-///
-/// `old_kp` is this cosigner's key package for the wallet key `V` — the reshare is dealt under the
-/// identifier it already has there, so the deltas land on the same points as the old shares.
-pub fn escrow_open(
-    sess: &mut EscrowSession,
-    old_kp: &KeyPackage,
-    wallet_identifier: &[u8],
-    wallet_round1_json: &str,
-    context: &[u8],
-) -> Result<String, Status> {
-    if sess.round1_secret.is_some() {
-        return Err(Status::failed_precondition("this escrow ceremony already opened"));
+    /// Round one: take the wallet's dealing, deal ours, and hand ours back.
+    ///
+    /// `old_kp` is this cosigner's key package for the wallet key `V` — the reshare is dealt under
+    /// the identifier it already has there, so the deltas land on the same points as the old
+    /// shares.
+    pub fn begin(
+        &mut self,
+        old_kp: &KeyPackage,
+        wallet_identifier: &[u8],
+        wallet_round1_json: &str,
+        context: &[u8],
+    ) -> Result<String, Status> {
+        if self.round1_secret.is_some() {
+            return Err(Status::failed_precondition("this escrow ceremony already opened"));
+        }
+        // Enough to be unrepeatable by accident, small enough to seal for every escrow a wallet
+        // holds.
+        if context.len() < 16 || context.len() > 32 {
+            return Err(Status::invalid_argument(
+                "an escrow derivation context must be 16 to 32 bytes",
+            ));
+        }
+
+        let wallet_id = Identifier::try_from(wallet_identifier)
+            .map_err(|e| Status::invalid_argument(format!("bad identifier: {e}")))?;
+        let server_id = old_kp.identifier.clone();
+        if wallet_id == server_id {
+            // Both deltas would land on one point and the reshare would not be a sharing at all.
+            return Err(Status::invalid_argument(
+                "the wallet's identifier is this cosigner's own",
+            ));
+        }
+
+        let wallet_round1 = Round1Package::from_json(wallet_round1_json)
+            .map_err(|e| Status::invalid_argument(format!("bad round1 package: {e}")))?;
+
+        // Our own Δ. Fresh every ceremony and from the enclave's RNG: a delta reused across two
+        // escrows would put two of this cosigner's dealings on one line.
+        let mut rng = OsRng;
+        let secret = random::mod_n_random(&mut rng);
+        let coefficients: Vec<_> = (0..THRESHOLD_COUNT - 1)
+            .map(|_| random::mod_n_random(&mut rng))
+            .collect();
+        let (r1_secret, r1_pub) = dkg::dkg_reshare_part1(
+            &server_id,
+            TOTAL_PARTICIPANTS,
+            THRESHOLD_COUNT,
+            &secret,
+            &coefficients,
+            &mut rng,
+        )
+        .map_err(|e| Status::internal(format!("dkg_reshare_part1: {e}")))?;
+
+        self.context_hex = Some(hex::encode(context));
+        self.wallet_id = Some(wallet_id);
+        self.wallet_round1 = Some(wallet_round1);
+        self.server_id = Some(server_id);
+        self.round1_secret = Some(r1_secret);
+        Ok(r1_pub.to_json())
     }
-    // Enough to be unrepeatable by accident, small enough to seal for every escrow a wallet holds.
-    if context.len() < 16 || context.len() > 32 {
-        return Err(Status::invalid_argument(
-            "an escrow derivation context must be 16 to 32 bytes",
-        ));
+
+    /// Round two: take the wallet's share of its delta, finalize `V'`, and hand back ours.
+    pub fn finalise(
+        &mut self,
+        old_kp: &KeyPackage,
+        old_pkp: &PublicKeyPackage,
+        wallet_round2_json: &str,
+    ) -> Result<String, Status> {
+        let (wallet_id, wallet_round1, server_id, r1_secret) = match (
+            self.wallet_id.take(),
+            self.wallet_round1.take(),
+            self.server_id.take(),
+            self.round1_secret.take(),
+        ) {
+            (Some(w), Some(p), Some(s), Some(r)) => (w, p, s, r),
+            _ => return Err(Status::failed_precondition("this escrow ceremony has not opened")),
+        };
+
+        let wallet_round2 = Round2Package::from_json(wallet_round2_json)
+            .map_err(|e| Status::invalid_argument(format!("bad round2 package: {e}")))?;
+
+        let peers_round1: BTreeMap<Identifier, Round1Package> =
+            [(wallet_id.clone(), wallet_round1)].into_iter().collect();
+
+        // Our round 2: a share of our delta for the wallet. No passive receivers — both parties
+        // deal and both finalize, so `dkg_part2` is given an empty receiver list.
+        let (r2_secret, our_shares): (Round2SecretPackage, BTreeMap<Identifier, Round2Package>) =
+            dkg::dkg_part2(&r1_secret, &peers_round1, &[])
+                .map_err(|e| Status::internal(format!("dkg_part2: {e}")))?;
+        let for_wallet = our_shares
+            .get(&wallet_id)
+            .ok_or_else(|| Status::internal("our reshare dealt the wallet nothing"))?
+            .clone();
+
+        let peers_round2: BTreeMap<Identifier, Round2Package> =
+            [(wallet_id.clone(), wallet_round2)].into_iter().collect();
+        let receivers = [wallet_id.clone(), server_id];
+
+        let (new_kp, new_pkp) = dkg::dkg_reshare_part3(
+            &r2_secret,
+            &peers_round1,
+            &peers_round2,
+            old_pkp,
+            old_kp,
+            &receivers,
+        )
+        .map_err(|e| Status::internal(format!("dkg_reshare_part3: {e}")))?;
+
+        let kp_json = new_kp.to_json();
+        let pkp_json = new_pkp.to_json();
+        let escrow_key = crate::serde::extract_verifying_key(&pkp_json)?;
+
+        self.material = Some(EscrowMaterial {
+            escrow_key,
+            key_package_json: kp_json,
+            public_key_package_json: pkp_json,
+            wallet_identifier_hex: hex::encode(wallet_id.serialize()),
+            context_hex: self.context_hex.take().unwrap_or_default(),
+            wallet_delta_share_hex: hex::encode(scalar_to_bytes(&for_wallet.secret_share)),
+        });
+
+        Ok(for_wallet.to_json())
     }
-
-    let wallet_id = Identifier::try_from(wallet_identifier)
-        .map_err(|e| Status::invalid_argument(format!("bad identifier: {e}")))?;
-    let server_id = old_kp.identifier.clone();
-    if wallet_id == server_id {
-        // Both deltas would land on one point and the reshare would not be a sharing at all.
-        return Err(Status::invalid_argument(
-            "the wallet's identifier is this cosigner's own",
-        ));
-    }
-
-    let wallet_round1 = Round1Package::from_json(wallet_round1_json)
-        .map_err(|e| Status::invalid_argument(format!("bad round1 package: {e}")))?;
-
-    // Our own Δ. Fresh every ceremony and from the enclave's RNG: a delta reused across two escrows
-    // would put two of this cosigner's dealings on one line.
-    let mut rng = OsRng;
-    let secret = random::mod_n_random(&mut rng);
-    let coefficients: Vec<_> = (0..THRESHOLD_COUNT - 1)
-        .map(|_| random::mod_n_random(&mut rng))
-        .collect();
-    let (r1_secret, r1_pub) = dkg::dkg_reshare_part1(
-        &server_id,
-        TOTAL_PARTICIPANTS,
-        THRESHOLD_COUNT,
-        &secret,
-        &coefficients,
-        &mut rng,
-    )
-    .map_err(|e| Status::internal(format!("dkg_reshare_part1: {e}")))?;
-
-    sess.context_hex = Some(hex::encode(context));
-    sess.wallet_id = Some(wallet_id);
-    sess.wallet_round1 = Some(wallet_round1);
-    sess.server_id = Some(server_id);
-    sess.round1_secret = Some(r1_secret);
-    Ok(r1_pub.to_json())
 }
-
-/// Round two: take the wallet's share of its delta, finalize `V'`, and hand back ours.
-pub fn escrow_finish(
-    sess: &mut EscrowSession,
-    old_kp: &KeyPackage,
-    old_pkp: &PublicKeyPackage,
-    wallet_round2_json: &str,
-) -> Result<String, Status> {
-    let (wallet_id, wallet_round1, server_id, r1_secret) = match (
-        sess.wallet_id.take(),
-        sess.wallet_round1.take(),
-        sess.server_id.take(),
-        sess.round1_secret.take(),
-    ) {
-        (Some(w), Some(p), Some(s), Some(r)) => (w, p, s, r),
-        _ => return Err(Status::failed_precondition("this escrow ceremony has not opened")),
-    };
-
-    let wallet_round2 = Round2Package::from_json(wallet_round2_json)
-        .map_err(|e| Status::invalid_argument(format!("bad round2 package: {e}")))?;
-
-    let peers_round1: BTreeMap<Identifier, Round1Package> =
-        [(wallet_id.clone(), wallet_round1)].into_iter().collect();
-
-    // Our round 2: a share of our delta for the wallet. No passive receivers — both parties deal
-    // and both finalize, so `dkg_part2` is given an empty receiver list.
-    let (r2_secret, our_shares): (Round2SecretPackage, BTreeMap<Identifier, Round2Package>) =
-        dkg::dkg_part2(&r1_secret, &peers_round1, &[])
-            .map_err(|e| Status::internal(format!("dkg_part2: {e}")))?;
-    let for_wallet = our_shares
-        .get(&wallet_id)
-        .ok_or_else(|| Status::internal("our reshare dealt the wallet nothing"))?
-        .clone();
-
-    let peers_round2: BTreeMap<Identifier, Round2Package> =
-        [(wallet_id.clone(), wallet_round2)].into_iter().collect();
-    let receivers = [wallet_id.clone(), server_id];
-
-    let (new_kp, new_pkp) = dkg::dkg_reshare_part3(
-        &r2_secret,
-        &peers_round1,
-        &peers_round2,
-        old_pkp,
-        old_kp,
-        &receivers,
-    )
-    .map_err(|e| Status::internal(format!("dkg_reshare_part3: {e}")))?;
-
-    let kp_json = new_kp.to_json();
-    let pkp_json = new_pkp.to_json();
-    let escrow_key = parsers::extract_verifying_key(&pkp_json)?;
-
-    sess.material = Some(EscrowMaterial {
-        escrow_key,
-        key_package_json: kp_json,
-        public_key_package_json: pkp_json,
-        wallet_identifier_hex: hex::encode(wallet_id.serialize()),
-        context_hex: sess.context_hex.take().unwrap_or_default(),
-        wallet_delta_share_hex: hex::encode(scalar_to_bytes(&for_wallet.secret_share)),
-    });
-
-    Ok(for_wallet.to_json())
-}
-
