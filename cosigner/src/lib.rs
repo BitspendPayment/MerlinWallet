@@ -10,10 +10,10 @@ pub mod asp;
 pub mod boarding;
 pub mod config;
 pub mod cosigner;
-
 pub mod grpc;
 pub mod handlers;
 pub mod host;
+pub mod onboarding;
 pub mod escrow;
 pub mod escrow_session;
 pub mod evidence;

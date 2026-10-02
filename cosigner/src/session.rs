@@ -476,8 +476,7 @@ async fn dkg(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<proto::DkgClientMsg, proto::DkgServerMsg>,
 ) -> Result<(), Status> {
-    use crate::handlers::onboarding as ob;
-    use crate::handlers::onboarding::OnboardingSession;
+    use crate::onboarding::OnboardingSession;
 
     let first = duplex.expect("it opened").await?;
     let session_id = first.session_id.clone();
@@ -498,8 +497,7 @@ async fn dkg(
     // stream.
     let mut sess = OnboardingSession::new();
 
-    let r1 = ob::dkg_open(
-        &mut sess,
+    let r1 = sess.begin(
         wp::DkgStep1Request {
             identifier: open.identifier.clone(),
             round1_package: open.round1_package,
@@ -518,29 +516,28 @@ async fn dkg(
         proto::dkg_client_msg::Body::Round2(r) => r,
         _ => return Err(Status::invalid_argument("expected DkgRound2")),
     };
-    let r3 = ob::dkg_finish(
-        &mut sess,
+    let r3 = sess.finalise(
         wp::DkgStep3Request {
             identifier: round2.identifier,
             round2_packages_for_others: round2.round2_packages_for_others,
         },
     )?;
-    let mat = sess
-        .seed_material
-        .take()
-        .ok_or_else(|| Status::internal("DKG finished without key material"))?;
-    let group_key = mat.group_key.clone();
+    let (Some(group_key), Some(key_package_json), Some(public_key_package_json)) =
+        (sess.group_key.take(), sess.key_package_json.take(), sess.public_key_package_json.take())
+    else {
+        return Err(Status::internal("DKG finished without key material"));
+    };
 
     // Install the key and seal it. No plaintext fallback: if this fails the ceremony fails, rather
     // than leaving a wallet whose key exists only in a reply.
     {
         let mut c = lock(&cosigner);
         c.install_policy(
-            mat.group_key,
-            &mat.key_package_json,
-            &mat.public_key_package_json,
-            mat.user_signing_identifier_hex.as_deref(),
-            mat.wallet_dealt_share_hex,
+            group_key.clone(),
+            &key_package_json,
+            &public_key_package_json,
+            sess.user_signing_identifier_hex.as_deref(),
+            sess.wallet_dealt_share_hex.take(),
         )
         .map_err(Status::internal)?;
         c.seal();

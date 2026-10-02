@@ -88,10 +88,10 @@ Merlin is a concrete consumer of the runtime's capabilities. Its [`Host` trait](
 | Carry multiple signing rounds under one approved interaction | Passkey-minted interaction token, HTTP/2, bidirectional request/response bodies | [`connection.dart`](app-core/lib/cosigner/connection.dart), [`session.rs`](cosigner/src/session.rs), [`grpc/`](cosigner/src/grpc/) |
 | Keep each wallet's files and execution separate | Tenant-scoped preopen and per-tenant execution lock | [`open_cosigner`](cosigner/src/main.rs), [`store.rs`](cosigner/src/store.rs) |
 | Preserve state beyond an invocation or restart | Copy-on-write encrypted filesystem and durable sync/rename operations | [`SnapshotState`](cosigner/src/types.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
-| Execute an already authorized renewal later | `enclave:tasks/queue` and the `run-task` callback | [`renew.rs`](cosigner/src/renew.rs), [`watch.rs`](cosigner/src/handlers/watch.rs) |
+| Execute an already authorized renewal later | `enclave:tasks/queue` and the `run-task` callback | [`renew.rs`](cosigner/src/renew.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
 | Reach the ASP during unattended work | Exact-origin guest egress policy | [`asp/`](cosigner/src/asp/), [`up-enclave.sh`](scripts/up-enclave.sh) |
 | Let a paired service initiate an exchange | `enclave:streams/connection` and `on-message` | [`service_stream.rs`](cosigner/src/service_stream.rs), [`release.rs`](cosigner/src/handlers/release.rs) |
-| Notify the owner without putting private details in a push | Runtime-owned device enrollment and FCM wake queue | [`host.rs`](cosigner/src/host.rs), [`watch.rs`](cosigner/src/handlers/watch.rs) |
+| Notify the owner without putting private details in a push | Runtime-owned device enrollment and FCM wake queue | [`host.rs`](cosigner/src/host.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
 
 ### Persistent wallet state
 

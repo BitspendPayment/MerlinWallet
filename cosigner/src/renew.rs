@@ -7,7 +7,7 @@
 //! refresh all of it (valid from the earliest expiry less the safety margin) and the forfeits it
 //! will need (`ALL|ANYONECANPAY`, so the round's connector can be added later), and the wallet
 //! FROST-signs them. That signed delegate is sealed, and the settle watch is armed for the moment
-//! it becomes valid — see `crate::handlers::watch` for what runs it. `RenewOpen.delegate_only` does
+//! it becomes valid — see `Cosigner::run_task` for what runs it. `RenewOpen.delegate_only` does
 //! the same on its own, for funds that arrived by a receive.
 //!
 //! **Running a round.** What the cosigner contributes to an ASP round is signatures: the intent
@@ -24,8 +24,11 @@ use ark::client::types::ArkInfo;
 use ark::exit::{self, ExitInput, ExitSpend};
 
 use crate::boarding::BoardingSettleSession;
-use crate::cosigner::Cosigner;
+use crate::cosigner::{
+    Cosigner, Task, CATEGORY_SETTLE_DUE, WATCH_INTERVAL_MS, WATCH_TASK_ID,
+};
 use crate::grpc::{Duplex, HasBody, Status};
+use crate::host::valid_label;
 use crate::session::{enrol_device, lock, proto};
 use crate::types::{BoardingSettleSubmitted, VtxoInput};
 
@@ -509,7 +512,35 @@ impl DelegateRenew {
         let valid_at = c.settle_deadline().ok_or_else(|| {
             Status::internal("the delegate lost its deadline between building and signing")
         })?;
-        c.arm_settle_watch(valid_at).map_err(Status::internal)?;
+
+        // Arm the watch for that deadline. Here, because `enqueue` is interactive only: background
+        // work cannot grant itself standing work, so arming rides the call that signed the
+        // delegate. It is the only thing this queue is used for — `crate::escrow_session` says why
+        // an escrow's deadline needs no task.
+        debug_assert!(valid_label(CATEGORY_SETTLE_DUE));
+        let payload = serde_json::to_vec(&Task::SettleDue { deadline_secs: valid_at })
+            .map_err(|e| Status::internal(format!("encode task: {e}")))?;
+        // First run at the deadline itself — a delegate is not valid before it, so running earlier
+        // would only report NotDue and put the real run a whole interval late. One already past
+        // runs at once; one missed while the enclave was down runs when it recovers the queue.
+        let host = c.host.clone();
+        let enqueue =
+            || host.enqueue(WATCH_TASK_ID, &payload, valid_at * 1000, Some(WATCH_INTERVAL_MS));
+        match enqueue() {
+            Ok(()) => {}
+            // A task id is an idempotency key: arming again with the same deadline is a no-op, and
+            // with a different one — a new delegate over VTXOs that expire at another time — the
+            // runtime refuses until the old record is gone. Cancelled is terminal, so it can then
+            // be forgotten, and the id is free. The watch cannot be running meanwhile: renewing
+            // happens in a request, which holds the tenant the background task would need.
+            Err(e) if e.contains("different input") => {
+                let rearm = |e: String| Status::internal(format!("re-arming the watch: {e}"));
+                host.cancel(WATCH_TASK_ID).map_err(rearm)?;
+                host.forget(WATCH_TASK_ID).map_err(rearm)?;
+                enqueue().map_err(Status::internal)?;
+            }
+            Err(e) => return Err(Status::internal(e)),
+        }
         c.seal();
         Ok(proto::DelegateRenewed {
             valid_at_secs: valid_at,

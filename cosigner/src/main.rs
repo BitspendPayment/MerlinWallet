@@ -180,7 +180,7 @@ mod runtime {
     /// The runtime calls this on its own schedule with no request in flight, so it opens the wallet
     /// itself rather than sharing one — there is no instance kept between a request and a task to
     /// share. When the sealed delegate has come due it runs it against the ASP the image names —
-    /// see `handlers/watch.rs` — and wakes the owner only when it cannot.
+    /// see `Cosigner::run_task` — and wakes the owner only when it cannot.
     struct Background;
 
     impl bindings::Guest for Background {

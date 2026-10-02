@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use rand::rngs::OsRng;
 
 use cosigner::handlers::escrow::{self, EscrowSession};
-use cosigner::handlers::onboarding::{self as ob, OnboardingSession};
+use cosigner::onboarding::OnboardingSession;
 use cosigner::wallet_proto::{DkgStep1Request, DkgStep3Request};
 
 use threshold::dkg::{self, Round1Package, Round2Package};
@@ -76,8 +76,7 @@ fn onboard() -> Wallet {
     let wallet_id = w_r1_secret.identifier.clone();
 
     let mut sess = OnboardingSession::new();
-    let r1 = ob::dkg_open(
-        &mut sess,
+    let r1 = sess.begin(
         DkgStep1Request {
             identifier: wallet_id.serialize().to_vec(),
             round1_package: w_r1_pub.to_json(),
@@ -99,8 +98,7 @@ fn onboard() -> Wallet {
         .collect();
 
     let (w_r2_secret, w_r2_out) = dkg::dkg_part2(&w_r1_secret, &others_r1, &[]).unwrap();
-    let r3 = ob::dkg_finish(
-        &mut sess,
+    let r3 = sess.finalise(
         DkgStep3Request {
             identifier: wallet_id.serialize().to_vec(),
             round2_packages_for_others: w_r2_out
@@ -110,7 +108,6 @@ fn onboard() -> Wallet {
         },
     )
     .expect("finish");
-    let mat = sess.seed_material.take().expect("key material");
 
     let ours: BTreeMap<Identifier, Round2Package> = r3
         .round2_packages_for_me
@@ -129,8 +126,9 @@ fn onboard() -> Wallet {
         kp,
         pkp,
         coefficients: w_r1_secret.coefficients.iter().map(scalar_to_bytes).collect(),
-        dealt_share_hex: mat.wallet_dealt_share_hex.expect("a sealed dealt share"),
-        cosigner_kp: KeyPackage::from_json(&mat.key_package_json).expect("cosigner kp"),
+        dealt_share_hex: sess.wallet_dealt_share_hex.take().expect("a sealed dealt share"),
+        cosigner_kp: KeyPackage::from_json(sess.key_package_json.as_deref().expect("key material"))
+            .expect("cosigner kp"),
     }
 }
 

@@ -10,12 +10,13 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use ark::client::types::ArkInfo;
-use cosigner::handlers::watch::{Outcome, Task, CATEGORY_SETTLE_DUE, WATCH_TASK_ID};
+use cosigner::cosigner::{Outcome, Task, CATEGORY_SETTLE_DUE, WATCH_TASK_ID};
 use common::Recorder;
 use cosigner::renew::DelegateRenew;
 use cosigner::host::valid_label;
 use cosigner::session::proto;
 use cosigner::types::VtxoInput;
+use threshold::keys::KeyPackage;
 
 fn payload(deadline_secs: u64) -> Vec<u8> {
     serde_json::to_vec(&Task::SettleDue { deadline_secs }).unwrap()
@@ -72,21 +73,6 @@ fn an_undecodable_payload_is_an_error() {
     assert!(err.contains("tenant-local"), "unhelpful error: {err}");
 }
 
-/// Arming needs a real deadline. Expiry is the ASP's to know and is 0 until it has indexed the
-/// VTXOs; arming against that would wake the owner about a deadline nobody computed.
-#[test]
-fn an_unknown_deadline_is_not_armed() {
-    let Some(store) = common::try_store() else {
-        return;
-    };
-    let host = Arc::new(Recorder::default());
-    let c = open_with(&store, host.clone(), "unknown");
-
-    let err = c.arm_settle_watch(0).expect_err("0 is not a deadline");
-    assert!(err.contains("not known yet"), "unhelpful error: {err}");
-    assert!(host.enqueued.lock().unwrap().is_empty());
-}
-
 /// Arming asks for the shape `enclave:tasks` specifies: a tenant-local idempotency key, a repeating
 /// interval at or above the runtime's floor, and a payload the task can decode back.
 #[test]
@@ -95,9 +81,9 @@ fn arming_enqueues_a_repeating_watch() {
         return;
     };
     let host = Arc::new(Recorder::default());
-    let c = open_with(&store, host.clone(), "arm");
+    let (c, kp_user) = wallet(&store, host.clone());
 
-    c.arm_settle_watch(2_000_000_000).expect("arm");
+    renew_expiring_at(&c, &kp_user, 2_000_000_000);
 
     let enqueued = host.enqueued.lock().unwrap();
     assert_eq!(enqueued.len(), 1, "one watch, however often it is armed");
@@ -110,10 +96,49 @@ fn arming_enqueues_a_repeating_watch() {
     assert_eq!(
         serde_json::from_slice::<Task>(payload).unwrap(),
         Task::SettleDue {
-            deadline_secs: 2_000_000_000
+            deadline_secs: deadline(&store, 2_000_000_000)
         },
         "the task must be able to decode what arming encoded"
     );
+}
+
+/// A wallet that has been through DKG, on [host].
+fn wallet(
+    store: &Arc<cosigner::store::Store>,
+    host: Arc<Recorder>,
+) -> (Arc<Mutex<cosigner::Cosigner>>, KeyPackage) {
+    let (kps, pkp) = common::dkg_2of2();
+    let group_key = hex::encode(pkp.verifying_key.serialize());
+    let c = Mutex::new(open_with(store, host, &group_key));
+    common::seed_policy(&c, &group_key, &kps[1], &kps[0], &pkp);
+    (Arc::new(c), kps[0].clone())
+}
+
+/// Renew the delegate over one VTXO expiring at [expires_at], answering its round as the wallet
+/// would. Renewing is what arms the watch.
+fn renew_expiring_at(c: &Arc<Mutex<cosigner::Cosigner>>, kp_user: &KeyPackage, expires_at: i64) {
+    let request = proto::RenewDelegate {
+        vtxos: vec![proto::VtxoInput {
+            txid: "a".repeat(64),
+            vout: 0,
+            amount_sats: 100_000,
+            exit_delay: 512,
+            expires_at,
+        }],
+        ark_info: Some((&ark_info()).into()),
+        ..Default::default()
+    };
+    let (renew, to_sign) = DelegateRenew::build(c, request).expect("build");
+    let rounds = common::wallet_answers(kp_user, &to_sign.delegate, &to_sign.commitments)
+        .into_iter()
+        .map(|h| proto::WalletRound { hiding: h.hiding, binding: h.binding, share: h.share })
+        .collect();
+    renew.finalise(c, rounds, "").expect("renew");
+}
+
+/// The deadline a VTXO expiring at [expires_at] is armed for: its expiry, less the margin.
+fn deadline(store: &cosigner::store::Store, expires_at: i64) -> u64 {
+    (expires_at - store.auto_settle_safety_margin_secs) as u64
 }
 
 /// The category the app matches on is an opaque label, not prose: the payload crosses the parent
@@ -397,7 +422,8 @@ fn renewing_without_a_known_expiry_is_refused() {
     let Some(store) = common::try_store() else {
         return;
     };
-    let c = Arc::new(Mutex::new(open_with(&store, Arc::new(Recorder::default()), "unindexed")));
+    let host = Arc::new(Recorder::default());
+    let c = Arc::new(Mutex::new(open_with(&store, host.clone(), "unindexed")));
     let request = proto::RenewDelegate {
         vtxos: vec![proto::VtxoInput {
             txid: "a".repeat(64),
@@ -413,6 +439,7 @@ fn renewing_without_a_known_expiry_is_refused() {
         .map(|_| ())
         .expect_err("nothing to schedule against");
     assert!(err.message().contains("known expiry"), "unhelpful error: {err}");
+    assert!(host.enqueued.lock().unwrap().is_empty(), "and no watch is armed against a guess");
 }
 
 /// Renewing the delegate re-arms the watch for its own deadline. The runtime refuses an id reused
@@ -425,17 +452,19 @@ fn arming_again_for_a_new_deadline_replaces_the_watch() {
         return;
     };
     let host = Arc::new(Recorder::default());
-    let c = open_with(&store, host.clone(), "rearm");
+    let (c, kp_user) = wallet(&store, host.clone());
 
-    c.arm_settle_watch(2_000_000_000).expect("first");
-    c.arm_settle_watch(2_000_000_000).expect("the same deadline again is a no-op");
-    c.arm_settle_watch(2_100_000_000).expect("a new deadline replaces the watch");
+    renew_expiring_at(&c, &kp_user, 2_000_000_000);
+    // The same deadline again is a no-op.
+    renew_expiring_at(&c, &kp_user, 2_000_000_000);
+    // A new deadline replaces the watch.
+    renew_expiring_at(&c, &kp_user, 2_100_000_000);
 
     let enqueued = host.enqueued.lock().unwrap();
     assert_eq!(enqueued.len(), 2);
     assert_eq!(
         serde_json::from_slice::<Task>(&enqueued[1].1).unwrap(),
-        Task::SettleDue { deadline_secs: 2_100_000_000 }
+        Task::SettleDue { deadline_secs: deadline(&store, 2_100_000_000) }
     );
     assert_eq!(*host.cancelled.lock().unwrap(), vec![WATCH_TASK_ID]);
 }

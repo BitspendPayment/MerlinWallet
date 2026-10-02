@@ -126,7 +126,7 @@ pub fn service_stream_id(service_id_hex: &str) -> String {
 
 /// What this cosigner sends a service.
 ///
-/// Tagged, like [`Task`](crate::handlers::watch::Task), so the stored payload stays readable and a
+/// Tagged, like [`Task`](crate::cosigner::Task), so the stored payload stays readable and a
 /// new kind costs a variant rather than a new channel.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]

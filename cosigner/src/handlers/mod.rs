@@ -7,8 +7,6 @@
 //! blocking task, which is the safe pattern for tokio's blocking pool.
 
 pub mod helpers;
-pub mod onboarding;
-pub mod watch;
 pub mod escrow;
 pub mod delivery;
 pub mod pairing;
