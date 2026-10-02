@@ -193,6 +193,7 @@ class EscrowSession {
         walletIdentifier: walletId,
         cosignerId: cosignerId,
         serviceIdentifier: pair.service,
+        attemptId: pair.attemptId,
         slope: pair.slope,
         delivery: pair.delivery,
         cancel: pair.cancel,

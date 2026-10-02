@@ -5,7 +5,7 @@
 /// lifecycle needs — `Dkg`, `Sign`, `Recover`, and `Escrow` as far as minting — over real gRPC on a
 /// loopback port, playing the cosigner's half of each ceremony with the same threshold library the
 /// wallet uses.
-/// `Send` and `Settle` need an ASP and are the e2e suite's.
+/// `Send` and `Renew` need an ASP and are the e2e suite's.
 ///
 /// It keeps the contract the real one keeps (`cosigner/src/handlers/recover.rs`,
 /// `cosigner/tests/stream_contribution_test.rs`): what it dealt the wallet comes back on the first
@@ -311,7 +311,6 @@ class FakeCosigner extends cs.CosignerServiceBase {
         // The driver checks only that the pairing signs for the escrow key, which this does.
         publicKeyPackageJson: jsonEncode(escrowPkp.toJson()),
         serviceOrigin: pairingOrigin,
-        attemptId: open.attemptId,
       ),
     );
     if (!await inbound.moveNext() || !inbound.current.hasDelivered()) {
@@ -320,33 +319,6 @@ class FakeCosigner extends cs.CosignerServiceBase {
     pairingsConfirmed++;
     yield cs.EscrowServerMsg(seq: Int64(4), confirmed: cs.PairServiceConfirmResponse());
   }
-
-  /// Not implemented here either — and for the same reason. Pairing's decisions are proved against
-  /// the real handler in `cosigner/tests/pairing_test.rs`.
-  @override
-  Stream<cs.PairServiceServerMsg> pairService(
-    ServiceCall call,
-    Stream<cs.PairServiceClientMsg> request,
-  ) async* {
-    throw GrpcError.unimplemented('this fake does not pair services');
-  }
-
-  /// Nor this: a reclaim is `{wallet, cosigner}` signing the escrow key, and what it decides — that
-  /// the deal is over, and where the money goes — is proved against the real handler.
-  @override
-  Stream<cs.EscrowReclaimServerMsg> escrowReclaim(
-    ServiceCall call,
-    Stream<cs.EscrowReclaimClientMsg> request,
-  ) async* {
-    throw GrpcError.unimplemented('this fake does not reclaim escrows');
-  }
-
-  @override
-  Future<cs.PairServiceConfirmResponse> pairServiceConfirm(
-    ServiceCall call,
-    cs.PairServiceConfirmRequest request,
-  ) async =>
-      throw GrpcError.unimplemented('this fake pairs no services to confirm');
 
   @override
   Future<cs.EscrowOpenSessionResponse> escrowOpenSession(
@@ -386,39 +358,39 @@ class FakeCosigner extends cs.CosignerServiceBase {
 
   @override
   Stream<cs.SendServerMsg> send(ServiceCall call, Stream<cs.SendClientMsg> request) => _no('send');
-  // --- Settle, as far as the wait ------------------------------------------------------------------
+  // --- Renew, as far as the wait -----------------------------------------------------------------
   //
-  // Not a settle: there is no transaction here and no ASP round. It is the *shape* of one up to
+  // Not a renewal: there is no transaction here and no ASP round. It is the *shape* of one up to
   // the point that matters for cancellation — the intent proof signed in-band, so the wallet has
   // rebuilt its share, then the intent registered, then `Idle`: "relay me the ASP's next event".
-  // A real settle sits exactly there for minutes. What happens if the ASP never speaks again is
+  // A real renewal sits exactly there for minutes. What happens if the ASP never speaks again is
   // the test's business.
 
-  int settlesOpened = 0;
+  int renewsOpened = 0;
 
-  /// Completes when a settle has signed its intent proof and been told to wait on the ASP.
-  Completer<void> settleWaitingOnAsp = Completer<void>();
+  /// Completes when a renewal has signed its intent proof and been told to wait on the ASP.
+  Completer<void> renewWaitingOnAsp = Completer<void>();
 
-  /// Completes when that settle's stream ends, however it ends.
-  Completer<void> settleEnded = Completer<void>();
+  /// Completes when that renewal's stream ends, however it ends.
+  Completer<void> renewEnded = Completer<void>();
 
   @override
-  Stream<cs.SettleServerMsg> settle(
-      ServiceCall call, Stream<cs.SettleClientMsg> request) async* {
-    settlesOpened++;
+  Stream<cs.RenewServerMsg> renew(
+      ServiceCall call, Stream<cs.RenewClientMsg> request) async* {
+    renewsOpened++;
     try {
       final inbound = StreamIterator(request);
       if (!await inbound.moveNext() || !inbound.current.hasOpen()) {
-        throw GrpcError.invalidArgument('a session must open with SettleOpen');
+        throw GrpcError.invalidArgument('a session must open with RenewOpen');
       }
       final dealt = _dealtShareFor(inbound.current.open.identifier);
 
       final keyPackage = _keyPackage!;
       final message = Uint8List.fromList(List<int>.generate(32, (i) => 0x51 ^ i));
       final nonce = frost_comm.newNonce(keyPackage.secretShare);
-      yield cs.SettleServerMsg(
+      yield cs.RenewServerMsg(
         seq: Int64(1),
-        sighashes: cs.SettleSighashes(
+        sighashes: cs.RenewSighashes(
           messagesToSign: [message],
           scriptPathSpend: true,
           cosignerCommitments: [
@@ -433,7 +405,7 @@ class FakeCosigner extends cs.CosignerServiceBase {
       );
 
       if (!await inbound.moveNext() || !inbound.current.hasSigned()) {
-        throw GrpcError.invalidArgument('expected SettleSigned');
+        throw GrpcError.invalidArgument('expected RenewSigned');
       }
       // Aggregated, so that "the wallet rebuilt its share" is something this saw and not something
       // it assumed: a wrong share does not get this far.
@@ -455,20 +427,20 @@ class FakeCosigner extends cs.CosignerServiceBase {
         _publicKeyPackage!,
       );
 
-      yield cs.SettleServerMsg(
+      yield cs.RenewServerMsg(
         seq: Int64(2),
         register: cs.RegisterIntent(proof: 'proof', message: 'message', topics: ['topic']),
       );
       if (!await inbound.moveNext() || !inbound.current.hasRegistered()) {
         throw GrpcError.invalidArgument('expected IntentRegistered');
       }
-      yield cs.SettleServerMsg(seq: Int64(3), idle: cs.SettleIdle());
-      if (!settleWaitingOnAsp.isCompleted) settleWaitingOnAsp.complete();
+      yield cs.RenewServerMsg(seq: Int64(3), idle: cs.RenewIdle());
+      if (!renewWaitingOnAsp.isCompleted) renewWaitingOnAsp.complete();
 
       // The wallet is now waiting on the ASP, not on this. Nothing more is said.
       while (await inbound.moveNext()) {}
     } finally {
-      if (!settleEnded.isCompleted) settleEnded.complete();
+      if (!renewEnded.isCompleted) renewEnded.complete();
     }
   }
   @override

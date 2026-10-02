@@ -194,7 +194,7 @@ class PushService {
 /// Renewal is the cosigner's: it runs the sealed delegate itself, from the
 /// enclave, against the ASP. The wakes that reach this isolate say that it did
 /// (`delegate-settled`) or that it could not (`settle-due`), and either way what
-/// follows needs the user — sealing a new delegate, or refreshing in person —
+/// follows needs the user — renewing the delegate, or refreshing in person —
 /// which a background isolate cannot ask for. The wake is data-only, so there is
 /// nothing to display; the next foreground refresh raises the Ark-tab banner.
 @pragma('vm:entry-point')

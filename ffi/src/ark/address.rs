@@ -20,7 +20,7 @@
 
 use ark_core::{BoardingOutput, Vtxo};
 use bitcoin::key::Secp256k1;
-use bitcoin::{Network, XOnlyPublicKey};
+use bitcoin::Network;
 
 use super::{read_cstr, FfiResult};
 use std::os::raw::c_char;
@@ -88,8 +88,8 @@ fn derive(
     let net = read_cstr(network).ok_or("network is null or not UTF-8")?;
 
     let secp = Secp256k1::new();
-    let owner_pk = hex_to_xonly(&owner)?;
-    let asp_pk = hex_to_xonly(&asp)?;
+    let owner_pk = ark::keys::parse_xonly(&owner)?;
+    let asp_pk = ark::keys::parse_xonly(&asp)?;
     let net = parse_network(&net)?;
     let exit_seq = ark_core::server::parse_sequence_number(exit_delay as i64)
         .map_err(|e| format!("parse_sequence_number: {e}"))?;
@@ -121,18 +121,6 @@ fn parse_network(network: &str) -> Result<Network, String> {
         "regtest" => Ok(Network::Regtest),
         _ => Err(format!("unknown network: {network}")),
     }
-}
-
-/// Accepts x-only (64 hex chars) or compressed (66, with an 02/03 prefix). The ASP publishes its
-/// signer key in the compressed form and a wallet's own key is usually x-only, so both arrive here.
-fn hex_to_xonly(s: &str) -> Result<XOnlyPublicKey, String> {
-    let s = if s.len() == 66 && (s.starts_with("02") || s.starts_with("03")) {
-        &s[2..]
-    } else {
-        s
-    };
-    let bytes = hex::decode(s).map_err(|e| format!("invalid pubkey hex: {e}"))?;
-    XOnlyPublicKey::from_slice(&bytes).map_err(|e| format!("invalid x-only pubkey: {e}"))
 }
 
 #[cfg(test)]
@@ -207,8 +195,8 @@ mod tests {
         kind: Kind,
     ) -> Result<String, String> {
         let secp = Secp256k1::new();
-        let owner_pk = hex_to_xonly(owner)?;
-        let asp_pk = hex_to_xonly(asp)?;
+        let owner_pk = ark::keys::parse_xonly(owner)?;
+        let asp_pk = ark::keys::parse_xonly(asp)?;
         let net = parse_network(network)?;
         let exit_seq = ark_core::server::parse_sequence_number(delay as i64)
             .map_err(|e| format!("parse_sequence_number: {e}"))?;

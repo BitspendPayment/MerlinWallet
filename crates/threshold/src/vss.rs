@@ -1,8 +1,8 @@
 use crate::error::Error;
+use hex_conservative::{DisplayHex, FromHex};
 use crate::identifier::Identifier;
 use crate::keys::VerifyingKey;
 use crate::point;
-use alloc::string::String;
 use alloc::vec::Vec;
 use k256::{ProjectivePoint, Scalar};
 
@@ -40,7 +40,7 @@ impl VssCommitment {
         let mut coeffs = Vec::with_capacity(arr.len());
         for item in arr {
             let hex_str = item.as_str().ok_or(Error::SerializationError)?;
-            let bytes = hex_decode_33(hex_str)?;
+            let bytes = <[u8; 33]>::from_hex(hex_str)?;
             let p = point::deserialize_compressed(&bytes)?;
             coeffs.push(p);
         }
@@ -54,7 +54,7 @@ impl VssCommitment {
             .iter()
             .map(|c| {
                 let bytes = point::serialize_compressed(c);
-                serde_json::Value::String(hex_encode(&bytes))
+                serde_json::Value::String(bytes.to_lower_hex_string())
             })
             .collect();
         serde_json::Value::Array(arr)
@@ -85,34 +85,4 @@ pub fn sum_commitments(commitments: &[VssCommitment]) -> Result<VssCommitment, E
     }
 
     Ok(VssCommitment { coeffs: group })
-}
-
-// --- Hex helpers ---
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use alloc::format;
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn hex_decode_33(s: &str) -> Result<[u8; 33], Error> {
-    let bytes = hex_decode(s)?;
-    if bytes.len() != 33 {
-        return Err(Error::SerializationError);
-    }
-    let mut out = [0u8; 33];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-fn hex_decode(s: &str) -> Result<Vec<u8>, Error> {
-    if s.len() % 2 != 0 {
-        return Err(Error::SerializationError);
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for i in (0..s.len()).step_by(2) {
-        let byte = u8::from_str_radix(&s[i..i + 2], 16)
-            .map_err(|_| Error::SerializationError)?;
-        out.push(byte);
-    }
-    Ok(out)
 }

@@ -56,7 +56,7 @@ fn a_boarded_vtxo_is_visible_to_a_send() {
     let group_key = hex::encode(pkp.verifying_key.serialize());
 
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
 
     {
         let mut c = cosigner.lock().unwrap();
@@ -86,7 +86,7 @@ fn the_owned_set_survives_a_reopen() {
 
     {
         let cosigner = common::open_cosigner(&store, &group_key);
-        common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+        common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
         let mut c = cosigner.lock().unwrap();
         c.apply_boarding_settle(boarded("bb", 25_000, 144));
         c.seal();
@@ -115,7 +115,7 @@ fn a_caller_cannot_widen_what_it_owns() {
     let group_key = hex::encode(pkp.verifying_key.serialize());
 
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
     let mut c = cosigner.lock().unwrap();
 
     // Both of the wallet's own delays are accepted — a mixed set is the normal case.

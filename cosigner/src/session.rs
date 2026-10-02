@@ -27,6 +27,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use wstd::http::{Body, Request, Response};
 
 use crate::cosigner::Cosigner;
+use crate::delegate::DelegateRenew;
+use crate::escrow_session::Escrow;
 use crate::grpc::{self, Duplex, SessionBody, Status};
 use crate::handlers::recover::dealt_share_for;
 use crate::wallet_proto as wp;
@@ -37,19 +39,18 @@ pub mod proto {
 }
 
 use proto::{
-    sign_client_msg, sign_server_msg, Commitment, SignClientMsg, SignCommitments, SignComplete,
-    SignServerMsg,
+    sign_client_msg, sign_server_msg, SignClientMsg, SignCommitments, SignComplete, SignServerMsg,
 };
 
 /// Every RPC this service answers, under the package and service names in `cosign_session.proto`.
 const PREFIX: &str = "/cosigner.v1.Cosigner/";
 
-pub struct CosignerService {
+pub struct Session {
     cosigner: Arc<Mutex<Cosigner>>,
     server_info: wp::GetServerInfoResponse,
 }
 
-impl CosignerService {
+impl Session {
     pub fn new(cosigner: Arc<Mutex<Cosigner>>, server_info: wp::GetServerInfoResponse) -> Self {
         Self {
             cosigner,
@@ -63,22 +64,8 @@ impl CosignerService {
     /// fifteen names — clearer than a code generator, and the only part of tonic still in use once
     /// the framing and the status had their own modules.
     pub async fn route(&self, req: Request<Body>) -> Response<Body> {
-        // Nothing is served without the runtime's word that a passkey approved this request.
-        //
-        // That is the whole of authentication now. Every request used to carry a Schnorr signature
-        // by the wallet's share key, checked here in the guest; enclave-runtime gates every request
-        // on a WebAuthn assertion bound to its exact method and path before it reaches us, and stamps
-        // the tenant it resolved onto this header — having stripped any copy a client sent, so it
-        // cannot be supplied from outside. A passkey-gated wallet could not have produced the old
-        // signature anyway: it holds no plaintext share to sign with.
-        //
-        // It is checked first, before the path, so an unauthenticated caller learns nothing about the
-        // method surface. And it fails CLOSED: behind a runtime with no gate configured the header is
-        // never set, so this cosigner refuses everything rather than serving keys to whoever connects.
-        if let Err(status) = tenant_of(&req) {
-            return grpc::failed(status);
-        }
-
+        // Authentication is the runtime's: it lets a request through only once a passkey approved
+        // it. Run it without a gate and anyone can call this.
         let path = req.uri().path().to_string();
         let Some(method) = path.strip_prefix(PREFIX) else {
             return grpc::failed(Status::unimplemented(format!("no such service: {path}")));
@@ -101,10 +88,8 @@ impl CosignerService {
             "Sign" => ceremony!(sign),
             "Dkg" => ceremony!(dkg),
             "Send" => ceremony!(send),
-            "Settle" => ceremony!(settle),
+            "Renew" => ceremony!(renew),
             "Escrow" => ceremony!(escrow),
-            "PairService" => ceremony!(pair_service),
-            "EscrowReclaim" => ceremony!(escrow_reclaim),
             _ => {}
         }
 
@@ -128,7 +113,6 @@ impl CosignerService {
             "Recover" => unary!(self.recover(body)),
             "EscrowList" => unary!(self.escrow_list(body)),
             "EscrowOpenSession" => unary!(self.escrow_open_session(body)),
-            "PairServiceConfirm" => unary!(self.pair_service_confirm(body)),
             other => grpc::failed(Status::unimplemented(format!("no such method: {other}"))),
         }
     }
@@ -178,24 +162,6 @@ impl CosignerService {
         crate::handlers::recover::recover(&lock(&self.cosigner), req)
     }
 
-    /// Mark a pairing usable: the service has both halves and its share checks out.
-    ///
-    /// The cosigner cannot establish this for itself — it never sees the wallet's half, and asking
-    /// the service would mean trusting an answer it has no way to check. What it can do is refuse
-    /// to treat a pairing as usable until the party that *would* know says so, and refuse a
-    /// confirmation that names a different attempt than the one it sealed.
-    async fn pair_service_confirm(
-        &self,
-        body: Body,
-    ) -> Result<proto::PairServiceConfirmResponse, Status> {
-        let req: proto::PairServiceConfirmRequest = grpc::one_message(body).await?;
-        let mut c = lock(&self.cosigner);
-        c.confirm_escrow_pairing(&req.escrow_key, &hex::encode(&req.attempt_id))
-            .map_err(Status::failed_precondition)?;
-        c.seal();
-        Ok(proto::PairServiceConfirmResponse {})
-    }
-
     /// Commit an escrow to a deal: what the paired service may take, and until when.
     async fn escrow_open_session(
         &self,
@@ -203,13 +169,12 @@ impl CosignerService {
     ) -> Result<proto::EscrowOpenSessionResponse, Status> {
         let req: proto::EscrowOpenSessionRequest = grpc::one_message(body).await?;
         let now = crate::handlers::helpers::now_secs();
-        let session = deal_of(&req, now)?;
-        let description = session.policy.describe();
-        let deadline = session.deadline;
+        let escrow = Escrow::from_request(&req, now)?;
+        let description = escrow.policy.describe();
+        let deadline = escrow.deadline;
 
         let mut c = lock(&self.cosigner);
-        c.open_escrow_session(&req.escrow_key, session, now)
-            .map_err(Status::failed_precondition)?;
+        c.open_escrow_session(escrow, now).map_err(Status::failed_precondition)?;
         c.seal();
         // Nothing is scheduled for the deadline, and nothing needs to be. A deadline is a fact
         // about the clock that every decision reads out of the seal — `may_release` and
@@ -232,72 +197,9 @@ impl CosignerService {
         let now = crate::handlers::helpers::now_secs();
         let c = lock(&self.cosigner);
         Ok(proto::EscrowListResponse {
-            escrows: c.escrows().iter().map(|e| escrow_summary(e, now)).collect(),
+            escrows: c.escrows().iter().map(|e| e.summary(now)).collect(),
         })
     }
-}
-
-/// One escrow as a caller may see it: the public projection, as of [now]. What `EscrowList`
-/// returns, and what `Recover` hands a new device so it can rebuild its escrows the way it
-/// rebuilt the wallet.
-pub(crate) fn escrow_summary(e: &crate::types::EscrowRecord, now: i64) -> proto::EscrowSummary {
-    proto::EscrowSummary {
-
-        escrow_key: e.escrow_key.clone(),
-        wallet_identifier: hex::decode(&e.wallet_identifier_hex).unwrap_or_default(),
-        public_key_package_json: e.public_key_package_json.clone(),
-        created_at: e.created_at,
-        service_identifier: e
-            .pairing
-            .as_ref()
-            .map(|p| p.service_identifier_hex.clone())
-            .unwrap_or_default(),
-        service_ready: e
-            .pairing
-            .as_ref()
-            .is_some_and(|p| p.state() == crate::types::PairingState::Ready),
-        // Reported apart as well as together: they arrive by different routes, at
-        // different moments, and a caller waiting on one wants to know which.
-        service_confirmed: e
-            .pairing
-            .as_ref()
-            .is_some_and(|p| p.service_confirmed),
-        wallet_confirmed: e
-            .pairing
-            .as_ref()
-            .is_some_and(|p| p.wallet_confirmed),
-        session: e.session.as_ref().map(|s| proto::EscrowSessionSummary {
-            // Whether it still holds the escrow: a spent deal lets the next one be struck.
-            open: s.holds_the_escrow(now),
-            deadline_secs: s.deadline,
-            opened_at: s.opened_at,
-            released_sats: s.released_sats,
-            policy_description: s.policy.describe(),
-        }),
-        context: hex::decode(&e.context_hex).unwrap_or_default(),
-        reclaim_opened: e.reclaim_opened_at.is_some(),
-    }
-}
-
-/// The header the runtime puts the resolved tenant on.
-pub const TENANT_HEADER: &str = "x-enclave-tenant";
-
-/// The tenant the runtime authenticated this request as, or why there is none.
-///
-/// Sixteen bytes as lowercase hex, exactly as `apply_tenant` writes it. A malformed value is refused
-/// like a missing one: the runtime never produces it, so it did not come from the runtime.
-fn tenant_of(req: &Request<Body>) -> Result<String, Status> {
-    let value = req
-        .headers()
-        .get(TENANT_HEADER)
-        .ok_or_else(|| Status::unauthenticated("no tenant: this request was not approved by the runtime"))?
-        .to_str()
-        .map_err(|_| Status::unauthenticated("the tenant header is not text"))?;
-    let well_formed = value.len() == 32 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    if !well_formed {
-        return Err(Status::unauthenticated("the tenant header is malformed"));
-    }
-    Ok(value.to_string())
 }
 
 /// The cosigner, with a poisoned lock recovered rather than propagated.
@@ -305,7 +207,7 @@ fn tenant_of(req: &Request<Body>) -> Result<String, Status> {
 /// A panic mid-ceremony leaves the wallet's in-memory state as it was — its authority comes from
 /// the seal, not from this guard — and taking down every later call because one caller panicked
 /// would turn a single failed request into a dead instance.
-fn lock(cosigner: &Arc<Mutex<Cosigner>>) -> MutexGuard<'_, Cosigner> {
+pub(crate) fn lock(cosigner: &Arc<Mutex<Cosigner>>) -> MutexGuard<'_, Cosigner> {
     cosigner.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -317,7 +219,7 @@ fn lock(cosigner: &Arc<Mutex<Cosigner>>) -> MutexGuard<'_, Cosigner> {
 ///
 /// The wallet used to commit first, in `SignOpen`. It cannot: its nonce is hedged with its share,
 /// and it holds no share until this stream's first answer brings the half the cosigner dealt it.
-/// So this is the round `Send` and `Settle` already run — the cosigner commits first, the wallet
+/// So this is the round `Send` and `Renew` already run — the cosigner commits first, the wallet
 /// answers with its commitments and its share together — over a single message.
 ///
 /// Script-path only, like every in-band round: the cosigner signs untweaked and `aggregate` checks
@@ -367,7 +269,7 @@ async fn sign(
         body: Some(sign_server_msg::Body::Commitments(SignCommitments {
             commitments: commitments
                 .into_iter()
-                .map(|c| (c.identifier_hex, Commitment { hiding: c.hiding, binding: c.binding }))
+                .map(|c| (c.identifier_hex.clone(), c.into()))
                 .collect(),
             message_to_sign: open.message_to_sign,
             wallet_dealt_share: dealt,
@@ -378,22 +280,14 @@ async fn sign(
     //
     // If the client never sends it, or the stream dies here, `round` drops with this task and the
     // nonce is gone. That is the safe failure: an abandoned round leaves nothing reusable.
-    let second = duplex.expect("the share arrived").await?;
-    let share = match second.body {
-        Some(sign_client_msg::Body::Share(s)) => s,
+    let share = match duplex.next_body("the share arrived").await? {
+        sign_client_msg::Body::Share(s) => s,
         _ => return Err(Status::invalid_argument("expected SignShare")),
     };
 
     // A bad share is the caller's fault, and is reported as such rather than as ours.
     let signature = lock(&cosigner)
-        .sign_in_band_finish(
-            round,
-            vec![crate::cosigner::WalletHalf {
-                hiding: share.hiding_commitment,
-                binding: share.binding_commitment,
-                share: share.signature_share,
-            }],
-        )
+        .sign_in_band_finish(round, vec![share.into()])
         .map_err(Status::invalid_argument)?
         .pop()
         .ok_or_else(|| Status::internal("the round produced no signature"))?;
@@ -416,20 +310,6 @@ async fn sign(
     Ok(())
 }
 
-/// The deal an [`EscrowOpenSessionRequest`](proto::EscrowOpenSessionRequest) asks for, as of `now`
-/// — asked on its own or riding a send that tops the escrow up.
-fn deal_of(
-    req: &proto::EscrowOpenSessionRequest,
-    now: i64,
-) -> Result<crate::escrow_session::EscrowSession, Status> {
-    // An unparseable policy is `never`, not `always`: a deal nobody can take from is a bad day,
-    // and one anybody can take from is a lost escrow.
-    let policy: crate::policy::Policy = serde_json::from_str(&req.policy_json)
-        .map_err(|e| Status::invalid_argument(format!("that is not a policy: {e}")))?;
-    crate::escrow_session::EscrowSession::open(policy, now, req.deadline_secs)
-        .map_err(Status::invalid_argument)
-}
-
 /// DKG as one session.
 ///
 /// The unary form needed a `sessions` map keyed by user, with a TTL and an eviction loop, purely to
@@ -444,9 +324,9 @@ fn deal_of(
 /// already have keys: the reshare is dealt under the identifiers they hold in the wallet key, and
 /// neither side's wallet share changes. See [`crate::handlers::escrow`].
 ///
-/// When the open names a service, the stream goes on to pair it into the new escrow — the
-/// [`pair_service`] ceremony without its first round, and with the wallet's confirmation on this
-/// stream — so an escrow is set up for a service on one approval.
+/// When the open names a service, the stream goes on to pair it into the new escrow, and the
+/// wallet confirms on this stream — so an escrow is set up for a service on one approval. The
+/// pairing is usable once the service confirms too, which can only arrive after this stream ends.
 async fn escrow(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<proto::EscrowClientMsg, proto::EscrowServerMsg>,
@@ -460,14 +340,19 @@ async fn escrow(
         _ => return Err(Status::invalid_argument("a session must open with EscrowOpen")),
     };
 
-    // A service to pair into the escrow once it exists, on this same approval. Checked as
-    // `pair_service` checks it and before anything is dealt, so naming one this image does not know
-    // mints nothing.
-    let pairing = if open.service_identifier.is_empty() && open.attempt_id.is_empty() {
+    // A service to pair into the escrow once it exists, on this same approval. Checked before
+    // anything is dealt, so naming one this image does not know mints nothing.
+    let service = if open.service_identifier.is_empty() && open.attempt_id.is_empty() {
         None
     } else {
-        Some(pairing_target(&open.service_identifier, &open.attempt_id)?)
+        // Enough to be unrepeatable by accident. It is a label, not a secret: it ties two
+        // deliveries together and nothing rests on it being unguessable.
+        if open.attempt_id.len() != 16 {
+            return Err(Status::invalid_argument("a pairing attempt id is 16 bytes"));
+        }
+        Some(crate::escrow::Service::named(&open.service_identifier)?)
     };
+    let attempt_id_hex = hex::encode(&open.attempt_id);
 
     // There is nothing to reshare before there is a wallet. Taken once, up front, so the ceremony
     // runs against one consistent view of the key it is derived from.
@@ -511,9 +396,8 @@ async fn escrow(
         )),
     });
 
-    let msg = duplex.expect("round 2").await?;
-    let round2 = match msg.body {
-        Some(proto::escrow_client_msg::Body::Round2(r)) => r,
+    let round2 = match duplex.next_body("round 2").await? {
+        proto::escrow_client_msg::Body::Round2(r) => r,
         _ => return Err(Status::invalid_argument("expected EscrowRound2")),
     };
     let for_wallet = esc::escrow_finish(&mut sess, &old_kp, &old_pkp, &round2.round2_package)?;
@@ -553,37 +437,33 @@ async fn escrow(
             },
         )),
     });
-    let Some(target) = pairing else { return Ok(()) };
+    let Some(service) = service else { return Ok(()) };
 
-    // --- Pairing the service in, as `pair_service` does ------------------------------------------
-    //
-    // Without its first round: the wallet holds the share it just minted, so there is nothing to
-    // rebuild it from.
-    let msg = duplex.expect("the wallet's dealing").await?;
-    let deal = match msg.body {
-        Some(proto::escrow_client_msg::Body::Deal(d)) => d,
+    // --- Pairing the service in ----------------------------------------------------------------
+    let deal = match duplex.next_body("the wallet's dealing").await? {
+        proto::escrow_client_msg::Body::Deal(d) => d,
         _ => return Err(Status::invalid_argument("expected PairServiceDeal")),
     };
-    let material = lock(&cosigner)
-        .escrow_key_material(&escrow_key)
+    let escrow = lock(&cosigner)
+        .escrow_details(&escrow_key)
         .ok_or_else(|| Status::internal("this escrow's sealed key material is unreadable"))?;
-    let paired = deal_and_deliver(&cosigner, &escrow_key, material, &target, deal).await?;
+    let paired = escrow.deal_and_deliver(&cosigner, &service, &attempt_id_hex, deal).await?;
     duplex.send(proto::EscrowServerMsg {
         session_id: session_id.clone(),
         seq: 3,
         body: Some(proto::escrow_server_msg::Body::Paired(paired)),
     });
 
-    // The wallet's word that its own half was delivered and taken — what `PairServiceConfirm`
-    // says, on this stream because a second call could not run while it is open. The service's
-    // word arrives after the stream ends: it needs the tenant this stream holds.
-    let msg = duplex.expect("word that the wallet delivered its half").await?;
-    if !matches!(msg.body, Some(proto::escrow_client_msg::Body::Delivered(_))) {
+    // The wallet's word that its own half was delivered and taken — on this stream, because a
+    // second call could not run while it is open. The service's word arrives after the stream
+    // ends: it needs the tenant this stream holds.
+    let delivered = duplex.next_body("word that the wallet delivered its half").await?;
+    if !matches!(delivered, proto::escrow_client_msg::Body::Delivered(_)) {
         return Err(Status::invalid_argument("expected PairServiceConfirmRequest"));
     }
     {
         let mut c = lock(&cosigner);
-        c.confirm_escrow_pairing(&escrow_key, &hex::encode(&target.attempt_id))
+        c.confirm_escrow_pairing(&escrow_key, &attempt_id_hex)
             .map_err(Status::failed_precondition)?;
         c.seal();
     }
@@ -595,193 +475,6 @@ async fn escrow(
         )),
     });
     Ok(())
-}
-
-/// Pairing a service into an escrow, and handing it its half — deliver, then seal.
-///
-/// A stream because the wallet cannot deal until it has rebuilt its escrow share, and it keeps no
-/// share: the two halves it needs ride the first server message, as they do on every other stream.
-///
-/// The order at the end is deliberate and documented in [`crate::handlers::delivery`]: this
-/// cosigner never keeps the service's half, so a pairing sealed before a failed delivery could
-/// never be completed. Delivering first makes a failure harmless — nothing is sealed, and the
-/// wallet simply pairs again with a fresh half.
-async fn pair_service(
-    cosigner: Arc<Mutex<Cosigner>>,
-    duplex: Duplex<proto::PairServiceClientMsg, proto::PairServiceServerMsg>,
-) -> Result<(), Status> {
-    let first = duplex.expect("it opened").await?;
-    let session_id = first.session_id.clone();
-    let open = match first.body {
-        Some(proto::pair_service_client_msg::Body::Open(o)) => o,
-        _ => return Err(Status::invalid_argument("a session must open with PairServiceOpen")),
-    };
-    let target = pairing_target(&open.service_identifier, &open.attempt_id)?;
-
-    let (material, dealt, delta) = {
-        let c = lock(&cosigner);
-        let escrow = c
-            .escrow(&open.escrow_key)
-            .ok_or_else(|| Status::not_found("this wallet holds no such escrow"))?;
-        // A FINISHED pairing is not replaceable: a second service in one escrow is a second way to
-        // be paid out of money committed to a single deal. A *pending* one is a different matter —
-        // it is an attempt that did not complete, and pairing again is how a wallet retries. The
-        // cosigner deals a fresh half each time, because it keeps none.
-        if escrow
-            .pairing
-            .as_ref()
-            .is_some_and(|p| p.state() == crate::types::PairingState::Ready)
-        {
-            return Err(Status::failed_precondition(
-                "this escrow already has a service paired into it",
-            ));
-        }
-        let delta = hex::decode(&escrow.wallet_delta_share_hex)
-            .map_err(|e| Status::internal(format!("sealed escrow delta is not hex: {e}")))?;
-        let wallet_id_bytes = hex::decode(&escrow.wallet_identifier_hex)
-            .map_err(|e| Status::internal(format!("sealed wallet identifier is not hex: {e}")))?;
-        // Answered only to the identifier the ceremony recorded — the same rule every other stream
-        // applies, reached through the same function.
-        let dealt = dealt_share_for(&c, &wallet_id_bytes)?;
-        let material = c
-            .escrow_key_material(&open.escrow_key)
-            .ok_or_else(|| Status::internal("this escrow's sealed key material is unreadable"))?;
-        (material, dealt, delta)
-    };
-
-    duplex.send(proto::PairServiceServerMsg {
-        session_id: session_id.clone(),
-        seq: 1,
-        body: Some(proto::pair_service_server_msg::Body::Ready(
-            proto::PairServiceReady {
-                wallet_dealt_share: dealt,
-                escrow_delta_share: delta,
-            },
-        )),
-    });
-
-    let msg = duplex.expect("the wallet's dealing").await?;
-    let deal = match msg.body {
-        Some(proto::pair_service_client_msg::Body::Deal(d)) => d,
-        _ => return Err(Status::invalid_argument("expected PairServiceDeal")),
-    };
-    let done = deal_and_deliver(&cosigner, &open.escrow_key, material, &target, deal).await?;
-
-    duplex.send(proto::PairServiceServerMsg {
-        session_id,
-        seq: 2,
-        body: Some(proto::pair_service_server_msg::Body::Done(done)),
-    });
-    Ok(())
-}
-
-/// A service to pair into an escrow, and the attempt that ties its two halves together.
-struct PairingTarget {
-    service_id: threshold::identifier::Identifier,
-    /// Where the service is, according to the image.
-    origin: String,
-    attempt_id: Vec<u8>,
-}
-
-/// Check what a pairing names, before anything is dealt — on `PairService`, and on an `Escrow`
-/// stream that pairs the escrow it mints.
-fn pairing_target(service_identifier: &[u8], attempt_id: &[u8]) -> Result<PairingTarget, Status> {
-    use crate::handlers::delivery::ServiceRegistry;
-
-    // Enough to be unrepeatable by accident. It is a label, not a secret: it ties two deliveries
-    // together and nothing rests on it being unguessable.
-    if attempt_id.len() != 16 {
-        return Err(Status::invalid_argument("a pairing attempt id is 16 bytes"));
-    }
-
-    // Where this service is, according to the IMAGE. Resolved before anything is dealt, so naming
-    // a service this enclave does not know costs nothing and reveals nothing.
-    let origin = ServiceRegistry::from_env()
-        .origin_of(&hex::encode(service_identifier))?
-        .to_string();
-
-    let b: [u8; 32] = service_identifier
-        .try_into()
-        .map_err(|_| Status::invalid_argument("a service identifier is 32 bytes"))?;
-    let service_id = threshold::identifier::Identifier::deserialize(&b)
-        .map_err(|e| Status::invalid_argument(format!("bad service identifier: {e}")))?;
-    Ok(PairingTarget { service_id, origin, attempt_id: attempt_id.to_vec() })
-}
-
-/// Deal this cosigner's half of a pairing from the wallet's dealing, hand it to the service, and
-/// seal the pairing pending — deliver, then seal, as [`pair_service`] explains. What comes back
-/// tells the wallet where to send its own half.
-async fn deal_and_deliver(
-    cosigner: &Arc<Mutex<Cosigner>>,
-    escrow_key: &str,
-    (escrow_kp, escrow_pkp, wallet_id): (
-        threshold::keys::KeyPackage,
-        threshold::keys::PublicKeyPackage,
-        threshold::identifier::Identifier,
-    ),
-    target: &PairingTarget,
-    deal: proto::PairServiceDeal,
-) -> Result<proto::PairServiceDone, Status> {
-    let material = crate::handlers::pairing::pair_service(
-        &escrow_kp,
-        &escrow_pkp,
-        &wallet_id,
-        &target.service_id,
-        &deal.contribution_to_cosigner,
-        &deal.contribution_to_service,
-    )?;
-    let attempt_id_hex = hex::encode(&target.attempt_id);
-
-    // Over the connection the runtime will go on holding after this call ends — that is what lets
-    // the service speak first later, when it asks for a release. See `handlers::delivery`.
-    let host = lock(cosigner).host();
-    crate::handlers::delivery::deliver_pairing_half(
-        host.as_ref(),
-        &material.service_identifier_hex,
-        &target.origin,
-        &crate::service_stream::ToService::PairingHalf {
-            escrow_key: escrow_key.to_string(),
-            attempt_id: attempt_id_hex.clone(),
-            service_identifier: material.service_identifier_hex.clone(),
-            half: hex::encode(&material.service_half),
-            public_key_package_json: material.public_key_package_json.clone(),
-            service_verifying_share: material.service_verifying_share_hex.clone(),
-        },
-    )
-    .await
-    .map_err(|e| {
-        Status::unavailable(format!(
-            "the service did not take its half, so nothing was paired: {e}"
-        ))
-    })?;
-
-    let done = proto::PairServiceDone {
-        public_key_package_json: material.public_key_package_json.clone(),
-        service_verifying_share: material.service_verifying_share_hex.clone(),
-        // So the wallet delivers its own half to the same place. It does not choose an origin, and
-        // could not: the list lives in the image.
-        service_origin: target.origin.clone(),
-        attempt_id: target.attempt_id.clone(),
-    };
-    let mut c = lock(cosigner);
-    c.pair_escrow_service(
-        escrow_key,
-        crate::types::ServicePairing {
-            service_identifier_hex: material.service_identifier_hex,
-            key_package_json: material.key_package_json,
-            public_key_package_json: material.public_key_package_json,
-            service_verifying_share_hex: material.service_verifying_share_hex,
-            paired_at: crate::handlers::helpers::now_secs(),
-            attempt_id_hex,
-            // Delivered, not yet shown to work: the service has one half of two, and neither
-            // party has vouched for it. See `handlers::delivery`.
-            service_confirmed: false,
-            wallet_confirmed: false,
-        },
-    )
-    .map_err(Status::failed_precondition)?;
-    c.seal();
-    Ok(done)
 }
 
 async fn dkg(
@@ -826,9 +519,8 @@ async fn dkg(
     });
 
     // --- The wallet's round 2, and the key ------------------------------------------------
-    let msg = duplex.expect("round 2").await?;
-    let round2 = match msg.body {
-        Some(proto::dkg_client_msg::Body::Round2(r)) => r,
+    let round2 = match duplex.next_body("round 2").await? {
+        proto::dkg_client_msg::Body::Round2(r) => r,
         _ => return Err(Status::invalid_argument("expected DkgRound2")),
     };
     let r3 = ob::dkg_finish(
@@ -853,7 +545,6 @@ async fn dkg(
             &mat.key_package_json,
             &mat.public_key_package_json,
             mat.user_signing_identifier_hex.as_deref(),
-            mat.server_dkg_secret_hex,
             mat.wallet_dealt_share_hex,
         )
         .map_err(Status::internal)?;
@@ -875,41 +566,34 @@ async fn dkg(
     Ok(())
 }
 
-/// A send as one session, with the caller submitting.
-///
-/// The unary form parked the half-built transactions on the actor between "build it" and "submit
-/// it", and called the ASP itself for both `SubmitTx` and `FinalizeTx`. Here the session is a local
-/// on this handler and the caller makes those two calls: the cosigner hands over what to send and
-/// seals only once the ASP has accepted it, so an interrupted send leaves neither a half-signed
-/// transaction addressable by the next request nor a recorded spend that never happened.
-/// Taking back what is left of an escrow, once its deal is over.
+/// Taking back what is left of an escrow, once its deal is over: a [`send`] whose open names
+/// `reclaim_escrow`.
 ///
 /// The same four steps a send takes, because it is one — of the escrow's key rather than the
 /// wallet's. See [`crate::handlers::reclaim`] for what is checked and what is derived rather than
 /// accepted.
-async fn escrow_reclaim(
+async fn reclaim(
     cosigner: Arc<Mutex<Cosigner>>,
-    duplex: Duplex<proto::EscrowReclaimClientMsg, proto::EscrowReclaimServerMsg>,
+    duplex: Duplex<proto::SendClientMsg, proto::SendServerMsg>,
+    session_id: String,
+    open: proto::SendOpen,
 ) -> Result<(), Status> {
-    let first = duplex.expect("it opened").await?;
-    let session_id = first.session_id.clone();
-    let open = match first.body {
-        Some(proto::escrow_reclaim_client_msg::Body::Open(o)) => o,
-        _ => {
-            return Err(Status::invalid_argument(
-                "a session must open with EscrowReclaimOpen",
-            ))
-        }
-    };
+    // Where it goes is derived, never named, and it takes everything the escrow holds.
+    if !open.recipient_ark_address.is_empty() || open.amount != 0 || open.escrow_commit.is_some() {
+        return Err(Status::invalid_argument(
+            "a reclaim names no recipient, amount or deal: it returns what the escrow holds to \
+             this wallet",
+        ));
+    }
     let info = open
         .ark_info
-        .map(ark_info_from_proto)
-        .ok_or_else(|| Status::invalid_argument("EscrowReclaimOpen carried no ark_info"))?;
+        .map(ark::client::types::ArkInfo::from)
+        .ok_or_else(|| Status::invalid_argument("SendOpen carried no ark_info"))?;
 
     let now = crate::handlers::helpers::now_secs();
     let mut reclaim = lock(&cosigner).reclaim_open(
-        &open.escrow_key,
-        vtxos_from_proto(open.vtxos.clone()),
+        &open.reclaim_escrow,
+        open.vtxos.into_iter().map(Into::into).collect(),
         &info,
         now,
     )?;
@@ -920,7 +604,7 @@ async fn escrow_reclaim(
     // that cannot be written means no round at all. See `Cosigner::open_escrow_session`.
     {
         let mut c = lock(&cosigner);
-        c.mark_escrow_reclaim_opened(&open.escrow_key, now)
+        c.mark_escrow_reclaim_opened(&open.reclaim_escrow, now)
             .map_err(Status::failed_precondition)?;
         c.try_seal().map_err(|e| {
             Status::unavailable(format!("could not record the reclaim, so it does not begin: {e}"))
@@ -932,26 +616,22 @@ async fn escrow_reclaim(
     let (round, commitments) = lock(&cosigner)
         .sign_in_band_begin_as(&reclaim.key_package, &reclaim.sighashes);
 
-    duplex.send(proto::EscrowReclaimServerMsg {
+    duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
         seq: 1,
-        body: Some(proto::escrow_reclaim_server_msg::Body::Sighashes(
-            proto::EscrowReclaimSighashes {
-                messages_to_sign: reclaim.sighashes.clone(),
-                cosigner_identifier: cosigner_identifier(&commitments),
-                cosigner_commitments: wire_commitments(commitments),
-                wallet_dealt_share: reclaim.wallet_dealt_share.clone(),
-                escrow_delta_share: reclaim.escrow_delta_share.clone(),
-                to_ark_address: reclaim.to_ark_address.clone(),
-                amount_sats: reclaim.amount_sats,
-            },
-        )),
+        body: Some(proto::send_server_msg::Body::Sighashes(proto::SendSighashes {
+            wallet_dealt_share: reclaim.wallet_dealt_share.clone(),
+            escrow_delta_share: reclaim.escrow_delta_share.clone(),
+            to_ark_address: reclaim.to_ark_address.clone(),
+            amount_sats: reclaim.amount_sats,
+            ..proto::SendSighashes::round(reclaim.sighashes.clone(), commitments)
+        })),
     });
 
     // --- The wallet's half of the round, then what it must submit --------------------------
-    let signed = match reclaim_body(&duplex, "mid-reclaim").await? {
-        proto::escrow_reclaim_client_msg::Body::Signed(s) => s,
-        _ => return Err(Status::invalid_argument("expected EscrowReclaimSigned")),
+    let signed = match duplex.next_body("mid-reclaim").await? {
+        proto::send_client_msg::Body::Signed(s) => s,
+        _ => return Err(Status::invalid_argument("expected SendSigned")),
     };
     let signatures = lock(&cosigner)
         .sign_in_band_finish_as(
@@ -959,7 +639,7 @@ async fn escrow_reclaim(
             &reclaim.public_key_package,
             &reclaim.wallet_identifier,
             round,
-            wallet_halves(signed.rounds),
+            signed.rounds.into_iter().map(Into::into).collect(),
         )
         .map_err(Status::invalid_argument)?;
     let (ark_tx_b64, checkpoint_txs) = {
@@ -971,10 +651,10 @@ async fn escrow_reclaim(
             .map_err(|e| Status::internal(format!("prepare submit: {e}")))?
     };
 
-    duplex.send(proto::EscrowReclaimServerMsg {
+    duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
         seq: 2,
-        body: Some(proto::escrow_reclaim_server_msg::Body::Submit(
+        body: Some(proto::send_server_msg::Body::Submit(
             proto::SendSubmit {
                 ark_tx_b64,
                 checkpoint_txs,
@@ -983,8 +663,8 @@ async fn escrow_reclaim(
     });
 
     // --- What the ASP returned, turned into the finalize call ------------------------------
-    let submitted = match reclaim_body(&duplex, "mid-reclaim").await? {
-        proto::escrow_reclaim_client_msg::Body::Submitted(s) => s,
+    let submitted = match duplex.next_body("mid-reclaim").await? {
+        proto::send_client_msg::Body::Submitted(s) => s,
         _ => return Err(Status::invalid_argument("expected SendSubmitted")),
     };
     let final_checkpoint_txs = reclaim
@@ -992,10 +672,10 @@ async fn escrow_reclaim(
         .finalize_checkpoints(&submitted.signed_checkpoint_txs)
         .map_err(|e| Status::internal(format!("finalize checkpoints: {e}")))?;
 
-    duplex.send(proto::EscrowReclaimServerMsg {
+    duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
         seq: 3,
-        body: Some(proto::escrow_reclaim_server_msg::Body::Finalize(
+        body: Some(proto::send_server_msg::Body::Finalize(
             proto::SendFinalize {
                 ark_txid: submitted.ark_txid.clone(),
                 final_checkpoint_txs,
@@ -1004,8 +684,8 @@ async fn escrow_reclaim(
     });
 
     // --- Accepted. Only now is the escrow closed for good ----------------------------------
-    match reclaim_body(&duplex, "mid-reclaim").await? {
-        proto::escrow_reclaim_client_msg::Body::Finalized(_) => {}
+    match duplex.next_body("mid-reclaim").await? {
+        proto::send_client_msg::Body::Finalized(_) => {}
         _ => return Err(Status::invalid_argument("expected SendFinalized")),
     }
     reclaim.session.mark_done();
@@ -1013,18 +693,25 @@ async fn escrow_reclaim(
     // this runs the deal is already over — by the clock, which is the only way a deal ends.
     lock(&cosigner).seal();
 
-    duplex.send(proto::EscrowReclaimServerMsg {
+    duplex.send(proto::SendServerMsg {
         session_id,
         seq: 4,
-        body: Some(proto::escrow_reclaim_server_msg::Body::Complete(
-            proto::EscrowReclaimComplete {
-                ark_txid: submitted.ark_txid,
-            },
-        )),
+        body: Some(proto::send_server_msg::Body::Complete(proto::SendComplete {
+            ark_txid: submitted.ark_txid,
+            change: None,
+            committed: None,
+        })),
     });
     Ok(())
 }
 
+/// A send as one session, with the caller submitting.
+///
+/// The unary form parked the half-built transactions on the actor between "build it" and "submit
+/// it", and called the ASP itself for both `SubmitTx` and `FinalizeTx`. Here the session is a local
+/// on this handler and the caller makes those two calls: the cosigner hands over what to send and
+/// seals only once the ASP has accepted it, so an interrupted send leaves neither a half-signed
+/// transaction addressable by the next request nor a recorded spend that never happened.
 async fn send(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<proto::SendClientMsg, proto::SendServerMsg>,
@@ -1038,12 +725,18 @@ async fn send(
     // Authenticated by the runtime at open — see `sign` above.
 
     // The wallet's half of its own share, before anything is built — see `dealt_share_for`. It
-    // rides the first sighashes and nothing after: the trailing seal reuses what the wallet rebuilt.
+    // rides the first sighashes and nothing after: a trailing delegate renewal reuses what the
+    // wallet rebuilt.
     let dealt = dealt_share_for(&lock(&cosigner), &open.identifier)?;
+
+    // Taking back what is left of an escrow is a send too, on this same stream — see [`reclaim`].
+    if !open.reclaim_escrow.is_empty() {
+        return reclaim(cosigner, duplex, session_id, open).await;
+    }
 
     let info = open
         .ark_info
-        .map(ark_info_from_proto)
+        .map(ark::client::types::ArkInfo::from)
         .ok_or_else(|| Status::invalid_argument("SendOpen carried no ark_info"))?;
 
     // A top-up that also commits its escrow to a deal. Asked now, before anything is built: a deal
@@ -1055,11 +748,11 @@ async fn send(
         None => None,
         Some(req) => {
             let now = crate::handlers::helpers::now_secs();
-            let deal = deal_of(req, now)?;
+            let deal = Escrow::from_request(req, now)?;
             lock(&cosigner)
-                .may_commit_escrow(&req.escrow_key, now)
+                .may_commit_escrow(&deal.escrow_key, now)
                 .map_err(Status::failed_precondition)?;
-            Some((req.escrow_key.clone(), deal, now))
+            Some((deal, now))
         }
     };
 
@@ -1070,7 +763,7 @@ async fn send(
         let step1 = crate::types::SendVtxoStep1 {
             recipient_ark_address: open.recipient_ark_address.clone(),
             amount: open.amount,
-            vtxos: vtxos_from_proto(open.vtxos.clone()),
+            vtxos: open.vtxos.iter().cloned().map(Into::into).collect(),
         };
         lock(&cosigner).send_open(step1, &info).map_err(Status::internal)?
     };
@@ -1086,19 +779,19 @@ async fn send(
         seq: 1,
         body: Some(proto::send_server_msg::Body::Sighashes(proto::SendSighashes {
             wallet_dealt_share: dealt,
-            ..sighashes_msg(sighashes, commitments)
+            ..proto::SendSighashes::round(sighashes, commitments)
         })),
     });
     tracing::info!("Send: returned the dealt share to the wallet's own identifier");
 
     // --- The wallet's half of the round, then what it must submit --------------------------
-    let signed = match next_body(&duplex, "mid-send").await? {
+    let signed = match duplex.next_body("mid-send").await? {
         proto::send_client_msg::Body::Signed(s) => s,
         _ => return Err(Status::invalid_argument("expected SendSigned")),
     };
     // A bad share is the caller's fault, and is reported as such rather than as ours.
     let signatures = lock(&cosigner)
-        .sign_in_band_finish(round, wallet_halves(signed.rounds))
+        .sign_in_band_finish(round, signed.rounds.into_iter().map(Into::into).collect())
         .map_err(Status::invalid_argument)?;
     let (ark_tx_b64, checkpoint_txs) = lock(&cosigner)
         .send_prepare(
@@ -1119,7 +812,7 @@ async fn send(
     });
 
     // --- What the ASP returned, turned into the finalize call ------------------------------
-    let submitted = match next_body(&duplex, "mid-send").await? {
+    let submitted = match duplex.next_body("mid-send").await? {
         proto::send_client_msg::Body::Submitted(s) => s,
         _ => return Err(Status::invalid_argument("expected SendSubmitted")),
     };
@@ -1137,7 +830,7 @@ async fn send(
     });
 
     // --- Accepted. Only now is it ours to record -------------------------------------------
-    match next_body(&duplex, "mid-send").await? {
+    match duplex.next_body("mid-send").await? {
         proto::send_client_msg::Body::Finalized(_) => {}
         _ => return Err(Status::invalid_argument("expected SendFinalized")),
     }
@@ -1152,7 +845,7 @@ async fn send(
             }
             // The money is in the escrow now, so no failure below may read like the refusal at
             // open: an app retries that one, and a retry here would send the money twice.
-            Some((escrow_key, deal, now)) => {
+            Some((deal, now)) => {
                 let committed = proto::EscrowOpenSessionResponse {
                     policy_description: deal.policy.describe(),
                     deadline_secs: deal.deadline,
@@ -1160,7 +853,7 @@ async fn send(
                 // Checked at open with this same `now`, and nothing wrote since, so this does not
                 // fail. If it ever did, its reason stays in the log: said here, it could read
                 // like the refusal an app retries.
-                c.open_escrow_session(&escrow_key, deal, now).map_err(|e| {
+                c.open_escrow_session(deal, now).map_err(|e| {
                     tracing::error!("a deal checked at open was refused after the send: {e}");
                     Status::internal(
                         "the send went through but the deal was not committed; commit it on its \
@@ -1190,95 +883,75 @@ async fn send(
         })),
     });
 
-    // --- Optionally, seal a delegate over what the wallet holds now -------------------------
+    // --- Optionally, renew the delegate over what the wallet holds now ---------------------
     //
     // On this stream so it rides the approval — and the passkey seed — the send already had. A
     // caller that closes instead has simply not asked for it.
     if let Some(msg) = duplex.recv().await {
-        let mut seal = match msg.body {
-            Some(proto::send_client_msg::Body::Seal(seal)) => seal,
-            _ => return Err(Status::invalid_argument("after SendComplete only a seal may follow")),
+        let request = match msg.body {
+            Some(proto::send_client_msg::Body::RenewDelegate(r)) => r,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "after SendComplete only the delegate's renewal may follow",
+                ))
+            }
         };
-        let device_token = std::mem::take(&mut seal.device_token);
-        let seal_round = seal_open(&cosigner, seal)?;
-        let mut sighashes =
-            sighashes_msg(seal_round.delegate_sighashes, seal_round.commitments);
-        sighashes.exit_messages = seal_round.exit_sighashes;
-        duplex.send(proto::SendServerMsg {
-            session_id: session_id.clone(),
-            seq: 5,
-            body: Some(proto::send_server_msg::Body::Sighashes(sighashes)),
-        });
-        let signed = match next_body(&duplex, "the delegate's signatures").await? {
-            proto::send_client_msg::Body::Signed(s) => s,
-            _ => return Err(Status::invalid_argument("expected the delegate's signatures")),
-        };
-        let sealed = seal_finish(
-            &cosigner,
-            seal_round.round,
-            seal_round.exits,
-            signed.rounds,
-            &device_token,
-        )?;
-        duplex.send(proto::SendServerMsg {
-            session_id,
-            seq: 6,
-            body: Some(proto::send_server_msg::Body::Sealed(sealed)),
-        });
+        DelegateRenew::run(&cosigner, &duplex, request, &session_id, 5, vec![]).await?;
     }
     Ok(())
 }
 
-/// Settling, with the caller driving the ASP round.
+/// Renewing a boarding output into Ark, or the VTXOs held, with the caller driving the ASP round.
 ///
 /// The cosigner answers each relayed event with what to send the ASP next and never opens a socket
 /// of its own. `ark_info` arrives from the caller for the same reason: it is the one talking to the
-/// ASP. See `settle.rs` for why that cannot redirect funds.
-async fn settle(
+/// ASP. See `handlers/renew.rs` for why that cannot redirect funds.
+async fn renew(
     cosigner: Arc<Mutex<Cosigner>>,
-    duplex: Duplex<proto::SettleClientMsg, proto::SettleServerMsg>,
+    duplex: Duplex<proto::RenewClientMsg, proto::RenewServerMsg>,
 ) -> Result<(), Status> {
-    use crate::handlers::settle::SettleStep;
+    use crate::handlers::renew::RenewStep;
 
     let first = duplex.expect("it opened").await?;
     let session_id = first.session_id.clone();
     let open = match first.body {
-        Some(proto::settle_client_msg::Body::Open(o)) => o,
-        _ => return Err(Status::invalid_argument("a session must open with SettleOpen")),
+        Some(proto::renew_client_msg::Body::Open(o)) => o,
+        _ => return Err(Status::invalid_argument("a session must open with RenewOpen")),
     };
     // Authenticated by the runtime at open — see `sign` above.
 
     // The wallet's half of its own share — see `dealt_share_for`. Taken by the FIRST sighashes this
-    // stream sends, whichever path sends them, and gone after: a settle signs two or three rounds
+    // stream sends, whichever path sends them, and gone after: a renewal signs two or three rounds
     // and the wallet rebuilds its share once.
     let mut dealt = Some(dealt_share_for(&lock(&cosigner), &open.identifier)?);
-    tracing::info!("Settle: returning the dealt share to the wallet's own identifier");
+    tracing::info!("Renew: returning the dealt share to the wallet's own identifier");
 
     let info = open
         .ark_info
-        .map(ark_info_from_proto)
-        .ok_or_else(|| Status::invalid_argument("SettleOpen carried no ark_info"))?;
-    if open.seal_only {
-        // Nothing to refresh now; seal a delegate over the set and close.
-        let seal = proto::SealDelegate {
+        .map(ark::client::types::ArkInfo::from)
+        .ok_or_else(|| Status::invalid_argument("RenewOpen carried no ark_info"))?;
+    if open.delegate_only {
+        // Nothing to refresh now; renew the delegate over the set and close.
+        let request = proto::RenewDelegate {
             vtxos: open.vtxos,
-            ark_info: Some(info_to_proto(&info)),
+            ark_info: Some(wp::ArkInfo::from(&info)),
             device_token: open.device_token,
             exit_script_pubkey: open.exit_script_pubkey,
         };
-        return settle_seal(&cosigner, &duplex, seal, &session_id, 1, dealt.take()).await;
+        let dealt = dealt.take().unwrap_or_default();
+        return DelegateRenew::run(&cosigner, &duplex, request, &session_id, 1, dealt).await;
     }
     let boarding_utxo = open.boarding_utxo.map(|u| (u.txid, u.vout, u.amount_sats));
-    let vtxos = vtxos_from_proto(open.vtxos);
+    let vtxos: Vec<crate::types::VtxoInput> = open.vtxos.into_iter().map(Into::into).collect();
 
     let sighashes = lock(&cosigner)
-        .settle_open(boarding_utxo, vtxos, info)
+        .renew_open(boarding_utxo, vtxos, info)
         .map_err(Status::internal)?;
 
     let mut seq = 1u64;
-    let mut step = SettleStep::Sighashes(sighashes);
+    let mut step = RenewStep::Sighashes(sighashes);
 
-    // The FROST round that is waiting for the wallet's half. A settle signs twice — the intent
+    // The FROST round that is waiting for the wallet's half. A renewal signs twice — the intent
     // proof, and for a boarding settle the commitment transaction later — so this is set each time
     // sighashes go out and taken when the matching `Signed` comes back. Holding it here rather than
     // on the cosigner is what keeps the nonces on this stream's stack, where a dropped stream takes
@@ -1288,31 +961,31 @@ async fn settle(
     loop {
         // Say what we need, then read what the caller did about it.
         let body = match step {
-            SettleStep::Sighashes(messages_to_sign) => {
+            RenewStep::Sighashes(messages_to_sign) => {
                 // Round one, on this stream — see `Cosigner::sign_in_band_begin` for why it cannot
                 // be a nested `Sign` any more.
                 let (round, commitments) = lock(&cosigner)
                     .sign_in_band_begin(&messages_to_sign)
                     .map_err(Status::internal)?;
                 pending_round = Some(round);
-                Some(proto::settle_server_msg::Body::Sighashes(proto::SettleSighashes {
+                Some(proto::renew_server_msg::Body::Sighashes(proto::RenewSighashes {
                     wallet_dealt_share: dealt.take().unwrap_or_default(),
-                    ..settle_sighashes_msg(messages_to_sign, commitments)
+                    ..proto::RenewSighashes::round(messages_to_sign, commitments)
                 }))
             }
-            SettleStep::Register { proof, message, topics } => Some(
-                proto::settle_server_msg::Body::Register(proto::RegisterIntent {
+            RenewStep::Register { proof, message, topics } => Some(
+                proto::renew_server_msg::Body::Register(proto::RegisterIntent {
                     proof,
                     message,
                     topics,
                 }),
             ),
-            SettleStep::Submit(call) => {
-                Some(proto::settle_server_msg::Body::Submit(asp_submit(call)))
+            RenewStep::Submit(call) => {
+                Some(proto::renew_server_msg::Body::Submit(call.into()))
             }
-            SettleStep::Idle => Some(proto::settle_server_msg::Body::Idle(proto::SettleIdle {})),
-            SettleStep::Complete(sub) => {
-                let complete = proto::SettleComplete {
+            RenewStep::Idle => Some(proto::renew_server_msg::Body::Idle(proto::RenewIdle {})),
+            RenewStep::Complete(sub) => {
+                let complete = proto::RenewComplete {
                     commitment_txid: sub.commitment_txid.clone(),
                     vtxo_txid: sub.vtxo_txid.clone(),
                     vtxo_vout: sub.vtxo_vout,
@@ -1324,357 +997,83 @@ async fn settle(
                     c.apply_boarding_settle(sub);
                     c.seal();
                 }
-                duplex.send(proto::SettleServerMsg {
+                duplex.send(proto::RenewServerMsg {
                     session_id: session_id.clone(),
                     seq,
-                    body: Some(proto::settle_server_msg::Body::Complete(complete)),
+                    body: Some(proto::renew_server_msg::Body::Complete(complete)),
                 });
-                // Optionally, seal a delegate over what the wallet holds now — on this stream, so it
-                // rides the approval and the passkey seed the settle already had.
+                // Optionally, renew the delegate over what the wallet holds now — on this stream,
+                // so it rides the approval and the passkey seed the renewal already had.
                 if let Some(msg) = duplex.recv().await {
-                    let seal = match msg.body {
-                        Some(proto::settle_client_msg::Body::Seal(seal)) => seal,
+                    let request = match msg.body {
+                        Some(proto::renew_client_msg::Body::RenewDelegate(r)) => r,
                         _ => {
                             return Err(Status::invalid_argument(
-                                "after SettleComplete only a seal may follow",
+                                "after RenewComplete only the delegate's renewal may follow",
                             ))
                         }
                     };
-                    // No share with it: the settle's first round already carried one.
-                    settle_seal(&cosigner, &duplex, seal, &session_id, seq + 1, None).await?;
+                    // No share with it: the renewal's first round already carried one.
+                    let next = seq + 1;
+                    DelegateRenew::run(&cosigner, &duplex, request, &session_id, next, vec![])
+                        .await?;
                 }
                 return Ok(());
             }
         };
 
-        duplex.send(proto::SettleServerMsg {
+        duplex.send(proto::RenewServerMsg {
             session_id: session_id.clone(),
             seq,
             body,
         });
         seq += 1;
 
-        let msg = duplex.expect("the next settle step").await?;
-        let body = msg
-            .body
-            .ok_or_else(|| Status::invalid_argument("empty SettleClientMsg"))?;
+        let body = duplex.next_body("the next renewal step").await?;
 
         // Scoped to this iteration, and released before the loop comes back around to
         // `recv().await`. That used to matter because the caller opened a nested `Sign` on its own
         // connection while this stream was parked; signing is in-band now, so nothing else takes
-        // this lock mid-settle — but holding a guard across an await is still the wrong habit.
+        // this lock mid-renewal — but holding a guard across an await is still the wrong habit.
         let mut c = lock(&cosigner);
         step = match body {
-            proto::settle_client_msg::Body::Signed(s) => {
+            proto::renew_client_msg::Body::Signed(s) => {
                 let round = pending_round.take().ok_or_else(|| {
                     Status::invalid_argument("signatures arrived with no round waiting for them")
                 })?;
                 let signatures = c
-                    .sign_in_band_finish(round, wallet_halves(s.rounds))
+                    .sign_in_band_finish(round, s.rounds.into_iter().map(Into::into).collect())
                     .map_err(Status::invalid_argument)?;
-                c.settle_signed(signatures).map_err(Status::internal)?
+                c.renew_signed(signatures).map_err(Status::internal)?
             }
-            proto::settle_client_msg::Body::Registered(r) => {
-                c.settle_registered(r.intent_id).map_err(Status::internal)?;
-                SettleStep::Idle
+            proto::renew_client_msg::Body::Registered(r) => {
+                c.renew_registered(r.intent_id).map_err(Status::internal)?;
+                RenewStep::Idle
             }
-            proto::settle_client_msg::Body::Event(e) => match decode_event(&e.encoded)? {
-                Some(ev) => c.settle_on_event(ev).map_err(Status::internal)?,
-                None => SettleStep::Idle,
+            proto::renew_client_msg::Body::Event(e) => match Option::try_from(e)? {
+                Some(ev) => c.renew_on_event(ev).map_err(Status::internal)?,
+                None => RenewStep::Idle,
             },
-            proto::settle_client_msg::Body::Open(_) => {
+            proto::renew_client_msg::Body::Open(_) => {
                 return Err(Status::invalid_argument("the session is already open"))
             }
-            proto::settle_client_msg::Body::Seal(_) => {
-                return Err(Status::invalid_argument("a seal follows SettleComplete, not the round"))
+            proto::renew_client_msg::Body::RenewDelegate(_) => {
+                return Err(Status::invalid_argument(
+                    "the delegate's renewal follows RenewComplete, not the round",
+                ))
             }
         };
         drop(c);
     }
 }
 
-async fn reclaim_body(
-    duplex: &Duplex<proto::EscrowReclaimClientMsg, proto::EscrowReclaimServerMsg>,
-    what: &str,
-) -> Result<proto::escrow_reclaim_client_msg::Body, Status> {
-    duplex
-        .expect(what)
-        .await?
-        .body
-        .ok_or_else(|| Status::invalid_argument("empty EscrowReclaimClientMsg"))
-}
-
-async fn next_body(
-    duplex: &Duplex<proto::SendClientMsg, proto::SendServerMsg>,
-    what: &str,
-) -> Result<proto::send_client_msg::Body, Status> {
-    duplex
-        .expect(what)
-        .await?
-        .body
-        .ok_or_else(|| Status::invalid_argument("empty SendClientMsg"))
-}
-
-/// One `GetEventStreamResponse` as it came off the ASP. `None` when the response carried no event,
-/// which the ASP does send — a keepalive is not an error.
-fn decode_event(
-    encoded: &[u8],
-) -> Result<Option<ark::client::proto::get_event_stream_response::Event>, Status> {
-    use prost::Message as _;
-    let resp = ark::client::proto::GetEventStreamResponse::decode(encoded)
-        .map_err(|e| Status::invalid_argument(format!("undecodable ASP event: {e}")))?;
-    Ok(resp.event)
-}
-
-/// The wallet's half of an in-band round, off the wire.
-fn wallet_halves(rounds: Vec<proto::WalletRound>) -> Vec<crate::cosigner::WalletHalf> {
-    rounds
-        .into_iter()
-        .map(|r| crate::cosigner::WalletHalf {
-            hiding: r.hiding,
-            binding: r.binding,
-            share: r.share,
-        })
-        .collect()
-}
-
-/// The identifier every commitment in a batch shares — they are all the cosigner's.
-fn cosigner_identifier(commitments: &[crate::types::Commitment]) -> String {
-    commitments
-        .first()
-        .map(|c| c.identifier_hex.clone())
-        .unwrap_or_default()
-}
-
-fn wire_commitments(commitments: Vec<crate::types::Commitment>) -> Vec<proto::Commitment> {
-    commitments
-        .into_iter()
-        .map(|c| proto::Commitment {
-            hiding: c.hiding,
-            binding: c.binding,
-        })
-        .collect()
-}
-
-/// A send's sighashes with the cosigner's half of round one. Always script-path: the cosigner signs
-/// untweaked, and in-band signing cannot compensate a tweak — see `Cosigner::sign_in_band_begin`.
-fn sighashes_msg(
-    messages_to_sign: Vec<Vec<u8>>,
-    commitments: Vec<crate::types::Commitment>,
-) -> proto::SendSighashes {
-    proto::SendSighashes {
-        messages_to_sign,
-        script_path_spend: true,
-        cosigner_identifier: cosigner_identifier(&commitments),
-        cosigner_commitments: wire_commitments(commitments),
-        exit_messages: Vec::new(),
-        wallet_dealt_share: Vec::new(),
-    }
-}
-
-fn settle_sighashes_msg(
-    messages_to_sign: Vec<Vec<u8>>,
-    commitments: Vec<crate::types::Commitment>,
-) -> proto::SettleSighashes {
-    proto::SettleSighashes {
-        messages_to_sign,
-        script_path_spend: true,
-        cosigner_identifier: cosigner_identifier(&commitments),
-        cosigner_commitments: wire_commitments(commitments),
-        exit_messages: Vec::new(),
-        wallet_dealt_share: Vec::new(),
-    }
-}
-
-fn vtxos_from_proto(v: Vec<proto::VtxoInput>) -> Vec<crate::types::VtxoInput> {
-    v.into_iter()
-        .map(|i| crate::types::VtxoInput {
-            txid: i.txid,
-            vout: i.vout,
-            amount_sats: i.amount_sats,
-            exit_delay: i.exit_delay,
-            expires_at: i.expires_at,
-        })
-        .collect()
-}
-
-/// Build the delegate over the set the caller reports, and open the FROST round that signs it.
-/// What a seal's round is signing: the delegate's messages, then the exits'.
-struct SealRound {
-    round: crate::cosigner::InBandRound,
-    delegate_sighashes: Vec<Vec<u8>>,
-    exit_sighashes: Vec<Vec<u8>>,
-    exits: crate::handlers::delegate::PendingExits,
-    commitments: Vec<crate::types::Commitment>,
-}
-
-fn seal_open(
-    cosigner: &Arc<Mutex<Cosigner>>,
-    seal: proto::SealDelegate,
-) -> Result<SealRound, Status> {
-    let info = seal
-        .ark_info
-        .map(ark_info_from_proto)
-        .ok_or_else(|| Status::invalid_argument("SealDelegate carried no ark_info"))?;
-    let mut c = lock(cosigner);
-    let (delegate_sighashes, exits) = c
-        .seal_delegate_open(vtxos_from_proto(seal.vtxos), &info, &seal.exit_script_pubkey)
-        .map_err(Status::failed_precondition)?;
-    // One round over both halves, in that order: the wallet answers them as one list, and the
-    // signatures come back the same way.
-    let exit_sighashes = exits.sighashes();
-    let all: Vec<Vec<u8>> = delegate_sighashes
-        .iter()
-        .chain(exit_sighashes.iter())
-        .cloned()
-        .collect();
-    let (round, commitments) = c.sign_in_band_begin(&all).map_err(Status::internal)?;
-    Ok(SealRound { round, delegate_sighashes, exit_sighashes, exits, commitments })
-}
-
-/// Finish the round, seal the delegate, and arm the watch — and enrol [device_token] for the wakes
-/// that watch sends, when the seal carried one.
-fn seal_finish(
-    cosigner: &Arc<Mutex<Cosigner>>,
-    round: crate::cosigner::InBandRound,
-    exits: crate::handlers::delegate::PendingExits,
-    rounds: Vec<proto::WalletRound>,
-    device_token: &str,
-) -> Result<proto::DelegateSealed, Status> {
-    let device_enrolled = enrol_device(cosigner, device_token);
-    let mut c = lock(cosigner);
-    // A bad share is the caller's fault, and is reported as such.
-    let signatures = c
-        .sign_in_band_finish(round, wallet_halves(rounds))
-        .map_err(Status::invalid_argument)?;
-    let sealed = c
-        .seal_delegate_finish(signatures, exits)
-        .map_err(Status::internal)?;
-    c.seal();
-    Ok(proto::DelegateSealed {
-        valid_at_secs: sealed.valid_at,
-        margin_secs: sealed.margin,
-        covered: sealed.covered,
-        device_enrolled,
-        exit_txs: sealed
-            .exits
-            .into_iter()
-            .map(|e| proto::ExitTx {
-                outpoint: e.outpoint,
-                raw_tx: e.raw_tx,
-                sequence: e.sequence,
-                amount_sats: e.amount_sats,
-            })
-            .collect(),
-    })
-}
-
 /// Enrol a device token carried in-band, if there is one. Whether it was, rather than an error: the
 /// operation it rode on is what the caller asked for, and must not fail because a wake could not be
 /// arranged — the wallet sends the token again next time.
-fn enrol_device(cosigner: &Arc<Mutex<Cosigner>>, token: &str) -> bool {
+pub(crate) fn enrol_device(cosigner: &Arc<Mutex<Cosigner>>, token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
     lock(cosigner).host.register_device(token).is_ok()
 }
 
-/// The seal exchange on a `Settle` stream: sighashes out, signatures in, sealed out.
-///
-/// [dealt_share] is the wallet's half of its share when this seal is the stream's first round — a
-/// `seal_only` open — and `None` when a settle ran before it and already handed it over.
-async fn settle_seal(
-    cosigner: &Arc<Mutex<Cosigner>>,
-    duplex: &Duplex<proto::SettleClientMsg, proto::SettleServerMsg>,
-    mut seal: proto::SealDelegate,
-    session_id: &str,
-    seq: u64,
-    dealt_share: Option<Vec<u8>>,
-) -> Result<(), Status> {
-    let device_token = std::mem::take(&mut seal.device_token);
-    let seal_round = seal_open(cosigner, seal)?;
-    let mut sighashes = settle_sighashes_msg(seal_round.delegate_sighashes, seal_round.commitments);
-    sighashes.exit_messages = seal_round.exit_sighashes;
-    sighashes.wallet_dealt_share = dealt_share.unwrap_or_default();
-    duplex.send(proto::SettleServerMsg {
-        session_id: session_id.to_string(),
-        seq,
-        body: Some(proto::settle_server_msg::Body::Sighashes(sighashes)),
-    });
-    let signed = match duplex.expect("the delegate's signatures").await?.body {
-        Some(proto::settle_client_msg::Body::Signed(s)) => s,
-        _ => return Err(Status::invalid_argument("expected the delegate's signatures")),
-    };
-    let sealed = seal_finish(
-        cosigner,
-        seal_round.round,
-        seal_round.exits,
-        signed.rounds,
-        &device_token,
-    )?;
-    duplex.send(proto::SettleServerMsg {
-        session_id: session_id.to_string(),
-        seq: seq + 1,
-        body: Some(proto::settle_server_msg::Body::Sealed(sealed)),
-    });
-    Ok(())
-}
-
-fn info_to_proto(i: &ark::client::types::ArkInfo) -> wp::ArkInfo {
-    wp::ArkInfo {
-        signer_pubkey: i.signer_pubkey.clone(),
-        forfeit_pubkey: i.forfeit_pubkey.clone(),
-        forfeit_address: i.forfeit_address.clone(),
-        checkpoint_tapscript: i.checkpoint_tapscript.clone(),
-        network: i.network.clone(),
-        session_duration: i.session_duration,
-        unilateral_exit_delay: i.unilateral_exit_delay,
-        boarding_exit_delay: i.boarding_exit_delay,
-        vtxo_min_amount: i.vtxo_min_amount,
-        dust: i.dust,
-    }
-}
-
-fn ark_info_from_proto(i: wp::ArkInfo) -> ark::client::types::ArkInfo {
-    ark::client::types::ArkInfo {
-        signer_pubkey: i.signer_pubkey,
-        forfeit_pubkey: i.forfeit_pubkey,
-        forfeit_address: i.forfeit_address,
-        checkpoint_tapscript: i.checkpoint_tapscript,
-        network: i.network,
-        session_duration: i.session_duration,
-        unilateral_exit_delay: i.unilateral_exit_delay,
-        boarding_exit_delay: i.boarding_exit_delay,
-        vtxo_min_amount: i.vtxo_min_amount,
-        dust: i.dust,
-    }
-}
-
-fn asp_submit(call: crate::handlers::settle::AspCall) -> proto::AspSubmit {
-    use crate::handlers::settle::AspCall;
-    use proto::asp_submit::Call;
-    let call = match call {
-        AspCall::ConfirmRegistration { intent_id } => {
-            Call::ConfirmRegistration(proto::ConfirmRegistration { intent_id })
-        }
-        AspCall::TreeNonces { batch_id, pubkey, nonces } => Call::TreeNonces(proto::TreeNonces {
-            batch_id,
-            pubkey,
-            nonces: nonces.into_iter().collect(),
-        }),
-        AspCall::TreeSignatures { batch_id, pubkey, signatures } => {
-            Call::TreeSignatures(proto::TreeSignatures {
-                batch_id,
-                pubkey,
-                signatures: signatures.into_iter().collect(),
-            })
-        }
-        AspCall::ForfeitTxs { signed_txs, signed_commitment_b64 } => {
-            Call::ForfeitTxs(proto::ForfeitTxs {
-                signed_forfeit_txs: signed_txs,
-                signed_commitment_tx: signed_commitment_b64,
-            })
-        }
-    };
-    proto::AspSubmit { call: Some(call) }
-}

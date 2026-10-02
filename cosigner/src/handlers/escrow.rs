@@ -134,7 +134,8 @@ pub fn escrow_open(
         ));
     }
 
-    let wallet_id = parse_identifier(wallet_identifier)?;
+    let wallet_id = Identifier::try_from(wallet_identifier)
+        .map_err(|e| Status::invalid_argument(format!("bad identifier: {e}")))?;
     let server_id = old_kp.identifier.clone();
     if wallet_id == server_id {
         // Both deltas would land on one point and the reshare would not be a sharing at all.
@@ -232,12 +233,5 @@ pub fn escrow_finish(
     });
 
     Ok(for_wallet.to_json())
-}
-
-fn parse_identifier(bytes: &[u8]) -> Result<Identifier, Status> {
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| Status::invalid_argument("identifier must be 32 bytes"))?;
-    Identifier::deserialize(&arr).map_err(|e| Status::invalid_argument(format!("bad identifier: {e}")))
 }
 

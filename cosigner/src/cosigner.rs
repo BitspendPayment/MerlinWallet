@@ -106,7 +106,7 @@ pub struct Ceremony {
 
 /// A FROST round the cosigner is halfway through, for every sighash in one batch.
 ///
-/// Held by the `Send` or `Settle` handler across a single round trip, and consumed by
+/// Held by the `Send` or `Renew` handler across a single round trip, and consumed by
 /// [`Cosigner::sign_in_band_finish`]. Deliberately opaque and not `Clone`: each entry owns a
 /// single-use nonce, and a copy is a second use waiting to happen.
 pub struct InBandRound {
@@ -122,21 +122,14 @@ pub struct WalletHalf {
 
 pub struct Cosigner {
     policy: Option<GroupKeys>,
-    /// A `ReadyToSettle` delegate session the core can drive autonomously (auto-settle).
-    pub(crate) delegate_session: Option<DelegateSettleSession>,
-    /// See `SnapshotState::delegate_intent_id`.
-    pub(crate) delegate_intent_id: Option<String>,
+    /// The wallet's delegate, and whether its round is running.
+    pub(crate) delegate_session: Option<DelegateSession>,
     /// In-flight GUEST-style boarding settle, held across the commitment-FROST pause (the client
     /// must FROST-sign the commitment sighashes between step 2 and step 3). Native: no held stream
     /// (step 3 finalizes optimistically). Transient — never snapshotted.
-    pub(crate) boarding_settle: Option<BoardingSettleInFlight>,
-    /// The settle the caller is driving: which FROST round is open, the registered intent id, and
-    /// the ASP parameters it supplied. See [`crate::settle`].
-    pub(crate) settle_inflight: Option<crate::handlers::settle::InFlight>,
-    /// The Ark cosigner (MuSig2) secret, hex — zeroized on drop. Used for tree signing.
-    ark_cosigner_secret_hex: Option<Zeroizing<String>>,
-    /// See `SnapshotState::wallet_dealt_share_hex`. Zeroized on drop like the secret above: it is
-    /// half of the owner's signing key, and the other half is one passkey away.
+    pub(crate) boarding_session: Option<BoardingSettleSession>,
+    /// See `SnapshotState::wallet_dealt_share_hex`. Zeroized on drop: it is half of the owner's
+    /// signing key, and the other half is one passkey away.
     wallet_dealt_share_hex: Option<Zeroizing<String>>,
     /// The escrow keys this wallet has minted. See `SnapshotState::escrows`.
     escrows: Vec<crate::types::EscrowRecord>,
@@ -170,12 +163,58 @@ pub struct Cosigner {
 /// comment describing a design that was already gone. The cosigner does hold an ASP connection of
 /// its own (`crate::asp`) — but for the unattended case, executing a sealed delegate, not for a
 /// round the app is already driving.
-pub struct BoardingSettleInFlight {
+pub struct BoardingSettleSession {
     pub session: ark::client::batch::SettleSession,
     pub signer: ark::client::batch::BoardingTreeSigner,
     pub amount_sats: u64,
     /// Boarding exit delay, carried through to the finalized VTXO entry the host persists.
     pub exit_delay: u32,
+    /// Which FROST round the caller's next signatures answer.
+    pub phase: crate::handlers::renew::Phase,
+    /// The ASP's id for this round's registration, once the caller reports it. Empty until then.
+    pub intent_id: String,
+}
+
+/// The wallet's delegate, and whether a round is running for it.
+pub(crate) enum DelegateSession {
+    /// Waiting: for the wallet's signatures, or, signed and sealed, for its deadline.
+    Awaiting(DelegateSettleSession),
+    /// Its round is running: a refresh the owner asked for, or the watch running it.
+    InFlight {
+        session: DelegateSettleSession,
+        /// The ASP's exit delay, which the VTXO the round produces is held under.
+        exit_delay: u32,
+    },
+}
+
+impl DelegateSession {
+    pub(crate) fn session(&self) -> &DelegateSettleSession {
+        match self {
+            Self::Awaiting(session) | Self::InFlight { session, .. } => session,
+        }
+    }
+
+    pub(crate) fn session_mut(&mut self) -> &mut DelegateSettleSession {
+        match self {
+            Self::Awaiting(session) | Self::InFlight { session, .. } => session,
+        }
+    }
+
+    /// Its round starts, under the ASP's current `exit_delay`.
+    pub(crate) fn in_flight(self, exit_delay: u32) -> Self {
+        Self::InFlight { session: self.into_session(), exit_delay }
+    }
+
+    /// Its round stopped short of finishing, so it waits again.
+    pub(crate) fn awaiting(self) -> Self {
+        Self::Awaiting(self.into_session())
+    }
+
+    fn into_session(self) -> DelegateSettleSession {
+        match self {
+            Self::Awaiting(session) | Self::InFlight { session, .. } => session,
+        }
+    }
 }
 
 impl Cosigner {
@@ -222,10 +261,7 @@ impl Cosigner {
         Self {
             policy: None,
             delegate_session: None,
-            delegate_intent_id: None,
-            boarding_settle: None,
-            settle_inflight: None,
-            ark_cosigner_secret_hex: None,
+            boarding_session: None,
             wallet_dealt_share_hex: None,
             escrows: Vec::new(),
             released_references: BTreeMap::new(),
@@ -248,7 +284,7 @@ impl Cosigner {
                 .user_signing_identifier
                 .as_ref()
                 .map(|id| hex::encode(id.serialize())),
-            ark_cosigner_secret_hex: self.ark_secret().map(|s| s.to_string()),
+            ark_cosigner_secret_hex: None,
             wallet_dealt_share_hex: self
                 .wallet_dealt_share_hex
                 .as_ref()
@@ -258,9 +294,9 @@ impl Cosigner {
             delegate_json: self
                 .delegate_session
                 .as_ref()
-                .and_then(|s| s.to_persisted().ok())
+                .and_then(|d| d.session().to_persisted().ok())
                 .and_then(|p| serde_json::to_string(&p).ok()),
-            delegate_intent_id: self.delegate_intent_id.clone(),
+            delegate_intent_id: None,
             escrows: self.escrows.clone(),
             released_references: self.released_references.clone(),
         };
@@ -275,41 +311,40 @@ impl Cosigner {
             .map_err(|e| format!("bad key package: {e}"))?;
         let public_key_package = PublicKeyPackage::from_json(&snap.public_key_package_json)
             .map_err(|e| format!("bad public key package: {e}"))?;
-        let user_signing_identifier = match snap.user_signing_identifier_hex {
-            Some(h) => Some(parse_identifier_hex(&h)?),
-            None => None,
-        };
+        let user_signing_identifier = snap
+            .user_signing_identifier_hex
+            .map(|h| h.parse::<Identifier>())
+            .transpose()
+            .map_err(|e| format!("bad identifier: {e}"))?;
         self.policy = Some(GroupKeys {
             group_key: snap.group_key,
             key_package,
             public_key_package,
             user_signing_identifier,
         });
-        self.ark_cosigner_secret_hex = snap.ark_cosigner_secret_hex.map(Zeroizing::new);
         self.wallet_dealt_share_hex = snap.wallet_dealt_share_hex.map(Zeroizing::new);
         self.owned_vtxos = snap.vtxos;
         self.escrows = snap.escrows;
         self.released_references = snap.released_references;
-        self.delegate_intent_id = snap.delegate_intent_id;
-        // Restore a pending ReadyToSettle delegate (needs the cosigner secret to re-derive its kp).
-        self.delegate_session = match (snap.delegate_json, self.ark_secret()) {
-            (Some(dj), Some(secret)) => {
-                let persisted: PersistedDelegate = serde_json::from_str(&dj)
+        // A delegate carries its own tree-signing key and its registration's id. Older seals kept
+        // both beside it — a wallet-wide key, and `delegate_intent_id` — which are read here for
+        // that and nothing else: the next seal writes them inside the delegate, and not beside it.
+        self.delegate_session = match snap.delegate_json {
+            Some(dj) => {
+                let mut persisted: PersistedDelegate = serde_json::from_str(&dj)
                     .map_err(|e| format!("parse persisted delegate: {e}"))?;
-                Some(DelegateSettleSession::from_persisted(&persisted, secret)?)
+                if persisted.delegate_cosigner_secret_hex.is_empty() {
+                    persisted.delegate_cosigner_secret_hex =
+                        snap.ark_cosigner_secret_hex.unwrap_or_default();
+                }
+                if persisted.intent_id.is_none() {
+                    persisted.intent_id = snap.delegate_intent_id;
+                }
+                Some(DelegateSession::Awaiting(DelegateSettleSession::from_persisted(&persisted)?))
             }
-            _ => None,
+            None => None,
         };
         Ok(())
-    }
-
-    /// The MuSig2 secret (hex), if installed.
-    pub(crate) fn ark_secret(&self) -> Option<&str> {
-        self.ark_cosigner_secret_hex.as_ref().map(|z| z.as_str())
-    }
-
-    pub fn ark_cosigner_secret_hex(&self) -> Option<&str> {
-        self.ark_secret()
     }
 
     /// The share this cosigner dealt the wallet at DKG, hex, if this wallet was onboarded after
@@ -453,11 +488,6 @@ impl Cosigner {
         Ok(hex::encode(&vk[1..]))
     }
 
-    /// The in-flight delegate/auto-settle session, mutated step-by-step by the async settle flow.
-    pub fn delegate_session_mut(&mut self) -> Option<&mut DelegateSettleSession> {
-        self.delegate_session.as_mut()
-    }
-
     pub(crate) fn apply_delegate_sigs(&mut self, req: ApplyDelegateSigs) -> Result<(), String> {
         // Auth (OP_SETTLE_DELEGATE) ran at the REST boundary.
         let signatures: Vec<[u8; 64]> = req
@@ -472,10 +502,11 @@ impl Cosigner {
         let session = self
             .delegate_session
             .as_mut()
-            .ok_or("no delegate session")?;
+            .ok_or("no delegate session")?
+            .session_mut();
         session.sign_with_frost(signatures)?;
-        // Arming the watch is sealing's business (`seal_delegate_finish`), not signing's: a delegate
-        // signed for a refresh the owner asked for now is spent in the same round.
+        // Arming the watch is renewing's business (`renew_delegate_finish`), not signing's: a
+        // delegate signed for a refresh the owner asked for now is spent in the same round.
         Ok(())
     }
 
@@ -493,24 +524,22 @@ impl Cosigner {
         key_package_json: &str,
         public_key_package_json: &str,
         user_signing_identifier_hex: Option<&str>,
-        server_dkg_secret_hex: Option<String>,
         wallet_dealt_share_hex: Option<String>,
     ) -> Result<(), String> {
         let key_package =
             KeyPackage::from_json(key_package_json).map_err(|e| format!("bad key package: {e}"))?;
         let public_key_package = PublicKeyPackage::from_json(public_key_package_json)
             .map_err(|e| format!("bad public key package: {e}"))?;
-        let user_signing_identifier = match user_signing_identifier_hex {
-            Some(h) => Some(parse_identifier_hex(h)?),
-            None => None,
-        };
+        let user_signing_identifier = user_signing_identifier_hex
+            .map(|h| h.parse::<Identifier>())
+            .transpose()
+            .map_err(|e| format!("bad identifier: {e}"))?;
         self.policy = Some(GroupKeys {
             group_key,
             key_package,
             public_key_package,
             user_signing_identifier,
         });
-        self.ark_cosigner_secret_hex = server_dkg_secret_hex.map(Zeroizing::new);
         self.wallet_dealt_share_hex = wallet_dealt_share_hex.map(Zeroizing::new);
         Ok(())
     }
@@ -567,18 +596,17 @@ impl Cosigner {
         self.escrows.iter().find(|e| x_only(&e.escrow_key) == want)
     }
 
-    /// One escrow's key material, for a pairing to be dealt against: this cosigner's share of
-    /// `V'`, the escrow's public package, and the wallet's identifier in it.
-    pub(crate) fn escrow_key_material(
-        &self,
-        escrow_key: &str,
-    ) -> Option<(KeyPackage, PublicKeyPackage, Identifier)> {
+    /// One escrow's key material, to deal a pairing or sign a reclaim against. `None` when the
+    /// escrow is unknown or its sealed material does not parse.
+    pub(crate) fn escrow_details(&self, escrow_key: &str) -> Option<crate::escrow::EscrowDetails> {
         let record = self.escrow(escrow_key)?;
-        let kp = KeyPackage::from_json(&record.key_package_json).ok()?;
-        let pkp = PublicKeyPackage::from_json(&record.public_key_package_json).ok()?;
         let id_bytes: [u8; 32] = hex::decode(&record.wallet_identifier_hex).ok()?.try_into().ok()?;
-        let wallet_id = Identifier::deserialize(&id_bytes).ok()?;
-        Some((kp, pkp, wallet_id))
+        Some(crate::escrow::EscrowDetails {
+            key: record.escrow_key.clone(),
+            key_package: KeyPackage::from_json(&record.key_package_json).ok()?,
+            public_key_package: PublicKeyPackage::from_json(&record.public_key_package_json).ok()?,
+            wallet_id: Identifier::deserialize(&id_bytes).ok()?,
+        })
     }
 
     /// Record a service pairing against one escrow.
@@ -673,18 +701,17 @@ impl Cosigner {
     /// owner out of their own money until a deadline for no one's benefit.
     pub fn open_escrow_session(
         &mut self,
-        escrow_key: &str,
-        session: crate::escrow_session::EscrowSession,
+        escrow: crate::escrow_session::Escrow,
         now: i64,
     ) -> Result<(), String> {
-        self.may_commit_escrow(escrow_key, now)?;
-        let want = x_only(escrow_key);
+        self.may_commit_escrow(&escrow.escrow_key, now)?;
+        let want = x_only(&escrow.escrow_key);
         let record = self
             .escrows
             .iter_mut()
             .find(|e| x_only(&e.escrow_key) == want)
             .ok_or("this wallet holds no such escrow")?;
-        record.session = Some(session);
+        record.session = Some(escrow);
         Ok(())
     }
 
@@ -972,10 +999,10 @@ impl Cosigner {
     }
 
     // -------------------------------------------------------------------------------------------
-    // In-band signing: FROST carried inside the Send and Settle streams
+    // In-band signing: FROST carried inside the Send and Renew streams
     // -------------------------------------------------------------------------------------------
     //
-    // A send and a settle both stop for the wallet to sign sighashes the cosigner built. They used
+    // A send and a renewal both stop for the wallet to sign sighashes the cosigner built. They used
     // to do it by opening a *second* stream — a nested `Sign` per sighash, while the outer stream
     // sat parked waiting for the result. That worked against a native server running many streams
     // at once, and cannot work inside enclave-runtime, which runs **one request per tenant for the
@@ -1132,7 +1159,8 @@ fn in_band_finish(
 
                 ceremony.commitments.insert(
                     user_identifier.clone(),
-                    commitments_from_bytes(&half.hiding, &half.binding).map_err(at)?,
+                    SigningCommitments::from_bytes(&half.hiding, &half.binding)
+                        .map_err(|e| at(e.to_string()))?,
                 );
                 let share_bytes: [u8; 32] = half
                     .share
@@ -1237,11 +1265,7 @@ impl Cosigner {
         boarding_exit_delay: u32,
         network: &str,
     ) -> Result<Vec<Vec<u8>>, String> {
-        let secret = self
-            .ark_cosigner_secret_hex()
-            .ok_or("no Ark cosigner secret installed")?
-            .to_string();
-        let signer = ark::client::batch::BoardingTreeSigner::new(&secret)?;
+        let signer = ark::client::batch::BoardingTreeSigner::generate();
         let cosigner_pk_hex = signer.cosigner_pubkey_hex();
         let (session, sighashes) = ark::client::batch::SettleSession::new_boarding(
             owner_pk_hex,
@@ -1256,17 +1280,19 @@ impl Cosigner {
             &cosigner_pk_hex,
         )
         .map_err(|e| format!("new_boarding: {e}"))?;
-        self.boarding_settle = Some(BoardingSettleInFlight {
+        self.boarding_session = Some(BoardingSettleSession {
             session,
             signer,
             amount_sats: boarding_amount_sats,
             exit_delay: boarding_exit_delay,
+            phase: crate::handlers::renew::Phase::Intent,
+            intent_id: String::new(),
         });
         Ok(sighashes.iter().map(|s| s.to_vec()).collect())
     }
 
     /// Delegate phase 1: build the pre-authorized intent + forfeit PSBTs (after `GetInfo`) and return
-    /// the sighashes the client must FROST-sign. The Ark cosigner secret never leaves the core.
+    /// the sighashes the client must FROST-sign.
     /// `deferred`: valid from the renewal deadline (a sealed delegate), or from now (a refresh the
     /// owner is asking for in person — the ASP refuses an intent valid in the future until then).
     pub fn generate_delegate_for(
@@ -1281,17 +1307,8 @@ impl Cosigner {
                 None
             },
         };
-        let (owner_pk_hex, cosigner_secret_hex, vtxos) = {
-            let owner = match self.owner_pk_hex() {
-                Ok(o) => o,
-                Err(e) => return Err(e),
-            };
-            let secret = match self.ark_cosigner_secret_hex() {
-                Some(s) => s.to_string(),
-                None => return Err("no Ark cosigner secret installed".into()),
-            };
-            (owner, secret, self.vtxos().to_vec())
-        };
+        let owner_pk_hex = self.owner_pk_hex()?;
+        let vtxos = self.vtxos().to_vec();
 
         if vtxos.is_empty() {
             return Err("no VTXOs to settle".into());
@@ -1330,7 +1347,6 @@ impl Cosigner {
             &owner_pk_hex,
             &info.signer_pubkey,
             &info.forfeit_pubkey,
-            &cosigner_secret_hex,
             &vtxo_inputs,
             &outputs,
             &info.forfeit_address,
@@ -1339,7 +1355,7 @@ impl Cosigner {
             req.intent_valid_at,
         ) {
             Ok((session, sighashes)) => {
-                self.delegate_session = Some(session);
+                self.delegate_session = Some(DelegateSession::Awaiting(session));
                 Ok(sighashes.iter().map(|s| s.to_vec()).collect())
             }
             Err(e) => Err(format!("generate_delegate: {e}")),
@@ -1441,15 +1457,6 @@ impl Cosigner {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn parse_identifier_hex(h: &str) -> Result<Identifier, String> {
-    let bytes = hex::decode(h).map_err(|e| format!("bad identifier hex: {e}"))?;
-    let arr: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "identifier must be 32 bytes")?;
-    Identifier::deserialize(&arr).map_err(|e| format!("bad identifier: {e}"))
-}
-
 /// Build the off-chain send transactions (SendVtxoStep1): derive change address, run
 /// `SendSession::build`, and return `(session, change_exit_delay, sighashes)`. Pure ark signing math
 /// (no I/O); `info` comes from a prior gRPC `GetInfo`.
@@ -1508,16 +1515,6 @@ pub(crate) fn build_send(
         change_exit_delay,
         sighashes.iter().map(|s| s.to_vec()).collect(),
     ))
-}
-
-fn commitments_from_bytes(hiding: &[u8], binding: &[u8]) -> Result<SigningCommitments, String> {
-    let h: [u8; 33] = hiding.try_into().map_err(|_| "hiding must be 33 bytes")?;
-    let b: [u8; 33] = binding.try_into().map_err(|_| "binding must be 33 bytes")?;
-    Ok(SigningCommitments {
-        hiding: point::deserialize_compressed(&h).map_err(|e| format!("bad hiding point: {e}"))?,
-        binding: point::deserialize_compressed(&b)
-            .map_err(|e| format!("bad binding point: {e}"))?,
-    })
 }
 
 use ark::client::batch::{DelegateOutput, DelegateVtxoInput};

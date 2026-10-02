@@ -407,7 +407,7 @@ void main() {
     test("an authenticated stranger cannot recover this wallet's half", () async {
       // The enclave gives each tenant its own instance; this is what one instance says to a wallet
       // that is not the one it holds — which is all an authenticated stranger can be to it. The
-      // same rule guards `Sign`, `Send` and `Settle`, and is proved on the wire for all of them in
+      // same rule guards `Sign`, `Send` and `Renew`, and is proved on the wire for all of them in
       // `cosigner/tests/stream_contribution_test.rs`: from this client a stranger cannot even ask,
       // because a passkey that is not the wallet's is refused before a stream is opened (above).
       final owner = device(seed(14), newBox());
@@ -460,9 +460,9 @@ void main() {
       expect(d.client.operationInProgress, isFalse);
     });
 
-    test('a settle is cancelled while the ASP is silent: the share goes, and so does its turn',
+    test('a renewal is cancelled while the ASP is silent: the share goes, and so does its turn',
         () async {
-      // The wait a cosigner-only cancel could not reach. By the time a settle is waiting for the
+      // The wait a cosigner-only cancel could not reach. By the time a renewal is waiting for the
       // ASP's batch it has signed its intent proof, so it is holding a rebuilt share — and it is
       // parked on the ASP's event stream, not on the cosigner. An ASP that never speaks again
       // would have kept that share in memory, and the lock against every later operation, forever.
@@ -470,17 +470,17 @@ void main() {
       final d = device(seed(20), newBox(), asp: asp);
       await d.client.doDkg();
 
-      final settling = d.client.settle(boardingUtxos: [
+      final renewing = d.client.renew(boardingUtxos: [
         cs.BoardingUtxo(txid: 'ab' * 32, vout: 0, amountSats: Int64(50000)),
       ]);
       // Whatever becomes of it is looked at below; until then it is not an unhandled error.
-      settling.ignore();
+      renewing.ignore();
 
-      await cosigner.settleWaitingOnAsp.future.timeout(const Duration(seconds: 10));
+      await cosigner.renewWaitingOnAsp.future.timeout(const Duration(seconds: 10));
       // Give the driver its turn to go from `Idle` to the event stream.
       await Future<void>.delayed(const Duration(milliseconds: 200));
       expect(asp.intentsRegistered, 1);
-      expect(asp.listening, isTrue, reason: 'the settle is parked on the ASP, not the cosigner');
+      expect(asp.listening, isTrue, reason: 'the renewal is parked on the ASP, not the cosigner');
       final operation = d.operations.last;
       expect(operation.holdsSecrets, isTrue, reason: 'the intent proof was signed: a share exists');
       expect(d.client.operationInProgress, isTrue);
@@ -490,14 +490,14 @@ void main() {
 
       await d.client.cancelOperation();
 
-      await expectLater(settling, throwsA(isA<OperationCancelled>()));
+      await expectLater(renewing, throwsA(isA<OperationCancelled>()));
       expect(operation.isDisposed, isTrue);
       expect(operation.holdsSecrets, isFalse, reason: 'a silent ASP keeps no share alive');
       expect(d.seeds.handedOut.take(2), everyElement(everyElement(0)));
 
       // The driver really unwound, rather than being left parked with the share in its frame:
       // it let go of the ASP's stream and the cosigner saw its own end.
-      await cosigner.settleEnded.future.timeout(const Duration(seconds: 10));
+      await cosigner.renewEnded.future.timeout(const Duration(seconds: 10));
       expect(asp.listenerLeft, isTrue);
 
       // And the turn passed on: the operation that was waiting runs, and signs.

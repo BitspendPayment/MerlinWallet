@@ -13,7 +13,7 @@
 /// one turn and grpc-dart's reconnect logic sees a dead transport before it tries to use one.
 ///
 /// One token per call also means one per *stream*, not one per message: the runtime redeems at
-/// open and never looks again, which is what lets a settle round run for minutes on one approval.
+/// open and never looks again, which is what lets a renewal run for minutes on one approval.
 library;
 
 import 'gate.dart';

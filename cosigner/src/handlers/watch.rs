@@ -30,7 +30,7 @@ pub const WATCH_INTERVAL_MS: u64 = 30 * 60 * 1000;
 pub const CATEGORY_SETTLE_DUE: &str = "settle-due";
 
 /// Raised after the cosigner refreshed the funds itself: the refreshed VTXO has no delegate yet, and
-/// the next time the owner is here the wallet seals one.
+/// the next time the owner is here the wallet renews the delegate.
 pub const CATEGORY_DELEGATE_SETTLED: &str = "delegate-settled";
 
 /// What the watch carries. Small and self-describing so the runtime's stored payload stays
@@ -102,7 +102,8 @@ impl Cosigner {
         asp: Option<&mut A>,
     ) -> Result<Outcome, String> {
         // No sealed delegate: it was run, or spent by a send, or replaced — nothing is owed. The
-        // cancel is best-effort (a background run may not mutate the queue); the next seal re-arms.
+        // cancel is best-effort (a background run may not mutate the queue); the next renewal
+        // re-arms.
         if self.delegate_session.is_none() {
             self.host.cancel(WATCH_TASK_ID).ok();
             return Ok(Outcome::NothingToSettle);
@@ -162,8 +163,8 @@ impl Cosigner {
             // A task id is an idempotency key: arming again with the same deadline is a no-op, and
             // with a different one — a new delegate over VTXOs that expire at another time — the
             // runtime refuses until the old record is gone. Cancelled is terminal, so it can then be
-            // forgotten, and the id is free. The watch cannot be running meanwhile: sealing happens
-            // in a request, which holds the tenant the background task would need.
+            // forgotten, and the id is free. The watch cannot be running meanwhile: renewing
+            // happens in a request, which holds the tenant the background task would need.
             Err(e) if e.contains("different input") => {
                 self.host.cancel(WATCH_TASK_ID).map_err(|e| format!("re-arming the watch: {e}"))?;
                 self.host.forget(WATCH_TASK_ID).map_err(|e| format!("re-arming the watch: {e}"))?;

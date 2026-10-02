@@ -36,7 +36,6 @@ fn recover_returns_the_dealt_share_to_the_wallets_own_identifier() {
         &kps[1],
         &kps[0],
         &pkp,
-        Some(hex::encode([9u8; 32])),
         Some(hex::encode(DEALT)),
     );
 
@@ -90,7 +89,6 @@ fn recover_refuses_an_identifier_the_ceremony_never_saw() {
         &kps[1],
         &kps[0],
         &pkp,
-        None,
         Some(hex::encode(DEALT)),
     );
 
@@ -113,7 +111,7 @@ fn recover_refuses_a_wallet_onboarded_before_the_share_was_kept() {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
 
     let err = recover(&cosigner.lock().unwrap(), asking_as(&kps[0].identifier))
         .expect_err("an old wallet has no restore path, and must be told so");
@@ -139,7 +137,6 @@ fn the_dealt_share_survives_seal_and_restore() {
             &kps[1],
             &kps[0],
             &pkp,
-            Some(hex::encode([9u8; 32])),
             Some(hex::encode(DEALT)),
         );
     }
@@ -170,7 +167,6 @@ fn recover_returns_the_escrows_a_new_device_needs_to_rebuild() {
         &kps[1],
         &kps[0],
         &pkp,
-        Some(hex::encode([9u8; 32])),
         Some(hex::encode(DEALT)),
     );
     let escrow_key = format!("02{}", "ab".repeat(32));

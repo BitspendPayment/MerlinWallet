@@ -32,7 +32,6 @@ fn wallet(store: &Arc<cosigner::store::Store>, host: Arc<Recorder>) -> cosigner:
         &kps[1],
         &kps[0],
         &pkp,
-        Some(hex::encode([9u8; 32])),
         Some(hex::encode([7u8; 32])),
     );
     c.into_inner().unwrap()

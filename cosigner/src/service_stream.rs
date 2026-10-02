@@ -370,8 +370,8 @@ impl Cosigner {
                 reason,
             } => {
                 self.speaks_for(stream_id, &escrow_key, &attempt_id)?;
-                // Nothing to undo: the pairing is `pending`, which is already "not usable". The
-                // wallet pairs again, and this cosigner deals a fresh half because it kept none.
+                // Nothing to undo: the pairing is `pending`, which is already "not usable", and the
+                // wallet sets up a new escrow.
                 tracing::info!(
                     escrow = %escrow_key,
                     attempt = %attempt_id,

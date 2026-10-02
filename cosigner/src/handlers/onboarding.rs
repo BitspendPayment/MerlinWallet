@@ -42,7 +42,6 @@ pub struct SeedMaterial {
     pub key_package_json: String,
     pub public_key_package_json: String,
     pub user_signing_identifier_hex: Option<String>,
-    pub server_dkg_secret_hex: Option<String>,
     /// `f_cosigner(wallet_identifier)`: the share this cosigner dealt to the wallet during the
     /// ceremony, kept so the wallet can be rebuilt on another device.
     ///
@@ -55,8 +54,6 @@ pub struct SeedMaterial {
 
 pub struct OnboardingSession {
     pub rounds: CeremonyRounds,
-    /// Server's Onboarding secret (hex 32-byte scalar), persisted to the policy at finalize.
-    pub server_internal_secret_hex: String,
     /// Set when round 3 finalizes: the key material to install.
     pub seed_material: Option<SeedMaterial>,
 }
@@ -65,7 +62,6 @@ impl OnboardingSession {
     pub fn new() -> Self {
         Self {
             rounds: CeremonyRounds::default(),
-            server_internal_secret_hex: String::new(),
             seed_material: None,
         }
     }
@@ -163,11 +159,6 @@ fn hex_decode_32(s: &str) -> Result<[u8; 32], Status> {
     Ok(out)
 }
 
-pub fn parse_identifier_hex(hex: &str) -> Result<Identifier, Status> {
-    let bytes = hex_decode_32(hex)?;
-    Identifier::deserialize(&bytes).map_err(|e| Status::internal(format!("bad identifier: {e}")))
-}
-
 pub fn parse_scalar_hex(hex: &str) -> Result<k256::Scalar, Status> {
     let bytes = hex_decode_32(hex)?;
     scalar_from_bytes(&bytes).map_err(|e| Status::internal(format!("bad scalar: {e}")))
@@ -184,7 +175,9 @@ pub fn round2_pkgs_from_wire(
 ) -> Result<BTreeMap<Identifier, Round2Package>, Status> {
     let mut out = BTreeMap::new();
     for (id_hex, pkg_json) in wire {
-        let id = parse_identifier_hex(id_hex)?;
+        let id = id_hex
+            .parse::<Identifier>()
+            .map_err(|e| Status::internal(format!("bad identifier: {e}")))?;
         let pkg = Round2Package::from_json(pkg_json)
             .map_err(|e| Status::internal(format!("bad R2 pkg: {e}")))?;
         out.insert(id, pkg);
@@ -198,7 +191,7 @@ const TOTAL_PARTICIPANTS: usize = 2;
 const THRESHOLD_COUNT: usize = 2;
 
 fn req_identifier(bytes: &[u8]) -> Result<Identifier, Status> {
-    parse_identifier_hex(&hex::encode(bytes))
+    Identifier::try_from(bytes).map_err(|e| Status::internal(format!("bad identifier: {e}")))
 }
 
 #[tracing::instrument(skip_all, name = "dkg::open")]
@@ -259,7 +252,6 @@ pub fn dkg_open(
         };
         let server_id = r1_secret.identifier.clone();
         sess.rounds.server_id = Some(server_id.clone());
-        sess.server_internal_secret_hex = secret_hex;
         sess.rounds.round1_packages.insert(server_id, r1_pub);
         sess.rounds.round1_secret = Some(r1_secret);
     }
@@ -395,7 +387,6 @@ pub fn dkg_finish(
         let group_key = parsers::extract_verifying_key(&pkp_json)?;
 
         let user_signing_identifier_hex = Some(wallet_identifier_hex);
-        let server_dkg_secret_hex = Some(sess.server_internal_secret_hex.clone());
 
         // The one thing from this ceremony the wallet could never reconstruct for itself.
         let wallet_dealt_share_hex = sess
@@ -409,7 +400,6 @@ pub fn dkg_finish(
             key_package_json: kp_json,
             public_key_package_json: pkp_json,
             user_signing_identifier_hex,
-            server_dkg_secret_hex,
             wallet_dealt_share_hex,
         });
 

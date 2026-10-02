@@ -23,7 +23,7 @@ use http_body_util::BodyExt;
 use prost::Message as ProstMessage;
 use wstd::http::{Body, Error, Response, StatusCode};
 
-pub use duplex::{Duplex, SessionBody};
+pub use duplex::{Duplex, HasBody, SessionBody};
 pub use status::{Code, Status};
 
 /// gRPC is always HTTP 200; the real status is in the trailers.

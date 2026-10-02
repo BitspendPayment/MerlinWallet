@@ -10,7 +10,7 @@ pub mod ark_send;
 pub mod delegate;
 pub mod helpers;
 pub mod onboarding;
-pub mod settle;
+pub mod renew;
 pub mod watch;
 pub mod parsers;
 pub mod escrow;

@@ -10,13 +10,14 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use common::wire::{self, block_on, collect, service, TENANT};
+use common::wire::{self, block_on, collect, service};
 use common::Recorder;
+use cosigner::grpc::Code;
 use cosigner::session::proto;
 use cosigner::types::VtxoInput;
 use cosigner::wallet_proto as wp;
 use cosigner::asp::AspApi;
-use cosigner::escrow_session::EscrowSession;
+use cosigner::escrow_session::Escrow;
 use cosigner::evidence::{Evidence, EvidenceRequest, FetchEvidence, HttpGet, OnUnavailable, Predicate};
 use cosigner::handlers::helpers::block_on_ready;
 use cosigner::handlers::release::{ProposedInput, ReleaseRequest, WireCommitment};
@@ -222,7 +223,6 @@ fn paired_with(
         &cosigner_kp,
         &wallet_kp,
         &pkp,
-        Some(hex::encode([9u8; 32])),
         Some(hex::encode([7u8; 32])),
     );
     let mut cosigner = c.into_inner().unwrap();
@@ -252,7 +252,7 @@ fn paired_with(
             // both, which `serde(default)` makes possible for anything written before the
             // confirmation existed. So that case is installed rather than opened.
             session: (!finished).then(|| {
-                EscrowSession::open(policy.clone(), now, now + lasts).expect("a deal")
+                Escrow::validate(&escrow_key, policy.clone(), now, now + lasts).expect("a deal")
             }),
             reclaim_opened_at: None,
         })
@@ -260,8 +260,7 @@ fn paired_with(
     if finished {
         cosigner
             .open_escrow_session(
-                &escrow_key,
-                EscrowSession::open(policy, now, now + lasts).expect("a deal"),
+                Escrow::validate(&escrow_key, policy, now, now + lasts).expect("a deal"),
                 now,
             )
             .expect("commit it");
@@ -305,8 +304,7 @@ fn second_escrow(p: &mut Paired) -> String {
         .expect("a second escrow");
     p.cosigner
         .open_escrow_session(
-            &key,
-            EscrowSession::open(permissive(), now, now + HOUR).expect("a deal"),
+            Escrow::validate(&key, permissive(), now, now + HOUR).expect("a deal"),
             now,
         )
         .expect("commit it");
@@ -950,8 +948,7 @@ fn reopening_an_escrow_does_not_hand_back_the_payments_it_already_spent() {
     let now = now();
     p.cosigner
         .open_escrow_session(
-            &key,
-            EscrowSession::open(permissive(), now, now + HOUR).expect("a new deal"),
+            Escrow::validate(&key, permissive(), now, now + HOUR).expect("a new deal"),
             now,
         )
         .expect("a new deal can be struck once the last one is over");
@@ -1239,8 +1236,7 @@ fn an_escrow_a_reclaim_was_opened_on_cannot_be_committed_again() {
     let refusal = p
         .cosigner
         .open_escrow_session(
-            &p.escrow_key,
-            EscrowSession::open(permissive(), later, later + HOUR).expect("a deal"),
+            Escrow::validate(&p.escrow_key, permissive(), later, later + HOUR).expect("a deal"),
             later,
         )
         .expect_err("a deal over an escrow with reclaim signatures out is a deal the owner can empty");
@@ -1253,8 +1249,7 @@ fn an_escrow_a_reclaim_was_opened_on_cannot_be_committed_again() {
             .expect("reopen");
     let refusal = reopened
         .open_escrow_session(
-            &p.escrow_key,
-            EscrowSession::open(permissive(), later, later + HOUR).expect("a deal"),
+            Escrow::validate(&p.escrow_key, permissive(), later, later + HOUR).expect("a deal"),
             later,
         )
         .expect_err("the mark must survive the seal");
@@ -1262,6 +1257,58 @@ fn an_escrow_a_reclaim_was_opened_on_cannot_be_committed_again() {
     assert!(
         reopened.escrows()[0].reclaim_opened_at.is_some(),
         "and it is what the wallet is told about"
+    );
+}
+
+/// A reclaim of [p]'s escrow, as a `Send` opens one — [adjust] changes it before it goes.
+fn reclaim_open(p: &Paired, adjust: impl FnOnce(&mut proto::SendOpen)) -> proto::SendClientMsg {
+    let wallet_id = &p.cosigner.escrow(&p.escrow_key).expect("the escrow").wallet_identifier_hex;
+    let mut open = proto::SendOpen {
+        reclaim_escrow: p.escrow_key.clone(),
+        identifier: hex::decode(wallet_id).unwrap(),
+        vtxos: vec![proto::VtxoInput {
+            txid: "11".repeat(32),
+            vout: 0,
+            amount_sats: VTXO_SATS,
+            exit_delay: 512,
+            expires_at: 0,
+        }],
+        ark_info: Some(proto_ark_info()),
+        ..Default::default()
+    };
+    adjust(&mut open);
+    proto::SendClientMsg {
+        session_id: "r".into(),
+        seq: 0,
+        body: Some(proto::send_client_msg::Body::Open(open)),
+    }
+}
+
+/// A reclaim goes to this wallet's own address, derived by the cosigner, and takes everything the
+/// escrow holds. One that names a recipient or an amount is refused before anything happens — the
+/// escrow is not even retired from deals.
+#[test]
+fn a_reclaim_that_names_where_it_goes_is_refused_before_anything_happens() {
+    let Some(store) = common::try_store() else { return };
+    // A deal already over, so nothing but the guard stands between this and the first sighashes.
+    let p = paired_for(&store, permissive(), 1);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let group_key = p.cosigner.group_key().to_string();
+
+    let open = reclaim_open(&p, |o| o.recipient_ark_address = "tark1somewhere-else".into());
+    let answer = collect::<proto::SendServerMsg>(block_on(
+        service(p.cosigner).route(wire::request("Send", &[open])),
+    ));
+    assert_eq!(answer.code, Code::InvalidArgument as u32, "{}", answer.message);
+    assert!(answer.messages.is_empty(), "nothing may go out");
+
+    let reopened =
+        cosigner::Cosigner::open_with_host(store, group_key, Arc::new(Recorder::default()))
+            .expect("reopen");
+    // Nothing is sealed here unless a reclaim began: it seals its mark before the first sighashes.
+    assert!(
+        reopened.escrows().iter().all(|e| e.reclaim_opened_at.is_none()),
+        "a refused reclaim retires nothing"
     );
 }
 
@@ -1278,25 +1325,9 @@ fn a_reclaim_abandoned_after_its_first_message_has_already_retired_the_escrow() 
     let group_key = p.cosigner.group_key().to_string();
     let escrow_key = p.escrow_key.clone();
 
-    let open = proto::EscrowReclaimClientMsg {
-        session_id: "r".into(),
-        seq: 0,
-        body: Some(proto::escrow_reclaim_client_msg::Body::Open(
-            proto::EscrowReclaimOpen {
-                escrow_key: escrow_key.clone(),
-                vtxos: vec![proto::VtxoInput {
-                    txid: "11".repeat(32),
-                    vout: 0,
-                    amount_sats: VTXO_SATS,
-                    exit_delay: 512,
-                    expires_at: 0,
-                }],
-                ark_info: Some(proto_ark_info()),
-            },
-        )),
-    };
-    let answer = collect::<proto::EscrowReclaimServerMsg>(block_on(
-        service(p.cosigner).route(wire::request("EscrowReclaim", &[open], Some(TENANT))),
+    let open = reclaim_open(&p, |_| {});
+    let answer = collect::<proto::SendServerMsg>(block_on(
+        service(p.cosigner).route(wire::request("Send", &[open])),
     ));
     assert_eq!(
         answer.messages.len(),
@@ -1307,7 +1338,7 @@ fn a_reclaim_abandoned_after_its_first_message_has_already_retired_the_escrow() 
     );
     assert!(matches!(
         answer.messages[0].body,
-        Some(proto::escrow_reclaim_server_msg::Body::Sighashes(_))
+        Some(proto::send_server_msg::Body::Sighashes(_))
     ));
 
     // The next request, from the seal alone.
@@ -1317,8 +1348,7 @@ fn a_reclaim_abandoned_after_its_first_message_has_already_retired_the_escrow() 
     let later = now();
     let refusal = reopened
         .open_escrow_session(
-            &escrow_key,
-            EscrowSession::open(permissive(), later, later + HOUR).expect("a deal"),
+            Escrow::validate(&escrow_key, permissive(), later, later + HOUR).expect("a deal"),
             later,
         )
         .expect_err("retired before the first message went out");
@@ -1339,8 +1369,7 @@ fn one_price() -> Policy {
 fn open_next_deal(p: &mut Paired, at: i64) -> Result<(), String> {
     let key = p.escrow_key.clone();
     p.cosigner.open_escrow_session(
-        &key,
-        EscrowSession::open(permissive(), at, at + HOUR).expect("a deal"),
+        Escrow::validate(&key, permissive(), at, at + HOUR).expect("a deal"),
         at,
     )
 }

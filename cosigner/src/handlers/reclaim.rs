@@ -126,8 +126,13 @@ impl Cosigner {
         // applies, reached through the same function.
         let wallet_dealt_share = crate::handlers::recover::dealt_share_for(self, &wallet_id_bytes)?;
 
-        let (key_package, public_key_package, wallet_identifier) = self
-            .escrow_key_material(escrow_key)
+        let crate::escrow::EscrowDetails {
+            key_package,
+            public_key_package,
+            wallet_id: wallet_identifier,
+            ..
+        } = self
+            .escrow_details(escrow_key)
             .ok_or_else(|| Status::internal("this escrow's sealed key material is unreadable"))?;
 
         // Where it goes: the wallet's own address, from the wallet's own key. Not on the wire.

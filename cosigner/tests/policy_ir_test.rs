@@ -136,8 +136,9 @@ fn an_unrecognised_external_evaluator_denies() {
 
 #[test]
 fn always_holds_without_a_transaction_but_output_predicates_refuse_to_guess() {
-    // This is what lets the wallet's own `Always` policy sit on the signing path: a settle sighash
-    // arrives with no transaction at all, and denying globally on that would break every settle.
+    // This is what lets the wallet's own `Always` policy sit on the signing path: a renewal's
+    // sighash arrives with no transaction at all, and denying globally on that would break every
+    // renewal.
     assert!(enforce(&Policy::Always, &[], &nothing_owned()).is_ok());
     assert!(enforce(&Policy::Never, &[], &nothing_owned()).is_err());
 
@@ -431,7 +432,7 @@ fn a_release_needs_the_transaction_and_the_evidence_to_agree() {
 }
 
 /// A policy carrying an evidence condition cannot be satisfied on a path that has no release —
-/// the wallet's own settle and send, which know nothing about a payment.
+/// the wallet's own renewal and send, which know nothing about a payment.
 #[test]
 fn an_evidence_condition_denies_where_there_is_no_release_to_bind_to() {
     let raw = tx_paying(&[(DEST, 10_000)]);
@@ -524,7 +525,7 @@ fn a_running_total_that_would_overflow_denies_rather_than_wrapping() {
     assert!(err.contains("overflows"), "{err}");
 }
 
-/// Both terms are about a release. Asked outside one — a settle, a send the owner drove — they
+/// Both terms are about a release. Asked outside one — a renewal, a send the owner drove — they
 /// refuse rather than reading a missing figure as zero.
 #[test]
 fn the_release_terms_deny_where_there_is_no_release_to_read() {

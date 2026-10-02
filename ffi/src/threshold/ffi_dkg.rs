@@ -16,27 +16,13 @@ use threshold::random;
 // ---------------------------------------------------------------------------
 
 fn parse_identifier_hex(hex: &str) -> Result<Identifier, String> {
-    let bytes = hex_decode_32(hex).map_err(|e| format!("bad identifier hex: {e}"))?;
+    let bytes = crate::from_hex::<[u8; 32]>(hex).map_err(|e| format!("bad identifier hex: {e}"))?;
     Identifier::deserialize(&bytes).map_err(|e| format!("bad identifier: {e}"))
 }
 
 fn parse_scalar_hex(hex: &str) -> Result<k256::Scalar, String> {
-    let bytes = hex_decode_32(hex).map_err(|e| format!("bad scalar hex: {e}"))?;
+    let bytes = crate::from_hex::<[u8; 32]>(hex).map_err(|e| format!("bad scalar hex: {e}"))?;
     scalar_from_bytes(&bytes).map_err(|e| format!("bad scalar: {e}"))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(s).map_err(|e| e.to_string())?;
-    if bytes.len() != 32 {
-        return Err(format!("expected 32 bytes, got {}", bytes.len()));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
 }
 
 fn parse_round1_pkgs_json(
@@ -90,7 +76,7 @@ fn serialize_round1_pkg(pkg: &Round1Package) -> String {
 fn serialize_round2_pkgs(pkgs: &BTreeMap<Identifier, Round2Package>) -> String {
     let mut obj = serde_json::Map::new();
     for (id, pkg) in pkgs {
-        let id_hex = hex_encode(&id.serialize());
+        let id_hex = hex::encode(id.serialize());
         obj.insert(id_hex, pkg.to_json_value());
     }
     serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or_default()
@@ -360,7 +346,7 @@ pub extern "C" fn threshold_dkg_refresh_part1(
         // Return coefficients alongside the round1 package so the Dart side
         // can call evaluatePolynomial for protected-key derivation.
         let coeffs_hex: Vec<serde_json::Value> = secret_pkg.coefficients.iter()
-            .map(|c| serde_json::Value::String(hex_encode(&threshold::scalar::scalar_to_bytes(c))))
+            .map(|c| serde_json::Value::String(hex::encode(threshold::scalar::scalar_to_bytes(c))))
             .collect();
         let r1_pkg_val: serde_json::Value = serde_json::from_str(&serialize_round1_pkg(&pub_pkg))
             .unwrap_or_default();
@@ -510,8 +496,8 @@ pub extern "C" fn threshold_refresh_share_to_id(
             threshold::polynomial::evaluate_polynomial(&cosigner_id, &coeffs);
 
         let data = serde_json::json!({
-            "at_participant": hex_encode(&threshold::scalar::scalar_to_bytes(&at_participant)),
-            "at_cosigner": hex_encode(&threshold::scalar::scalar_to_bytes(&at_cosigner)),
+            "at_participant": hex::encode(threshold::scalar::scalar_to_bytes(&at_participant)),
+            "at_cosigner": hex::encode(threshold::scalar::scalar_to_bytes(&at_cosigner)),
         })
         .to_string();
         Ok(data)
@@ -748,74 +734,5 @@ pub extern "C" fn threshold_dkg_reshare_part3_receive(
     match result {
         Ok(data) => FfiResult::ok(&data),
         Err(e) => FfiResult::err(&e),
-    }
-}
-
-/// ECIES-encrypt a 32-byte payload (a scalar — a refresh half) to a recipient's
-/// compressed verifying-share pubkey. Returns the 97-byte blob as hex. Used by the
-/// author to encrypt its onboarding half to a participant.
-#[no_mangle]
-pub extern "C" fn threshold_ecies_encrypt(
-    payload_hex: *const c_char,
-    recipient_pubkey_hex: *const c_char,
-) -> *mut FfiResult {
-    let result = (|| -> Result<String, String> {
-        let payload_s = read_cstr(payload_hex).ok_or("null payload_hex")?;
-        let pk_s = read_cstr(recipient_pubkey_hex).ok_or("null recipient_pubkey_hex")?;
-        let payload: [u8; 32] = hex::decode(&payload_s)?
-            .try_into()
-            .map_err(|_| "payload must be 32 bytes".to_string())?;
-        let pk: [u8; 33] = hex::decode(&pk_s)?
-            .try_into()
-            .map_err(|_| "recipient pubkey must be 33 bytes".to_string())?;
-        let mut rng = OsRng;
-        let blob = threshold::ecies::encrypt(&payload, &pk, &mut rng)
-            .map_err(|e| format!("ecies encrypt: {e:?}"))?;
-        Ok(hex_encode(&blob))
-    })();
-    match result {
-        Ok(d) => FfiResult::ok(&d),
-        Err(e) => FfiResult::err(&e),
-    }
-}
-
-/// ECIES-decrypt a 97-byte blob (hex) with the recipient's secret scalar (hex).
-/// Returns the 32-byte payload as hex. Used by a participant to recover its share
-/// halves. Errors on a MAC mismatch (wrong key / tampered blob).
-#[no_mangle]
-pub extern "C" fn threshold_ecies_decrypt(
-    blob_hex: *const c_char,
-    secret_hex: *const c_char,
-) -> *mut FfiResult {
-    let result = (|| -> Result<String, String> {
-        let blob_s = read_cstr(blob_hex).ok_or("null blob_hex")?;
-        let secret_s = read_cstr(secret_hex).ok_or("null secret_hex")?;
-        let blob: [u8; 97] = hex::decode(&blob_s)?
-            .try_into()
-            .map_err(|_| "blob must be 97 bytes".to_string())?;
-        let secret = parse_scalar_hex(&secret_s)?;
-        let payload = threshold::ecies::decrypt(&blob, &secret)
-            .map_err(|e| format!("ecies decrypt: {e:?}"))?;
-        Ok(hex_encode(&payload))
-    })();
-    match result {
-        Ok(d) => FfiResult::ok(&d),
-        Err(e) => FfiResult::err(&e),
-    }
-}
-
-// Re-use hex decode for the module (avoids bringing in hex crate at top level)
-mod hex {
-    pub fn decode(s: &str) -> Result<Vec<u8>, String> {
-        if s.len() % 2 != 0 {
-            return Err("odd hex length".into());
-        }
-        let mut out = Vec::with_capacity(s.len() / 2);
-        for i in (0..s.len()).step_by(2) {
-            let byte = u8::from_str_radix(&s[i..i + 2], 16)
-                .map_err(|e| format!("bad hex at {i}: {e}"))?;
-            out.push(byte);
-        }
-        Ok(out)
     }
 }

@@ -1,34 +1,34 @@
 //! The delegate: funds renewed on a schedule, by the cosigner, with nobody connected.
 //!
-//! **Sealing** happens while the owner is here. At the end of a send or a settle — on the same
+//! **Renewing** happens while the owner is here. At the end of a send or a renewal — on the same
 //! stream, under the same approval — the wallet tells the cosigner what it now holds, the cosigner
 //! builds an intent to refresh all of it (valid from the earliest expiry less the safety margin) and
 //! the forfeits it will need (`ALL|ANYONECANPAY`, so the round's connector can be added later), and
 //! the wallet FROST-signs them. That signed delegate is sealed, and the settle watch is armed for
-//! the moment it becomes valid. `SettleOpen.seal_only` does the same on its own, for funds that
+//! the moment it becomes valid. `RenewOpen.delegate_only` does the same on its own, for funds that
 //! arrived by a receive.
 //!
 //! **Executing** happens in the watch's background task, when the deadline comes: the cosigner
 //! registers the sealed intent with its ASP itself, follows the round on the event stream, and
 //! answers it with the only key the round still needs, its own delegate cosigner key. No wallet
 //! signature, no phone, no passkey. The refreshed funds are covered by nothing until the owner is
-//! next here and seals a delegate for them — the next send or settle does it on its way out.
+//! next here and renews the delegate for them — the next send or renewal does it on its way out.
 
 use crate::asp::{AspApi, EventSource};
-use crate::cosigner::Cosigner;
-use crate::handlers::settle::{AspCall, InFlight, Phase, SettleStep};
+use crate::cosigner::{Cosigner, DelegateSession};
+use crate::handlers::renew::{AspCall, RenewStep};
 use crate::types::{VtxoEntry, VtxoInput};
 use ark::client::types::ArkInfo;
 use ark::exit::{self, ExitInput, ExitSpend};
 
-/// What a sealed delegate covers, as reported back to the wallet.
-pub struct Sealed {
+/// What a renewed delegate covers, as reported back to the wallet.
+pub struct Renewed {
     /// When its intent becomes valid, and the watch runs it. Unix seconds.
     pub valid_at: u64,
     pub margin: u64,
     /// `txid:vout` of each VTXO it refreshes.
     pub covered: Vec<String>,
-    /// One signed unilateral exit per VTXO, when the seal carried an exit script.
+    /// One signed unilateral exit per VTXO, when the renewal carried an exit script.
     pub exits: Vec<SignedExit>,
 }
 
@@ -42,7 +42,7 @@ pub struct SignedExit {
     pub amount_sats: u64,
 }
 
-/// The exits a seal is signing, waiting for the wallet's half of the round.
+/// The exits a renewal is signing, waiting for the wallet's half of the round.
 pub struct PendingExits {
     spends: Vec<(String, ExitSpend)>,
 }
@@ -66,7 +66,7 @@ impl Cosigner {
     /// Build a delegate over `vtxos` — the wallet's whole current set — and return the sighashes the
     /// wallet must FROST-sign. Refused when no expiry is known: a delegate valid "now" would be a
     /// refresh the owner did not ask for, and one valid never would renew nothing.
-    pub fn seal_delegate_open(
+    pub fn renew_delegate_open(
         &mut self,
         vtxos: Vec<VtxoInput>,
         info: &ArkInfo,
@@ -82,7 +82,6 @@ impl Cosigner {
                     .into(),
             );
         }
-        self.delegate_intent_id = None;
         let delegate = self.generate_delegate_for(info, true)?;
         let exits = self.build_exits(info, exit_script_pubkey)?;
         Ok((delegate, exits))
@@ -95,8 +94,8 @@ impl Cosigner {
     /// inputs and refuses the round unless the sighashes match, so neither side has to trust the
     /// other's arithmetic.
     ///
-    /// A VTXO too small to leave a non-dust output gets no exit rather than failing the seal: the
-    /// delegate still protects it, and the wallet shows it as uncovered.
+    /// A VTXO too small to leave a non-dust output gets no exit rather than failing the renewal:
+    /// the delegate still protects it, and the wallet shows it as uncovered.
     fn build_exits(
         &self,
         info: &ArkInfo,
@@ -105,9 +104,9 @@ impl Cosigner {
         if exit_script_pubkey.is_empty() {
             return Ok(PendingExits { spends: Vec::new() });
         }
-        let owner = parse_xonly(&self.owner_pk_hex()?)?;
-        let asp = parse_xonly(&info.signer_pubkey)?;
-        let network = parse_network(&info.network)?;
+        let owner = ark::keys::parse_xonly(&self.owner_pk_hex()?)?;
+        let asp = ark::keys::parse_xonly(&info.signer_pubkey)?;
+        let network = ark::client::parse_network(&info.network)?;
         let destination = bitcoin::ScriptBuf::from_bytes(exit_script_pubkey.to_vec());
 
         let mut spends = Vec::new();
@@ -131,13 +130,13 @@ impl Cosigner {
         Ok(PendingExits { spends })
     }
 
-    /// Take the wallet's signatures, seal the delegate, and arm the watch for when it becomes valid.
+    /// Take the wallet's signatures, keep the delegate, and arm the watch for when it is valid.
     /// The caller seals the snapshot.
-    pub fn seal_delegate_finish(
+    pub fn renew_delegate_finish(
         &mut self,
         signatures: Vec<Vec<u8>>,
         exits: PendingExits,
-    ) -> Result<Sealed, String> {
+    ) -> Result<Renewed, String> {
         // The round signed the delegate's messages and then the exits', in that order.
         if signatures.len() < exits.len() {
             return Err(format!(
@@ -157,7 +156,7 @@ impl Cosigner {
             .settle_deadline()
             .ok_or("the delegate lost its deadline between building and signing")?;
         self.arm_settle_watch(valid_at)?;
-        Ok(Sealed {
+        Ok(Renewed {
             valid_at,
             margin: self.store.auto_settle_safety_margin_secs.max(0) as u64,
             covered: self
@@ -175,31 +174,23 @@ impl Cosigner {
     /// assigns it, so a retry follows the same registration rather than making a second one, and a
     /// failed batch clears it so the next attempt registers afresh.
     pub async fn execute_delegate<A: AspApi>(&mut self, asp: &mut A) -> Result<String, String> {
-        let (proof, message, topics) = self
-            .delegate_session
-            .as_ref()
-            .ok_or("no sealed delegate")?
-            .register_payload()?;
+        let delegate = self.delegate_session.as_ref().ok_or("no sealed delegate")?.session();
+        let (proof, message, topics) = delegate.register_payload()?;
+        let registered = delegate.intent_id.is_some();
         let info = asp.get_info().await?;
 
-        let intent_id = match self.delegate_intent_id.clone() {
-            Some(id) => id,
-            None => {
-                let id = asp.register_intent(&proof, &message).await?;
-                self.delegate_intent_id = Some(id.clone());
-                self.seal();
-                id
+        if !registered {
+            let id = asp.register_intent(&proof, &message).await?;
+            if let Some(delegate) = self.delegate_session.as_mut() {
+                delegate.session_mut().intent_id = Some(id);
             }
-        };
+            self.seal();
+        }
 
         let mut events = asp.events(&topics).await?;
         let held: u64 = self.owned_vtxos.iter().map(|v| v.amount).sum();
-        self.settle_inflight = Some(InFlight {
-            phase: Phase::Intent,
-            intent_id: intent_id.clone(),
-            boarding: false,
-            info,
-        });
+        let exit_delay = info.unilateral_exit_delay as u32;
+        self.delegate_session = self.delegate_session.take().map(|d| d.in_flight(exit_delay));
 
         let outcome: Result<crate::types::BoardingSettleSubmitted, String> = async {
             loop {
@@ -207,11 +198,11 @@ impl Cosigner {
                     .next()
                     .await?
                     .ok_or("the ASP's event stream ended before the batch finalized")?;
-                match self.settle_on_event(event)? {
-                    SettleStep::Idle => {}
-                    SettleStep::Submit(call) => submit(asp, call).await?,
-                    SettleStep::Complete(sub) => return Ok(sub),
-                    SettleStep::Sighashes(_) | SettleStep::Register { .. } => {
+                match self.renew_on_event(event)? {
+                    RenewStep::Idle => {}
+                    RenewStep::Submit(call) => submit(asp, call).await?,
+                    RenewStep::Complete(sub) => return Ok(sub),
+                    RenewStep::Sighashes(_) | RenewStep::Register { .. } => {
                         return Err("a delegate round asked for a signature it should not need".into())
                     }
                 }
@@ -219,11 +210,12 @@ impl Cosigner {
         }
         .await;
 
-        self.settle_inflight = None;
+        // A round that stopped short leaves the delegate waiting again; a finished one took it.
+        self.delegate_session = self.delegate_session.take().map(DelegateSession::awaiting);
         match outcome {
             Ok(sub) => {
-                // Everything the delegate covered was spent into the one VTXO it produced.
-                self.delegate_intent_id = None;
+                // Everything the delegate covered was spent into the one VTXO it produced, and the
+                // delegate went with its round.
                 self.owned_vtxos = vec![VtxoEntry {
                     txid: sub.vtxo_txid,
                     vout: sub.vtxo_vout,
@@ -238,7 +230,9 @@ impl Cosigner {
             Err(e) => {
                 if e.contains("batch failed") {
                     // The ASP dropped the registration with the batch; register again next time.
-                    self.delegate_intent_id = None;
+                    if let Some(delegate) = self.delegate_session.as_mut() {
+                        delegate.session_mut().intent_id = None;
+                    }
                     self.seal();
                 }
                 Err(e)
@@ -282,23 +276,3 @@ fn finalize_exits(exits: PendingExits, signatures: &[Vec<u8>]) -> Result<Vec<Sig
         .collect()
 }
 
-fn parse_xonly(hex_str: &str) -> Result<bitcoin::XOnlyPublicKey, String> {
-    let hex_str = if hex_str.len() == 66 && (hex_str.starts_with("02") || hex_str.starts_with("03"))
-    {
-        &hex_str[2..]
-    } else {
-        hex_str
-    };
-    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid pubkey hex: {e}"))?;
-    bitcoin::XOnlyPublicKey::from_slice(&bytes).map_err(|e| format!("invalid x-only pubkey: {e}"))
-}
-
-fn parse_network(name: &str) -> Result<bitcoin::Network, String> {
-    match name {
-        "bitcoin" | "mainnet" => Ok(bitcoin::Network::Bitcoin),
-        "testnet" | "testnet3" => Ok(bitcoin::Network::Testnet),
-        "signet" | "mutinynet" => Ok(bitcoin::Network::Signet),
-        "regtest" => Ok(bitcoin::Network::Regtest),
-        _ => Err(format!("unknown network: {name}")),
-    }
-}

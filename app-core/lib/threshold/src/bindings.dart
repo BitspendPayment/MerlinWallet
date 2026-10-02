@@ -118,19 +118,6 @@ final refreshShareToIdFfi = nativeLib
     .lookupFunction<_RefreshShareToIdNative, _RefreshShareToIdDart>(
         'threshold_refresh_share_to_id');
 
-// ECIES: encrypt a 32-byte payload to a compressed pubkey; decrypt a 97-byte blob
-// with a secret scalar.
-typedef _EciesEncryptNative = Pointer<FfiResult> Function(
-    Pointer<Utf8>, Pointer<Utf8>);
-typedef _EciesEncryptDart = Pointer<FfiResult> Function(
-    Pointer<Utf8>, Pointer<Utf8>);
-final eciesEncryptFfi = nativeLib
-    .lookupFunction<_EciesEncryptNative, _EciesEncryptDart>(
-        'threshold_ecies_encrypt');
-final eciesDecryptFfi = nativeLib
-    .lookupFunction<_EciesEncryptNative, _EciesEncryptDart>(
-        'threshold_ecies_decrypt');
-
 // ---------------------------------------------------------------------------
 // Signing bindings
 // ---------------------------------------------------------------------------

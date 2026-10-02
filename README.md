@@ -348,19 +348,19 @@ sealed at DKG. Neither is the key. An operation that signs goes like this
    (`SeedSource.seedDuring`). The seed becomes the polynomial and is overwritten at once. A passkey
    that does not derive this wallet's identifier is refused here, before anything is opened.
 4. **Open the stream.** Its open names the wallet's identifier; the cosigner's first answer carries
-   `wallet_dealt_share`, on `Sign`, `Send` and `Settle` alike — once per stream, and never the
+   `wallet_dealt_share`, on `Sign`, `Send` and `Renew` alike — once per stream, and never the
    cosigner's own share (`cosigner/src/handlers/recover.rs`, `dealt_share_for`). No second call, so
    no second approval.
 5. **Add, fix the sign, check.** The sum is accepted only if `s·G` is the verifying share this
    device stored when the wallet was made — not one that arrived with the contribution
    (`app-core/lib/passkey/share_reconstruction.dart`). The share signs every round of that stream:
-   a settle's intent proof, its commitment, the trailing seal.
+   a renewal's intent proof, its commitment, the trailing seal.
 6. **Let go**, in a `finally`: on success, on failure, and on cancellation
    (`MpcClient.cancelOperation`).
 
 `Sign` had to change shape for this. The wallet used to commit first, and its nonce is hedged with
 its share — which it no longer has until the cosigner answers. So the cosigner commits first, as it
-always did on `Send` and `Settle`; FROST's binding factor covers every commitment whoever sent
+always did on `Send` and `Renew`; FROST's binding factor covers every commitment whoever sent
 theirs last. `Sign` is also now script-path only by name: it always was in effect, since the
 cosigner signs untweaked and checks every share.
 
@@ -403,9 +403,10 @@ operation gives an attacker who has both nothing they could not already ask for.
 
 **Escrows follow the same rule.** An escrow share is the wallet share plus two deltas — the
 wallet's, derived from the passkey under a per-escrow context, and the cosigner's, sealed — and is
-rebuilt inside the same operation, from the two halves the `PairService` or `EscrowReclaim` stream
-brings on its first round, checked against the escrow's stored verifying share, and released with
-the operation (`WalletOperation.escrowKeyPackage`). What the device keeps of an escrow is its key,
+rebuilt inside the same operation, from the two halves a reclaim (a `Send` naming the escrow)
+brings on its first round, checked against the escrow's stored verifying share, and released with the operation
+(`WalletOperation.escrowKeyPackage`). The operation that mints an escrow holds the share it made
+(`WalletOperation.holdEscrowKeyPackage`) instead. What the device keeps of an escrow is its key,
 its public package and that context; `Recover` hands a new device all three. An escrow minted
 before its context was recorded cannot be rebuilt by any passkey and is left out of recovery.
 

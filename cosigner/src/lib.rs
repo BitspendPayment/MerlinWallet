@@ -9,9 +9,11 @@
 pub mod asp;
 pub mod config;
 pub mod cosigner;
+pub mod delegate;
 pub mod grpc;
 pub mod handlers;
 pub mod host;
+pub mod escrow;
 pub mod escrow_session;
 pub mod evidence;
 pub mod policy;
@@ -19,6 +21,7 @@ pub mod service_stream;
 pub mod session;
 pub mod store;
 pub mod types;
+mod util;
 
 pub use cosigner::Cosigner;
 pub use types::ArkTxEntry;

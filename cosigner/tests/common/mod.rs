@@ -97,24 +97,15 @@ pub fn open_cosigner(store: &Arc<Store>, group_key: &str) -> Mutex<Cosigner> {
 }
 
 /// Install a wallet's key material and seal it, as DKG's final round does: the cosigner key
-/// package, the group PKP, the user's signing identifier and the Ark cosigner secret.
+/// package, the group PKP and the user's signing identifier.
 pub fn seed_policy(
     cosigner: &Mutex<Cosigner>,
     group_key: &str,
     kp_cosigner: &KeyPackage,
     kp_user: &KeyPackage,
     pkp: &PublicKeyPackage,
-    ark_cosigner_secret_hex: Option<String>,
 ) {
-    seed_policy_with_dealt_share(
-        cosigner,
-        group_key,
-        kp_cosigner,
-        kp_user,
-        pkp,
-        ark_cosigner_secret_hex,
-        None,
-    );
+    seed_policy_with_dealt_share(cosigner, group_key, kp_cosigner, kp_user, pkp, None);
 }
 
 /// As [`seed_policy`], plus the share the cosigner dealt the wallet at DKG — what `Recover` hands
@@ -125,7 +116,6 @@ pub fn seed_policy_with_dealt_share(
     kp_cosigner: &KeyPackage,
     kp_user: &KeyPackage,
     pkp: &PublicKeyPackage,
-    ark_cosigner_secret_hex: Option<String>,
     wallet_dealt_share_hex: Option<String>,
 ) {
     let mut actor = cosigner.lock().unwrap();
@@ -135,7 +125,6 @@ pub fn seed_policy_with_dealt_share(
             &kp_cosigner.to_json(),
             &pkp.to_json(),
             Some(&hex::encode(kp_user.identifier.serialize())),
-            ark_cosigner_secret_hex,
             wallet_dealt_share_hex,
             )
         .expect("install policy");
@@ -258,7 +247,7 @@ pub fn seed_escrow(
     .expect("install escrow");
 }
 
-/// Driving `CosignerService::route` with real framed bodies, as the runtime delivers them.
+/// Driving `Session::route` with real framed bodies, as the runtime delivers them.
 ///
 /// A body here is written whole before the handler runs, so a test can open a stream and read
 /// what the cosigner says first — but cannot answer it. A stream opened and left is cut off
@@ -272,13 +261,10 @@ pub mod wire {
     use http_body_util::BodyExt;
 
     use cosigner::grpc::framing::{frame, Deframer};
-    use cosigner::session::{CosignerService, TENANT_HEADER};
+    use cosigner::session::Session;
     use cosigner::wallet_proto::GetServerInfoResponse;
     use cosigner::Cosigner;
     use wstd::http::{Body, Request, Response};
-
-    /// What the runtime puts on an approved request: sixteen bytes, lowercase hex.
-    pub const TENANT: &str = "0123456789abcdef0123456789abcdef";
 
     /// Drive a future to completion on this thread.
     ///
@@ -297,25 +283,16 @@ pub mod wire {
         panic!("the future never completed");
     }
 
-    /// A gRPC request carrying `messages`, addressed at `method`, as the runtime would deliver it
-    /// — or, with `tenant: None`, as it would never deliver it.
-    pub fn request<M: prost::Message>(
-        method: &str,
-        messages: &[M],
-        tenant: Option<&str>,
-    ) -> Request<Body> {
+    /// A gRPC request carrying `messages`, addressed at `method`, as the runtime would deliver it.
+    pub fn request<M: prost::Message>(method: &str, messages: &[M]) -> Request<Body> {
         let mut buf = Vec::new();
         for message in messages {
             buf.extend_from_slice(&frame(&message.encode_to_vec()));
         }
-        let mut builder = Request::builder()
+        Request::builder()
             .method("POST")
             .uri(format!("http://cosigner/cosigner.v1.Cosigner/{method}"))
-            .header("content-type", "application/grpc+proto");
-        if let Some(tenant) = tenant {
-            builder = builder.header(TENANT_HEADER, tenant);
-        }
-        builder
+            .header("content-type", "application/grpc+proto")
             .body(Body::from_http_body(
                 http_body_util::Full::new(Bytes::from(buf))
                     .map_err(|e: std::convert::Infallible| -> wstd::http::Error { match e {} }),
@@ -355,8 +332,8 @@ pub mod wire {
         Answer { messages, code, message }
     }
 
-    pub fn service(cosigner: Cosigner) -> CosignerService {
-        CosignerService::new(
+    pub fn service(cosigner: Cosigner) -> Session {
+        Session::new(
             Arc::new(Mutex::new(cosigner)),
             GetServerInfoResponse { bitcoin_network: "regtest".into() },
         )

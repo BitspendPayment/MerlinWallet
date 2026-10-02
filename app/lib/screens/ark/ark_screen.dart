@@ -450,7 +450,7 @@ class ArkScreen extends StatelessWidget {
               final messenger = ScaffoldMessenger.of(context);
               try {
                 if (due) {
-                  // A refresh seals a new delegate on its way out, so one approval normally does
+                  // A refresh renews the delegate on its way out, so one approval normally does
                   // both. When the indexer was too slow for that, saying so beats reporting a
                   // success that leaves the renewal un-armed.
                   final armed = await mpcService.delegateNow();
@@ -586,7 +586,7 @@ class ArkScreen extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             // A sealed delegate can renew these outputs without the phone. The resulting
-            // outputs need a new owner-approved seal for another renewal and signed exits.
+            // outputs need the owner to renew the delegate again, and signed exits.
             Text(
               delegated
                   ? 'You signed a renewal for these funds, and the secure enclave '

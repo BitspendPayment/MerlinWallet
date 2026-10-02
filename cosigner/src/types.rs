@@ -54,6 +54,10 @@ pub struct SnapshotState {
     pub key_package_json: String,
     pub public_key_package_json: String,
     pub user_signing_identifier_hex: Option<String>,
+    /// The wallet-wide tree-signing key older seals kept — the cosigner's own DKG secret, reused
+    /// for every round. Read only to restore a delegate sealed under it, and never written: each
+    /// delegate now carries a key of its own.
+    #[serde(default, skip_serializing)]
     pub ark_cosigner_secret_hex: Option<String>,
     /// `f_cosigner(wallet_identifier)`, hex: the share this cosigner dealt the wallet at DKG.
     ///
@@ -70,9 +74,9 @@ pub struct SnapshotState {
     /// one is pending. Lets durable auto-settle survive actor eviction. Only ever
     /// `ReadyToSettle` (never a `Settling`-phase session — MuSig2 nonces must not persist).
     pub delegate_json: Option<String>,
-    /// The id the ASP gave the sealed delegate's registration, once the watch registered it — so a
-    /// retried run follows that registration instead of making a second. `default` for older seals.
-    #[serde(default)]
+    /// Where older seals kept the delegate's registration id, which the delegate now carries.
+    /// Read only to restore a delegate sealed before it did, and never written.
+    #[serde(default, skip_serializing)]
     pub delegate_intent_id: Option<String>,
     /// The escrow keys this wallet has minted, newest last. `default` for seals written before
     /// escrow existed — a wallet with none simply has none.
@@ -84,7 +88,7 @@ pub struct SnapshotState {
     /// **On the wallet, deliberately, and not on the session that spent it.** A payment that
     /// succeeded goes on being true for ever, so what stops it being paid against twice is this
     /// record and nothing else — which means it has to outlive everything a service could arrange
-    /// to have replaced. A ledger kept inside an [`EscrowSession`](crate::escrow_session::EscrowSession)
+    /// to have replaced. A ledger kept inside an [`Escrow`](crate::escrow_session::Escrow)
     /// would be emptied by reopening the deal, and would not be consulted at all by a second escrow
     /// paired to the same service. Both are ways to spend one payment twice.
     ///
@@ -165,7 +169,7 @@ pub struct EscrowRecord {
     /// The live deal: what the service may take, and until when. `None` before a session is opened
     /// — a minted escrow is a key, not yet a commitment. See `crate::escrow_session`.
     #[serde(default)]
-    pub session: Option<crate::escrow_session::EscrowSession>,
+    pub session: Option<crate::escrow_session::Escrow>,
     /// When a reclaim was first opened on this escrow, if one ever was. From that moment the owner
     /// may hold signatures that empty it — whether the stream finished or not, the cosigner cannot
     /// see — so it may never again be committed to a deal. See `Cosigner::open_escrow_session`.
@@ -331,7 +335,7 @@ pub struct BoardingSettleSubmitted {
     pub exit_delay: u32,
 }
 
-/// Result of a `boarding_settle` step: either more sighashes to FROST-sign (mid-flight) or the
+/// Result of a `boarding_session` step: either more sighashes to FROST-sign (mid-flight) or the
 /// finalized VTXO (completion).
 #[derive(Debug)]
 pub enum BoardingSettleOutcome {

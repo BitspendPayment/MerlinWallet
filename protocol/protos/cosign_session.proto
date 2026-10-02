@@ -46,19 +46,21 @@ service Cosigner {
   // wallet's round 1 in and everybody's out, then its round 2 in and the server's out with the key.
   rpc Dkg(stream DkgClientMsg) returns (stream DkgServerMsg);
 
-  // A send is two phases wearing one RPC: `SendVtxoRequest` means "build it" when its
-  // `signed_messages` is empty and "submit it" when it is not, and the half-built transactions
-  // wait on the server in between. Same shape as the sign nonce, same answer.
+  // A send, with the wallet driving the ASP: the cosigner builds it and signs its half, the wallet
+  // submits and finalizes, and the cosigner records it only once it is final.
+  //
+  // The same steps move money into and out of an escrow: a send may commit the escrow it tops up
+  // to a deal (`SendOpen.escrow_commit`), or take back what is left of one (`reclaim_escrow`).
   rpc Send(stream SendClientMsg) returns (stream SendServerMsg);
 
-  // Settling, with the client driving the ASP round.
+  // Renewing, with the client driving the ASP round.
   //
   // The cosigner used to hold the ASP connection: it registered the intent, opened the event
   // stream, and reacted to each event itself. That made it the Ark client as well as the signer.
   // Here the client drives the round and relays each event; the cosigner answers with what to
   // submit next, and never opens a socket. One RPC covers both shapes — a boarding output settles
   // when `boarding_utxo` is set, a self-refresh when it is not.
-  rpc Settle(stream SettleClientMsg) returns (stream SettleServerMsg);
+  rpc Renew(stream RenewClientMsg) returns (stream RenewServerMsg);
 
   // The rest. Not ceremonies — one round each, with nothing to hold between messages, so a stream
   // would buy nothing.
@@ -99,25 +101,17 @@ service Cosigner {
   // same pair. The wallet's key is untouched, which is the point: a service can be paired into an
   // escrow without being paired into the wallet, and escrowed money is visibly separate from the
   // rest. Two exchanges, the same shape as `Dkg`, and the secrets live on one handler's stack.
+  //
+  // Optionally it then pairs a service into the new escrow: a key-preserving refresh giving the
+  // service a share of the SAME key, so `{service, cosigner}` can sign it too. The cosigner's half
+  // of that share goes straight to the service, over an origin THIS IMAGE names; the wallet sends
+  // its own half to the same origin, then confirms here. The pairing is usable only once the
+  // service has confirmed as well. See `cosigner/src/handlers/delivery.rs`.
   rpc Escrow(stream EscrowClientMsg) returns (stream EscrowServerMsg);
 
   // The escrow keys this wallet holds. Public projection only — a device that keeps nothing asks
   // what exists rather than remembering.
   rpc EscrowList(EscrowListRequest) returns (EscrowListResponse);
-
-  // Pairing a service into an escrow: a key-preserving refresh giving the service a share of the
-  // SAME key, so `{service, cosigner}` can sign it too and the escrow key never moves.
-  //
-  // The cosigner's half of that share goes straight to the service, over an origin THIS IMAGE
-  // names — a wallet names a service id, never a URL. So the reply carries no half: a wallet
-  // holding both would hold the service's share. See `cosigner/src/handlers/delivery.rs`.
-  rpc PairService(stream PairServiceClientMsg) returns (stream PairServiceServerMsg);
-
-  // Finishing a pairing, once the service has BOTH contributions and has checked the share they
-  // sum to. Until then the pairing is `pending` and nothing may be committed to it: a service that
-  // holds one half can sign nothing, and an escrow that believed otherwise would be a deal with a
-  // party that cannot take its side of it.
-  rpc PairServiceConfirm(PairServiceConfirmRequest) returns (PairServiceConfirmResponse);
 
   // Committing an escrow to a deal: what the paired service may take, and until when.
   //
@@ -130,19 +124,6 @@ service Cosigner {
   // commitment: a service that had already paid a merchant against it would be left holding the
   // loss. Her control is the deadline she chooses here.
   rpc EscrowOpenSession(EscrowOpenSessionRequest) returns (EscrowOpenSessionResponse);
-
-  // Taking back what is left of an escrow, once its deal is over.
-  //
-  // The OTHER pairing over the same key — `{wallet, cosigner}`, the one the service is not in — so
-  // reclaiming needs the owner present and needs this cosigner to agree. It agrees only once the
-  // deal is over: until then the money is committed, and an escrow an owner can empty at will
-  // commits nothing to anybody.
-  //
-  // The destination is NOT on the wire. It is the wallet's own Ark address, derived here from the
-  // key this cosigner already holds, so a reclaim cannot be pointed anywhere else — not by a
-  // caller, and not by anything that reached a caller.
-  rpc EscrowReclaim(stream EscrowReclaimClientMsg) returns (stream EscrowReclaimServerMsg);
-
 }
 
 // 32-512 characters of [A-Za-z0-9_:.-], as `notify.wit` specifies.
@@ -195,27 +176,27 @@ message RecoverResponse {
   repeated EscrowSummary escrows = 4;
 }
 
-message SettleClientMsg {
+message RenewClientMsg {
   string session_id = 1;
   uint64 seq = 2;
   oneof body {
-    SettleOpen open = 3;
-    SettleSigned signed = 4;
+    RenewOpen open = 3;
+    RenewSigned signed = 4;
     IntentRegistered registered = 5;
     AspEvent event = 6;
-    // After `SettleComplete`, optionally: seal a delegate over the wallet's set as it now stands.
-    SealDelegate seal = 7;
+    // After `RenewComplete`, optionally: renew the delegate over the wallet's set as it now stands.
+    RenewDelegate renew_delegate = 7;
   }
 }
 
-// Opens the settle. `boarding_utxo` set settles that one output; absent refreshes the VTXOs the
+// Opens the renewal. `boarding_utxo` set settles that one output; absent refreshes the VTXOs the
 // cosigner already holds.
 //
 // `ark_info` comes from the caller because the caller is the one talking to the ASP. Lying about it
 // yields a transaction the ASP will not accept, or an address the liar cannot spend from — the
 // cosigner still derives every output from ITS OWN key, so a wrong `signer_pubkey` cannot redirect
 // funds, only waste a round.
-message SettleOpen {
+message RenewOpen {
   // Authentication is the runtime's — see the note at the top of this file.
   reserved 1, 2, 3;
   reserved "user_id", "signature", "timestamp_ms";
@@ -223,12 +204,13 @@ message SettleOpen {
   mpc_wallet.ArkInfo ark_info = 5;
   // The set to refresh, when `boarding_utxo` is absent. Ignored for a boarding settle.
   repeated VtxoInput vtxos = 6;
-  // Refresh nothing now: seal a delegate over `vtxos` and close. The in-band exchange `SealDelegate`
-  // describes — `sighashes`, `signed`, `sealed` — with no round before it.
-  bool seal_only = 7;
-  // With `seal_only`: the device token the seal carries, as `SealDelegate.device_token`.
+  // Refresh nothing now: renew the delegate over `vtxos` and close. The in-band exchange
+  // `RenewDelegate` describes — `sighashes`, `signed`, `delegate_renewed` — with no round before
+  // it.
+  bool delegate_only = 7;
+  // With `delegate_only`: the device token the renewal carries, as `RenewDelegate.device_token`.
   string device_token = 8;
-  // With `seal_only`: where a unilateral exit pays, as `SealDelegate.exit_script_pubkey`.
+  // With `delegate_only`: where a unilateral exit pays, as `RenewDelegate.exit_script_pubkey`.
   bytes exit_script_pubkey = 9;
   // The wallet's FROST identifier, 32 bytes big-endian — what `RecoverRequest.identifier` is.
   //
@@ -264,7 +246,7 @@ message VtxoInput {
   int64 expires_at = 5;
 }
 
-// Seal a delegate over these VTXOs: the wallet's whole current set.
+// Renew the delegate over these VTXOs: the wallet's whole current set.
 //
 // A VTXO has to be refreshed in a batch round before the ASP's expiry. A delegate lets the cosigner
 // do that alone: the wallet signs, now, an intent to refresh everything it holds — valid from the
@@ -272,12 +254,12 @@ message VtxoInput {
 // seals them. When the deadline comes, its background task registers the intent with its ASP itself,
 // follows the round, and signs the tree with its own key. No wallet signature, no phone.
 //
-// Sent in-band as the last exchange of `Send` and `Settle`, once the operation's result is indexed:
+// Sent in-band as the last exchange of `Send` and `Renew`, once the operation's result is indexed:
 // the cosigner answers with the sighashes to sign (in the stream's `sighashes`), the wallet with
-// `signed`, and the cosigner with `sealed`. It rides the approval the operation already had, and
-// the passkey seed the operation already derived. `SettleOpen.seal_only` does it on its own, for
-// funds that arrived by a receive.
-message SealDelegate {
+// `signed`, and the cosigner with `delegate_renewed`. It rides the approval the operation already
+// had, and the passkey seed the operation already derived. `RenewOpen.delegate_only` does it on its
+// own, for funds that arrived by a receive.
+message RenewDelegate {
   repeated VtxoInput vtxos = 1;
   mpc_wallet.ArkInfo ark_info = 2;
   // This device's push token, when the cosigner has not been given it yet — see `DkgOpen`.
@@ -309,7 +291,7 @@ message ExitTx {
   // one it signed (`ark_verify_exit_tx`). An identity it can compute is not one to be told.
 }
 
-message DelegateSealed {
+message DelegateRenewed {
   // When the delegate becomes valid and the cosigner will run it: the earliest expiry, less the
   // margin. Unix seconds.
   uint64 valid_at_secs = 1;
@@ -323,7 +305,7 @@ message DelegateSealed {
   repeated ExitTx exit_txs = 5;
 }
 
-message SettleSigned {
+message RenewSigned {
   // The wallet's half of each message's FROST round, in the order the sighashes arrived.
   //
   // This used to be `signed_messages` — finished 64-byte signatures the wallet produced by opening
@@ -350,21 +332,21 @@ message AspEvent {
   bytes encoded = 1;
 }
 
-message SettleServerMsg {
+message RenewServerMsg {
   string session_id = 1;
   uint64 seq = 2;
   oneof body {
-    SettleSighashes sighashes = 3;
+    RenewSighashes sighashes = 3;
     RegisterIntent register = 4;
     AspSubmit submit = 5;
-    SettleIdle idle = 6;
-    SettleComplete complete = 7;
-    // The delegate, sealed. See `SealDelegate`.
-    DelegateSealed sealed = 8;
+    RenewIdle idle = 6;
+    RenewComplete complete = 7;
+    // The delegate, renewed. See `RenewDelegate`.
+    DelegateRenewed delegate_renewed = 8;
   }
 }
 
-message SettleSighashes {
+message RenewSighashes {
   repeated bytes messages_to_sign = 1;
   bool script_path_spend = 2;
   // In-band FROST, round one: the cosigner's commitment for each message, in the same order.
@@ -396,7 +378,7 @@ message RegisterIntent {
 }
 
 // The event was consumed and produced nothing to send. The caller relays the next one.
-message SettleIdle {}
+message RenewIdle {}
 
 // One ASP call the caller must make on the cosigner's behalf.
 message AspSubmit {
@@ -426,7 +408,7 @@ message ForfeitTxs {
   string signed_commitment_tx = 2;
 }
 
-message SettleComplete {
+message RenewComplete {
   string commitment_txid = 1;
   string vtxo_txid = 2;
   uint32 vtxo_vout = 3;
@@ -442,8 +424,8 @@ message SendClientMsg {
     SendSigned signed = 4;
     SendSubmitted submitted = 5;
     SendFinalized finalized = 6;
-    // After `SendComplete`, optionally: seal a delegate over the wallet's set as it now stands.
-    SealDelegate seal = 7;
+    // After `SendComplete`, optionally: renew the delegate over the wallet's set as it now stands.
+    RenewDelegate renew_delegate = 7;
   }
 }
 
@@ -479,6 +461,13 @@ message SendOpen {
   // on the same approval. The recipient is then the escrow's address. Checked before anything is
   // built — a deal that could not be struck now is refused while no money has moved.
   EscrowOpenSessionRequest escrow_commit = 9;
+  // Set, to take back what is left of this escrow (compressed hex) instead of sending: the
+  // `{wallet, cosigner}` pairing over the escrow's key, refused while a deal holds it. `vtxos` are
+  // then the escrow's — named by the wallet, which is safe because a taproot sighash commits to
+  // every prevout — and the destination is NOT named: `recipient_ark_address` and `amount` must be
+  // empty. It is this wallet's own address, derived by the cosigner from the key it holds, so a
+  // reclaim cannot be pointed anywhere else.
+  string reclaim_escrow = 10;
 }
 
 message SendSigned {
@@ -505,8 +494,8 @@ message SendServerMsg {
     SendSubmit submit = 4;
     SendFinalize finalize = 5;
     SendComplete complete = 6;
-    // The delegate, sealed. See `SealDelegate`.
-    DelegateSealed sealed = 7;
+    // The delegate, renewed. See `RenewDelegate`.
+    DelegateRenewed delegate_renewed = 7;
   }
 }
 
@@ -533,7 +522,7 @@ message SendSighashes {
   repeated Commitment cosigner_commitments = 3;
   // Whose commitments those are: the FROST identifier the aggregate keys them under, hex.
   string cosigner_identifier = 4;
-  // As `SettleSighashes.exit_messages`.
+  // As `RenewSighashes.exit_messages`.
   repeated bytes exit_messages = 5;
   // `f_cosigner(wallet identifier)`, 32 bytes big-endian: what the cosigner dealt this wallet at
   // DKG, and half of the wallet's signing share — the wallet adds the half it re-derives from its
@@ -542,6 +531,12 @@ message SendSighashes {
   // On the FIRST sighashes of a stream only, and empty on every one after: one approved stream is
   // one reconstruction, and the rounds that follow reuse it.
   bytes wallet_dealt_share = 6;
+  // On a reclaim only. The sighashes are then the ESCROW key's, and the wallet rebuilds its share
+  // of it from `wallet_dealt_share`, this cosigner's delta share for the escrow, and the passkey.
+  bytes escrow_delta_share = 7;
+  // Where a reclaim goes, and how much: derived here, reported so the owner sees what they sign.
+  string to_ark_address = 8;
+  uint64 amount_sats = 9;
 }
 
 message SendComplete {
@@ -678,8 +673,8 @@ message DkgOpen {
   //
   // Carried here, not sent as a `RegisterDevice` of its own, because every call is a passkey
   // approval: a separate enrolment right after onboarding was a second fingerprint for nothing the
-  // user asked for. A token FCM rotates later rides the next `SealDelegate` the same way — a wake is
-  // only ever about a sealed delegate, so none is missed by waiting for one.
+  // user asked for. A token FCM rotates later rides the next `RenewDelegate` the same way — a wake
+  // is only ever about a renewed delegate, so none is missed by waiting for one.
   string device_token = 6;
 }
 
@@ -740,9 +735,12 @@ message EscrowOpen {
   // so a repeat is refused: two escrows dealt on one delta are two points on one line, and two
   // points determine it. 16 bytes, drawn fresh by the wallet.
   bytes context = 3;
-  // Optionally, a service to pair into the escrow once it is minted — as `PairServiceOpen` names
-  // one, and checked as it is, before anything is dealt. Both empty: mint only.
+  // Optionally, a service to pair into the escrow once it is minted. Both empty: mint only.
+  //
+  // The service's FROST identifier, 32 bytes. The IMAGE resolves it to an origin; a wallet never
+  // names one. An id this image does not know is refused before anything is dealt.
   bytes service_identifier = 4;
+  // What ties the two halves together at the service, 16 bytes, drawn fresh for each attempt.
   bytes attempt_id = 5;
 }
 
@@ -756,8 +754,7 @@ message EscrowServerMsg {
     EscrowRound1Out round1 = 3;
     EscrowComplete complete = 4;
     // The pairing that follows, when one was asked for: the cosigner's half delivered and sealed
-    // pending, then the wallet's confirmation taken. No `PairServiceReady` — the wallet already
-    // holds the escrow share it just minted.
+    // pending, then the wallet's confirmation taken.
     PairServiceDone paired = 5;
     PairServiceConfirmResponse confirmed = 6;
   }
@@ -783,32 +780,6 @@ message EscrowComplete {
   string escrow_key = 2;
 }
 
-// A stream rather than one call, because the wallet cannot deal until it has rebuilt its escrow
-// share — and it keeps no share, so the halves it needs ride this stream as they ride every other.
-message PairServiceClientMsg {
-  string session_id = 1;
-  uint64 seq = 2;
-  oneof body {
-    PairServiceOpen open = 3;
-    PairServiceDeal deal = 4;
-  }
-}
-
-message PairServiceOpen {
-  // Which escrow, compressed hex.
-  string escrow_key = 1;
-  // The service's FROST identifier, 32 bytes. The IMAGE resolves this to an origin; the request
-  // never names one. An id this image does not know is refused here, before anything is dealt.
-  bytes service_identifier = 2;
-  // What ties the two halves together, 16 bytes, drawn fresh by the wallet for each ATTEMPT.
-  //
-  // The two contributions reach the service by different routes — the cosigner's directly from the
-  // enclave, the wallet's from the device — so the service needs to know which two belong to each
-  // other. A retry deals fresh halves on a fresh slope, and halves from two attempts do not sum to
-  // anything; this is what keeps them apart rather than relying on the verification to notice.
-  bytes attempt_id = 3;
-}
-
 message PairServiceDeal {
   // The wallet's contribution to the cosigner: a 32-byte scalar.
   bytes contribution_to_cosigner = 1;
@@ -816,24 +787,6 @@ message PairServiceDeal {
   // behind it. A cosigner holding both that scalar and its own counter-share would have two points
   // on one line; it checks this point against public data instead. See `handlers/pairing.rs`.
   bytes contribution_to_service = 2;
-}
-
-message PairServiceServerMsg {
-  string session_id = 1;
-  uint64 seq = 2;
-  oneof body {
-    PairServiceReady ready = 3;
-    PairServiceDone done = 4;
-  }
-}
-
-// What the wallet needs to rebuild its escrow share, and nothing more. Both are halves of sums
-// whose other terms come from the passkey — see `SendSighashes.wallet_dealt_share`.
-message PairServiceReady {
-  // `f_cosigner(wallet identifier)` for the WALLET key, 32 bytes.
-  bytes wallet_dealt_share = 1;
-  // `delta_cosigner(wallet identifier)` for THIS ESCROW, 32 bytes.
-  bytes escrow_delta_share = 2;
 }
 
 message PairServiceDone {
@@ -848,10 +801,12 @@ message PairServiceDone {
   // different hosts would split a share between them. The wallet trusts this because it trusts
   // the attestation that says which image is running.
   string service_origin = 3;
-  // Echoed so the wallet labels its own delivery with the attempt this pairing belongs to.
-  bytes attempt_id = 4;
+  // The attempt id, echoed. The wallet sent it, so it labels its own delivery with that.
+  reserved 4;
+  reserved "attempt_id";
 }
 
+// The wallet's word, on the `Escrow` stream, that the service took its half.
 message PairServiceConfirmRequest {
   // Authentication is the runtime's — see the note at the top of this file.
   reserved 1, 2, 3;
@@ -930,80 +885,4 @@ message EscrowSessionSummary {
   int64 opened_at = 3;
   uint64 released_sats = 4;
   string policy_description = 5;
-}
-
-// ===========================================================================
-// Reclaiming an escrow
-//
-// The same four steps a send takes, because it IS a send — of the escrow's key rather than the
-// wallet's. The cosigner builds it, signs its half, and hands over transactions to submit; the
-// wallet drives the ASP, as it does for its own sends.
-// ===========================================================================
-
-message EscrowReclaimClientMsg {
-  string session_id = 1;
-  uint32 seq = 2;
-  oneof body {
-    EscrowReclaimOpen open = 3;
-    // The wallet's half of the FROST round, one entry per sighash and in the same order.
-    EscrowReclaimSigned signed = 4;
-    SendSubmitted submitted = 5;
-    SendFinalized finalized = 6;
-  }
-}
-
-message EscrowReclaimOpen {
-  // Which escrow. Compared x-only, so either parity resolves.
-  string escrow_key = 1;
-  // Reserved: the wallet's identifier used to be sent here. It is not, because the cosigner
-  // already has it — the ceremony recorded it — and reading it off the wire would be asking the
-  // caller to tell us something we know.
-  reserved 2;
-  reserved "identifier";
-  // The escrow's VTXOs, as the wallet's indexer resolved them.
-  //
-  // Named by the caller because this cosigner does not index the escrow's funds. That is safe for
-  // the same reason it is safe on a release: a taproot sighash commits to every prevout, so an
-  // input claimed wrongly produces a signature that verifies against nothing. The only claim that
-  // yields a usable signature is the true one.
-  repeated VtxoInput vtxos = 3;
-  mpc_wallet.ArkInfo ark_info = 4;
-}
-
-message EscrowReclaimSigned {
-  repeated WalletRound rounds = 1;
-}
-
-message EscrowReclaimServerMsg {
-  string session_id = 1;
-  uint32 seq = 2;
-  oneof body {
-    EscrowReclaimSighashes sighashes = 3;
-    SendSubmit submit = 4;
-    SendFinalize finalize = 5;
-    EscrowReclaimComplete complete = 6;
-  }
-}
-
-message EscrowReclaimSighashes {
-  repeated bytes messages_to_sign = 1;
-  // Round one, the cosigner's half: its commitment for each message, in the same order. It commits
-  // first here, as it does for a send — the wallet is present, holding the stream.
-  repeated Commitment cosigner_commitments = 2;
-  // Which identifier those commitments are the ESCROW key's, hex. A commitment carries no
-  // identifier of its own, so it is said once for the batch.
-  string cosigner_identifier = 7;
-  // The two halves the wallet needs to rebuild its share of the ESCROW key: what this cosigner
-  // dealt it at DKG, and this cosigner's delta share for it. The third term comes from the passkey
-  // and never leaves the device.
-  bytes wallet_dealt_share = 3;
-  bytes escrow_delta_share = 4;
-  // Where the money is going, and how much. Derived here, reported so the owner sees what they are
-  // signing rather than being told it worked.
-  string to_ark_address = 5;
-  uint64 amount_sats = 6;
-}
-
-message EscrowReclaimComplete {
-  string ark_txid = 1;
 }

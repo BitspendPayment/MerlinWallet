@@ -1,4 +1,4 @@
-//! FROST carried inside the Send and Settle streams.
+//! FROST carried inside the Send and Renew streams.
 //!
 //! The nested form — a second `Sign` stream per sighash while the outer stream waited — deadlocks
 //! inside enclave-runtime, which runs one request per tenant for the whole life of a stream. That
@@ -81,7 +81,7 @@ fn seeded() -> Option<(cosigner::Cosigner, Vec<KeyPackage>, PublicKeyPackage)> {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
     Some((cosigner.into_inner().unwrap(), kps, pkp))
 }
 

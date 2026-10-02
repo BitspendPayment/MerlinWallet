@@ -28,8 +28,8 @@ class SendResult {
   SendResult(this.arkTxid, this.delegate, {this.committed});
   final String arkTxid;
 
-  /// The delegate sealed over the wallet's set after the send, when [SendSession.send] was asked to
-  /// and could. See `delegate.dart`.
+  /// The delegate renewed over the wallet's set after the send, when [SendSession.send] was asked
+  /// to and could. See `delegate.dart`.
   final DelegateStatus? delegate;
 
   /// The deal an `escrowCommit` asked for, as the cosigner sealed it. Null means NOT committed —
@@ -45,7 +45,7 @@ class SendSession {
   /// Send [amountSats] to [recipientArkAddress].
   ///
   /// With [readHeld], once the send completes the wallet's set is re-read until the indexer
-  /// reflects it and a delegate is sealed over it, on this stream — see `delegate.dart`.
+  /// reflects it and the delegate is renewed over it, on this stream — see `delegate.dart`.
   ///
   /// [vtxos] is what this wallet holds, from the indexer. The cosigner validates every one against
   /// the scriptPubKey it derives from its own owner key before selecting from them, so naming a
@@ -98,7 +98,7 @@ class SendSession {
       }
       final h = sighashes.sighashes;
       // The first sighashes of the stream: they bring the half of the share the cosigner dealt,
-      // and this is where the share comes to exist. The trailing seal reuses it.
+      // and this is where the share comes to exist. A trailing delegate renewal reuses it.
       final keyPkg = resolve(h.walletDealtShare);
       duplex.send(cs.SendClientMsg(
         sessionId: '',
@@ -155,10 +155,10 @@ class SendSession {
       final arkTxid = complete.complete.arkTxid;
       final committed = complete.complete.hasCommitted() ? complete.complete.committed : null;
 
-      // --- Seal a delegate over what is held now, before closing -----------------------------
+      // --- Renew the delegate over what is held now, before closing --------------------------
       final delegate = readHeld == null
           ? null
-          : await sealAfter<cs.SendClientMsg, cs.SendServerMsg>(
+          : await renewDelegateAfter<cs.SendClientMsg, cs.SendServerMsg>(
               duplex: duplex,
               // A send spends every input it was given; what remains is its change, and whatever
               // arrived meanwhile.
@@ -167,7 +167,7 @@ class SendSession {
               info: info,
               resolve: resolve,
               groupPubKey: groupPubKey,
-              seal: (s) => cs.SendClientMsg(sessionId: '', seq: Int64(4), seal: s),
+              request: (s) => cs.SendClientMsg(sessionId: '', seq: Int64(4), renewDelegate: s),
               deviceToken: deviceToken,
               exitScriptPubkeyHex: exitScriptPubkeyHex,
               ownerXOnlyHex: ownerXOnlyHex,
@@ -183,7 +183,7 @@ class SendSession {
                   : null,
               signed: (rounds) =>
                   cs.SendClientMsg(sessionId: '', seq: Int64(5), signed: cs.SendSigned(rounds: rounds)),
-              sealedOf: (r) => r.hasSealed() ? r.sealed : null,
+              renewedOf: (r) => r.hasDelegateRenewed() ? r.delegateRenewed : null,
             );
       return SendResult(arkTxid, delegate, committed: committed);
     } finally {

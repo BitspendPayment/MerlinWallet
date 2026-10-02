@@ -171,7 +171,7 @@ fn a_wallet_with_a_key_refuses_a_second_dkg() {
     );
 
     let (kps, pkp) = common::dkg_2of2();
-    common::seed_policy(&fresh, "wallet", &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&fresh, "wallet", &kps[1], &kps[0], &pkp);
     drop(fresh);
 
     // Reopened, so the refusal comes from the seal and not from memory.

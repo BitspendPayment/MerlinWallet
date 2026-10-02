@@ -82,13 +82,12 @@ Future<void> main(List<String> args) async {
 
     // ---- 1. create and pair the escrow --------------------------------------------------------
     _step(1, 'Create and pair escrow');
-    final escrow = await alice.client.createEscrow();
-    print('  escrow key       ${escrow.escrowKeyHex}');
-    final pairing = await alice.client.pairService(
-      escrowKeyHex: escrow.escrowKeyHex,
+    final set = await alice.client.setUpEscrow(
       serviceIdentifier: serviceIdentifier,
       delivery: RewritingDelivery(),
     );
+    final escrow = set.escrow, pairing = set.pairing;
+    print('  escrow key       ${escrow.escrowKeyHex}');
     print('  cosigner delivered its half over the runtime-held stream');
     print('  wallet delivered its own half straight to ${pairing.serviceOrigin}');
     final ready = await _awaitPaired(alice.client, escrow.escrowKeyHex);
@@ -303,7 +302,7 @@ Future<List<IndexerVtxo>> _escrowVtxos(Wallet alice, String escrowKeyHex) async 
 
 /// Board, settle, and send the escrow its funding.
 ///
-/// Mining while the settle runs, because a settle waits on a round the chain has to advance for —
+/// Mining while the renewal runs, because a renewal waits on a round the chain has to advance for —
 /// the same thing the e2e suite does, spelled out here rather than borrowed from a test.
 Future<void> _fund(Wallet alice, RegtestHelper btc, String escrowAddress, int sats) async {
   final boarding = await alice.client.getBoardingAddress();
@@ -311,7 +310,7 @@ Future<void> _fund(Wallet alice, RegtestHelper btc, String escrowAddress, int sa
   await btc.generateToAddress(1, await btc.getNewAddress());
   final deposits = await pollBoardingUtxos(boarding, 200000);
   if (deposits.isEmpty) throw StateError('the deposit was never indexed');
-  await _whileMining(btc, () => settleBoarding(alice.client, deposits));
+  await _whileMining(btc, () => renewBoarding(alice.client, deposits));
   await _whileMining(btc, () => alice.client.sendVtxo(escrowAddress, sats));
 }
 

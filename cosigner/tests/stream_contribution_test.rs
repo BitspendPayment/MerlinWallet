@@ -2,11 +2,10 @@
 //!
 //! The wallet keeps no share between operations. Each one re-derives the wallet's own half from its
 //! passkey and adds the half the cosigner dealt it at DKG — which used to come back from `Recover`
-//! alone, and now rides the first round of `Sign`, `Send` and `Settle`, under the approval the
+//! alone, and now rides the first round of `Sign`, `Send` and `Renew`, under the approval the
 //! stream already has. These tests are about what may come back, to whom, and how often:
 //!
 //!  * to the identifier the ceremony recorded, and to no other;
-//!  * never without the runtime's tenant, which is what says whose instance this is;
 //!  * once per stream, on its first round;
 //!  * and never the cosigner's *own* share, which is a different scalar and leaves for nobody.
 //!
@@ -29,7 +28,7 @@ use cosigner::Cosigner;
 use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::scalar::scalar_to_bytes;
 
-use common::wire::{block_on, collect, request, service, Answer, TENANT};
+use common::wire::{block_on, collect, request, service, Answer};
 
 /// What the cosigner dealt this wallet. Any 32 bytes: nothing here adds it to anything.
 const DEALT: [u8; 32] = [0x5a; 32];
@@ -61,8 +60,6 @@ fn wallet(dealt: Option<[u8; 32]>) -> Option<Wallet> {
         &kps[1],
         &kps[0],
         &pkp,
-        // A seal needs the Ark cosigner key to sign the delegate with.
-        Some(hex::encode([9u8; 32])),
         dealt.map(hex::encode),
     );
     Some(Wallet { cosigner: cosigner.into_inner().unwrap(), kps, pkp })
@@ -122,20 +119,20 @@ fn send_open(w: &Wallet, identifier: Vec<u8>) -> proto::SendClientMsg {
             ark_info: Some(ark_info()),
             vtxos: vec![vtxo('a')],
             identifier,
-            escrow_commit: None,
+            ..Default::default()
         })),
     }
 }
 
-/// A `seal_only` settle: the one settle whose first round needs no ASP to have said anything.
-fn settle_open(identifier: Vec<u8>) -> proto::SettleClientMsg {
-    proto::SettleClientMsg {
+/// A `delegate_only` renewal: the one renewal whose first round needs no ASP to have said anything.
+fn renew_open(identifier: Vec<u8>) -> proto::RenewClientMsg {
+    proto::RenewClientMsg {
         session_id: "s".into(),
         seq: 0,
-        body: Some(proto::settle_client_msg::Body::Open(proto::SettleOpen {
+        body: Some(proto::renew_client_msg::Body::Open(proto::RenewOpen {
             ark_info: Some(ark_info()),
             vtxos: vec![vtxo('a')],
-            seal_only: true,
+            delegate_only: true,
             identifier,
             ..Default::default()
         })),
@@ -146,7 +143,7 @@ fn settle_open(identifier: Vec<u8>) -> proto::SettleClientMsg {
 enum First {
     Sign(Answer<proto::SignServerMsg>),
     Send(Answer<proto::SendServerMsg>),
-    Settle(Answer<proto::SettleServerMsg>),
+    Renew(Answer<proto::RenewServerMsg>),
 }
 
 impl First {
@@ -154,7 +151,7 @@ impl First {
         match self {
             First::Sign(a) => a.code,
             First::Send(a) => a.code,
-            First::Settle(a) => a.code,
+            First::Renew(a) => a.code,
         }
     }
 
@@ -162,7 +159,7 @@ impl First {
         match self {
             First::Sign(a) => &a.message,
             First::Send(a) => &a.message,
-            First::Settle(a) => &a.message,
+            First::Renew(a) => &a.message,
         }
     }
 
@@ -170,7 +167,7 @@ impl First {
         match self {
             First::Sign(a) => a.messages.len(),
             First::Send(a) => a.messages.len(),
-            First::Settle(a) => a.messages.len(),
+            First::Renew(a) => a.messages.len(),
         }
     }
 
@@ -186,30 +183,30 @@ impl First {
                 Some(proto::send_server_msg::Body::Sighashes(s)) => s.wallet_dealt_share.clone(),
                 other => panic!("expected sighashes, got {other:?}"),
             },
-            First::Settle(a) => match &a.messages.first().expect("an answer").body {
-                Some(proto::settle_server_msg::Body::Sighashes(s)) => s.wallet_dealt_share.clone(),
+            First::Renew(a) => match &a.messages.first().expect("an answer").body {
+                Some(proto::renew_server_msg::Body::Sighashes(s)) => s.wallet_dealt_share.clone(),
                 other => panic!("expected sighashes, got {other:?}"),
             },
         }
     }
 }
 
-const STREAMS: &[&str] = &["Sign", "Send", "Settle"];
+const STREAMS: &[&str] = &["Sign", "Send", "Renew"];
 
 /// Open [stream] on [w]'s instance as the wallet [identifier] claims to be, and read what comes back.
-fn open(stream: &str, w: Wallet, identifier: Vec<u8>, tenant: Option<&str>) -> First {
+fn open(stream: &str, w: Wallet, identifier: Vec<u8>) -> First {
     match stream {
         "Sign" => First::Sign(collect(block_on(
-            service(w.cosigner).route(request("Sign", &[sign_open(identifier)], tenant)),
+            service(w.cosigner).route(request("Sign", &[sign_open(identifier)])),
         ))),
         "Send" => {
             let open = send_open(&w, identifier);
             First::Send(collect(block_on(
-                service(w.cosigner).route(request("Send", &[open], tenant)),
+                service(w.cosigner).route(request("Send", &[open])),
             )))
         }
-        "Settle" => First::Settle(collect(block_on(
-            service(w.cosigner).route(request("Settle", &[settle_open(identifier)], tenant)),
+        "Renew" => First::Renew(collect(block_on(
+            service(w.cosigner).route(request("Renew", &[renew_open(identifier)])),
         ))),
         other => panic!("no such stream: {other}"),
     }
@@ -221,7 +218,7 @@ fn every_signing_stream_returns_the_dealt_share_to_the_wallets_own_identifier() 
     for stream in STREAMS {
         let Some(w) = wallet(Some(DEALT)) else { return };
         let id = w.identifier();
-        let first = open(stream, w, id, Some(TENANT));
+        let first = open(stream, w, id);
         assert_eq!(
             first.answered(),
             1,
@@ -243,7 +240,7 @@ fn the_cosigners_own_share_never_leaves() {
         let Some(w) = wallet(Some(DEALT)) else { return };
         let own = scalar_to_bytes(&w.kps[1].secret_share).to_vec();
         let id = w.identifier();
-        let dealt = open(stream, w, id, Some(TENANT)).dealt();
+        let dealt = open(stream, w, id).dealt();
         assert_ne!(dealt, own, "{stream} returned the cosigner's own signing share");
     }
 }
@@ -255,7 +252,7 @@ fn an_identifier_the_ceremony_never_saw_is_refused_on_every_stream() {
     for stream in STREAMS {
         let Some(w) = wallet(Some(DEALT)) else { return };
         let Some(stranger) = wallet(Some([0x11; 32])) else { return };
-        let first = open(stream, w, stranger.identifier(), Some(TENANT));
+        let first = open(stream, w, stranger.identifier());
         assert_eq!(
             first.code(),
             Code::PermissionDenied as u32,
@@ -276,26 +273,13 @@ fn one_tenants_instance_does_not_answer_for_another_tenants_wallet() {
         };
         let (id_a, id_b) = (a.identifier(), b.identifier());
 
-        let b_on_a = open(stream, a, id_b, Some(TENANT));
+        let b_on_a = open(stream, a, id_b);
         assert_eq!(b_on_a.code(), Code::PermissionDenied as u32, "{stream}: {}", b_on_a.message());
         assert_eq!(b_on_a.answered(), 0);
 
-        let a_on_b = open(stream, b, id_a, Some(TENANT));
+        let a_on_b = open(stream, b, id_a);
         assert_eq!(a_on_b.code(), Code::PermissionDenied as u32, "{stream}: {}", a_on_b.message());
         assert_eq!(a_on_b.answered(), 0);
-    }
-}
-
-/// Knowing the identifier is not enough — it is public. Without the tenant the runtime resolved,
-/// nothing is answered at all.
-#[test]
-fn the_right_identifier_without_a_tenant_gets_nothing() {
-    for stream in STREAMS {
-        let Some(w) = wallet(Some(DEALT)) else { return };
-        let id = w.identifier();
-        let first = open(stream, w, id, None);
-        assert_eq!(first.code(), Code::Unauthenticated as u32, "{stream}: {}", first.message());
-        assert_eq!(first.answered(), 0, "{stream} answered an unapproved caller");
     }
 }
 
@@ -305,7 +289,7 @@ fn the_right_identifier_without_a_tenant_gets_nothing() {
 fn a_missing_identifier_is_refused() {
     for stream in STREAMS {
         let Some(w) = wallet(Some(DEALT)) else { return };
-        let first = open(stream, w, Vec::new(), Some(TENANT));
+        let first = open(stream, w, Vec::new());
         assert_eq!(first.code(), Code::InvalidArgument as u32, "{stream}: {}", first.message());
         assert_eq!(first.answered(), 0);
     }
@@ -318,7 +302,7 @@ fn a_wallet_with_no_dealt_share_cannot_sign() {
     for stream in STREAMS {
         let Some(w) = wallet(None) else { return };
         let id = w.identifier();
-        let first = open(stream, w, id, Some(TENANT));
+        let first = open(stream, w, id);
         assert_eq!(first.code(), Code::FailedPrecondition as u32, "{stream}: {}", first.message());
         assert!(
             first.message().contains("created before recovery existed"),
@@ -338,7 +322,7 @@ fn a_key_path_sign_is_refused_by_name() {
         o.script_path_spend = false;
     }
     let answer = collect::<proto::SignServerMsg>(block_on(
-        service(w.cosigner).route(request("Sign", &[open], Some(TENANT))),
+        service(w.cosigner).route(request("Sign", &[open])),
     ));
     assert_eq!(answer.code, Code::InvalidArgument as u32, "{}", answer.message);
     assert!(answer.messages.is_empty(), "no share may go out for a round that will not run");
@@ -370,7 +354,7 @@ fn a_top_up_whose_deal_could_not_be_struck_is_refused_before_anything_is_built()
         common::seed_escrow(&c, ESCROW, paired);
 
         let answer: Answer<proto::SendServerMsg> = collect(block_on(
-            service(c.into_inner().unwrap()).route(request("Send", &[open], Some(TENANT))),
+            service(c.into_inner().unwrap()).route(request("Send", &[open])),
         ));
         if paired {
             assert_eq!(answer.messages.len(), 1, "{} {}", answer.code, answer.message);
@@ -419,7 +403,7 @@ fn a_mint_that_names_a_service_checks_it_before_anything_is_dealt() {
             })),
         };
         let answer: Answer<proto::EscrowServerMsg> = collect(block_on(
-            service(w.cosigner).route(request("Escrow", &[open], Some(TENANT))),
+            service(w.cosigner).route(request("Escrow", &[open])),
         ));
         match refused {
             None => {

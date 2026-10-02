@@ -83,7 +83,7 @@ Map<String, dynamic> validateClientState(dynamic raw) {
 
 /// Thread-safe wallet store with optional encryption support.
 ///
-/// What it holds is public: who the wallet is, the delegate last sealed and the exits signed with
+/// What it holds is public: who the wallet is, the delegate last renewed and the exits signed with
 /// it. It used to hold the client's half of the key as well. It does not, and [saveClientState]
 /// refuses anything that looks as though it might — a store that cannot be handed a secret is a
 /// stronger statement than callers that remember not to hand it one.

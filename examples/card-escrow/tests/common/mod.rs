@@ -14,7 +14,7 @@ use ark::client::types::ArkInfo;
 use card_escrow::policy::Terms;
 use card_escrow::provider::{MockProvider, MockTransaction, SimulateAuthorization, SimulateClearing};
 use cosigner::asp::AspApi;
-use cosigner::escrow_session::EscrowSession;
+use cosigner::escrow_session::Escrow;
 use cosigner::evidence::{Evidence, EvidenceRequest, FetchEvidence};
 use cosigner::handlers::helpers::block_on_ready;
 use cosigner::handlers::release::{ProposedInput, ReleaseRequest, WireCommitment};
@@ -222,8 +222,7 @@ impl World {
             .ok()?;
         cosigner
             .open_escrow_session(
-                &escrow_key,
-                EscrowSession::open(policy, now, now + lasts).ok()?,
+                Escrow::validate(&escrow_key, policy, now, now + lasts).ok()?,
                 now,
             )
             .ok()?;
@@ -349,8 +348,7 @@ impl World {
         let now = now();
         self.cosigner
             .open_escrow_session(
-                &key,
-                EscrowSession::open(policy, now, now + HOUR).expect("a new deal"),
+                Escrow::validate(&key, policy, now, now + HOUR).expect("a new deal"),
                 now,
             )
             .expect("a new deal can be struck once the last is over");
@@ -372,8 +370,7 @@ impl World {
             .expect("a second escrow");
         self.cosigner
             .open_escrow_session(
-                &key,
-                EscrowSession::open(policy, now, now + HOUR).expect("a deal"),
+                Escrow::validate(&key, policy, now, now + HOUR).expect("a deal"),
                 now,
             )
             .expect("commit it");
@@ -494,7 +491,6 @@ fn seed_policy(
             &kp_cosigner.to_json(),
             &pkp.to_json(),
             Some(&hex::encode(kp_user.identifier.serialize())),
-            Some(hex::encode([9u8; 32])),
             Some(hex::encode([7u8; 32])),
         )
         .expect("install policy");

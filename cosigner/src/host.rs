@@ -68,17 +68,11 @@ pub trait Host: Send + Sync {
     /// over the attested channel.
     fn wake(&self, category: &str, reference: Option<&str>) -> Result<(), String>;
 
-    // --- Connections the runtime holds ---------------------------------------------------------
+    // --- Connections to services, held by the runtime -----------------------------------------
     //
-    // An escrow service has no passkey for its user's tenant, so it can never call in; and this
-    // cosigner has no execution context between invocations, so it cannot hold a socket open. The
-    // runtime holds it, and each message becomes one invocation — see `enclave:streams`.
+    // Outbound: each message from a service is one invocation.
 
-    /// Ask the runtime to maintain a connection, and to keep maintaining it. Durable: it survives a
-    /// restart and is re-established without this cosigner being involved.
-    ///
-    /// `origin` must be one the IMAGE allows, exactly as an outgoing request must — asking the
-    /// runtime to hold a connection reaches no further than making the request directly.
+    /// Hold a connection to `origin`, which the image must allow. Survives a restart.
     fn stream_open(&self, id: &str, origin: &str) -> Result<(), String>;
 
     /// Stop maintaining it. Idempotent.

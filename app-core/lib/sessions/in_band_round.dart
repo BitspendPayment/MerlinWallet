@@ -1,6 +1,6 @@
 /// The wallet's half of a FROST round, carried inside the stream that needs the signatures.
 ///
-/// A send and a settle both stop for the wallet to sign sighashes the cosigner built. They used to
+/// A send and a renewal both stop for the wallet to sign sighashes the cosigner built. They used to
 /// open a *second* stream — a nested `Sign` per sighash — while the outer stream waited. That
 /// deadlocks inside enclave-runtime, which runs **one request per tenant for the whole life of a
 /// stream**: the outer stream holds the tenant, the nested one waits for it, and nothing moves

@@ -3,7 +3,8 @@
 /// A VTXO can be spent two ways: with the ASP's help, or alone after a relative timelock. The
 /// second way is what remains when the ASP or this wallet's cosigner stops answering — except that
 /// the "alone" is a 2-of-2, so the signature has to be obtained while the cosigner is still here.
-/// That is what a seal does: it hands back one signed exit per VTXO, and the wallet keeps them.
+/// That is what a delegate renewal does: it hands back one signed exit per VTXO, and the wallet
+/// keeps them.
 ///
 /// What this file is for is the check before the signature. The cosigner builds the exits and asks
 /// the wallet to sign their sighashes; the wallet builds the same exits from what it independently

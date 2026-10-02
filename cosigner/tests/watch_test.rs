@@ -156,7 +156,6 @@ fn with_delegate(
         &kps[1].to_json(),
         &pkp.to_json(),
         Some(&hex::encode(kps[0].identifier.serialize())),
-        Some(hex::encode([9u8; 32])),
         None,
     )
     .expect("install policy");
@@ -326,6 +325,20 @@ fn a_delegate_the_asp_refuses_wakes_the_owner_and_keeps_the_watch() {
     assert!(host.cancelled.lock().unwrap().is_empty(), "the delegate is still owed");
 }
 
+/// A delegate waiting for its deadline is not a round. What a renewal reports is refused rather than
+/// pinned on it — only a round in flight takes a registration or signatures.
+#[test]
+fn a_waiting_delegate_takes_nothing_meant_for_a_round() {
+    let Some(store) = common::try_store() else {
+        return;
+    };
+    let Some((mut c, _)) = with_delegate(&store, Arc::new(Recorder::default())) else {
+        return;
+    };
+    assert!(c.renew_registered("intent-1".into()).is_err());
+    assert!(c.renew_signed(Vec::new()).is_err());
+}
+
 /// The registration is sealed as soon as the ASP assigns it, so a run that dies mid-round and is
 /// retried follows the same registration instead of making a second one.
 #[test]
@@ -375,16 +388,16 @@ fn a_run_id_from_the_runtime_is_accepted() {
     assert!(err.contains("tenant-local"), "unhelpful error: {err}");
 }
 
-/// Sealing needs a deadline: with no expiry known there is nothing to schedule a renewal for, and a
+/// A renewal needs a deadline: with no expiry known there is nothing to schedule it for, and a
 /// delegate valid "now" would be a refresh nobody asked for.
 #[test]
-fn sealing_without_a_known_expiry_is_refused() {
+fn renewing_without_a_known_expiry_is_refused() {
     let Some(store) = common::try_store() else {
         return;
     };
     let mut c = open_with(&store, Arc::new(Recorder::default()), "unindexed");
     let err = c
-        .seal_delegate_open(
+        .renew_delegate_open(
             vec![VtxoInput {
                 txid: "a".repeat(64),
                 vout: 0,
@@ -400,9 +413,9 @@ fn sealing_without_a_known_expiry_is_refused() {
     assert!(err.contains("known expiry"), "unhelpful error: {err}");
 }
 
-/// Sealing a new delegate re-arms the watch for its own deadline. The runtime refuses an id reused
+/// Renewing the delegate re-arms the watch for its own deadline. The runtime refuses an id reused
 /// with different input, so the old watch is cancelled and forgotten first — without that, the
-/// second delegate a wallet ever sealed failed, and the first time the cosigner refreshed funds
+/// second renewal a wallet ever made failed, and the first time the cosigner refreshed funds
 /// itself, the wallet could never protect them again.
 #[test]
 fn arming_again_for_a_new_deadline_replaces_the_watch() {

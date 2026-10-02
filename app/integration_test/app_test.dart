@@ -28,7 +28,7 @@ void main() {
       //
       // The wallet is Ark-only now: there is no on-chain balance, no on-chain send, and no home
       // screen for either. What onboarding gained instead is the exit address, which is asked for
-      // before the wallet opens because every later seal pre-signs a spend to it.
+      // before the wallet opens because every later renewal pre-signs a spend to it.
       await resetAppState();
       await bootApp(tester);
       final exitAddress = await btc.getNewAddress();
@@ -71,8 +71,8 @@ void main() {
             reason: 'ark balance should be non-zero after boarding');
 
         // Auto-delegate regression guard. MpcService.refreshVtxos() ends
-        // with _delegateIfNeeded, which calls settleDelegate(storeOnly:
-        // true) when vtxos are non-empty and no delegate is yet stored.
+        // with _delegateIfNeeded, which renews the delegate when vtxos are
+        // non-empty and no delegate is yet stored.
         // After boarding settles, both conditions are true → delegate
         // should be stored within seconds.
         await svcBoard.refreshVtxos();
@@ -90,12 +90,12 @@ void main() {
 
         // ── The exits are real ───────────────────────────────────────
         //
-        // Sealing a delegate also signs one unilateral exit per VTXO. This is the thing the
+        // Renewing a delegate also signs one unilateral exit per VTXO. This is the thing the
         // cosigner cannot be asked for later: if it stops answering, these are the money.
         expect(svcBoard.exits, isNotEmpty,
-            reason: 'boarding sealed a delegate, which must also have signed an exit');
+            reason: 'boarding renewed the delegate, which must also have signed an exit');
         expect(svcBoard.vtxosWithoutExit, isEmpty,
-            reason: 'every held VTXO should have an exit after a seal');
+            reason: 'every held VTXO should have an exit after a renewal');
         final boardedExit = svcBoard.exits.first;
         expect(boardedExit.rawTx, isNotEmpty);
         expect(boardedExit.amountSats, greaterThan(0));
@@ -133,7 +133,7 @@ void main() {
         await Future<void>.delayed(const Duration(seconds: 15));
 
         // A fresh outpoint makes the sealed renewal stale, so refreshVtxos ->
-        // _delegateIfNeeded settles again and re-arms it.
+        // _delegateIfNeeded renews again and re-arms it.
         await svcBoard.refreshVtxos();
         final bgDeadline = DateTime.now().add(const Duration(minutes: 3));
         while (!svcBoard.fundsProtected &&
@@ -146,9 +146,9 @@ void main() {
             reason: 'Alice should hold Bob\'s 1500-sat VTXO (after fees)');
         expect(svcBoard.fundsProtected, isTrue,
             reason:
-                'a fresh outpoint should have triggered a settle, leaving a '
+                'a fresh outpoint should have triggered a renewal, leaving a '
                 'renewal that covers it. If false, _delegateIfNeeded did not '
-                'run or the settle round failed — the round waits on the ASP\'s '
+                'run or the renewal failed — the round waits on the ASP\'s '
                 'own schedule, so give it longer before suspecting the wiring.');
         expect(svcBoard.vtxosWithoutExit, isEmpty,
             reason: 'the seal that covered the received funds also signed their exit');

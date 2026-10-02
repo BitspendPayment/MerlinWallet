@@ -422,10 +422,11 @@ class MpcService extends ChangeNotifier {
   ///  2. **Ask the cosigner** for the half of the key it dealt at DKG — the gesture that approves
   ///     that call is the one that yields the seed — and check the two halves make this wallet's
   ///     share. See [MpcClient.recover]: what is saved is the public half, never the share.
-  ///  3. **Open the wallet.** Load VTXOs from the ASP; a new delegate is recorded on the next seal.
+  ///  3. **Open the wallet.** Load VTXOs from the ASP; a new delegate is recorded on the next
+  ///     delegate renewal.
   ///
   /// The exits do not come back — they are this device's copies of transactions signed for the old
-  /// one — so the exit address is asked for again and the next seal reissues them.
+  /// one — so the exit address is asked for again and the next delegate renewal reissues them.
   ///
   /// Throws if this install already has a wallet: recovering over one would replace it.
   Future<void> restoreWallet() async {
@@ -500,7 +501,7 @@ class MpcService extends ChangeNotifier {
   /// Stop the operation in flight — a board, a send, a renewal — if there is one.
   ///
   /// It fails where it stands, lets go of the key it rebuilt, and frees the queue behind it. For an
-  /// owner who has decided to stop waiting: a settle waits on the ASP for minutes by design, so
+  /// owner who has decided to stop waiting: a renewal waits on the ASP for minutes by design, so
   /// nothing but the owner can tell a slow batch from an ASP that has gone. Not something to call
   /// on a timer, or because the app went to the background — a round abandoned after its intent is
   /// registered is one the ASP was counting on. See [MpcClient.cancelOperation].
@@ -511,7 +512,7 @@ class MpcService extends ChangeNotifier {
 
   /// Hang up on the cosigner and the ASP, without waiting on an operation that may never finish.
   ///
-  /// `close` is graceful — it waits for calls in flight — so behind a settle parked on a silent
+  /// `close` is graceful — it waits for calls in flight — so behind a renewal parked on a silent
   /// ASP it would wait for ever, and so would the reconnect that was meant to fix exactly that.
   /// The operation is cancelled first: it fails, and lets go of what it held.
   Future<void> _hangUp() async {
@@ -609,8 +610,8 @@ class MpcService extends ChangeNotifier {
   /// Whether a sealed delegate covers everything held — so the cosigner will refresh it on its own,
   /// from the enclave, before it expires.
   ///
-  /// Answered locally, from the indexer and the delegate the last send, settle or [protectFunds]
-  /// sealed — no call to the cosigner, so no passkey prompt. It stops being true when funds arrive
+  /// Answered locally, from the indexer and the delegate the last send, renewal or [protectFunds]
+  /// renewed — no call to the cosigner, so no passkey prompt. It stops being true when funds arrive
   /// that no delegate covers: a receive, or the VTXO the cosigner produced when it ran one.
   bool get fundsProtected {
     final delegate = _client?.delegateStatus;
@@ -651,7 +652,8 @@ class MpcService extends ChangeNotifier {
 
   // --- The way out ------------------------------------------------------------------------------
   //
-  // Every seal signs one unilateral exit per VTXO, paying an address this wallet does not control.
+  // Every delegate renewal signs one unilateral exit per VTXO, paying an address this wallet does
+  // not control.
   // They are what the money is if the cosigner is never heard from again, so what matters here is
   // which funds have one and which do not.
 
@@ -662,15 +664,15 @@ class MpcService extends ChangeNotifier {
 
   bool get hasExitAddress => (_exitAddress ?? '').isNotEmpty;
 
-  /// The exits this wallet holds, from the last seal.
+  /// The exits this wallet holds, from the last delegate renewal.
   List<ExitTx> get exits => _client?.exits ?? const [];
 
   /// Held VTXOs with no exit signed for them.
   ///
-  /// Anything received since the last seal, and — the one that matters — everything the cosigner
-  /// made by running a delegate while nobody was here: a renewal spends the VTXOs the old exits
-  /// named and makes a new one, which cannot be pre-signed until it exists. Sealing again covers
-  /// it, which is what [protectFunds] does.
+  /// Anything received since the last delegate renewal, and — the one that matters — everything the
+  /// cosigner made by running a delegate while nobody was here: a renewal spends the VTXOs the old
+  /// exits named and makes a new one, which cannot be pre-signed until it exists. Renewing it again
+  /// covers it, which is what [protectFunds] does.
   List<IndexerVtxo> get vtxosWithoutExit {
     final covered = {for (final e in exits) e.outpoint};
     return _held
@@ -759,20 +761,22 @@ class MpcService extends ChangeNotifier {
     return token;
   }
 
-  /// Have the cosigner enrol [token] for wakes — on the DKG, or on the next delegate seal (a send, a
-  /// settle, or "Renew automatically"), never as a call of its own. Every call is a passkey approval,
-  /// and a separate enrolment was a fingerprint the user never asked for. Nothing is missed by
-  /// waiting: a wake is only ever about a sealed delegate, and the seal is what carries the token.
+  /// Have the cosigner enrol [token] for wakes — on the DKG, or on the next delegate renewal (a
+  /// send, a renewal, or "Renew automatically"), never as a call of its own. Every call is a
+  /// passkey approval, and a separate enrolment was a fingerprint the user never asked for. Nothing
+  /// is missed by waiting: a wake is only ever about a renewed delegate, and the renewal carries
+  /// the token.
   void offerDeviceToken(String token) {
     _pushToken = token;
     _client?.offerDeviceToken(_unenrolledToken);
   }
 
-  /// Seal a delegate over what is held, so the cosigner refreshes it on its own before it expires.
+  /// Renew the delegate over what is held, so the cosigner refreshes it on its own before it
+  /// expires.
   /// One passkey approval.
   ///
   /// For funds no delegate covers — a receive, or what the cosigner produced by running one. A send
-  /// or a settle seals on its way out with no approval of its own, so this is only needed when
+  /// or a renewal renews it on its way out with no approval of its own, so this is only needed when
   /// [fundsProtected] is false and nothing is being sent.
   Future<void> protectFunds() async {
     final client = _client;
@@ -782,11 +786,11 @@ class MpcService extends ChangeNotifier {
   }
 
   /// Refresh everything held in a batch round now — for funds past due that the cosigner could not
-  /// refresh itself. One passkey approval, and it seals a new delegate on its way out. Throws on
+  /// refresh itself. One passkey approval, and it renews the delegate on its way out. Throws on
   /// failure so the UI can surface it.
-  /// Returns whether the renewal was re-armed on the way out. A refresh seals a new delegate on
+  /// Returns whether the renewal was re-armed on the way out. A refresh renews the delegate on
   /// the same stream and the same approval, so this is normally true; it is false when the indexer
-  /// had not caught up in time, and then the owner has to seal again — which is worth saying
+  /// had not caught up in time, and then the owner has to renew it again — which is worth saying
   /// rather than reporting success.
   Future<bool> delegateNow() async {
     final client = _client;
@@ -797,7 +801,7 @@ class MpcService extends ChangeNotifier {
       throw StateError('a delegate is already in progress');
     _delegateInFlight = true;
     try {
-      await client.settleDelegate();
+      await client.renewHeld();
       await refreshVtxos();
       notifyListeners();
       return fundsProtected;
@@ -874,9 +878,9 @@ class MpcService extends ChangeNotifier {
 
   Future<String> boardFunds() async {
     if (_client == null) throw StateError("Client not initialized");
-    // Scan the boarding deposits on-chain and hand them to the cosigner's settle.
+    // Scan the boarding deposits on-chain and hand them to the cosigner's renewal.
     //
-    // ONE PER SETTLE. The cosigner's boarding session builds an intent proof for a
+    // ONE PER RENEWAL. The cosigner's boarding session builds an intent proof for a
     // single outpoint, so passing several used to board only the first and silently
     // strand the rest — while the UI reported the full scanned total as boarded.
     // Looping keeps "Boarding Complete" honest; the cosigner now rejects a batch
@@ -888,7 +892,7 @@ class MpcService extends ChangeNotifier {
     }
     String? txid;
     for (final utxo in utxos) {
-      txid = await _client!.settle(boardingUtxos: [utxo]);
+      txid = await _client!.renew(boardingUtxos: [utxo]);
     }
     await refreshVtxos();
     await refreshBoardingBalance();
@@ -909,9 +913,9 @@ class MpcService extends ChangeNotifier {
     return arkTxid;
   }
 
-  Future<String> settleDelegate() async {
+  Future<String> renewHeld() async {
     if (_client == null) throw StateError("Client not initialized");
-    final txid = await _client!.settleDelegate();
+    final txid = await _client!.renewHeld();
     await refreshVtxos();
     return txid;
   }

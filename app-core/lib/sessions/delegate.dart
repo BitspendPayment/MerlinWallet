@@ -5,10 +5,11 @@
 /// and the forfeits the round will need, and the cosigner seals them. When the deadline comes the
 /// cosigner runs that round itself, from a background task, against its ASP: no phone, no passkey.
 ///
-/// Sealing rides the end of every `Send` and `Settle`, on the same stream and under the same
+/// Renewing it rides the end of every `Send` and `Renew`, on the same stream and under the same
 /// approval — the passkey gesture that approved the operation also unlocked the share that signs
-/// the delegate. Funds that arrive any other way, a receive, are not covered until the wallet seals
-/// again; [DelegateStatus] is how the app notices, and `MpcClient.protectFunds` how it seals.
+/// the delegate. Funds that arrive any other way, a receive, are not covered until the wallet
+/// renews it again; [DelegateStatus] is how the app notices, and `MpcClient.protectFunds` how it
+/// renews it.
 library;
 
 import 'package:protocol/cosigner_v1.dart' as cs;
@@ -31,7 +32,7 @@ class DelegateStatus {
     this.exits = const [],
   });
 
-  factory DelegateStatus.fromSealed(cs.DelegateSealed s, {List<ExitTx> exits = const []}) =>
+  factory DelegateStatus.fromRenewed(cs.DelegateRenewed s, {List<ExitTx> exits = const []}) =>
       DelegateStatus(
         validAt: DateTime.fromMillisecondsSinceEpoch(s.validAtSecs.toInt() * 1000),
         margin: Duration(seconds: s.marginSecs.toInt()),
@@ -66,12 +67,12 @@ class DelegateStatus {
   /// `txid:vout` of each VTXO it refreshes.
   final Set<String> covered;
 
-  /// Whether the device token the seal carried was enrolled for wakes. Only meaningful on the seal
-  /// that carried one, so not persisted.
+  /// Whether the device token the renewal carried was enrolled for wakes. Only meaningful on the
+  /// renewal that carried one, so not persisted.
   final bool deviceEnrolled;
 
-  /// A signed unilateral exit per covered VTXO, when the wallet had an exit address to seal
-  /// against. What the owner broadcasts if this cosigner is never heard from again — see
+  /// A signed unilateral exit per covered VTXO, when the wallet had an exit address for them. What
+  /// the owner broadcasts if this cosigner is never heard from again — see
   /// `sessions/exit_plan.dart`.
   final List<ExitTx> exits;
 
@@ -80,7 +81,7 @@ class DelegateStatus {
 
 /// The wallet's set once the indexer reflects an operation: [gone] no longer held, [arrived] held
 /// with a known expiry, and every held VTXO's expiry known. Polls, because indexing trails the ASP
-/// by a moment; gives up with null rather than sealing over a set that is not settled yet.
+/// by a moment; gives up with null rather than renewing over a set that is not settled yet.
 Future<List<IndexerVtxo>?> heldOnceIndexed(
   Future<List<IndexerVtxo>> Function() read, {
   Set<String> gone = const {},
@@ -100,35 +101,35 @@ Future<List<IndexerVtxo>?> heldOnceIndexed(
   }
 }
 
-/// [deviceToken], when not empty, is enrolled for wakes as the delegate is sealed — see `DkgOpen` in
-/// `cosign_session.proto` for why it rides here.
-cs.SealDelegate sealMessage(
+/// [deviceToken], when not empty, is enrolled for wakes as the delegate is renewed — see `DkgOpen`
+/// in `cosign_session.proto` for why it rides here.
+cs.RenewDelegate renewDelegateRequest(
   List<IndexerVtxo> held,
   ArkInfo info, {
   String deviceToken = '',
   String exitScriptPubkeyHex = '',
 }) =>
-    cs.SealDelegate(
+    cs.RenewDelegate(
       vtxos: vtxosToProto(held),
       arkInfo: arkInfoToProto(info),
       deviceToken: deviceToken,
       exitScriptPubkey: hexBytes(exitScriptPubkeyHex),
     );
 
-/// Hex to bytes, for the scriptPubKey that rides the seal.
+/// Hex to bytes, for the scriptPubKey that rides the renewal.
 List<int> hexBytes(String hex) => [
       for (var i = 0; i + 1 < hex.length; i += 2)
         int.parse(hex.substring(i, i + 2), radix: 16),
     ];
 
-/// The in-band seal exchange: sighashes in, the wallet's half of the round out, the sealed delegate
-/// in. The caller has already sent whatever opens it — `SealDelegate` after a `Complete`, or a
-/// `SettleOpen` with `sealOnly`.
+/// The in-band delegate renewal: sighashes in, the wallet's half of the round out, the renewed
+/// delegate in. The caller has already sent whatever opens it — `RenewDelegate` after a `Complete`,
+/// or a `RenewOpen` with `delegateOnly`.
 ///
 /// [resolve] is the operation's key: handed whatever dealt share these sighashes carried. For a
-/// `sealOnly` open that is the stream's first round and brings the share; after a `Complete` it
-/// brings nothing, and the share the send or settle already rebuilt is reused — see `KeyResolver`.
-Future<DelegateStatus> answerSeal<Q, R>({
+/// `delegateOnly` open that is the stream's first round and brings the share; after a `Complete` it
+/// brings nothing, and the share the send or renewal already rebuilt is reused — see `KeyResolver`.
+Future<DelegateStatus> answerDelegateRenewal<Q, R>({
   required Duplex<Q, R> duplex,
   required KeyResolver resolve,
   required threshold.PublicKeyPackage groupPubKey,
@@ -141,7 +142,7 @@ Future<DelegateStatus> answerSeal<Q, R>({
     List<int> dealtShare,
   })? Function(R) sighashesOf,
   required Q Function(List<cs.WalletRound>) signed,
-  required cs.DelegateSealed? Function(R) sealedOf,
+  required cs.DelegateRenewed? Function(R) renewedOf,
   ExitPlan? exits,
 }) async {
   final h = sighashesOf(await duplex.next("the delegate's sighashes"));
@@ -159,21 +160,21 @@ Future<DelegateStatus> answerSeal<Q, R>({
     keyPkg: keyPkg,
     groupPubKey: groupPubKey,
   )));
-  final sealed = sealedOf(await duplex.next('the sealed delegate'));
-  if (sealed == null) throw CosignerException('expected the sealed delegate');
-  return DelegateStatus.fromSealed(sealed, exits: plan.accept(sealed.exitTxs));
+  final renewed = renewedOf(await duplex.next('the renewed delegate'));
+  if (renewed == null) throw CosignerException('expected the renewed delegate');
+  return DelegateStatus.fromRenewed(renewed, exits: plan.accept(renewed.exitTxs));
 }
 
-/// Seal a delegate as the last exchange of a stream that just completed. Null when it could not be —
-/// the operation already succeeded, and funds left without a delegate are something the app shows,
-/// not a failure of the send.
-Future<DelegateStatus?> sealAfter<Q, R>({
+/// Renew the delegate as the last exchange of a stream that just completed. Null when it could not
+/// be — the operation already succeeded, and funds left without a delegate are something the app
+/// shows, not a failure of the send.
+Future<DelegateStatus?> renewDelegateAfter<Q, R>({
   required Duplex<Q, R> duplex,
   required Future<List<IndexerVtxo>?> held,
   required ArkInfo info,
   required KeyResolver resolve,
   required threshold.PublicKeyPackage groupPubKey,
-  required Q Function(cs.SealDelegate) seal,
+  required Q Function(cs.RenewDelegate) request,
   String deviceToken = '',
   String exitScriptPubkeyHex = '',
   required ({
@@ -185,25 +186,25 @@ Future<DelegateStatus?> sealAfter<Q, R>({
     List<int> dealtShare,
   })? Function(R) sighashesOf,
   required Q Function(List<cs.WalletRound>) signed,
-  required cs.DelegateSealed? Function(R) sealedOf,
+  required cs.DelegateRenewed? Function(R) renewedOf,
   String ownerXOnlyHex = '',
 }) async {
   try {
     final set = await held;
     if (set == null || set.isEmpty) return null;
-    duplex.send(seal(sealMessage(
+    duplex.send(request(renewDelegateRequest(
       set,
       info,
       deviceToken: deviceToken,
       exitScriptPubkeyHex: exitScriptPubkeyHex,
     )));
-    return await answerSeal(
+    return await answerDelegateRenewal(
       duplex: duplex,
       resolve: resolve,
       groupPubKey: groupPubKey,
       sighashesOf: sighashesOf,
       signed: signed,
-      sealedOf: sealedOf,
+      renewedOf: renewedOf,
       exits: exitScriptPubkeyHex.isEmpty
           ? null
           : ExitPlan(
@@ -214,8 +215,8 @@ Future<DelegateStatus?> sealAfter<Q, R>({
             ),
     );
   } on ContributionProtocolException {
-    // Not an unlucky seal: the cosigner sent a second dealt share on one stream. The send or
-    // settle before this did happen, but a cosigner that breaks the one rule about when half a key
+    // Not an unlucky renewal: the cosigner sent a second dealt share on one stream. The send or
+    // renewal before this did happen, but a cosigner that breaks the one rule about when half a key
     // travels is not something to carry on past quietly.
     rethrow;
   } catch (_) {

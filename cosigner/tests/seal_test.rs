@@ -17,7 +17,7 @@ fn a_present_but_unreadable_seal_refuses_to_open_as_a_fresh_wallet() {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
     drop(cosigner);
 
     // Not hex at all.
@@ -52,7 +52,7 @@ fn a_seal_that_still_holds_contacts_and_payment_requests_opens() {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
     drop(cosigner);
 
     // Today's seal, plus the three fields as the old cosigner wrote them.

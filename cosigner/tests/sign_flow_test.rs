@@ -1,6 +1,6 @@
 //! The 2-of-2 cooperative sign, driven the way the `Sign` stream drives it: the cosigner commits
 //! first, the wallet answers with its commitments and its share together, the cosigner aggregates.
-//! It is the in-band round `Send` and `Settle` run, over one message — the wallet cannot commit
+//! It is the in-band round `Send` and `Renew` run, over one message — the wallet cannot commit
 //! first any more, because it holds no share until the stream's first answer brings the half the
 //! cosigner dealt it. The user/client half is simulated host-side.
 //!
@@ -30,7 +30,7 @@ fn sign_session_restores_seal_and_verifies() {
     let message = vec![0x42u8; 32];
 
     let seeder = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&seeder, &group_key, kp_cosigner, kp_user, &pkp, None);
+    common::seed_policy(&seeder, &group_key, kp_cosigner, kp_user, &pkp);
     drop(seeder);
 
     // A fresh instance holds nothing in memory: the seal is where its keys come from.
@@ -87,7 +87,7 @@ fn abandoned_ceremony_leaves_no_reusable_nonce() {
     let message = vec![0x42u8; 32];
 
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
 
     // Open a round and abandon it, as an interrupted stream does.
     let (_, first) = cosigner

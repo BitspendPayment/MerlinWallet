@@ -2,9 +2,9 @@
 ///
 /// A VTXO can be spent two ways. The cooperative way needs the ASP, and the unilateral way needs
 /// only its owner — except that the owner here is a 2-of-2 with the cosigner, so the signature has
-/// to be collected while the cosigner is still answering. That is what every seal does: at the end
-/// of a send, a settle or a renewal it hands back one signed exit per VTXO, paying an address in a
-/// wallet this app does not control. They are kept on this phone.
+/// to be collected while the cosigner is still answering. That is what every delegate renewal does:
+/// at the end of a send or a renewal it hands back one signed exit per VTXO, paying an
+/// address in a wallet this app does not control. They are kept on this phone.
 ///
 /// This screen is the honest account of that: what is covered, what is not, when each becomes
 /// spendable, and what still has to happen for a full exit — because a pre-signed spend is the last
@@ -176,7 +176,7 @@ class ExitScreen extends StatelessWidget {
       );
 
   /// Funds arrive, and the cosigner renews funds on its own — both leave money no exit covers until
-  /// the next seal. One approval fixes it, and only the owner can give it.
+  /// the next delegate renewal. One approval fixes it, and only the owner can give it.
   Widget _protectPrompt(
           BuildContext context, MpcService service, int uncoveredSats) =>
       Container(

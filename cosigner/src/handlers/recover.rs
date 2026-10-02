@@ -55,13 +55,13 @@ pub fn recover(c: &Cosigner, req: RecoverRequest) -> Result<RecoverResponse, Sta
         dealt_share,
         public_key_package_json,
         group_key,
-        escrows: c.escrows().iter().map(|e| crate::session::escrow_summary(e, now)).collect(),
+        escrows: c.escrows().iter().map(|e| e.summary(now)).collect(),
     })
 }
 
 /// The half of the wallet's share the cosigner dealt at DKG, for the wallet that is [identifier].
 ///
-/// `Recover` hands it to a device that has nothing. `Sign`, `Send` and `Settle` hand it back on
+/// `Recover` hands it to a device that has nothing. `Sign`, `Send` and `Renew` hand it back on
 /// their first round, every time, because the wallet keeps no share between operations any more:
 /// it re-derives its own half from the passkey and adds this one, under the approval the stream
 /// already has. One rule for all four, so there is one place it can be wrong.

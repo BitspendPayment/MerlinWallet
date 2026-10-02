@@ -8,7 +8,7 @@
 
 mod common;
 
-use cosigner::escrow_session::{EscrowSession, Refusal};
+use cosigner::escrow_session::{Escrow, Refusal};
 use cosigner::policy::Policy;
 use cosigner::types::{EscrowRecord, ServicePairing};
 
@@ -33,7 +33,6 @@ fn open(
         &kps[1],
         &kps[0],
         &pkp,
-        Some(hex::encode([9u8; 32])),
         Some(hex::encode([7u8; 32])),
     );
     c.into_inner().unwrap()
@@ -49,7 +48,6 @@ fn wallet(store: &std::sync::Arc<cosigner::store::Store>) -> (std::sync::Mutex<c
         &kps[1],
         &kps[0],
         &pkp,
-        Some(hex::encode([9u8; 32])),
         Some(hex::encode([7u8; 32])),
     );
     (c, group_key)
@@ -64,11 +62,11 @@ fn an_escrow_with_no_service_cannot_be_committed() {
     let key = "02".to_string() + &"ab".repeat(32);
     seed_escrow(&c, &key, false);
 
-    let session = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
+    let session = Escrow::validate(&key, Policy::Always, NOW, NOW + HOUR).unwrap();
     let err = c
         .lock()
         .unwrap()
-        .open_escrow_session(&key, session, NOW)
+        .open_escrow_session(session, NOW)
         .expect_err("an escrow with no service must not be committed");
     assert!(err.contains("no service paired"), "unexpected: {err}");
 }
@@ -80,14 +78,14 @@ fn a_live_deal_cannot_be_replaced_under_the_owners_feet() {
     let key = "02".to_string() + &"ab".repeat(32);
     seed_escrow(&c, &key, true);
 
-    let first = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
-    c.lock().unwrap().open_escrow_session(&key, first, NOW).expect("the first deal");
+    let first = Escrow::validate(&key, Policy::Always, NOW, NOW + HOUR).unwrap();
+    c.lock().unwrap().open_escrow_session(first, NOW).expect("the first deal");
 
-    let second = EscrowSession::open(Policy::Always, NOW, NOW + 2 * HOUR).unwrap();
+    let second = Escrow::validate(&key, Policy::Always, NOW, NOW + 2 * HOUR).unwrap();
     let err = c
         .lock()
         .unwrap()
-        .open_escrow_session(&key, second, NOW)
+        .open_escrow_session(second, NOW)
         .expect_err("a second deal over a live one must be refused");
     assert!(err.contains("already committed"), "unexpected: {err}");
 }
@@ -101,13 +99,13 @@ fn an_escrow_can_be_committed_again_once_its_deal_is_over() {
     let key = "02".to_string() + &"ab".repeat(32);
     seed_escrow(&c, &key, true);
 
-    let first = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
-    c.lock().unwrap().open_escrow_session(&key, first, NOW).expect("the first deal");
+    let first = Escrow::validate(&key, Policy::Always, NOW, NOW + HOUR).unwrap();
+    c.lock().unwrap().open_escrow_session(first, NOW).expect("the first deal");
 
-    let second = EscrowSession::open(Policy::Always, NOW + 2 * HOUR, NOW + 3 * HOUR).unwrap();
+    let second = Escrow::validate(&key, Policy::Always, NOW + 2 * HOUR, NOW + 3 * HOUR).unwrap();
     c.lock()
         .unwrap()
-        .open_escrow_session(&key, second, NOW + 2 * HOUR)
+        .open_escrow_session(second, NOW + 2 * HOUR)
         .expect("a deal after the last one ended");
 }
 
@@ -121,14 +119,15 @@ fn a_deal_survives_the_seal_and_a_restored_instance_agrees_with_the_clock() {
         let (c, gk) = wallet(&store);
         group_key = gk;
         seed_escrow(&c, &key, true);
-        let session = EscrowSession::open(
+        let session = Escrow::validate(
+            &key,
             Policy::TotalOutMax { sats: 50_000 },
             NOW,
             NOW + HOUR,
         )
         .unwrap();
         let mut guard = c.lock().unwrap();
-        guard.open_escrow_session(&key, session, NOW).expect("commit");
+        guard.open_escrow_session(session, NOW).expect("commit");
         guard.seal();
     }
 
@@ -160,16 +159,15 @@ fn a_second_deal_waits_for_the_first_ones_deadline() {
     let key = "02".to_string() + &"ab".repeat(32);
     seed_escrow(&c, &key, true);
 
-    let first = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
-    c.lock().unwrap().open_escrow_session(&key, first, NOW).expect("the first deal");
+    let first = Escrow::validate(&key, Policy::Always, NOW, NOW + HOUR).unwrap();
+    c.lock().unwrap().open_escrow_session(first, NOW).expect("the first deal");
 
     // While it runs, no.
     let err = c
         .lock()
         .unwrap()
         .open_escrow_session(
-            &key,
-            EscrowSession::open(Policy::Always, NOW + 60, NOW + 60 + HOUR).unwrap(),
+            Escrow::validate(&key, Policy::Always, NOW + 60, NOW + 60 + HOUR).unwrap(),
             NOW + 60,
         )
         .expect_err("a running deal cannot be replaced");
@@ -180,8 +178,7 @@ fn a_second_deal_waits_for_the_first_ones_deadline() {
     c.lock()
         .unwrap()
         .open_escrow_session(
-            &key,
-            EscrowSession::open(Policy::Always, later, later + HOUR).unwrap(),
+            Escrow::validate(&key, Policy::Always, later, later + HOUR).unwrap(),
             later,
         )
         .expect("a new deal once the last one is over");
@@ -191,11 +188,12 @@ fn a_second_deal_waits_for_the_first_ones_deadline() {
 fn a_deal_on_an_escrow_this_wallet_does_not_hold_is_refused() {
     let Some(store) = common::try_store() else { return };
     let (c, _) = wallet(&store);
-    let session = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
+    let stranger = "02".to_string() + &"ff".repeat(32);
+    let session = Escrow::validate(stranger, Policy::Always, NOW, NOW + HOUR).unwrap();
     let err = c
         .lock()
         .unwrap()
-        .open_escrow_session(&("02".to_string() + &"ff".repeat(32)), session, NOW)
+        .open_escrow_session(session, NOW)
         .expect_err("a stranger's escrow is not this wallet's to commit");
     assert!(err.contains("no such escrow"), "unexpected: {err}");
 }
@@ -210,10 +208,10 @@ fn an_escrow_resolves_by_either_parity() {
     let odd = "03".to_string() + &"ab".repeat(32);
     seed_escrow(&c, &even, true);
 
-    let session = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
+    let session = Escrow::validate(&odd, Policy::Always, NOW, NOW + HOUR).unwrap();
     c.lock()
         .unwrap()
-        .open_escrow_session(&odd, session, NOW)
+        .open_escrow_session(session, NOW)
         .expect("the same key, named with the other parity");
 }
 
@@ -235,8 +233,8 @@ fn committing_an_escrow_to_a_deal_schedules_nothing() {
     let key = "02".to_string() + &"ab".repeat(32);
     seed_escrow(&c, &key, true);
 
-    let session = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
-    c.lock().unwrap().open_escrow_session(&key, session, NOW).expect("commit it");
+    let session = Escrow::validate(&key, Policy::Always, NOW, NOW + HOUR).unwrap();
+    c.lock().unwrap().open_escrow_session(session, NOW).expect("commit it");
 
     assert!(
         host.enqueued().is_empty(),
@@ -248,7 +246,7 @@ fn committing_an_escrow_to_a_deal_schedules_nothing() {
 /// And the answer it reaches without anything having run is the right one, before and after.
 #[test]
 fn the_deadline_decides_with_nothing_having_run_at_it() {
-    let session = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
+    let session = Escrow::validate("", Policy::Always, NOW, NOW + HOUR).unwrap();
     assert!(session.may_release(NOW + HOUR - 1).is_ok());
     assert!(session.may_reclaim(NOW + HOUR - 1).is_err());
 
@@ -258,7 +256,7 @@ fn the_deadline_decides_with_nothing_having_run_at_it() {
     assert!(session.may_reclaim(NOW + HOUR).is_ok());
     assert_eq!(
         session,
-        EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap(),
+        Escrow::validate("", Policy::Always, NOW, NOW + HOUR).unwrap(),
         "the session is byte-identical either side of its deadline"
     );
 }
@@ -302,11 +300,11 @@ fn a_deal_cannot_be_committed_to_a_pairing_the_service_has_not_finished() {
             .expect("install escrow");
     }
 
-    let session = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
+    let session = Escrow::validate(&key, Policy::Always, NOW, NOW + HOUR).unwrap();
     let err = c
         .lock()
         .unwrap()
-        .open_escrow_session(&key, session, NOW)
+        .open_escrow_session(session, NOW)
         .expect_err("a pending pairing is not a service that can be paid");
     assert!(err.contains("not finished"), "unexpected: {err}");
 
@@ -316,11 +314,11 @@ fn a_deal_cannot_be_committed_to_a_pairing_the_service_has_not_finished() {
         .unwrap()
         .confirm_escrow_pairing(&key, &"aa".repeat(16))
         .expect("confirming the attempt that was sealed");
-    let session = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
+    let session = Escrow::validate(&key, Policy::Always, NOW, NOW + HOUR).unwrap();
     let err = c
         .lock()
         .unwrap()
-        .open_escrow_session(&key, session, NOW)
+        .open_escrow_session(session, NOW)
         .expect_err("one party's word is not both parties agreeing");
     assert!(err.contains("service has not confirmed"), "unexpected: {err}");
 
@@ -330,10 +328,10 @@ fn a_deal_cannot_be_committed_to_a_pairing_the_service_has_not_finished() {
         .unwrap()
         .confirm_pairing_by_service(&key, &"aa".repeat(16))
         .expect("the service confirming the attempt that was dealt");
-    let session = EscrowSession::open(Policy::Always, NOW, NOW + HOUR).unwrap();
+    let session = Escrow::validate(&key, Policy::Always, NOW, NOW + HOUR).unwrap();
     c.lock()
         .unwrap()
-        .open_escrow_session(&key, session, NOW)
+        .open_escrow_session(session, NOW)
         .expect("a finished pairing can be dealt against");
 }
 
@@ -504,7 +502,6 @@ fn a_reclaim_ignores_the_exit_delay_it_is_given() {
         &kps[1],
         &kps[0],
         &pkp,
-        Some(hex::encode([9u8; 32])),
         Some(hex::encode([7u8; 32])),
     );
     let key = group_key.clone();

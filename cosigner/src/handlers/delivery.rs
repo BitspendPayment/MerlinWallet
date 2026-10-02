@@ -69,7 +69,7 @@
 //!
 //! The cosigner's half is never retained, so a pairing whose delivery failed can never be
 //! completed: the service would have no share and the half that would have given it one is gone.
-//! Delivering first makes that harmless — nothing is sealed, and the wallet pairs again.
+//! Delivering first makes that harmless — nothing is sealed, and the wallet sets up a new escrow.
 //!
 //! But a pairing that has been delivered is not yet a pairing that *works*. Three things happen and
 //! each can fail on its own, so each is recorded on its own:
@@ -81,11 +81,10 @@
 //! ```
 //!
 //! A failure between 1 and 2 leaves a `pending` pairing sealed and the service holding one useless
-//! half; the wallet retries the same attempt, which is idempotent for the service, or pairs again
-//! with a fresh one. A failure between 2 and 3 is the same picture from one step further on. What
-//! is *not* possible is a pairing reported usable on one party's word: step 3 arrives over the
-//! stream from the service and step 2 from the wallet, and
-//! [`ServicePairing::state`](crate::types::ServicePairing::state) is `Ready` only with both. A
+//! half; that escrow stays unpaired, and the wallet sets up a new one. A failure between 2 and 3 is
+//! the same picture from one step further on. What is *not* possible is a pairing reported usable
+//! on one party's word: step 3 arrives over the stream from the service and step 2 from the wallet,
+//! and [`ServicePairing::state`](crate::types::ServicePairing::state) is `Ready` only with both. A
 //! restart changes none of this — the flags are in the seal.
 
 use std::collections::BTreeMap;

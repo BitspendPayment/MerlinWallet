@@ -860,34 +860,6 @@ PublicKeyPackage pkpFromCommitment(
   }
 }
 
-/// ECIES-encrypt a 32-byte [payload] to [recipientPubkey] (33-byte compressed).
-/// Returns the 97-byte blob.
-Uint8List eciesEncrypt(Uint8List payload, Uint8List recipientPubkey) {
-  final pPtr = hex.encode(payload).toNativeUtf8();
-  final pkPtr = hex.encode(recipientPubkey).toNativeUtf8();
-  try {
-    final data = callFfiData(eciesEncryptFfi(pPtr, pkPtr));
-    return Uint8List.fromList(hex.decode(data));
-  } finally {
-    calloc.free(pPtr);
-    calloc.free(pkPtr);
-  }
-}
-
-/// ECIES-decrypt a 97-byte [blob] with [secret] (the recipient's scalar). Returns
-/// the 32-byte payload. Throws on a MAC mismatch.
-Uint8List eciesDecrypt(Uint8List blob, BigInt secret) {
-  final bPtr = hex.encode(blob).toNativeUtf8();
-  final sPtr = _bigIntToHex64(secret).toNativeUtf8();
-  try {
-    final data = callFfiData(eciesDecryptFfi(bPtr, sPtr));
-    return Uint8List.fromList(hex.decode(data));
-  } finally {
-    calloc.free(bPtr);
-    calloc.free(sPtr);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Internal JSON helpers
 // ---------------------------------------------------------------------------

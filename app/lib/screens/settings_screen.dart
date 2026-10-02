@@ -60,7 +60,7 @@ class SettingsScreen extends StatelessWidget {
 
   /// Changing the address does not move anything and does not invalidate the exits already signed —
   /// those still pay the old address, and still work. It decides where the next ones pay, which is
-  /// the next time anything is sealed.
+  /// the next time the delegate is renewed.
   Future<void> _editExitAddress(BuildContext context, MpcService mpc) async {
     final controller = TextEditingController(text: mpc.exitAddress ?? '');
     final messenger = ScaffoldMessenger.of(context);
@@ -89,7 +89,7 @@ class SettingsScreen extends StatelessWidget {
             const SizedBox(height: 8),
             Text(
               'Exits already signed keep paying the old address. New ones start from the next '
-              'send, settle or renewal.',
+              'send or renewal.',
               style: GoogleFonts.inter(color: Colors.white38, fontSize: 11),
             ),
           ],

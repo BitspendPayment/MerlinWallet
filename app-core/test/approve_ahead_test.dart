@@ -42,9 +42,9 @@ void main() {
     final asked = <String>[];
     final conn = _connection(asked);
 
-    await conn.approveAhead('Settle');
+    await conn.approveAhead('Renew');
     await _openSend(conn);
-    expect(asked, ['/cosigner.v1.Cosigner/Settle', '/cosigner.v1.Cosigner/Send']);
+    expect(asked, ['/cosigner.v1.Cosigner/Renew', '/cosigner.v1.Cosigner/Send']);
   });
 
   test('a discarded approval is not used', () async {

@@ -85,7 +85,7 @@ use threshold::{point, scalar, signing};
 use crate::cosigner::x_only;
 use crate::asp::AspApi;
 use crate::cosigner::Cosigner;
-use crate::escrow_session::{DealTerms, EscrowSession};
+use crate::escrow_session::{DealTerms, Escrow};
 use crate::types::{Admission, ReleaseRecord, ServicePairing};
 use crate::evidence::{FetchEvidence, ReleaseFacts};
 use crate::service_stream::{StreamRefusal, ToService};
@@ -234,7 +234,7 @@ impl Cosigner {
         self.escrow(escrow_key)?
             .session
             .as_ref()
-            .map(EscrowSession::terms)
+            .map(Escrow::terms)
     }
 
     async fn judge_release<A: AspApi, F: FetchEvidence>(
@@ -581,7 +581,9 @@ impl PairingSigner {
                 .map_err(|e| {
                     Denial::Faulted(format!("this pairing's sealed package is unreadable: {e}"))
                 })?,
-            service_id: identifier_from_hex(&pairing.service_identifier_hex)
+            service_id: pairing
+                .service_identifier_hex
+                .parse::<Identifier>()
                 .map_err(|e| Denial::Faulted(format!("this pairing's sealed identifier: {e}")))?,
         })
     }
@@ -647,7 +649,8 @@ pub fn sign_second(
     let mut out = Vec::with_capacity(messages.len());
     for (i, message) in messages.iter().enumerate() {
         let at = |e: String| format!("message {i}: {e}");
-        let theirs = commitments_from_hex(&theirs[i].hiding, &theirs[i].binding).map_err(at)?;
+        let theirs = SigningCommitments::from_hex(&theirs[i].hiding, &theirs[i].binding)
+            .map_err(|e| at(e.to_string()))?;
 
         let nonce = nonce::new_nonce(&mut rng, &key_package.secret_share);
         let mut commitments = BTreeMap::new();
@@ -668,28 +671,6 @@ pub fn sign_second(
         // `nonce` is dropped here, having been used exactly once, and was never anywhere else.
     }
     Ok(out)
-}
-
-fn commitments_from_hex(hiding: &str, binding: &str) -> Result<SigningCommitments, String> {
-    let point = |what: &str, s: &str| -> Result<_, String> {
-        let bytes: [u8; 33] = hex::decode(s)
-            .map_err(|e| format!("{what} is not hex: {e}"))?
-            .try_into()
-            .map_err(|_| format!("{what} must be a 33-byte compressed point"))?;
-        point::deserialize_compressed(&bytes).map_err(|e| format!("bad {what}: {e}"))
-    };
-    Ok(SigningCommitments {
-        hiding: point("hiding commitment", hiding)?,
-        binding: point("binding commitment", binding)?,
-    })
-}
-
-fn identifier_from_hex(s: &str) -> Result<Identifier, String> {
-    let bytes: [u8; 32] = hex::decode(s)
-        .map_err(|e| format!("not hex: {e}"))?
-        .try_into()
-        .map_err(|_| "an identifier is 32 bytes".to_string())?;
-    Identifier::deserialize(&bytes).map_err(|e| format!("{e}"))
 }
 
 /// The scriptPubKeys that belong to this escrow: one per exit delay among the inputs, plus the one

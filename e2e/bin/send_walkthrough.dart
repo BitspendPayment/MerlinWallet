@@ -281,7 +281,7 @@ Future<void> _board(MpcClient client, RegtestHelper btc, double btcAmount) async
   await btc.generateToAddress(1, await btc.getNewAddress());
   final deposits = await pollBoardingUtxos(boarding, (btcAmount * 1e8).round());
   if (deposits.isEmpty) throw StateError('the deposit was never indexed');
-  await _whileMining(btc, () => settleBoarding(client, deposits));
+  await _whileMining(btc, () => renewBoarding(client, deposits));
 }
 
 /// Nothing moves on regtest unless somebody mines.

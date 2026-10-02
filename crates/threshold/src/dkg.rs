@@ -1,4 +1,5 @@
 use crate::error::Error;
+use hex_conservative::{DisplayHex, FromHex};
 use crate::identifier::Identifier;
 use crate::keys::{PublicKeyPackage, VerifyingKey};
 use crate::point;
@@ -976,8 +977,8 @@ impl DkgSignature {
         let r_hex = v["R"].as_str().ok_or(Error::SerializationError)?;
         let z_hex = v["Z"].as_str().ok_or(Error::SerializationError)?;
 
-        let r_bytes = hex_decode_33(r_hex)?;
-        let z_bytes = hex_decode_32(z_hex)?;
+        let r_bytes = <[u8; 33]>::from_hex(r_hex)?;
+        let z_bytes = <[u8; 32]>::from_hex(z_hex)?;
 
         let r = point::deserialize_compressed(&r_bytes)?;
         let z = scalar_from_bytes(&z_bytes)?;
@@ -987,8 +988,8 @@ impl DkgSignature {
 
     /// Serialize to JSON: {"R": "hex_compressed", "Z": "hex_scalar"}
     pub fn to_json_value(&self) -> serde_json::Value {
-        let r_hex = hex_encode(&point::serialize_compressed(&self.r));
-        let z_hex = hex_encode(&scalar_to_bytes(&self.z));
+        let r_hex = point::serialize_compressed(&self.r).to_lower_hex_string();
+        let z_hex = scalar_to_bytes(&self.z).to_lower_hex_string();
         serde_json::json!({
             "R": r_hex,
             "Z": z_hex
@@ -1069,7 +1070,7 @@ impl Round2Package {
         let hex_str = v["secretShare"]
             .as_str()
             .ok_or(Error::SerializationError)?;
-        let bytes = hex_decode_32(hex_str)?;
+        let bytes = <[u8; 32]>::from_hex(hex_str)?;
         let secret_share = scalar_from_bytes(&bytes)?;
         Ok(Self { secret_share })
     }
@@ -1081,49 +1082,7 @@ impl Round2Package {
     }
 
     pub fn to_json_value(&self) -> serde_json::Value {
-        let hex_str = hex_encode(&scalar_to_bytes(&self.secret_share));
+        let hex_str = scalar_to_bytes(&self.secret_share).to_lower_hex_string();
         serde_json::json!({ "secretShare": hex_str })
     }
-}
-
-// ---------------------------------------------------------------------------
-// Hex helpers
-// ---------------------------------------------------------------------------
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use alloc::format;
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn hex_decode_32(s: &str) -> Result<[u8; 32], Error> {
-    let bytes = hex_decode(s)?;
-    if bytes.len() != 32 {
-        return Err(Error::SerializationError);
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-fn hex_decode_33(s: &str) -> Result<[u8; 33], Error> {
-    let bytes = hex_decode(s)?;
-    if bytes.len() != 33 {
-        return Err(Error::SerializationError);
-    }
-    let mut out = [0u8; 33];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-fn hex_decode(s: &str) -> Result<Vec<u8>, Error> {
-    if s.len() % 2 != 0 {
-        return Err(Error::SerializationError);
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for i in (0..s.len()).step_by(2) {
-        let byte = u8::from_str_radix(&s[i..i + 2], 16)
-            .map_err(|_| Error::SerializationError)?;
-        out.push(byte);
-    }
-    Ok(out)
 }

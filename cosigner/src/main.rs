@@ -35,7 +35,7 @@ async fn main(req: Request<Body>) -> Result<Response<Body>, wstd::http::Error> {
 }
 
 async fn serve(req: Request<Body>) -> Result<Response<Body>, Status> {
-    let cfg = config::ServerConfig::from_environment();
+    let cfg = config::Config::from_environment();
 
     // Refuse to serve with an empty `bitcoin_network`. The client uses this string verbatim as the
     // HRP source for rendering wallet addresses; an empty value would silently fall through to a
@@ -54,7 +54,7 @@ async fn serve(req: Request<Body>) -> Result<Response<Body>, Status> {
         bitcoin_network: cfg.bitcoin_network.clone(),
     };
 
-    Ok(session::CosignerService::new(cosigner, server_info)
+    Ok(session::Session::new(cosigner, server_info)
         .route(req)
         .await)
 }
@@ -63,7 +63,7 @@ async fn serve(req: Request<Body>) -> Result<Response<Body>, Status> {
 ///
 /// Shared by the request path and the background task, which both need the whole wallet and get it
 /// the same way: there is no instance kept between them to inherit.
-fn open_cosigner(cfg: &config::ServerConfig) -> Result<Cosigner, Status> {
+fn open_cosigner(cfg: &config::Config) -> Result<Cosigner, Status> {
     // The only thing this instance opens: its own store, a directory on the filesystem the runtime
     // scoped to this client. No ASP connection, no push channel — the caller drives the Ark
     // protocol and the host wakes devices.
@@ -189,7 +189,7 @@ mod runtime {
             // reads it; stderr reaches the console. Said here too, so a watch that keeps failing
             // says why.
             let run = || {
-                let cfg = cosigner::config::ServerConfig::from_environment();
+                let cfg = cosigner::config::Config::from_environment();
                 let mut wallet = super::open_cosigner(&cfg).map_err(|e| e.to_string())?;
                 // The ASP, when the image names one — a due delegate is then run here, not handed
                 // back to a phone.
@@ -219,7 +219,7 @@ mod runtime {
             payload: Vec<u8>,
         ) -> Result<Vec<u8>, String> {
             let run = || {
-                let cfg = cosigner::config::ServerConfig::from_environment();
+                let cfg = cosigner::config::Config::from_environment();
                 let mut wallet = super::open_cosigner(&cfg).map_err(|e| e.to_string())?;
                 let asp = cosigner::asp::rest::AspRest::from_env();
                 wstd::runtime::block_on(wallet.on_service_message_with(
