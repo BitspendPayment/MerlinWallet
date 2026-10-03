@@ -1,9 +1,7 @@
-import 'package:app_core/platform/bank_send.dart' show BankSend;
 import 'package:app_core/platform/platform_client.dart' show Corridor, Rail, RailField;
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
 import '../../services/payout_service.dart';
@@ -260,19 +258,8 @@ class _PayoutFormScreenState extends State<PayoutFormScreen> {
                           SendNotice(
                             icon: Icons.hourglass_top,
                             color: Colors.amberAccent,
-                            text: holding.finished
-                                ? 'Your last payout still holds your escrow, until '
-                                    '${DateFormat.Hm().format(holding.holdUntil!)}. '
-                                    'You can send again after that.'
-                                : 'Your payout to ${holding.fullName} is still going through. '
-                                    'You can send again once it has finished.',
-                          ),
-                        ] else if (!payouts.hasEscrow) ...[
-                          const SizedBox(height: 16),
-                          SendNotice(
-                            icon: Icons.fingerprint,
-                            color: Colors.blueAccent,
-                            text: _firstTime(),
+                            text: 'Your payout to ${holding.fullName} is still going through. '
+                                'You can send again once it has finished.',
                           ),
                         ],
                       ],
@@ -291,14 +278,6 @@ class _PayoutFormScreenState extends State<PayoutFormScreen> {
         ),
       ),
     );
-  }
-
-  String _firstTime() {
-    final all = BankSend.approvalsNeeded(hasEscrow: false);
-    final send = BankSend.approvalsNeeded(hasEscrow: true);
-    return 'Your first send sets up your escrow first: you approve ${approvalTimes(all - send)} '
-        'with your passkey before you see the price, and ${approvalTimes(send)} more to send. You '
-        'only set up once.';
   }
 
   Widget _field(RailField f) {

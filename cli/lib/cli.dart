@@ -30,7 +30,7 @@ boarding-address                 the on-chain address that boards into Ark
 fund <sats>                      bitcoind pays the boarding address, then board
 board                            settle every confirmed boarding deposit into Ark
 balance                          VTXOs held, and whether a sealed delegate renews them
-protect                          seal a delegate over what is held, so the cosigner renews it itself
+protect                          renew the delegate over what is held, so the cosigner refreshes it
 send <ark-address|wallet> <sats> pay, off-chain
 
 reset <name>                     delete this machine's stored state for a wallet and rebuild it
@@ -144,9 +144,9 @@ class Cli {
         }
       case 'protect':
         final (_, w) = await _active();
-        final sealed = await w.client.protectFunds();
-        print('protected ${sealed.covered.length} VTXO(s): the cosigner renews them at '
-            '${sealed.validAt.toLocal()}');
+        final renewed = await w.client.protectFunds();
+        print('protected ${renewed.covered.length} VTXO(s): the cosigner renews them at '
+            '${renewed.validAt.toLocal()}');
       case 'send':
         final (_, w) = await _active();
         final to = _arg(rest, 0, 'ark address or wallet');
@@ -205,10 +205,10 @@ class Cli {
       print('no confirmed boarding deposits yet');
       return;
     }
-    // One per settle: the cosigner builds its boarding intent proof for a single outpoint.
+    // One per renewal: the cosigner builds its boarding intent proof for a single outpoint.
     for (final d in deposits) {
       print('settling ${d.amountSats} sats from ${d.txid}:${d.vout}…');
-      final commitment = await bitcoind.whileMining(() => client.settle(boardingUtxos: [d]));
+      final commitment = await bitcoind.whileMining(() => client.board(d));
       print('  commitment $commitment');
     }
   }

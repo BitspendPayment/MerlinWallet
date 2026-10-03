@@ -10,6 +10,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -19,6 +20,7 @@ import 'package:fixnum/fixnum.dart';
 import 'package:hive/hive.dart';
 import 'package:test/test.dart';
 
+import 'package:app_core/asp/ark_info.dart' show IndexerVtxo;
 import 'package:app_core/asp/asp_client.dart' show AspClient;
 import 'package:app_core/client.dart';
 import 'package:app_core/cosigner/connection.dart';
@@ -407,7 +409,7 @@ void main() {
     test("an authenticated stranger cannot recover this wallet's half", () async {
       // The enclave gives each tenant its own instance; this is what one instance says to a wallet
       // that is not the one it holds — which is all an authenticated stranger can be to it. The
-      // same rule guards `Sign`, `Send` and `Settle`, and is proved on the wire for all of them in
+      // same rule guards `Sign`, `Send` and `Renew`, and is proved on the wire for all of them in
       // `cosigner/tests/stream_contribution_test.rs`: from this client a stranger cannot even ask,
       // because a passkey that is not the wallet's is refused before a stream is opened (above).
       final owner = device(seed(14), newBox());
@@ -460,44 +462,48 @@ void main() {
       expect(d.client.operationInProgress, isFalse);
     });
 
-    test('a settle is cancelled while the ASP is silent: the share goes, and so does its turn',
+    test('a renewal is cancelled while the ASP is silent: the share goes, and so does its turn',
         () async {
-      // The wait a cosigner-only cancel could not reach. By the time a settle is waiting for the
+      // The wait a cosigner-only cancel could not reach. By the time a renewal is waiting for the
       // ASP's batch it has signed its intent proof, so it is holding a rebuilt share — and it is
       // parked on the ASP's event stream, not on the cosigner. An ASP that never speaks again
       // would have kept that share in memory, and the lock against every later operation, forever.
       final asp = SilentAsp();
       final d = device(seed(20), newBox(), asp: asp);
       await d.client.doDkg();
+      d.approvals.clear();
 
-      final settling = d.client.settle(boardingUtxos: [
+      final renewing = d.client.board(
         cs.BoardingUtxo(txid: 'ab' * 32, vout: 0, amountSats: Int64(50000)),
-      ]);
+      );
       // Whatever becomes of it is looked at below; until then it is not an unhandled error.
-      settling.ignore();
+      renewing.ignore();
 
-      await cosigner.settleWaitingOnAsp.future.timeout(const Duration(seconds: 10));
+      await cosigner.boardWaitingOnAsp.future.timeout(const Duration(seconds: 10));
       // Give the driver its turn to go from `Idle` to the event stream.
       await Future<void>.delayed(const Duration(milliseconds: 200));
       expect(asp.intentsRegistered, 1);
-      expect(asp.listening, isTrue, reason: 'the settle is parked on the ASP, not the cosigner');
+      expect(asp.listening, isTrue, reason: 'the renewal is parked on the ASP, not the cosigner');
       final operation = d.operations.last;
       expect(operation.holdsSecrets, isTrue, reason: 'the intent proof was signed: a share exists');
       expect(d.client.operationInProgress, isTrue);
+      // One fingerprint, approved for the stream boarding opens: the seed rides it, so an approval
+      // asked for under any other method would be a second prompt.
+      expect(d.approvals, ['/cosigner.v1.Cosigner/Board']);
 
       // A second operation, queued behind it. It must not be stuck there.
       final queued = d.client.sign(message);
 
       await d.client.cancelOperation();
 
-      await expectLater(settling, throwsA(isA<OperationCancelled>()));
+      await expectLater(renewing, throwsA(isA<OperationCancelled>()));
       expect(operation.isDisposed, isTrue);
       expect(operation.holdsSecrets, isFalse, reason: 'a silent ASP keeps no share alive');
       expect(d.seeds.handedOut.take(2), everyElement(everyElement(0)));
 
       // The driver really unwound, rather than being left parked with the share in its frame:
       // it let go of the ASP's stream and the cosigner saw its own end.
-      await cosigner.settleEnded.future.timeout(const Duration(seconds: 10));
+      await cosigner.boardEnded.future.timeout(const Duration(seconds: 10));
       expect(asp.listenerLeft, isTrue);
 
       // And the turn passed on: the operation that was waiting runs, and signs.
@@ -729,18 +735,24 @@ void main() {
 
   group('setting an escrow up for a service', () {
     final platform = threshold.Identifier.derive(Uint8List.fromList('the platform'.codeUnits));
+    const policy = {'op': 'always'};
+    final deadline = DateTime.now().add(const Duration(hours: 1));
 
-    test('mints and pairs on one approval, and the operation is over when it returns', () async {
+    test('mints, pairs and strikes the deal on one approval, and the operation is over when it '
+        'returns', () async {
       final box = newBox();
       final d = device(seed(40), box);
       await d.client.doDkg();
       d.approvals.clear();
       final delivery = ScriptedDelivery();
 
-      final set = await d.client.setUpEscrow(serviceIdentifier: platform, delivery: delivery);
+      final set = await d.client.setUpEscrow(
+            serviceIdentifier: platform, policy: policy, deadline: deadline, delivery: delivery);
       expect(d.approvals, ['/cosigner.v1.Cosigner/Escrow']);
       expect(delivery.taken, hasLength(1), reason: "the wallet's half went to the service");
       expect(cosigner.pairingsConfirmed, 1);
+      expect(cosigner.dealsStruck, [jsonEncode(policy)], reason: 'the deal rode the open');
+      expect(set.agreed, 'the deal ${jsonEncode(policy)}', reason: 'and came back as agreed');
       expect(d.client.escrows.map((e) => e.escrowKeyHex), [set.escrow.escrowKeyHex]);
       expect(d.operations.last.isDisposed, isTrue);
       expect(d.operations.last.holdsSecrets, isFalse,
@@ -755,7 +767,8 @@ void main() {
       final delivery = ScriptedDelivery(refuse: true);
 
       await expectLater(
-        d.client.setUpEscrow(serviceIdentifier: platform, delivery: delivery),
+        d.client.setUpEscrow(
+            serviceIdentifier: platform, policy: policy, deadline: deadline, delivery: delivery),
         throwsA(isA<ServiceDeliveryException>()),
       );
       expect(cosigner.pairingsConfirmed, 0,
@@ -771,7 +784,8 @@ void main() {
       await d.client.doDkg();
       final delivery = ScriptedDelivery(hang: true);
 
-      final setting = d.client.setUpEscrow(serviceIdentifier: platform, delivery: delivery);
+      final setting = d.client.setUpEscrow(
+            serviceIdentifier: platform, policy: policy, deadline: deadline, delivery: delivery);
       await delivery.asked.future;
       expect(d.operations.last.holdsSecrets, isTrue,
           reason: 'the minted share is held while the service is waited on');
@@ -784,6 +798,134 @@ void main() {
       expect(d.operations.last.isDisposed, isTrue);
       expect(d.operations.last.holdsSecrets, isFalse);
       expect(d.client.operationInProgress, isFalse, reason: 'its turn is released');
+    });
+  });
+
+  group('opening the app', () {
+    // Every entry to the app asks for the passkey once, and that one approval re-arms the renewal
+    // the cosigner runs on its own. The app unlocks on the approval — a refresh's round after it
+    // takes minutes — so what it is told, and when, is what keeps a lock honest.
+
+    /// A VTXO the wallet holds, as the indexer would report it — enough to ask for a renewal.
+    IndexerVtxo held() => IndexerVtxo(
+          txid: 'cd' * 32,
+          vout: 0,
+          amountSats: 50000,
+          script: '',
+          isSpent: false,
+          createdAt: 0,
+          expiresAt: 4102444800,
+          exitDelay: 512,
+        );
+
+    test('is told the approval was given, before the renewal opens its stream', () async {
+      final d = device(seed(60), newBox(), asp: SilentAsp());
+      await d.client.doDkg();
+      d.approvals.clear();
+
+      List<String>? approvedWith;
+      int? streamsWhenTold;
+      await expectLater(
+        d.client.protectFunds(
+          over: [held()],
+          onApproved: () {
+            approvedWith = List.of(d.approvals);
+            streamsWhenTold = cosigner.renewsOpened;
+          },
+        ),
+        throwsA(isA<GrpcError>()),
+      );
+
+      expect(approvedWith, ['/cosigner.v1.Cosigner/Renew'], reason: 'told once it was given');
+      expect(streamsWhenTold, 0, reason: 'and before the renewal opened its stream');
+      expect(cosigner.renewsOpened, 1, reason: 'the renewal itself went on after it');
+      expect(d.operations.last.isDisposed, isTrue);
+      expect(d.operations.last.holdsSecrets, isFalse);
+    });
+
+    test('a dismissed prompt is not an approval', () async {
+      var dismiss = false;
+      final d = device(seed(61), newBox(), asp: SilentAsp(), approve: (_) async {
+        if (dismiss) throw StateError('the owner cancelled');
+      });
+      await d.client.doDkg();
+
+      dismiss = true;
+      var told = false;
+      await expectLater(
+        d.client.protectFunds(over: [held()], onApproved: () => told = true),
+        throwsStateError,
+      );
+      expect(told, isFalse, reason: 'an app must stay locked when the owner says no');
+      expect(cosigner.renewsOpened, 0);
+    });
+
+    test("a passkey that is not this wallet's is not an approval", () async {
+      final box = newBox();
+      final owner = device(seed(62), box);
+      await owner.client.doDkg();
+      await owner.client.close();
+
+      final thief = device(seed(63), box, asp: SilentAsp());
+      expect(await thief.client.restoreState(), isTrue);
+      var told = false;
+      await expectLater(
+        thief.client.protectFunds(over: [held()], onApproved: () => told = true),
+        throwsA(isA<WrongPasskey>()),
+      );
+      expect(told, isFalse, reason: "a stranger's fingerprint unlocks nothing");
+      expect(cosigner.renewsOpened, 0, reason: 'and reaches no cosigner');
+      expect(thief.operations, isEmpty, reason: 'no operation ever held anything');
+    });
+
+    test('checking the passkey is one gesture, and asks the cosigner nothing', () async {
+      final d = device(seed(64), newBox());
+      await d.client.doDkg();
+      d.approvals.clear();
+      final gestures = d.seeds.handedOut.length;
+
+      await d.client.verifyPasskey();
+
+      expect(d.approvals, isEmpty, reason: 'no call is approved, so it works offline');
+      expect(d.seeds.handedOut, hasLength(gestures + 1), reason: 'one gesture');
+      expect(d.seeds.handedOut, everyElement(everyElement(0)));
+      expect(d.operations.last.isDisposed, isTrue);
+      expect(d.operations.last.holdsSecrets, isFalse);
+      expect(d.client.operationInProgress, isFalse);
+    });
+
+    test("checking the passkey refuses one that is not this wallet's", () async {
+      final box = newBox();
+      final owner = device(seed(65), box);
+      await owner.client.doDkg();
+      await owner.client.close();
+
+      final thief = device(seed(66), box);
+      expect(await thief.client.restoreState(), isTrue);
+      await expectLater(thief.client.verifyPasskey(), throwsA(isA<WrongPasskey>()));
+      expect(thief.seeds.handedOut.single, everyElement(0));
+      expect(thief.operations, isEmpty);
+    });
+
+    test('checking the passkey waits its turn', () async {
+      final d = device(seed(67), newBox());
+      await d.client.doDkg();
+
+      cosigner.holdSigns = Completer<void>();
+      final signing = d.client.sign(message);
+      // Long enough for the sign to have taken its gesture and opened its stream.
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      final gestures = d.seeds.handedOut.length;
+
+      final checking = d.client.verifyPasskey();
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      expect(d.seeds.handedOut, hasLength(gestures),
+          reason: 'no gesture is asked for while another operation holds the turn');
+
+      cosigner.holdSigns!.complete();
+      await signing;
+      await checking;
+      expect(d.seeds.handedOut, hasLength(gestures + 1));
     });
   });
 

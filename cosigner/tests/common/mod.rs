@@ -93,28 +93,21 @@ pub fn dkg_2of2() -> (Vec<KeyPackage>, PublicKeyPackage) {
 
 /// Open the cosigner this process serves, loading whatever its seal already holds.
 pub fn open_cosigner(store: &Arc<Store>, group_key: &str) -> Mutex<Cosigner> {
-    Mutex::new(Cosigner::open(store.clone(), group_key.to_string()).expect("open cosigner"))
+    let detached = std::sync::Arc::new(cosigner::host::Detached);
+    let cosigner = Cosigner::open(store.clone(), group_key.to_string(), detached);
+    Mutex::new(cosigner.expect("open cosigner"))
 }
 
 /// Install a wallet's key material and seal it, as DKG's final round does: the cosigner key
-/// package, the group PKP, the user's signing identifier and the Ark cosigner secret.
+/// package, the group PKP and the user's signing identifier.
 pub fn seed_policy(
     cosigner: &Mutex<Cosigner>,
     group_key: &str,
     kp_cosigner: &KeyPackage,
     kp_user: &KeyPackage,
     pkp: &PublicKeyPackage,
-    ark_cosigner_secret_hex: Option<String>,
 ) {
-    seed_policy_with_dealt_share(
-        cosigner,
-        group_key,
-        kp_cosigner,
-        kp_user,
-        pkp,
-        ark_cosigner_secret_hex,
-        None,
-    );
+    seed_policy_with_dealt_share(cosigner, group_key, kp_cosigner, kp_user, pkp, None);
 }
 
 /// As [`seed_policy`], plus the share the cosigner dealt the wallet at DKG — what `Recover` hands
@@ -125,17 +118,15 @@ pub fn seed_policy_with_dealt_share(
     kp_cosigner: &KeyPackage,
     kp_user: &KeyPackage,
     pkp: &PublicKeyPackage,
-    ark_cosigner_secret_hex: Option<String>,
     wallet_dealt_share_hex: Option<String>,
 ) {
     let mut actor = cosigner.lock().unwrap();
     actor
-        .install_policy(
+        .install_key(
             group_key.to_string(),
             &kp_cosigner.to_json(),
             &pkp.to_json(),
             Some(&hex::encode(kp_user.identifier.serialize())),
-            ark_cosigner_secret_hex,
             wallet_dealt_share_hex,
             )
         .expect("install policy");
@@ -181,13 +172,13 @@ pub fn group_sign(
         .serialize()
 }
 
-/// The wallet's half of an in-band round over [messages]: a fresh nonce for each, then a share
+/// The wallet's half of a signing session over [messages]: a fresh nonce for each, then a share
 /// over both commitments. What `answerRound` does in the app.
 pub fn wallet_answers(
     kp_user: &KeyPackage,
     messages: &[Vec<u8>],
     cosigner_commitments: &[cosigner::types::Commitment],
-) -> Vec<cosigner::cosigner::WalletHalf> {
+) -> Vec<cosigner::sign::WalletHalf> {
     use threshold::commitment::SigningPackage;
     use threshold::nonce::{self, SigningCommitments};
     use threshold::point;
@@ -216,7 +207,7 @@ pub fn wallet_answers(
             commitments.insert(kp_user.identifier.clone(), ours.commitments.clone());
             let package = SigningPackage::new(commitments, message.clone());
             let share = signing::sign(&package, &ours, kp_user).expect("wallet share");
-            cosigner::cosigner::WalletHalf {
+            cosigner::sign::WalletHalf {
                 hiding: point::serialize_compressed(&ours.commitments.hiding).to_vec(),
                 binding: point::serialize_compressed(&ours.commitments.binding).to_vec(),
                 share: scalar_to_bytes(&share.s).to_vec(),
@@ -232,7 +223,7 @@ pub fn seed_escrow(
     paired: bool,
 ) {
     let mut c = cosigner.lock().unwrap();
-    c.install_escrow(cosigner::types::EscrowRecord {
+    c.add_escrow(cosigner::escrow::EscrowSession {
         escrow_key: escrow_key.to_string(),
         key_package_json: "{}".into(),
         public_key_package_json: "{}".into(),
@@ -240,25 +231,26 @@ pub fn seed_escrow(
         context_hex: "22".repeat(16),
         wallet_delta_share_hex: "33".repeat(32),
         created_at: 1_700_000_000,
-        pairing: paired.then(|| cosigner::types::ServicePairing {
-            service_identifier_hex: "44".repeat(32),
-            key_package_json: "{}".into(),
-            public_key_package_json: "{}".into(),
-            service_verifying_share_hex: "55".repeat(33),
-            paired_at: 1_700_000_000,
-            attempt_id_hex: "aa".repeat(16),
-            // Seeded finished: these tests are about the DEAL, and a pending pairing is refused a
-            // deal for reasons of its own — proved in `escrow_session_test.rs`.
-            service_confirmed: true,
-            wallet_confirmed: true,
-        }),
-        session: None,
-        reclaim_opened_at: None,
+        stage: match paired {
+            false => cosigner::escrow::EscrowStage::Minted,
+            true => cosigner::escrow::EscrowStage::Paired(cosigner::escrow::ServicePairing {
+                service_identifier_hex: "44".repeat(32),
+                key_package_json: "{}".into(),
+                public_key_package_json: "{}".into(),
+                service_verifying_share_hex: "55".repeat(33),
+                paired_at: 1_700_000_000,
+                attempt_id_hex: "aa".repeat(16),
+                // Seeded finished: these tests are about the DEAL, and a pending pairing is refused
+                // a deal for reasons of its own — proved in `escrow_session_test.rs`.
+                service_confirmed: true,
+                wallet_confirmed: true,
+            }),
+        },
     })
     .expect("install escrow");
 }
 
-/// Driving `CosignerService::route` with real framed bodies, as the runtime delivers them.
+/// Driving `Session::route` with real framed bodies, as the runtime delivers them.
 ///
 /// A body here is written whole before the handler runs, so a test can open a stream and read
 /// what the cosigner says first — but cannot answer it. A stream opened and left is cut off
@@ -272,13 +264,10 @@ pub mod wire {
     use http_body_util::BodyExt;
 
     use cosigner::grpc::framing::{frame, Deframer};
-    use cosigner::session::{CosignerService, TENANT_HEADER};
+    use cosigner::session::Session;
     use cosigner::wallet_proto::GetServerInfoResponse;
     use cosigner::Cosigner;
     use wstd::http::{Body, Request, Response};
-
-    /// What the runtime puts on an approved request: sixteen bytes, lowercase hex.
-    pub const TENANT: &str = "0123456789abcdef0123456789abcdef";
 
     /// Drive a future to completion on this thread.
     ///
@@ -297,25 +286,16 @@ pub mod wire {
         panic!("the future never completed");
     }
 
-    /// A gRPC request carrying `messages`, addressed at `method`, as the runtime would deliver it
-    /// — or, with `tenant: None`, as it would never deliver it.
-    pub fn request<M: prost::Message>(
-        method: &str,
-        messages: &[M],
-        tenant: Option<&str>,
-    ) -> Request<Body> {
+    /// A gRPC request carrying `messages`, addressed at `method`, as the runtime would deliver it.
+    pub fn request<M: prost::Message>(method: &str, messages: &[M]) -> Request<Body> {
         let mut buf = Vec::new();
         for message in messages {
             buf.extend_from_slice(&frame(&message.encode_to_vec()));
         }
-        let mut builder = Request::builder()
+        Request::builder()
             .method("POST")
             .uri(format!("http://cosigner/cosigner.v1.Cosigner/{method}"))
-            .header("content-type", "application/grpc+proto");
-        if let Some(tenant) = tenant {
-            builder = builder.header(TENANT_HEADER, tenant);
-        }
-        builder
+            .header("content-type", "application/grpc+proto")
             .body(Body::from_http_body(
                 http_body_util::Full::new(Bytes::from(buf))
                     .map_err(|e: std::convert::Infallible| -> wstd::http::Error { match e {} }),
@@ -355,8 +335,8 @@ pub mod wire {
         Answer { messages, code, message }
     }
 
-    pub fn service(cosigner: Cosigner) -> CosignerService {
-        CosignerService::new(
+    pub fn service(cosigner: Cosigner) -> Session {
+        Session::new(
             Arc::new(Mutex::new(cosigner)),
             GetServerInfoResponse { bitcoin_network: "regtest".into() },
         )

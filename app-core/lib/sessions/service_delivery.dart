@@ -38,7 +38,7 @@ class ServiceContribution {
   final String escrowKeyHex;
 
   /// Which attempt. The cosigner's half carries the same label — that is what tells the service
-  /// which two halves belong together, and keeps a retry's halves apart from an abandoned one's.
+  /// which two halves belong together, and keeps one attempt's halves apart from another's.
   final String attemptIdHex;
   final String serviceIdentifierHex;
 

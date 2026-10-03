@@ -83,6 +83,21 @@ impl<Req, Resp> Duplex<Req, Resp> {
     }
 }
 
+/// A stream message whose payload is a `oneof body` — as every client message here is.
+pub trait HasBody {
+    type Body;
+
+    fn into_body(self) -> Option<Self::Body>;
+}
+
+impl<Req: HasBody, Resp> Duplex<Req, Resp> {
+    /// The next message's body: [`expect`](Self::expect), and refused if the message is empty.
+    pub async fn next_body(&self, what: &str) -> Result<Req::Body, Status> {
+        let empty = || Status::invalid_argument(format!("an empty message where {what} belonged"));
+        self.expect(what).await?.into_body().ok_or_else(empty)
+    }
+}
+
 enum Phase {
     Talking,
     Trailers,

@@ -267,7 +267,7 @@ void main() {
 
         // Straight from the ASP. The cosigner used to relay `GetArkInfo` from its own connection;
         // it has no socket, so the client asks arkd itself and passes what it learns back in on
-        // each SendOpen/SettleOpen.
+        // each SendOpen/RenewOpen.
         final info = await alice.client.getArkInfo();
         expect(info.signerPubkey, isNotEmpty);
         expect(info.network, 'regtest');
@@ -327,15 +327,15 @@ void main() {
   Future<Wallet> wallet(String name) => harness!.wallet(name, aspHost: aspHost, aspPort: aspPort);
 
   /// Fund [w]'s boarding address with [btcAmount], settle it into Ark, and return what it holds.
-  Future<List<IndexerVtxo>> boardAndSettle(Wallet w, double btcAmount) async {
+  Future<List<IndexerVtxo>> boardAndRenew(Wallet w, double btcAmount) async {
     final boarding = await w.client.getBoardingAddress();
     await btc.sendToAddress(boarding, btcAmount);
     await btc.generateToAddress(1, await btc.getNewAddress());
     final minSats = (btcAmount * 1e8).round();
     final deposits = await pollBoardingUtxos(boarding, minSats);
     expect(deposits, isNotEmpty, reason: '${w.name}: electrs should index the deposit');
-    final commitment = await whileMining(btc, () => settleBoarding(w.client, deposits));
-    expect(commitment, isNotEmpty, reason: '${w.name}: the settle should return a commitment');
+    final commitment = await whileMining(btc, () => renewBoarding(w.client, deposits));
+    expect(commitment, isNotEmpty, reason: '${w.name}: the renewal should return a commitment');
     return eventually(
       '${w.name}: the boarded VTXO to be indexed',
       w.client.listVtxos,
@@ -366,7 +366,7 @@ void main() {
   /// never answers again, these are the money — so they are checked to be complete, correct and
   /// re-issued whenever the set of VTXOs changes.
   group('the way out', () {
-    test('every seal signs an exit for every VTXO it covers', () async {
+    test('every renewal signs an exit for every VTXO it covers', () async {
       final erin = await wallet('exit_erin');
       try {
         await erin.client.doDkg();
@@ -375,7 +375,7 @@ void main() {
         final exitAddress = await btc.getNewAddress();
         await erin.client.setExitAddress(exitAddress);
 
-        final held = await boardAndSettle(erin, 0.005);
+        final held = await boardAndRenew(erin, 0.005);
         final vtxo = held.single;
 
         final exits = erin.client.exits;
@@ -406,7 +406,7 @@ void main() {
         }
         Log.info('exit path: ${chain.hops.map((h) => h.kind.name).join(' -> ')}');
 
-        // Spending the VTXO makes its exit meaningless, and the seal on the way out replaces it.
+        // Spending the VTXO makes its exit meaningless, and the renewal on the way out replaces it.
         final bob = await wallet('exit_bob');
         await bob.client.doDkg();
         final bobAddress = await bob.client.getArkAddress();
@@ -417,12 +417,12 @@ void main() {
         expect(after, isNotEmpty, reason: "the change VTXO has an exit of its own");
         expect(after.single.amountSats, lessThan(vtxo.amountSats));
 
-        // Bob received, and nothing of his has been sealed yet: he holds money with no exit until
+        // Bob received, and has renewed nothing yet: he holds money with no exit until
         // he protects it. That gap is what the Exit tab shows, and what `protectFunds` closes.
         expect(bob.client.exits, isEmpty);
         await bob.client.setExitAddress(await btc.getNewAddress());
-        final sealed = await bob.client.protectFunds();
-        expect(sealed.exits, hasLength(1));
+        final renewed = await bob.client.protectFunds();
+        expect(renewed.exits, hasLength(1));
         expect(bob.client.exits.single.amountSats, 10000);
       } finally {
         await erin.close();
@@ -475,7 +475,7 @@ void main() {
         // derives the script from its own key, so an output that is not ours is one it cannot
         // produce a spendable signature for anyway.
         final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-        final sealed = await alice.client.protectFunds(over: [
+        final renewed = await alice.client.protectFunds(over: [
           IndexerVtxo(
             txid: fundingTxid,
             vout: (output['n'] as num).toInt(),
@@ -487,7 +487,7 @@ void main() {
             exitDelay: info.unilateralExitDelay,
           )
         ]);
-        final exit = sealed.exits.single;
+        final exit = renewed.exits.single;
         expect(exit.amountSats, amountSats);
 
         // Too early: the timelock is the whole point of an exit, so it must actually bind.
@@ -524,11 +524,11 @@ void main() {
     }, timeout: const Timeout(Duration(minutes: 10)));
 
     /// A wallet that never set one still works — it simply has nothing to fall back on.
-    test('a wallet with no exit address still seals a delegate', () async {
+    test('a wallet with no exit address still renews its delegate', () async {
       final dana = await wallet('exit_dana');
       try {
         await dana.client.doDkg();
-        await boardAndSettle(dana, 0.005);
+        await boardAndRenew(dana, 0.005);
         expect(dana.client.delegateStatus, isNotNull);
         expect(dana.client.exits, isEmpty);
       } finally {
@@ -547,14 +547,14 @@ void main() {
         await alice.client.doDkg();
         await bob.client.doDkg();
 
-        // A token that arrives after onboarding — FCM rotated it — rides the next seal.
-        const token = 'e2e-seal-device-token-0123456789abcdef';
+        // A token that arrives after onboarding — FCM rotated it — rides the next renewal.
+        const token = 'e2e-renew-device-token-0123456789abcdef';
         final enrolled = <String>[];
         alice.client.onDeviceEnrolled = enrolled.add;
         alice.client.offerDeviceToken(token);
 
-        final held = await boardAndSettle(alice, 0.01);
-        expect(enrolled, [token], reason: 'the settle\'s seal should carry the token and enrol it');
+        final held = await boardAndRenew(alice, 0.01);
+        expect(enrolled, [token], reason: 'the renewal should carry the token and enrol it');
         expect(await alice.client.deviceCount(), 1);
         expect(held, hasLength(1));
         final vtxo = held.single;
@@ -566,10 +566,10 @@ void main() {
         // by a subscription the cosigner ran; nothing runs one now.
         expect(vtxo.expiresAt, greaterThan(0));
 
-        // The settle sealed a delegate on its way out, on the same stream and approval: over the one
-        // VTXO held, valid from its expiry less the margin.
+        // Boarding renewed the delegate on its way out, on the same stream and approval: over the
+        // one VTXO held, valid from its expiry less the margin.
         final boarded = alice.client.delegateStatus;
-        expect(boarded, isNotNull, reason: 'the settle should seal a delegate before closing');
+        expect(boarded, isNotNull, reason: 'boarding should renew the delegate before closing');
         expect(boarded!.covered, {'${vtxo.txid}:${vtxo.vout}'});
         expect(boarded.validAt,
             DateTime.fromMillisecondsSinceEpoch(vtxo.expiresAt * 1000).subtract(boarded.margin));
@@ -582,18 +582,18 @@ void main() {
 
         expect((await bob.client.listVtxos()).totalSats, 170000);
 
-        // Each send sealed a new delegate over what was left, so Alice's change is covered with no
+        // Each send renewed the delegate over what was left, so Alice's change is covered with no
         // call of its own.
         expect(alice.client.delegateStatus, isNotNull);
         expect(await alice.client.unprotectedVtxos(), isEmpty,
-            reason: 'a send should seal a delegate over its change before closing');
+            reason: 'a send should renew the delegate over its change before closing');
 
-        // Bob only received. No delegate covers those funds until he seals one — one call, and then
-        // one does.
+        // Bob only received. No delegate covers those funds until he protects them — one call, and
+        // then one does.
         expect(bob.client.delegateStatus, isNull);
         expect(await bob.client.unprotectedVtxos(), hasLength(3));
-        final sealed = await bob.client.protectFunds();
-        expect(sealed.covered, hasLength(3));
+        final renewed = await bob.client.protectFunds();
+        expect(renewed.covered, hasLength(3));
         expect(await bob.client.unprotectedVtxos(), isEmpty);
       } finally {
         await alice.close();
@@ -610,7 +610,7 @@ void main() {
       final erin = await wallet('delegate_erin');
       try {
         await erin.client.doDkg();
-        final held = await boardAndSettle(erin, 0.005);
+        final held = await boardAndRenew(erin, 0.005);
         final before = held.single;
         final delegate = erin.client.delegateStatus!;
         expect(delegate.covered, {'${before.txid}:${before.vout}'});
@@ -645,8 +645,8 @@ void main() {
 
         // The refreshed VTXO has no delegate of its own until the wallet is next here to sign one.
         expect(await erin.client.unprotectedVtxos(), hasLength(1));
-        final resealed = await erin.client.protectFunds();
-        expect(resealed.covered, {'${after.txid}:${after.vout}'});
+        final renewed = await erin.client.protectFunds();
+        expect(renewed.covered, {'${after.txid}:${after.vout}'});
       } finally {
         await erin.close();
       }
@@ -655,7 +655,7 @@ void main() {
 
   group('nothing secret at rest', () {
     /// No share is stored: each operation rebuilds one from the passkey's seed and the half the
-    /// cosigner returns on the stream it approved. A right seed signs a settle the ASP accepts —
+    /// cosigner returns on the stream it approved. A right seed signs a renewal the ASP accepts —
     /// every round of it, off one reconstruction — and leaves nothing of itself on disk; a wrong
     /// one is refused on the device, before anything is opened.
     test('the right seed signs and leaves nothing behind; a wrong seed cannot spend', () async {
@@ -670,13 +670,13 @@ void main() {
         await alice.client.doDkg();
         await bob.client.doDkg();
 
-        final held = await boardAndSettle(alice, 0.01);
+        final held = await boardAndRenew(alice, 0.01);
         expect(held, hasLength(1),
             reason: 'a VTXO means the rebuilt share signed validly, twice, in-band — the intent '
-                'proof and the commitment — and then the seal, all off one contribution');
+                'proof and the commitment — and then the delegate, all off one contribution');
 
-        // What is on disk after a DKG, a settle and a seal. The file, not the live value: Hive
-        // appends, so anything ever written is still in it.
+        // What is on disk after a DKG, a boarding and its delegate. The file, not the live value:
+        // Hive appends, so anything ever written is still in it.
         final polynomial = await walletPolynomial(Uint8List.fromList(seed));
         final raw = await harness!.stateFileOf(alice).readAsBytes();
         final rawText = String.fromCharCodes(raw).toLowerCase();
@@ -724,8 +724,8 @@ void main() {
         expect(info.boardingExitDelay, isNot(equals(info.unilateralExitDelay)),
             reason: 'with equal delays this test cannot detect the bug — check the arkd config');
 
-        await boardAndSettle(alice, 0.002);
-        await boardAndSettle(bob, 0.003);
+        await boardAndRenew(alice, 0.002);
+        await boardAndRenew(bob, 0.003);
 
         // Alice receives, so she now holds one of each.
         await sendAndSettleBalances(bob, alice, 150000);
@@ -737,7 +737,7 @@ void main() {
         await sendAndSettleBalances(alice, bob, 250000);
 
         // Reverse: the change is already held, and a fresh boarding arrives after it.
-        await boardAndSettle(alice, 0.002);
+        await boardAndRenew(alice, 0.002);
         final reversed = await alice.client.listVtxos();
         expect(reversed.map((v) => v.exitDelay).toSet(), hasLength(2));
         await sendAndSettleBalances(alice, bob, reversed.totalSats - 10000);
@@ -764,7 +764,7 @@ void main() {
         await first.client.doDkg();
         await dave.client.doDkg();
         key = first.client.groupKeyHex!;
-        await boardAndSettle(first, 0.005);
+        await boardAndRenew(first, 0.005);
       } finally {
         await first.close();
       }
@@ -797,7 +797,7 @@ void main() {
         await erin.client.doDkg();
         await frank.client.doDkg();
         key = erin.client.groupKeyHex!;
-        held = (await boardAndSettle(erin, 0.005)).totalSats;
+        held = (await boardAndRenew(erin, 0.005)).totalSats;
       } finally {
         await erin.close();
       }
@@ -931,13 +931,18 @@ void main() {
       final alice = await wallet('pair_alice');
       try {
         await alice.client.doDkg();
-        final escrow = await alice.client.createEscrow();
+        final passkey = alice.gate.authenticator as SoftwareAuthenticator;
+        final before = passkey.counter;
 
-        final pairing = await alice.client.pairService(
-          escrowKeyHex: escrow.escrowKeyHex,
+        final set = await alice.client.setUpEscrow(
           serviceIdentifier: serviceIdentifier,
+          policy: const {'op': 'always'},
+          deadline: DateTime.now().add(const Duration(hours: 1)),
           delivery: delivery,
         );
+        final escrow = set.escrow, pairing = set.pairing;
+        expect(passkey.counter - before, 1,
+            reason: 'minting, pairing and striking the deal are one approval');
 
         // The service has both halves and checked the share they sum to. Nothing about that came
         // from the wallet's say-so — it assembled and verified for itself.
@@ -969,6 +974,7 @@ void main() {
             .firstWhere((e) => e.escrowKey.toLowerCase() == escrow.escrowKeyHex.toLowerCase());
         expect(
             row.serviceIdentifier.toLowerCase(), _hex(serviceIdentifier.serialize()).toLowerCase());
+        expect(row.hasSession(), isTrue, reason: 'the deal was struck with the pairing');
 
         // The connection outlives the call that opened it. That is the whole reason the half went
         // on a stream rather than in a POST: the service has to be able to speak first later.
@@ -984,121 +990,48 @@ void main() {
       final bob = await wallet('pair_bob');
       try {
         await bob.client.doDkg();
-        final escrow = await bob.client.createEscrow();
 
         service!.rejectWalletDeliveries = true;
         await expectLater(
-          bob.client.pairService(
-            escrowKeyHex: escrow.escrowKeyHex,
+          bob.client.setUpEscrow(
             serviceIdentifier: serviceIdentifier,
+            policy: const {'op': 'always'},
+            deadline: DateTime.now().add(const Duration(hours: 1)),
             delivery: delivery,
           ),
           throwsA(anything),
           reason: 'a pairing the service cannot complete must not report success',
         );
         service!.rejectWalletDeliveries = false;
+        // Minted before the pairing failed, so this wallet still knows it holds it.
+        final escrow = bob.client.escrows.single;
 
-        // The cosigner sealed it pending, not ready — so nothing may be committed to it. Given
-        // time to converge rather than checked instantly, so this cannot pass merely by being
-        // quick: neither party has anything to say, and after the wait it is still not ready.
+        // The cosigner sealed it pending, not ready. Given time to converge rather than checked
+        // instantly, so this cannot pass merely by being quick: neither party has anything to say,
+        // and after the wait it is still not ready.
         expect(await readyWithin(bob, escrow.escrowKeyHex, limit: const Duration(seconds: 3)),
             isNot('ready'),
             reason: 'one half is not a pairing, and must not be reported as one');
 
-        await expectLater(
-          bob.client.openEscrowSession(
-            escrowKeyHex: escrow.escrowKeyHex,
-            policy: {'op': 'always'},
-            deadline: DateTime.now().add(const Duration(hours: 1)),
-          ),
-          throwsA(anything),
-          reason: 'an escrow whose service cannot sign must not be committed to a deal',
-        );
+        // And no deal: it is struck only once the wallet's half is delivered, and nothing else
+        // ever commits an escrow — so this one is its owner's, and never anybody's to be paid from.
+        final row = (await bob.client.escrowStatus()).firstWhere(
+            (e) => e.escrowKey.toLowerCase() == escrow.escrowKeyHex.toLowerCase());
+        expect(row.hasSession(), isFalse,
+            reason: 'an escrow whose service cannot sign must not be committed to a deal');
       } finally {
         await bob.close();
       }
     }, timeout: const Timeout(Duration(minutes: 15)));
 
-    /// Retrying the SAME attempt redelivers the same contribution, so the halves still sum. A
-    /// retry that dealt a fresh slope would leave the service holding two halves of two different
-    /// pairings and able to complete neither.
-    test('a failed wallet delivery is retried under the same attempt', () async {
-      final carol = await wallet('pair_carol');
-      try {
-        await carol.client.doDkg();
-        final escrow = await carol.client.createEscrow();
-
-        // A fixed attempt id, so the retry below names the one that half-finished.
-        final attempt = List<int>.generate(16, (i) => i + 1);
-
-        service!.rejectWalletDeliveries = true;
-        await expectLater(
-          carol.client.pairService(
-            escrowKeyHex: escrow.escrowKeyHex,
-            serviceIdentifier: serviceIdentifier,
-            attemptId: attempt,
-            delivery: delivery,
-          ),
-          throwsA(anything),
-        );
-        service!.rejectWalletDeliveries = false;
-        expect(service!.isReady(escrow.escrowKeyHex, _hex(attempt)), isFalse);
-
-        // The same attempt again. The cosigner deals a fresh half — its own is never retained — and
-        // the wallet's slope is derived, so what it sends is the same scalar as before.
-        final pairing = await carol.client.pairService(
-          escrowKeyHex: escrow.escrowKeyHex,
-          serviceIdentifier: serviceIdentifier,
-          attemptId: attempt,
-          delivery: delivery,
-        );
-        expect(pairing.attemptIdHex, _hex(attempt));
-        expect(service!.isReady(escrow.escrowKeyHex, _hex(attempt)), isTrue);
-        expect(service!.refusals, isEmpty,
-            reason: 'no assembled share should ever have failed its check');
-
-        expect(await readyWithin(carol, escrow.escrowKeyHex), 'ready');
-      } finally {
-        await carol.close();
-      }
-    }, timeout: const Timeout(Duration(minutes: 15)));
-
-    /// Setting an escrow up for a service is ONE approval: the mint and the pairing are one stream,
-    /// and the wallet's word that its half arrived rides it too. Nothing else changes — the service
-    /// still assembles and checks for itself, and the cosigner still waits for the service's word,
-    /// which can only land once the stream that paired it has closed.
-    test('an escrow is minted and a service paired into it on one approval', () async {
-      final frank = await wallet('setup_frank');
-      try {
-        await frank.client.doDkg();
-        final passkey = frank.gate.authenticator as SoftwareAuthenticator;
-        final before = passkey.counter;
-
-        final set = await frank.client.setUpEscrow(
-          serviceIdentifier: serviceIdentifier,
-          delivery: delivery,
-        );
-        expect(passkey.counter - before, 1, reason: 'minting and pairing are one approval');
-        expect(service!.isReady(set.escrow.escrowKeyHex, set.pairing.attemptIdHex), isTrue,
-            reason: 'the service must hold a finished share, not one half of one');
-        expect(frank.client.escrows.map((e) => e.escrowKeyHex), [set.escrow.escrowKeyHex]);
-        expect(await readyWithin(frank, set.escrow.escrowKeyHex), 'ready');
-      } finally {
-        await frank.close();
-      }
-    }, timeout: const Timeout(Duration(minutes: 15)));
-
-    /// Topping an escrow up and committing it to a deal is ONE approval: the send that funds it
-    /// commits it once final. And a deal the cosigner could not strike is refused before the send
-    /// is built, so a refusal moves no money at all.
-    test('an escrow is topped up and committed on one approval, and a refusal moves nothing',
-        () async {
+    /// An escrow is set up with its deal on ONE approval — minted, paired, committed — and funded
+    /// by an ordinary send to its address, on one more.
+    test('an escrow is set up, dealt and funded on one approval', () async {
       final grace = await wallet('fund_grace');
       try {
         await grace.client.doDkg();
-        await boardAndSettle(grace, 0.005);
+        await boardAndRenew(grace, 0.005);
         final passkey = grace.gate.authenticator as SoftwareAuthenticator;
-        const policy = {'op': 'always'};
         final deadline = DateTime.now().add(const Duration(hours: 1));
         Future<int> heldBy(String escrowKeyHex) async =>
             (await grace.client.vtxosAtArkAddress(escrowKeyHex.substring(2)))
@@ -1106,48 +1039,35 @@ void main() {
                 .toList()
                 .totalSats;
 
-        // Nothing paired into it: nobody could ever release from it, so there is no deal to strike.
-        final bare = await grace.client.createEscrow();
-        final balance = (await grace.client.listVtxos()).totalSats;
-        await expectLater(
-          whileMining(
-              btc,
-              () => grace.client.fundEscrowDeal(
-                    escrowKeyHex: bare.escrowKeyHex,
-                    amountSats: 20000,
-                    policy: policy,
-                    deadline: deadline,
-                  )),
-          throwsA(predicate((e) => '$e'.contains('no service paired'))),
-        );
-        expect((await grace.client.listVtxos()).totalSats, balance,
-            reason: 'refused before the send was built, so nothing left the wallet');
-        expect(await heldBy(bare.escrowKeyHex), 0);
-
-        final set = await grace.client.setUpEscrow(
-          serviceIdentifier: serviceIdentifier,
-          delivery: delivery,
-        );
-        final key = set.escrow.escrowKeyHex;
-        expect(await readyWithin(grace, key), 'ready');
-
         final before = passkey.counter;
-        final funded = await whileMining(
-            btc,
-            () => grace.client.fundEscrowDeal(
-                  escrowKeyHex: key,
-                  amountSats: 20000,
-                  policy: policy,
-                  deadline: deadline,
-                ));
-        expect(passkey.counter - before, 1, reason: 'the top-up and the seal are one approval');
-        expect(funded.agreed, isNotNull, reason: 'this cosigner commits on the send');
+        String? toldBeforeFunding;
+        final set = await whileMining(
+          btc,
+          () => grace.client.setUpEscrow(
+            serviceIdentifier: serviceIdentifier,
+            policy: const {'op': 'always'},
+            deadline: deadline,
+            delivery: delivery,
+            fundSats: 20000,
+            beforeFunding: (escrowKeyHex) async => toldBeforeFunding = escrowKeyHex,
+          ),
+        );
+        expect(passkey.counter - before, 1,
+            reason: 'the escrow, its deal and its funding are one approval');
+        expect(set.agreed, isNotEmpty, reason: 'the owner is told what she agreed to');
+        final key = set.escrow.escrowKeyHex;
+        expect(toldBeforeFunding, key, reason: 'the escrow is known before any money moves to it');
+        expect(set.fundTxid, isNotEmpty);
+        expect(await readyWithin(grace, key), 'ready');
 
         final row = (await grace.client.escrowStatus())
             .firstWhere((e) => e.escrowKey.toLowerCase() == key.toLowerCase());
         expect(row.session.open, isTrue, reason: 'the escrow is committed to the deal');
         expect(row.session.deadlineSecs.toInt(), deadline.millisecondsSinceEpoch ~/ 1000);
-        await eventually('the escrow to hold the top-up', () => heldBy(key), (int s) => s == 20000);
+
+        // The price went to the escrow the cosigner minted, at the address its key gives.
+        await eventually(
+            'the escrow to hold what was sent', () => heldBy(key), (int s) => s == 20000);
       } finally {
         await grace.close();
       }
@@ -1166,12 +1086,16 @@ void main() {
       final erin = await wallet('release_erin');
       try {
         await erin.client.doDkg();
-        final escrow = await erin.client.createEscrow();
-        final pairing = await erin.client.pairService(
-          escrowKeyHex: escrow.escrowKeyHex,
+        // The deal: what the service may take, and until when. Short, because this test waits it
+        // out — the only way a deal ends — and long enough to be paired and asked within.
+        final deadline = DateTime.now().add(const Duration(seconds: 45));
+        final set = await erin.client.setUpEscrow(
           serviceIdentifier: serviceIdentifier,
+          policy: const {'op': 'always'},
+          deadline: deadline,
           delivery: delivery,
         );
+        final escrow = set.escrow, pairing = set.pairing;
         expect(await readyWithin(erin, escrow.escrowKeyHex), 'ready');
         final share = service!.shareFor(escrow.escrowKeyHex, pairing.attemptIdHex)!;
 
@@ -1184,15 +1108,6 @@ void main() {
             reason: 'one connection per wallet, all announcing the same local id');
         expect(share.streamId, endsWith('-${_streamIdFor(serviceIdentifier)}'),
             reason: 'the wire name is the tenant and then the id the guest chose');
-
-        // The deal: what the service may take, and until when. Short, because this test waits it
-        // out — the only way a deal ends.
-        final deadline = DateTime.now().add(const Duration(seconds: 20));
-        await erin.client.openEscrowSession(
-          escrowKeyHex: escrow.escrowKeyHex,
-          policy: {'op': 'always'},
-          deadline: deadline,
-        );
 
         // One VTXO in, one payout and change out — so two things to sign, and two commitments.
         final inputs = [
@@ -1274,8 +1189,8 @@ void main() {
         expect(afterwards['reason'], contains('deal is over'));
 
         // The other half of the same swap — the owner being able to take it back — needs an escrow
-        // that actually holds something. This one spends synthetic inputs, so reclaim is proved
-        // where the money is real: `bin/card_walkthrough.dart`, which funds, lapses and reclaims.
+        // that actually holds something. This one spends synthetic inputs, so a reclaim of real
+        // money is not proved end to end yet.
       } finally {
         await erin.close();
       }
@@ -1286,18 +1201,19 @@ void main() {
       final dave = await wallet('pair_dave');
       try {
         await dave.client.doDkg();
-        final escrow = await dave.client.createEscrow();
         final stranger =
             ark_threshold.Identifier.derive(Uint8List.fromList('nobody-the-image-knows'.codeUnits));
 
         await expectLater(
-          dave.client.pairService(
-            escrowKeyHex: escrow.escrowKeyHex,
+          dave.client.setUpEscrow(
             serviceIdentifier: stranger,
+            policy: const {'op': 'always'},
+            deadline: DateTime.now().add(const Duration(hours: 1)),
             delivery: delivery,
           ),
           throwsA(predicate((e) => '$e'.contains('does not know that service'))),
         );
+        expect(dave.client.escrows, isEmpty, reason: 'refused before an escrow was minted');
       } finally {
         await dave.close();
       }
@@ -1334,7 +1250,7 @@ final _random = Random.secure();
 
 /// The id the enclave opens its connection to a service under.
 ///
-/// Derived the same way `cosigner::service_stream::service_stream_id` derives it, and duplicated
+/// Derived the same way `cosigner::escrow::service_stream_id` derives it, and duplicated
 /// here on purpose: a test that computed it by asking the thing it is testing would prove nothing.
 String _streamIdFor(ark_threshold.Identifier identifier) =>
     'svc-${_hex(identifier.serialize()).toLowerCase().substring(0, 40)}';

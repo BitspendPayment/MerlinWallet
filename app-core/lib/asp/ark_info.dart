@@ -2,7 +2,7 @@
 ///
 /// The wallet used to get these from the cosigner over `GetArkInfo`, which relayed its own
 /// `GetInfo` call. The cosigner has no ASP connection any more — the caller drives the Ark protocol
-/// — so the wallet asks the ASP itself and passes what it learned into `SendOpen`/`SettleOpen`.
+/// — so the wallet asks the ASP itself and passes what it learned into `SendOpen`/`RenewOpen`.
 ///
 /// A value type rather than the generated `GetInfoResponse`: this is the subset the protocol
 /// actually uses, and naming it separately keeps the twenty-field wire message out of every

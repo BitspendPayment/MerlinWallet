@@ -9,7 +9,7 @@ mod common;
 
 
 #[test]
-fn install_policy_seals_without_plaintext() {
+fn install_key_seals_without_plaintext() {
     let Some(store) = common::try_store() else {
         return;
     };
@@ -21,7 +21,7 @@ fn install_policy_seals_without_plaintext() {
 
     // Install straight into the actor — note we never write the `policies` tree.
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, kp_cosigner, kp_user, &pkp, None);
+    common::seed_policy(&cosigner, &group_key, kp_cosigner, kp_user, &pkp);
 
     // The actor sealed its state ⇒ a sealed_state blob exists for the group key.
     let blob = store.get("sealed_state", &group_key).unwrap();

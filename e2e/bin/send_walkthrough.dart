@@ -6,10 +6,11 @@
 ///
 /// Alice pays a Nigerian bank, a Kenyan M-PESA wallet, Ghanaian mobile money, a Ghanaian bank and a
 /// South African bank, through the same wallet library the app uses (`BankSend`): quote, check the
-/// policy, top the escrow up to the price and seal, and let MerlinPlatform pay and be repaid — each
-/// payout counting the passkey approvals it really took. Then the
-/// cases that must not work: a payout that fails, a payee the bank does not know, messages the
-/// enclave did not send, a policy sealed with a term added, a deal too short to be repaid in.
+/// policy, set up an escrow with the deal sealed and send it the price, and let MerlinPlatform pay
+/// and be repaid — each payout on an escrow of its own, counting the passkey approvals it really
+/// took. Then the cases that must not work: a payout that fails, whose escrow she takes back; a
+/// payee the bank does not know; messages the enclave did not send; a policy sealed with a term
+/// added; a deal too short to be repaid in.
 ///
 /// **Every payout here is simulated.** The fake Grid answers the way Grid's sandbox does, and marks
 /// everything it returns `simulated`. The Bitcoin is real regtest Bitcoin, and every signature,
@@ -75,31 +76,38 @@ Future<void> main() async {
 
     final flow = _Flow(send, alice.client, alice.gate.authenticator as SoftwareAuthenticator, btc);
 
-    _step('1. ₦30,000 to a Nigerian bank — the first send also sets up the escrow');
-    await flow.pay('NG', 'bank', await fields('NG', 'bank', '0123456789'), 3000000,
-        approvals: 2);
+    _step('1. ₦30,000 to a Nigerian bank');
+    await flow.pay('NG', 'bank', await fields('NG', 'bank', '0123456789'), 3000000);
 
-    _step('2. Straight after: KSh 1,500 to M-PESA — the last deal was spent, so the escrow is free');
-    await flow.pay('KE', 'mobile_money', await fields('KE', 'mobile_money', '+254712345678'), 150000,
-        approvals: 1);
+    _step('2. Straight after: KSh 1,500 to M-PESA, on an escrow of its own');
+    await flow.pay(
+        'KE', 'mobile_money', await fields('KE', 'mobile_money', '+254712345678'), 150000);
 
     _step('3. Ghana, mobile money and then a bank; then a South African bank');
-    await flow.pay('GH', 'mobile_money', await fields('GH', 'mobile_money', '+233241234567'), 20000,
-        approvals: 1);
-    await flow.pay('GH', 'bank', await fields('GH', 'bank', '1234567890'), 20000, approvals: 1);
-    await flow.pay('ZA', 'bank', await fields('ZA', 'bank', '1234567890'), 50000, approvals: 1);
+    await flow.pay(
+        'GH', 'mobile_money', await fields('GH', 'mobile_money', '+233241234567'), 20000);
+    await flow.pay('GH', 'bank', await fields('GH', 'bank', '1234567890'), 20000);
+    await flow.pay('ZA', 'bank', await fields('ZA', 'bank', '1234567890'), 50000);
 
     _step('4. R 500 to a South African account the bank cannot pay (…002)');
-    await flow.pay('ZA', 'bank', await fields('ZA', 'bank', '1234567002'), 50000,
-        approvals: 1, fails: true);
-    _say('the platform ended the deal it gave up on, so the escrow still holds that price — and the '
-        'next send of the same amount needs no top-up');
-    await flow.pay('ZA', 'bank', await fields('ZA', 'bank', '1234567890'), 50000, approvals: 1);
+    await flow.pay('ZA', 'bank', await fields('ZA', 'bank', '1234567002'), 50000, fails: true);
+    _say("the platform ended the deal it gave up on, so what its escrow holds is Alice's to take "
+        'back');
+    final left = (await send.held(flow.escrow!)).where((v) => !v.isSpent).toList();
+    final back = await _whileMining(
+        btc, () => alice.client.reclaimEscrow(escrowKeyHex: flow.escrow!, vtxos: left));
+    if (back.amountSats != _sats(left)) {
+      throw StateError('took back ${back.amountSats} sats of the ${_sats(left)} the escrow held');
+    }
+    final after = await _eventually(() async => _sats(await send.held(flow.escrow!)),
+        until: (s) => s == 0);
+    if (after != 0) throw StateError('the escrow still holds $after sats after its reclaim');
+    _say('took back ${back.amountSats} sats, to ${back.toArkAddress}');
+    await flow.pay('ZA', 'bank', await fields('ZA', 'bank', '1234567890'), 50000);
 
     _step('5. A Nigerian account whose holder the bank does not recognise (…102)');
     try {
       await send.quote(
-        escrowKeyHex: flow.escrow!,
         country: 'NG',
         rail: 'bank',
         fields: await fields('NG', 'bank', '0123456102'),
@@ -124,49 +132,48 @@ Future<void> main() async {
     if (forged != 401 || dialled != 401) throw StateError('the platform heard the unattested');
 
     _step('7. What an app could seal instead of what it was offered — neither is paid');
-    final offered = await send.quote(
-      escrowKeyHex: flow.escrow!,
-      country: 'NG',
-      rail: 'bank',
-      fields: await fields('NG', 'bank', '0123456789'),
-      fullName: 'Ada Obi',
-      amountMinor: 3000000,
-    );
-    await _whileMining(btc, () async {
-      final short = BankSend.shortfall(offered.sats, await send.held(flow.escrow!));
-      if (short > 0) {
-        await alice.client.sendVtxo(await alice.client.escrowArkAddress(flow.escrow!), short);
+    // Each sealed on an escrow of its own and funded with the price, as `BankSend.commit` would —
+    // but on terms other than the ones offered: [policy] of the offered policy, for [lasts].
+    Future<void> sealedOtherwise(
+      String what,
+      Map<String, dynamic> Function(Map<String, dynamic> offered) policy,
+      Duration Function(PayoutQuote offered) lasts,
+    ) async {
+      final offered = await send.quote(
+        country: 'NG',
+        rail: 'bank',
+        fields: await fields('NG', 'bank', '0123456789'),
+        fullName: 'Ada Obi',
+        amountMinor: 3000000,
+      );
+      final set = await alice.client.setUpEscrow(
+        serviceIdentifier: platformIdentifier,
+        policy: policy(offered.policy),
+        deadline: DateTime.now().add(lasts(offered)),
+        delivery: RewritingDelivery(),
+      );
+      final key = set.escrow.escrowKeyHex;
+      final address = await alice.client.escrowArkAddress(key);
+      await _whileMining(btc, () => alice.client.sendVtxo(address, offered.sats));
+      try {
+        await platform.fund(offered.requestId, escrowKeyHex: key);
+        throw StateError('the platform funded $what');
+      } on PlatformException catch (e) {
+        if (!e.refused) rethrow;
+        _say('$what: ${e.message}');
       }
-    });
-    await alice.client.openEscrowSession(
-      escrowKeyHex: flow.escrow!,
-      policy: {
-        'op': 'all_of',
-        'of': [offered.policy, {'op': 'never'}],
-      },
-      deadline: DateTime.now().add(Duration(seconds: offered.dealSeconds)),
-    );
-    await _refusedToFund(send, offered, 'a policy with a term added');
+    }
 
-    // The escrow above is held by that deal until its deadline, so this one needs its own.
-    final second = await send.ensureEscrow();
-    final hurried = await send.quote(
-      escrowKeyHex: second,
-      country: 'NG',
-      rail: 'bank',
-      fields: await fields('NG', 'bank', '0123456789'),
-      fullName: 'Ada Obi',
-      amountMinor: 3000000,
+    await sealedOtherwise(
+      'a policy with a term added',
+      (offered) => {
+        'op': 'all_of',
+        'of': [offered, {'op': 'never'}],
+      },
+      (offered) => Duration(seconds: offered.dealSeconds),
     );
-    await _whileMining(btc, () async {
-      await alice.client.sendVtxo(await alice.client.escrowArkAddress(second), hurried.sats);
-    });
-    await alice.client.openEscrowSession(
-      escrowKeyHex: second,
-      policy: hurried.policy,
-      deadline: DateTime.now().add(const Duration(seconds: 90)),
-    );
-    await _refusedToFund(send, hurried, 'a deal that ends before it could be repaid');
+    await sealedOtherwise('a deal that ends before it could be repaid', (offered) => offered,
+        (_) => const Duration(seconds: 90));
 
     print('\n  ${'=' * 60}\n  every payout paid, every refusal refused\n');
   } finally {
@@ -175,8 +182,8 @@ Future<void> main() async {
   }
 }
 
-/// One payout after another through the same escrow, checking that exactly the price moves — and
-/// that the owner was asked exactly as often as the app says they will be.
+/// One payout after another, each on an escrow of its own, checking that exactly the price moves —
+/// and that the owner was asked exactly as often as the app says they will be.
 class _Flow {
   _Flow(this.send, this.wallet, this.passkey, this.btc);
   final BankSend send;
@@ -185,15 +192,14 @@ class _Flow {
   /// Counts its assertions, and every approval is one: what the owner was really asked.
   final SoftwareAuthenticator passkey;
   final RegtestHelper btc;
+
+  /// The last payout's escrow.
   String? escrow;
 
   Future<void> pay(String country, String rail, Map<String, String> fields, int amountMinor,
-      {required int approvals, bool fails = false}) async {
-    final hadEscrow = escrow != null;
+      {bool fails = false}) async {
     final askedBefore = passkey.counter;
-    escrow = await send.ensureEscrow(known: escrow);
     final quote = await send.quote(
-      escrowKeyHex: escrow!,
       country: country,
       rail: rail,
       fields: fields,
@@ -203,21 +209,21 @@ class _Flow {
     _say('${quote.currency} ${amountMinor / 100} to ${fields.values.join(' ')} '
         'for ${quote.sats} sats; the bank says ${quote.nameAtBank ?? '—'} (${quote.nameCheck ?? 'no check'})');
 
-    final needed = BankSend.approvalsNeeded(hasEscrow: hadEscrow);
-    if (needed != approvals) {
-      throw StateError('expected $approvals approvals, the flow needs $needed');
-    }
-
     final treasuryBefore = await _treasurySats();
-    final committed = await _whileMining(
-        btc, () => send.commit(quote, escrowKeyHex: escrow!, fields: fields));
+    final committed = await _whileMining(btc, () => send.commit(quote, fields: fields));
     final asked = passkey.counter - askedBefore;
-    if (asked != approvals) {
-      throw StateError('the owner was asked $asked times, not the $approvals the app says');
+    if (asked != BankSend.approvals) {
+      throw StateError('the owner was asked $asked times, not the ${BankSend.approvals} the app '
+          'says');
     }
-    final escrowBefore = _sats(await send.held(escrow!));
+    escrow = committed.escrowKeyHex;
+    final escrowBefore = await _eventually(() async => _sats(await send.held(escrow!)),
+        until: (s) => s == quote.sats);
+    if (escrowBefore != quote.sats) {
+      throw StateError('the escrow holds $escrowBefore sats, not the price ${quote.sats}');
+    }
     _say('sealed: ${committed.agreed}');
-    await send.fund(quote);
+    await send.fund(quote, committed);
 
     PayoutStatus? last;
     await for (final status in send.follow(quote.dealTag)) {
@@ -239,16 +245,6 @@ class _Flow {
         until: (g) => g >= quote.sats);
     if (gained != quote.sats) throw StateError('the platform gained $gained sats, not ${quote.sats}');
     _say('repaid ${quote.sats} sats: the escrow paid exactly the price, and the platform got it');
-  }
-}
-
-Future<void> _refusedToFund(BankSend send, PayoutQuote quote, String what) async {
-  try {
-    await send.fund(quote);
-    throw StateError('the platform funded $what');
-  } on PlatformException catch (e) {
-    if (!e.refused) rethrow;
-    _say('$what: ${e.message}');
   }
 }
 
@@ -281,7 +277,7 @@ Future<void> _board(MpcClient client, RegtestHelper btc, double btcAmount) async
   await btc.generateToAddress(1, await btc.getNewAddress());
   final deposits = await pollBoardingUtxos(boarding, (btcAmount * 1e8).round());
   if (deposits.isEmpty) throw StateError('the deposit was never indexed');
-  await _whileMining(btc, () => settleBoarding(client, deposits));
+  await _whileMining(btc, () => renewBoarding(client, deposits));
 }
 
 /// Nothing moves on regtest unless somebody mines.

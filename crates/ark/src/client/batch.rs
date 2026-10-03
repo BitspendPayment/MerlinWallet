@@ -203,18 +203,16 @@ pub struct BoardingTreeSigner {
 }
 
 impl BoardingTreeSigner {
-    /// Build from the cosigner's MuSig2 tree-signing secret (the Ark `dkg-secret`, held in-guest).
-    pub fn new(cosigner_secret_hex: &str) -> Result<Self, String> {
-        let secp = Secp256k1::new();
-        let bytes = hex_decode_32(cosigner_secret_hex)?;
-        let sk = bitcoin::secp256k1::SecretKey::from_slice(&bytes)
-            .map_err(|e| format!("bad cosigner secret: {e}"))?;
-        Ok(Self {
-            cosigner_kp: Keypair::from_secret_key(&secp, &sk),
+    /// A signer with a tree-signing key of its own, drawn for this one round. Once the round is
+    /// over the tree is presigned and nothing needs the key again; one key across rounds would only
+    /// let the ASP link them.
+    pub fn generate() -> Self {
+        Self {
+            cosigner_kp: Keypair::new(&Secp256k1::new(), &mut rand::thread_rng()),
             tx_graph: None,
             commitment_psbt: None,
             nonce_kps: None,
-        })
+        }
     }
 
     /// The cosigner's MuSig2 public key (33-byte compressed, hex) — the host needs it for the
@@ -1298,6 +1296,9 @@ pub struct DelegateSettleSession {
     // -- delegate data --
     delegate: ark_core::batch::Delegate,
     delegate_cosigner_kp: Keypair,
+    /// The ASP's id for this delegate's registration, once it is registered: a run that stops
+    /// mid-round follows it rather than registering the same intent twice.
+    pub intent_id: Option<String>,
 
     // -- sighash metadata for FROST --
     sighash_meta: Vec<SighashEntry>,
@@ -1332,11 +1333,11 @@ struct SighashEntry {
 // MuSig2 secret-nonce material that MUST NEVER be persisted: rehydrating
 // a partially-settled session would risk nonce re-use.
 //
-// `delegate_cosigner_kp` is the server's MuSig2 cosigner secret. It's the
-// same value as the user's `dkg-secret.<canonical>` already kept in the
-// `SecretStore`. We deliberately do NOT persist it here — the cosigner-
-// runtime looks it up from `SecretStore` at rehydration time and passes
-// it into `from_persisted`. See GitHub issue #31 for why this matters.
+// `delegate_cosigner_kp` is the delegate's own MuSig2 tree-signing key, drawn
+// when the delegate is built. It IS persisted, in the record: the round the
+// delegate joins runs later, with nobody connected, and signs with it then.
+// It lives as long as the delegate and no longer. It used to be the server's
+// DKG secret, one key for the wallet's whole life and every round.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1348,7 +1349,7 @@ pub struct PersistedSighashEntry {
 }
 
 /// Serializable snapshot of a `DelegateSettleSession` in `ReadyToSettle`
-/// phase. Does NOT contain the cosigner secret — see module-level note.
+/// phase, its tree-signing key included — see the note above.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PersistedDelegate {
     pub owner_pk_hex: String,
@@ -1367,6 +1368,13 @@ pub struct PersistedDelegate {
     pub forfeit_psbts_b64: Vec<String>,
     /// Hex of the cosigner public key (33-byte compressed).
     pub delegate_cosigner_pk_hex: String,
+    /// Hex of this delegate's tree-signing secret. Empty in a record persisted before a delegate
+    /// carried its own; `from_persisted` refuses that until its caller supplies the key.
+    #[serde(default)]
+    pub delegate_cosigner_secret_hex: String,
+    /// See [`DelegateSettleSession::intent_id`].
+    #[serde(default)]
+    pub intent_id: Option<String>,
     pub sighash_meta: Vec<PersistedSighashEntry>,
 }
 
@@ -1389,12 +1397,12 @@ impl DelegateSettleSession {
     ///
     /// Reconstructs `ark_core::Vtxo` objects from the provided metadata,
     /// calls `prepare_delegate_psbts`, and returns sighashes that need
-    /// FROST signing (intent proof + all forfeit PSBTs).
+    /// FROST signing (intent proof + all forfeit PSBTs). The round's tree-signing key is drawn
+    /// here, for this delegate alone.
     pub fn generate_delegate(
         owner_pk_hex: &str,
         asp_pk_hex: &str,
         forfeit_pk_hex: &str,
-        delegate_cosigner_secret_hex: &str,
         vtxo_inputs: &[DelegateVtxoInput],
         outputs: &[DelegateOutput],
         forfeit_address: &str,
@@ -1416,11 +1424,7 @@ impl DelegateSettleSession {
             return Err("no VTXO inputs".to_string());
         }
 
-        // Build delegate cosigner keypair from server's DKG secret.
-        let cosigner_secret_bytes = hex_decode_32(delegate_cosigner_secret_hex)?;
-        let cosigner_secret = bitcoin::secp256k1::SecretKey::from_slice(&cosigner_secret_bytes)
-            .map_err(|e| format!("invalid delegate cosigner secret: {e}"))?;
-        let delegate_cosigner_kp = Keypair::from_secret_key(&secp, &cosigner_secret);
+        let delegate_cosigner_kp = Keypair::new(&secp, &mut rand::thread_rng());
         let delegate_cosigner_pk = delegate_cosigner_kp.public_key();
 
         // Reconstruct default VTXOs for spend info — one per DISTINCT exit
@@ -1524,6 +1528,7 @@ impl DelegateSettleSession {
             exit_delay: vtxo_by_delay[&vtxo_inputs[0].exit_delay].0,
             delegate,
             delegate_cosigner_kp,
+            intent_id: None,
             sighash_meta,
             batch_id: None,
             batch_expiry: None,
@@ -1748,20 +1753,15 @@ impl DelegateSettleSession {
             intent_message_json,
             forfeit_psbts_b64,
             delegate_cosigner_pk_hex,
+            delegate_cosigner_secret_hex: hex::encode(self.delegate_cosigner_kp.secret_bytes()),
+            intent_id: self.intent_id.clone(),
             sighash_meta,
         })
     }
 
-    /// Reconstruct a `ReadyToSettle` session from a `PersistedDelegate` +
-    /// the cosigner secret looked up out-of-band from the `SecretStore`.
-    ///
-    /// The persisted record deliberately doesn't carry the secret — see
-    /// the module-level note and GitHub issue #31 for the security
-    /// rationale.
-    pub fn from_persisted(
-        p: &PersistedDelegate,
-        delegate_cosigner_secret_hex: &str,
-    ) -> Result<Self, String> {
+    /// Reconstruct a `ReadyToSettle` session from a `PersistedDelegate`,
+    /// with the tree-signing key it carries.
+    pub fn from_persisted(p: &PersistedDelegate) -> Result<Self, String> {
         let owner_pk = XOnlyPublicKey::from_str(&p.owner_pk_hex)
             .map_err(|e| format!("parse owner_pk: {e}"))?;
         let asp_pk = XOnlyPublicKey::from_str(&p.asp_pk_hex)
@@ -1796,16 +1796,17 @@ impl DelegateSettleSession {
             bitcoin::secp256k1::PublicKey::from_slice(&delegate_cosigner_pk_bytes)
                 .map_err(|e| format!("parse cosigner pk: {e}"))?;
 
-        let cosigner_secret_bytes = hex_decode_32(delegate_cosigner_secret_hex)?;
+        if p.delegate_cosigner_secret_hex.is_empty() {
+            return Err("this delegate was persisted without its tree-signing key".into());
+        }
+        let cosigner_secret_bytes = hex_decode_32(&p.delegate_cosigner_secret_hex)?;
         let secp = Secp256k1::new();
         let cosigner_secret = bitcoin::secp256k1::SecretKey::from_slice(&cosigner_secret_bytes)
             .map_err(|e| format!("parse cosigner secret: {e}"))?;
         let delegate_cosigner_kp = Keypair::from_secret_key(&secp, &cosigner_secret);
-        // Sanity check: the persisted pubkey must match the one derivable
-        // from the secret we got from SecretStore. If they diverge, the
-        // delegate was stored under a different user's identity (or the
-        // SecretStore is corrupt). Refuse rather than sign with the wrong
-        // key.
+        // The key must be the one the intent registered. If they diverge the
+        // record is corrupt, or was given a key that is not its own: refuse
+        // rather than sign with the wrong one.
         if delegate_cosigner_kp.public_key() != delegate_cosigner_pk {
             return Err(
                 "delegate cosigner secret does not match persisted pubkey".into(),
@@ -1847,6 +1848,7 @@ impl DelegateSettleSession {
                 delegate_cosigner_pk,
             },
             delegate_cosigner_kp,
+            intent_id: p.intent_id.clone(),
             sighash_meta,
             batch_id: None,
             batch_expiry: None,
@@ -2533,6 +2535,15 @@ mod batch_intent_tests {
 
     /// The bug this guards: a stranger's batch failing used to abort our settle,
     /// and a stranger's batch finalizing used to be recorded as our settlement.
+    /// Each boarding round draws its own tree-signing key, so no two rounds share one.
+    #[test]
+    fn every_boarding_signer_has_a_key_of_its_own() {
+        assert_ne!(
+            BoardingTreeSigner::generate().cosigner_pubkey_hex(),
+            BoardingTreeSigner::generate().cosigner_pubkey_hex()
+        );
+    }
+
     #[test]
     fn foreign_batch_events_are_rejected() {
         let ours = |id: &str| id == "ours";

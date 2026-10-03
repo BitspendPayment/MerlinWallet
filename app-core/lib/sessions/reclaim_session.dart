@@ -16,14 +16,16 @@
 /// ```
 ///
 /// The same four steps a send takes, because it is one — of the escrow's key rather than this
-/// wallet's. What differs is the share: it is rebuilt here from three terms, two of which arrive on
-/// this stream and one of which comes from the passkey and never leaves the device.
+/// wallet's — and on the same stream: a `Send` whose open names the escrow to reclaim. What differs
+/// is the share: it is rebuilt here from three terms, two of which arrive on this stream and one of
+/// which comes from the passkey and never leaves the device.
 ///
 /// **Where the money goes is not sent.** The cosigner derives this wallet's own Ark address from
 /// the key it already holds. It is reported back so the owner can see it, and there is no field to
 /// put a different one in.
 library;
 
+import 'package:fixnum/fixnum.dart';
 import 'package:protocol/cosigner_v1.dart' as cs;
 
 import '../asp/asp_client.dart';
@@ -73,21 +75,23 @@ class ReclaimSession {
     required ArkInfo info,
     required ResolveEscrowShare resolveEscrow,
     required threshold.PublicKeyPackage escrowPubKey,
+    required List<int> identifier,
     CancelSignal? cancel,
   }) async {
     // Every wait on the ASP goes through this: from the first sighashes on, this frame holds the
     // escrow share, and a cancel has to be able to unwind it — see `CancelSignal`.
     Future<T> guarded<T>(Future<T> work) => cancel?.guard(work) ?? work;
 
-    final duplex = _conn.openEscrowReclaim();
+    final duplex = _conn.openSend();
     try {
-      duplex.send(cs.EscrowReclaimClientMsg(
+      duplex.send(cs.SendClientMsg(
         sessionId: '',
-        seq: 0,
-        open: cs.EscrowReclaimOpen(
-          escrowKey: escrowKeyHex,
+        seq: Int64(0),
+        open: cs.SendOpen(
+          reclaimEscrow: escrowKeyHex,
           vtxos: vtxosToProto(vtxos),
           arkInfo: arkInfoToProto(info),
+          identifier: identifier,
         ),
       ));
 
@@ -101,10 +105,10 @@ class ReclaimSession {
       // own. The sum is checked against the verifying share the escrow published before it is used.
       final keyPkg = resolveEscrow(h.walletDealtShare, h.escrowDeltaShare);
 
-      duplex.send(cs.EscrowReclaimClientMsg(
+      duplex.send(cs.SendClientMsg(
         sessionId: '',
-        seq: 1,
-        signed: cs.EscrowReclaimSigned(
+        seq: Int64(1),
+        signed: cs.SendSigned(
           rounds: answerRound(
             sighashes: h.messagesToSign,
             cosignerCommitments: h.cosignerCommitments,
@@ -125,9 +129,9 @@ class ReclaimSession {
         submit.submit.arkTxB64,
         submit.submit.checkpointTxs,
       ));
-      duplex.send(cs.EscrowReclaimClientMsg(
+      duplex.send(cs.SendClientMsg(
         sessionId: '',
-        seq: 2,
+        seq: Int64(2),
         submitted: cs.SendSubmitted(
           arkTxid: submitted.arkTxid,
           signedCheckpointTxs: submitted.signedCheckpointTxs,
@@ -143,9 +147,9 @@ class ReclaimSession {
         finalize.finalize.arkTxid,
         finalize.finalize.finalCheckpointTxs,
       ));
-      duplex.send(cs.EscrowReclaimClientMsg(
+      duplex.send(cs.SendClientMsg(
         sessionId: '',
-        seq: 3,
+        seq: Int64(3),
         finalized: cs.SendFinalized(),
       ));
 

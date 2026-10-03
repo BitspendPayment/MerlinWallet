@@ -2,7 +2,7 @@
 ///
 /// What a half-open connection looks like, or an ASP that fell over between registering an intent
 /// and running its batch: `RegisterIntent` answers, the event stream opens, and no event comes. A
-/// real settle waits there for minutes by design — so nothing about the wait itself can tell the
+/// real renewal waits there for minutes by design — so nothing about the wait itself can tell the
 /// wallet the ASP has gone. It is the case cancellation exists for.
 library;
 
@@ -14,7 +14,7 @@ import 'package:protocol/ark_v1.dart' as ark;
 import 'package:app_core/asp/asp_client.dart';
 
 class SilentAsp extends AspClient {
-  // Never dialled: everything a settle asks of the ASP before the wait is answered here.
+  // Never dialled: everything a renewal asks of the ASP before the wait is answered here.
   SilentAsp()
       : super(ClientChannel('127.0.0.1',
             port: 9, options: const ChannelOptions(credentials: ChannelCredentials.insecure())));

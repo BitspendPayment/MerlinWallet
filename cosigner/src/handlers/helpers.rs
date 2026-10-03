@@ -17,9 +17,9 @@ pub fn now_secs() -> i64 {
 
 /// Drive a future that never actually waits.
 ///
-/// The paths that use it — `run_task` with no ASP, `on_service_message` with none — are async only
-/// because their with-an-ASP siblings are. A `Pending` here is a bug, not a slow call, so it panics
-/// rather than spinning: there is no reactor under it to make progress.
+/// What the tests drive the async paths with when nothing under them waits — a service's message
+/// with no ASP, say. A `Pending` here is a bug, not a slow call, so it panics rather than
+/// spinning: there is no reactor under it to make progress.
 pub fn block_on_ready<F: std::future::Future>(fut: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}

@@ -1,4 +1,4 @@
-//! FROST carried inside the Send and Settle streams.
+//! A signing session: FROST carried inside the stream that needs it — see `cosigner::sign`.
 //!
 //! The nested form — a second `Sign` stream per sighash while the outer stream waited — deadlocks
 //! inside enclave-runtime, which runs one request per tenant for the whole life of a stream. That
@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use bitcoin::secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey};
 use rand::rngs::OsRng;
 
-use cosigner::cosigner::WalletHalf;
+use cosigner::sign::{SigningSession, WalletHalf};
 use cosigner::types::Commitment;
 
 use threshold::commitment::SigningPackage;
@@ -81,8 +81,13 @@ fn seeded() -> Option<(cosigner::Cosigner, Vec<KeyPackage>, PublicKeyPackage)> {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
     Some((cosigner.into_inner().unwrap(), kps, pkp))
+}
+
+/// Round one over [messages], with the wallet's own key.
+fn begin(cosigner: &cosigner::Cosigner, messages: &[Vec<u8>]) -> (SigningSession, Vec<Commitment>) {
+    SigningSession::begin(cosigner.signing_key().expect("a key"), messages)
 }
 
 /// Three sighashes, one round trip, three signatures the chain would accept.
@@ -91,11 +96,11 @@ fn a_batch_signs_in_one_round_trip() {
     let Some((cosigner, kps, pkp)) = seeded() else { return };
     let messages: Vec<Vec<u8>> = (0u8..3).map(|i| vec![0x40 + i; 32]).collect();
 
-    let (round, theirs) = cosigner.sign_in_band_begin(&messages).expect("begin");
+    let (round, theirs) = begin(&cosigner, &messages);
     assert_eq!(theirs.len(), 3, "one commitment per message");
 
     let ours = wallet_answers(&kps[0], &messages, &theirs);
-    let signatures = cosigner.sign_in_band_finish(round, ours).expect("finish");
+    let signatures = round.finish(ours).expect("finish");
 
     assert_eq!(signatures.len(), 3);
     for (i, (message, signature)) in messages.iter().zip(&signatures).enumerate() {
@@ -114,9 +119,9 @@ fn each_signature_belongs_to_its_own_message() {
     let Some((cosigner, kps, pkp)) = seeded() else { return };
     let messages: Vec<Vec<u8>> = vec![vec![0x11; 32], vec![0x22; 32]];
 
-    let (round, theirs) = cosigner.sign_in_band_begin(&messages).expect("begin");
-    let signatures = cosigner
-        .sign_in_band_finish(round, wallet_answers(&kps[0], &messages, &theirs))
+    let (round, theirs) = begin(&cosigner, &messages);
+    let signatures = round
+        .finish(wallet_answers(&kps[0], &messages, &theirs))
         .expect("finish");
 
     assert!(bip340_ok(&pkp, &messages[0], &signatures[0]));
@@ -131,7 +136,7 @@ fn a_bad_share_is_refused_and_named() {
     let Some((cosigner, kps, _)) = seeded() else { return };
     let messages: Vec<Vec<u8>> = vec![vec![0x33; 32], vec![0x44; 32]];
 
-    let (round, theirs) = cosigner.sign_in_band_begin(&messages).expect("begin");
+    let (round, theirs) = begin(&cosigner, &messages);
     // Answer message 1 with a share computed over message 0's bytes.
     let mut ours = wallet_answers(&kps[0], &messages, &theirs);
     let wrong = wallet_answers(&kps[0], &[messages[0].clone()], &theirs[1..2]);
@@ -141,8 +146,8 @@ fn a_bad_share_is_refused_and_named() {
         share: wrong[0].share.clone(),
     };
 
-    let err = cosigner
-        .sign_in_band_finish(round, ours)
+    let err = round
+        .finish(ours)
         .expect_err("a share over the wrong message must not aggregate");
     assert!(err.starts_with("message 1:"), "the error must name the message, got: {err}");
 }
@@ -153,11 +158,11 @@ fn a_short_batch_is_refused() {
     let Some((cosigner, kps, _)) = seeded() else { return };
     let messages: Vec<Vec<u8>> = vec![vec![0x55; 32], vec![0x66; 32]];
 
-    let (round, theirs) = cosigner.sign_in_band_begin(&messages).expect("begin");
+    let (round, theirs) = begin(&cosigner, &messages);
     let mut ours = wallet_answers(&kps[0], &messages, &theirs);
     ours.pop();
 
-    let err = cosigner.sign_in_band_finish(round, ours).expect_err("short");
+    let err = round.finish(ours).expect_err("short");
     assert!(err.contains("1 of 2"), "got: {err}");
 }
 
@@ -169,15 +174,15 @@ fn nonces_are_fresh_every_round() {
     let Some((cosigner, kps, pkp)) = seeded() else { return };
     let messages: Vec<Vec<u8>> = vec![vec![0x77; 32]];
 
-    let (round_a, theirs_a) = cosigner.sign_in_band_begin(&messages).expect("begin a");
-    let (round_b, theirs_b) = cosigner.sign_in_band_begin(&messages).expect("begin b");
+    let (round_a, theirs_a) = begin(&cosigner, &messages);
+    let (round_b, theirs_b) = begin(&cosigner, &messages);
     assert_ne!(theirs_a[0].hiding, theirs_b[0].hiding, "the cosigner's nonce must not repeat");
 
-    let a = cosigner
-        .sign_in_band_finish(round_a, wallet_answers(&kps[0], &messages, &theirs_a))
+    let a = round_a
+        .finish(wallet_answers(&kps[0], &messages, &theirs_a))
         .expect("finish a");
-    let b = cosigner
-        .sign_in_band_finish(round_b, wallet_answers(&kps[0], &messages, &theirs_b))
+    let b = round_b
+        .finish(wallet_answers(&kps[0], &messages, &theirs_b))
         .expect("finish b");
 
     assert_ne!(a[0], b[0]);

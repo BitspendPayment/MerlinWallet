@@ -37,7 +37,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use cosigner::service_stream::{FromService, ToService};
+use cosigner::escrow::{FromService, ToService};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -436,7 +436,7 @@ fn admit(
     id: &str,
     body: &[u8],
 ) -> Result<u64, axum::response::Response> {
-    let ours = cosigner::service_stream::service_stream_id(&hex::encode(
+    let ours = cosigner::escrow::service_stream_id(&hex::encode(
         wire.service.identifier.serialize(),
     ));
     if !id.ends_with(&format!("-{ours}")) {
@@ -633,7 +633,7 @@ mod tests {
     /// The wire id the runtime uses for `tenant`'s connection to this service.
     fn stream(wire: &Arc<Wire>, tenant: &str) -> String {
         let ours = hex::encode(wire.service.identifier.serialize());
-        format!("{tenant}-{}", cosigner::service_stream::service_stream_id(&ours))
+        format!("{tenant}-{}", cosigner::escrow::service_stream_id(&ours))
     }
 
     async fn post(wire: &Arc<Wire>, stream: &str, message: &ToService) -> StatusCode {
@@ -742,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn a_connection_named_for_another_service_is_refused() {
         let wire = wire();
-        let theirs = format!("a-{}", cosigner::service_stream::service_stream_id(&"77".repeat(32)));
+        let theirs = format!("a-{}", cosigner::escrow::service_stream_id(&"77".repeat(32)));
         let (half, _) = halves(&wire, "a1", None);
         assert_eq!(post(&wire, &theirs, &half).await, StatusCode::BAD_REQUEST);
     }

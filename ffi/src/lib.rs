@@ -8,3 +8,13 @@
 mod ark;
 mod enclave;
 mod threshold;
+
+/// Hex as it crosses the FFI: bytes, or a fixed-size array, with the reason as text. The `hex` crate
+/// never panics on what it is given — non-ASCII included — where the hand-sliced decoders this
+/// replaces could, and a panic in an `extern "C"` function is an abort.
+pub(crate) fn from_hex<T: hex::FromHex>(s: &str) -> Result<T, String>
+where
+    T::Error: std::fmt::Display,
+{
+    T::from_hex(s).map_err(|e| format!("invalid hex: {e}"))
+}

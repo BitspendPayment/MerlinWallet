@@ -8,7 +8,6 @@
 
 mod common;
 
-use cosigner::handlers::recover::recover;
 use cosigner::session::proto::RecoverRequest;
 
 use threshold::identifier::Identifier;
@@ -36,11 +35,10 @@ fn recover_returns_the_dealt_share_to_the_wallets_own_identifier() {
         &kps[1],
         &kps[0],
         &pkp,
-        Some(hex::encode([9u8; 32])),
         Some(hex::encode(DEALT)),
     );
 
-    let resp = recover(&cosigner.lock().unwrap(), asking_as(&kps[0].identifier))
+    let resp = cosigner.lock().unwrap().recover(asking_as(&kps[0].identifier))
         .expect("the owner's own identifier must be answered");
 
     assert_eq!(resp.dealt_share, DEALT.to_vec(), "the sealed share, verbatim");
@@ -52,7 +50,7 @@ fn recover_returns_the_dealt_share_to_the_wallets_own_identifier() {
 
     // Nothing was installed: the wallet that existed before the call is the one that exists after,
     // under the same key, and it answers again the same way.
-    let again = recover(&cosigner.lock().unwrap(), asking_as(&kps[0].identifier))
+    let again = cosigner.lock().unwrap().recover(asking_as(&kps[0].identifier))
         .expect("recovering must not consume or re-key the wallet");
     assert_eq!(again.group_key, group_key);
     assert_eq!(again.dealt_share, resp.dealt_share);
@@ -68,7 +66,7 @@ fn recover_refuses_before_there_is_a_wallet() {
     // Opened, never onboarded — the mirror of `refuse_if_onboarded`.
     let cosigner = common::open_cosigner(&store, &group_key);
 
-    let err = recover(&cosigner.lock().unwrap(), asking_as(&kps[0].identifier))
+    let err = cosigner.lock().unwrap().recover(asking_as(&kps[0].identifier))
         .expect_err("there is nothing to recover before a ceremony");
     assert!(
         format!("{err:?}").contains("no key yet"),
@@ -90,14 +88,13 @@ fn recover_refuses_an_identifier_the_ceremony_never_saw() {
         &kps[1],
         &kps[0],
         &pkp,
-        None,
         Some(hex::encode(DEALT)),
     );
 
     // A passkey whose PRF answered differently derives a different identifier. It would rebuild a
     // share that cannot sign, so it is refused rather than served.
     let (other_kps, _) = common::dkg_2of2();
-    let err = recover(&cosigner.lock().unwrap(), asking_as(&other_kps[0].identifier))
+    let err = cosigner.lock().unwrap().recover(asking_as(&other_kps[0].identifier))
         .expect_err("a stranger's identifier must not be answered");
     assert!(
         format!("{err:?}").contains("does not derive this wallet"),
@@ -113,9 +110,9 @@ fn recover_refuses_a_wallet_onboarded_before_the_share_was_kept() {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let cosigner = common::open_cosigner(&store, &group_key);
-    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
 
-    let err = recover(&cosigner.lock().unwrap(), asking_as(&kps[0].identifier))
+    let err = cosigner.lock().unwrap().recover(asking_as(&kps[0].identifier))
         .expect_err("an old wallet has no restore path, and must be told so");
     assert!(
         format!("{err:?}").contains("before recovery existed"),
@@ -139,14 +136,13 @@ fn the_dealt_share_survives_seal_and_restore() {
             &kps[1],
             &kps[0],
             &pkp,
-            Some(hex::encode([9u8; 32])),
             Some(hex::encode(DEALT)),
         );
     }
 
     // A second actor over the same store: what the runtime does on every reseat.
     let reopened = common::open_cosigner(&store, &group_key);
-    let resp = recover(&reopened.lock().unwrap(), asking_as(&kps[0].identifier))
+    let resp = reopened.lock().unwrap().recover(asking_as(&kps[0].identifier))
         .expect("a restored wallet must still be recoverable");
     assert_eq!(resp.dealt_share, DEALT.to_vec());
 }
@@ -170,7 +166,6 @@ fn recover_returns_the_escrows_a_new_device_needs_to_rebuild() {
         &kps[1],
         &kps[0],
         &pkp,
-        Some(hex::encode([9u8; 32])),
         Some(hex::encode(DEALT)),
     );
     let escrow_key = format!("02{}", "ab".repeat(32));
@@ -178,7 +173,7 @@ fn recover_returns_the_escrows_a_new_device_needs_to_rebuild() {
     cosigner
         .lock()
         .unwrap()
-        .install_escrow(cosigner::types::EscrowRecord {
+        .add_escrow(cosigner::escrow::EscrowSession {
             escrow_key: escrow_key.clone(),
             key_package_json: kps[1].to_json(),
             public_key_package_json: pkp.to_json(),
@@ -186,13 +181,11 @@ fn recover_returns_the_escrows_a_new_device_needs_to_rebuild() {
             context_hex: hex::encode(context),
             wallet_delta_share_hex: hex::encode([4u8; 32]),
             created_at: 1,
-            pairing: None,
-            session: None,
-            reclaim_opened_at: None,
+            stage: cosigner::escrow::EscrowStage::Minted,
         })
         .expect("install");
 
-    let resp = recover(&cosigner.lock().unwrap(), asking_as(&kps[0].identifier)).expect("answered");
+    let resp = cosigner.lock().unwrap().recover(asking_as(&kps[0].identifier)).expect("answered");
     assert_eq!(resp.escrows.len(), 1);
     let e = &resp.escrows[0];
     assert_eq!(e.escrow_key, escrow_key);

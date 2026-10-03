@@ -1,4 +1,5 @@
 use crate::error::Error;
+use hex_conservative::{DisplayHex, FromHex};
 use crate::identifier::Identifier;
 use crate::point;
 use crate::scalar::{scalar_from_bytes, scalar_to_bytes};
@@ -123,10 +124,10 @@ impl KeyPackage {
             .as_u64()
             .ok_or(Error::SerializationError)? as usize;
 
-        let id_bytes = hex_decode_32(id_hex)?;
-        let secret_bytes = hex_decode_32(secret_hex)?;
-        let vs_bytes = hex_decode_33(vs_hex)?;
-        let vk_bytes = hex_decode_33(vk_hex)?;
+        let id_bytes = <[u8; 32]>::from_hex(id_hex)?;
+        let secret_bytes = <[u8; 32]>::from_hex(secret_hex)?;
+        let vs_bytes = <[u8; 33]>::from_hex(vs_hex)?;
+        let vk_bytes = <[u8; 33]>::from_hex(vk_hex)?;
 
         Ok(Self {
             identifier: Identifier::deserialize(&id_bytes)?,
@@ -140,10 +141,10 @@ impl KeyPackage {
     /// Serialize to JSON (matching Dart format).
     pub fn to_json(&self) -> alloc::string::String {
         use alloc::format;
-        let id = hex_encode(&self.identifier.serialize());
-        let ss = hex_encode(&scalar_to_bytes(&self.secret_share));
-        let vs = hex_encode(&point::serialize_compressed(&self.verifying_share));
-        let vk = hex_encode(&self.verifying_key.serialize());
+        let id = self.identifier.serialize().to_lower_hex_string();
+        let ss = scalar_to_bytes(&self.secret_share).to_lower_hex_string();
+        let vs = point::serialize_compressed(&self.verifying_share).to_lower_hex_string();
+        let vk = self.verifying_key.serialize().to_lower_hex_string();
         format!(
             r#"{{"identifier":"{}","secretShare":"{}","verifyingShare":"{}","verifyingKey":"{}","minSigners":{}}}"#,
             id, ss, vs, vk, self.min_signers
@@ -211,14 +212,14 @@ impl PublicKeyPackage {
         use alloc::string::String;
         use alloc::vec::Vec;
 
-        let vk = hex_encode(&self.verifying_key.serialize());
+        let vk = self.verifying_key.serialize().to_lower_hex_string();
 
         let shares: Vec<String> = self
             .verifying_shares
             .iter()
             .map(|(id, share)| {
-                let id_hex = hex_encode(&id.serialize());
-                let share_hex = hex_encode(&point::serialize_compressed(share));
+                let id_hex = id.serialize().to_lower_hex_string();
+                let share_hex = point::serialize_compressed(share).to_lower_hex_string();
                 format!(r#""{}":"{}""#, id_hex, share_hex)
             })
             .collect();
@@ -241,7 +242,7 @@ impl PublicKeyPackage {
         let vk_hex = v["verifyingKey"]
             .as_str()
             .ok_or(Error::SerializationError)?;
-        let vk_bytes = hex_decode_33(vk_hex)?;
+        let vk_bytes = <[u8; 33]>::from_hex(vk_hex)?;
         let verifying_key = VerifyingKey::deserialize(&vk_bytes)?;
 
         let shares_obj = v["verifyingShares"]
@@ -249,11 +250,11 @@ impl PublicKeyPackage {
             .ok_or(Error::SerializationError)?;
         let mut verifying_shares = BTreeMap::new();
         for (key, value) in shares_obj {
-            let id_bytes = hex_decode_32(key)?;
+            let id_bytes = <[u8; 32]>::from_hex(key)?;
             let id = Identifier::deserialize(&id_bytes)?;
             let share_hex =
                 value.as_str().ok_or(Error::SerializationError)?;
-            let share_bytes = hex_decode_33(share_hex)?;
+            let share_bytes = <[u8; 33]>::from_hex(share_hex)?;
             let share = point::deserialize_compressed(&share_bytes)?;
             verifying_shares.insert(id, share);
         }
@@ -263,44 +264,4 @@ impl PublicKeyPackage {
             verifying_key,
         })
     }
-}
-
-// --- Hex helpers ---
-
-fn hex_encode(bytes: &[u8]) -> alloc::string::String {
-    use alloc::format;
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn hex_decode_32(s: &str) -> Result<[u8; 32], Error> {
-    let bytes = hex_decode(s)?;
-    if bytes.len() != 32 {
-        return Err(Error::SerializationError);
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-fn hex_decode_33(s: &str) -> Result<[u8; 33], Error> {
-    let bytes = hex_decode(s)?;
-    if bytes.len() != 33 {
-        return Err(Error::SerializationError);
-    }
-    let mut out = [0u8; 33];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-fn hex_decode(s: &str) -> Result<alloc::vec::Vec<u8>, Error> {
-    if s.len() % 2 != 0 {
-        return Err(Error::SerializationError);
-    }
-    let mut out = alloc::vec::Vec::with_capacity(s.len() / 2);
-    for i in (0..s.len()).step_by(2) {
-        let byte = u8::from_str_radix(&s[i..i + 2], 16)
-            .map_err(|_| Error::SerializationError)?;
-        out.push(byte);
-    }
-    Ok(out)
 }

@@ -253,7 +253,7 @@ this entire file.
   [protocol/protos/mpc_wallet.proto](protocol/protos/mpc_wallet.proto);
   unauthenticated handler in
   [cosigner-runtime/src/rest_api.rs](cosigner-runtime/src/rest_api.rs)
-  serves `bitcoin_network` from `ServerConfig`.
+  serves `bitcoin_network` from `Config`.
   `AppState` widened to a struct with `FromRef` impls so existing handlers
   keep extracting `Arc<CosignerRegistry>` unchanged.
 * Client: `getServerInfo()` added through the api stack
@@ -326,7 +326,7 @@ user-specific. No `signature` / `timestamp_ms` fields.
 
 Implement in `cosigner-runtime/src/cosigner/handlers/` (probably a new
 `server.rs` or fold into an existing `info.rs`). Stateless — reads from the
-process-wide `ServerConfig`.
+process-wide `Config`.
 
 Wire into `actor.rs` dispatch and `rest_api.rs` REST route:
 `GET /api/server-info` (no `/u/<user_id>/` prefix since it's not user-scoped).

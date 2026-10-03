@@ -2,7 +2,7 @@
 /// out of an escrow.
 ///
 /// The steps are app-core's `BankSend`. This keeps what the app has to remember between them —
-/// each payout, and the key of the escrow they are paid from — in the `payouts` box, and follows the
+/// each payout, with the key of the escrow it is paid from — in the `payouts` box, and follows the
 /// payouts in flight, again after a restart. Following asks the platform, never the cosigner, so it
 /// costs no approval.
 library;
@@ -30,9 +30,6 @@ import 'server_host.dart' as server_host;
 /// Also cleared by name in `MpcService.resetLocalWallet`.
 const _boxName = 'payouts';
 
-/// Kept in the box beside the payouts, which are maps under their deal tags.
-const _escrowKeyKey = 'escrowKey';
-
 /// A payout's steps, in order. [Payout.step] is the one it has got to; `done` is past them all.
 const payoutSteps = ['policy', 'seal', 'fund', 'pay', 'repay'];
 
@@ -53,15 +50,12 @@ class Payout {
   String get currency => json['currency'] as String;
   int get decimals => json['decimals'] as int;
 
-  /// The agreed price.
+  /// The agreed price — what is sent to its escrow, and what the platform is repaid out of it.
   int get sats => json['sats'] as int;
-  String get escrowKey => json['escrow_key'] as String;
 
-  /// This send set the escrow up first.
-  bool get setUp => json['set_up'] as bool? ?? false;
-
-  /// What was, or is being, sent to the escrow to bring it up to the price.
-  int get topUpSats => json['top_up_sats'] as int? ?? 0;
+  /// The payout's own escrow, once its deal is sealed. Null before, and for a payout that failed
+  /// before it got that far: nothing was sent anywhere.
+  String? get escrowKey => json['escrow_key'] as String?;
 
   /// The platform's word — quoted, funding, paying, paid_out, repaying, repaid, failed — or
   /// `committing` while this device seals it.
@@ -82,8 +76,8 @@ class Payout {
   int? get leftoverSats => json['leftover_sats'] as int?;
   DateTime get createdAt => DateTime.fromMillisecondsSinceEpoch(json['created_at'] as int);
 
-  /// Until when its deal holds the escrow: nothing else can be sealed over it, and nothing taken
-  /// back from it, before then. Null when no deal does.
+  /// Until when its deal holds the escrow: nothing is taken back from it before then. Null when no
+  /// deal does.
   DateTime? get holdUntil {
     final at = json['hold_until'] as int?;
     return at == null ? null : DateTime.fromMillisecondsSinceEpoch(at);
@@ -156,12 +150,6 @@ String formatSats(int sats) => NumberFormat('#,##0', 'en_US').format(sats);
 /// How many passkey approvals, in words: "once", "twice", "3 times".
 String approvalTimes(int n) => switch (n) { 1 => 'once', 2 => 'twice', _ => '$n times' };
 
-/// Whether [e] is the platform saying it holds no share of the escrow it was asked to quote against
-/// — in the words its quote route refuses with. Its store lost the share, so that escrow can never
-/// pay it again: a new one has to be set up.
-bool platformHoldsNoShare(Object e) =>
-    e is PlatformException && e.refused && e.message.contains('holds no share of that escrow');
-
 /// [e] in words the owner can act on.
 String plainError(Object e) {
   if (e is PolicyRefused) {
@@ -181,11 +169,7 @@ String plainError(Object e) {
     return 'Could not connect. Check your connection and try again.';
   }
   if (e is StateError) return e.message;
-  final message = e is GrpcError ? e.message ?? '$e' : '$e';
-  if (message.contains('already committed to a deal')) {
-    return 'Your last payout still holds your escrow. You can send again once it has finished.';
-  }
-  return message;
+  return e is GrpcError ? e.message ?? '$e' : '$e';
 }
 
 int _sum(Iterable<IndexerVtxo> vtxos) =>
@@ -297,16 +281,6 @@ class PayoutService extends ChangeNotifier {
     return v is Map ? Payout(v) : null;
   }
 
-  /// The escrow payouts are paid from, once one is set up.
-  String? get escrowKey => _box?.get(_escrowKeyKey) as String?;
-
-  /// Whether that escrow is set up, and this wallet still holds it.
-  bool get hasEscrow {
-    final key = escrowKey?.toLowerCase();
-    return key != null &&
-        (_mpc.client?.escrows.any((e) => e.escrowKeyHex.toLowerCase() == key) ?? false);
-  }
-
   /// Who was paid lately, newest first and once each — the ones the money reached.
   List<Payout> get recipients {
     final seen = <(String, String, String, String)>{};
@@ -316,30 +290,19 @@ class PayoutService extends ChangeNotifier {
     ].take(5).toList();
   }
 
-  /// Payouts still to be dealt with: in flight, or failed with their escrow still this wallet's
-  /// and nothing paid from it since — whatever it holds may be theirs to take back.
-  List<Payout> get pending {
-    final all = payouts;
-    return [
-      for (final (i, p) in all.indexed)
-        if (!p.finished ||
-            (p.failed &&
-                p.leftoverSats == null &&
-                p.escrowKey == escrowKey &&
-                !all.take(i).any((q) => q.escrowKey == p.escrowKey)))
-          p,
-    ];
-  }
+  /// Payouts still to be dealt with: in flight, or failed with an escrow whose leftover has not
+  /// been taken back — whatever it holds is the owner's.
+  List<Payout> get pending => [
+        for (final p in payouts)
+          if (!p.finished || (p.failed && p.escrowKey != null && p.leftoverSats == null)) p,
+      ];
 
-  /// The payout whose deal still holds the escrow, if one does. Another can't be sealed over it
-  /// until that one is repaid or its deadline passes: the cosigner would refuse.
+  /// The payout still going through, if one is. The app sends one payout at a time: each has an
+  /// escrow of its own, so nothing at the cosigner would stop a second, but one in flight is
+  /// enough for an owner to follow.
   Payout? get holding {
-    final key = escrowKey, now = DateTime.now();
     for (final p in payouts) {
-      final until = p.holdUntil;
-      if (p.escrowKey == key && p.state != 'repaid' && until != null && until.isAfter(now)) {
-        return p;
-      }
+      if (!p.finished) return p;
     }
     return null;
   }
@@ -354,49 +317,15 @@ class PayoutService extends ChangeNotifier {
 
   Future<List<String>> banks(String country) => _platformClient().banks(country);
 
-  /// Mint the escrow payouts are paid from, and pair the platform into it. One approval, once.
-  Future<void> setUp() async {
-    await _open();
-    final key = await _need().ensureEscrow(known: escrowKey);
-    await _box!.put(_escrowKeyKey, key);
-    notifyListeners();
-  }
-
-  /// The platform's price for [d], and the policy it asks to have sealed. Commits nothing.
-  ///
-  /// An escrow the platform no longer holds a share of is forgotten here — see
-  /// [platformHoldsNoShare] — so the next [setUp] mints a new one.
-  // ponytail: what a forgotten escrow still holds is returned only from a failed payout that used
-  // it; a sweep of forgotten escrows is the upgrade if a platform ever loses shares for real.
-  Future<PayoutQuote> quote(PayoutDraft d) async {
-    final key = escrowKey;
-    if (key == null) throw StateError('Set up sending first.');
-    try {
-      return await _need().quote(
-        escrowKeyHex: key,
+  /// The platform's price for [d], and the policy it asks to have sealed. Commits nothing, and sets
+  /// nothing up: a payout's escrow is minted when it is sent.
+  Future<PayoutQuote> quote(PayoutDraft d) => _need().quote(
         country: d.corridor.country,
         rail: d.rail.kind,
         fields: d.fields,
         fullName: d.fullName,
         amountMinor: d.amountMinor,
       );
-    } catch (e) {
-      if (platformHoldsNoShare(e) && escrowKey == key) {
-        await _box!.delete(_escrowKeyKey);
-        notifyListeners();
-      }
-      rethrow;
-    }
-  }
-
-  /// What the escrow holds, and what has to be sent to it from the balance for it to hold [q]'s
-  /// price.
-  Future<({int held, int topUp})> funding(PayoutQuote q) async {
-    final bank = _need();
-    final held = await bank.held(escrowKey!);
-    final info = await bank.wallet.getArkInfo();
-    return (held: _sum(held), topUp: BankSend.shortfall(q.sats, held, dust: info.dust));
-  }
 
   Future<int> heldSats(String escrowKeyHex) async => _sum(await _need().held(escrowKeyHex));
 
@@ -404,10 +333,7 @@ class PayoutService extends ChangeNotifier {
 
   /// Go ahead with [q]: remember it, then seal it and have the platform pay, in the background.
   /// Returns its deal tag at once; [payout] says how it is going.
-  ///
-  /// [topUp] is what the quote screen worked out the escrow is short by.
-  Future<String> start(PayoutDraft d, PayoutQuote q,
-      {required bool setUp, required int topUp}) async {
+  Future<String> start(PayoutDraft d, PayoutQuote q) async {
     final box = await _open();
     final now = DateTime.now().millisecondsSinceEpoch;
     await box.put(q.dealTag, <String, dynamic>{
@@ -422,9 +348,6 @@ class PayoutService extends ChangeNotifier {
       'currency': q.currency,
       'decimals': d.corridor.decimals,
       'sats': q.sats,
-      'escrow_key': escrowKey,
-      'set_up': setUp,
-      'top_up_sats': topUp,
       'state': 'committing',
       'step': 'policy',
       // Until the seal says exactly when: the deal it is about to seal lasts this long.
@@ -445,20 +368,24 @@ class PayoutService extends ChangeNotifier {
       final Commitment sealed;
       try {
         bank = _need();
-        sealed = await bank.commit(
+        // Two operations — the escrow set up, then the send that funds it — and one flow: an entry
+        // to the app must not lock between them (`MpcService.runFlow`).
+        sealed = await _mpc.runFlow(() => bank.commit(
           q,
-          escrowKeyHex: payout(tag)!.escrowKey,
           fields: fields,
           onStep: (step) => unawaited(_update(
               tag,
               (p) => p['step'] = switch (step) {
                     CommitStep.policy => 'policy',
-                    CommitStep.seal => 'seal',
+                    CommitStep.seal || CommitStep.fund => 'seal',
                   })),
-        );
+          // Remembered before anything is sent to it, so whatever the send does, what it holds can
+          // be taken back.
+          onSealed: (key) => _update(tag, (p) => p['escrow_key'] = key),
+        ));
       } catch (e) {
-        // Not sealed, so no deal holds the escrow. What a top-up sent stays in it, and counts toward
-        // the next send.
+        // Not funded, so the platform pays nothing. An escrow that was set up holds what its send
+        // got there, if anything — the owner's to take back once its deal is over.
         await _update(tag, (p) {
           p['state'] = 'failed';
           p['failure'] = plainError(e);
@@ -471,17 +398,16 @@ class PayoutService extends ChangeNotifier {
       await _update(tag, (p) {
         p['state'] = 'funding';
         p['step'] = 'fund';
-        p['top_up_sats'] = sealed.topUpSats;
         p['hold_until'] = sealed.deadline.millisecondsSinceEpoch;
       });
 
       try {
-        await bank.fund(q);
+        await bank.fund(q, sealed);
         await _update(tag, (p) => p['step'] = 'pay');
       } on PlatformException catch (e) {
         if (e.refused) {
-          // Not paid. Still followed: the platform ends the deal once it gives the payout up,
-          // and that frees the escrow — and a refusal can be "funded already".
+          // Not paid. Still followed: the platform ends the deal once it gives the payout up, and
+          // that lets its escrow be taken back — and a refusal can be "funded already".
           await _update(
               tag,
               (p) => p
@@ -564,15 +490,20 @@ class PayoutService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Take back what [p]'s escrow still holds, into the wallet. One approval, refused while a deal
-  /// holds the escrow — and it retires the escrow for good, so the next send sets up a new one.
-  Future<int> returnLeftover(Payout p) async {
+  /// Take back what [p]'s escrow still holds, into the wallet. One approval, refused while its deal
+  /// holds the escrow. A flow, so a return to the app cannot lock between reading what the escrow
+  /// holds and taking it back.
+  Future<int> returnLeftover(Payout p) => _mpc.runFlow(() => _returnLeftover(p));
+
+  Future<int> _returnLeftover(Payout p) async {
+    final key = p.escrowKey;
     final bank = _need();
-    final held = (await bank.held(p.escrowKey)).where((v) => !v.isSpent).toList();
+    final held = key == null
+        ? const <IndexerVtxo>[]
+        : (await bank.held(key)).where((v) => !v.isSpent).toList();
     var back = 0;
     if (held.isNotEmpty) {
-      back = (await bank.wallet.reclaimEscrow(escrowKeyHex: p.escrowKey, vtxos: held)).amountSats;
-      if (escrowKey == p.escrowKey) await _box!.delete(_escrowKeyKey);
+      back = (await bank.wallet.reclaimEscrow(escrowKeyHex: key!, vtxos: held)).amountSats;
       unawaited(_mpc.refreshVtxos());
     }
     await _update(p.dealTag, (json) => json['leftover_sats'] = back);

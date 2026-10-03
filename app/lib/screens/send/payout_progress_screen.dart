@@ -70,7 +70,8 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
         ),
       );
     }
-    if (p.failed && p.leftoverSats == null) _left ??= payouts.heldSats(p.escrowKey);
+    final escrow = p.escrowKey;
+    if (p.failed && p.leftoverSats == null && escrow != null) _left ??= payouts.heldSats(escrow);
 
     return Scaffold(
       appBar: AppBar(
@@ -116,7 +117,7 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
                       const SizedBox(height: 16),
                       _receipt(p),
                     ],
-                    if (p.failed) ...[
+                    if (p.failed && p.escrowKey != null) ...[
                       const SizedBox(height: 16),
                       _leftover(p),
                     ],
@@ -164,25 +165,19 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
   }
 
   List<Widget> _steps(Payout p) {
-    final steps = [
-      if (p.setUp) 'set_up',
-      ...payoutSteps,
-    ];
+    const steps = payoutSteps;
     final at = p.step == 'done' ? steps.length : max(0, steps.indexOf(p.step));
     return [
       for (final (i, s) in steps.indexed)
         _StepRow(
           title: switch (s) {
-            'set_up' => 'Set up sending',
             'policy' => "Check the platform's terms",
-            'seal' => p.topUpSats > 0
-                ? 'Top up your escrow and seal the deal · ${formatSats(p.topUpSats)} sats'
-                : 'Seal the deal',
+            'seal' => 'Set up an escrow, seal the deal and send it ${formatSats(p.sats)} sats',
             'fund' => 'The platform pays',
             'pay' => 'Paid out to ${p.fullName}',
             _ => 'The platform is repaid · ${formatSats(p.sats)} sats',
           },
-          state: i < at || s == 'set_up'
+          state: i < at
               ? _StepState.done
               : i > at
                   ? _StepState.waiting
@@ -195,7 +190,7 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
                   ? p.failure ?? 'It did not go through.'
                   : switch (s) {
                       'policy' => 'That it holds the platform to what you agreed',
-                      'seal' => 'Approve with your passkey',
+                      'seal' => 'Approve once with your passkey',
                       'fund' => p.note ?? 'It checks it will be repaid, then pays',
                       'pay' => p.gridStatus == null
                           ? 'Waiting for the money to arrive'
@@ -235,8 +230,8 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
     ]);
   }
 
-  /// A failed payout may have left money in the escrow — a top-up, say. It can stay there for the
-  /// next send, or come back to the balance.
+  /// A failed payout leaves what its escrow was sent there, to come back to the balance once its
+  /// deal is over.
   Widget _leftover(Payout p) {
     final returned = p.leftoverSats;
     final text = GoogleFonts.inter(color: Colors.white70, fontSize: 13, height: 1.4);
@@ -263,9 +258,8 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Text(
-                'Your escrow still holds ${formatSats(held)} sats. Leave it and it counts '
-                'toward your next send — or take it back into your balance. Taking it back '
-                'retires the escrow, so your next send sets up a new one.',
+                "This payment's escrow still holds ${formatSats(held)} sats. Take it back into "
+                'your balance.',
                 style: text,
               ),
               if (until != null && until.isAfter(DateTime.now())) ...[

@@ -155,7 +155,7 @@ Future<void> main() async {
     }
 
     final deposits = await pollBoardingUtxos(boarding, boardSats, host: electrumHost, attempts: 60);
-    final commitment = await settleBoarding(alice.client, deposits);
+    final commitment = await renewBoarding(alice.client, deposits);
     step('boarded: commitment $commitment; delegate ${alice.client.delegateStatus?.validAt}');
 
     await eventually('alice\'s VTXO', alice.client.listVtxos, (v) => v.isNotEmpty);

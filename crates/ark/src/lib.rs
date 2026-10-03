@@ -8,6 +8,9 @@ pub mod client;
 #[cfg(feature = "exit")]
 pub mod exit;
 
+#[cfg(feature = "exit")]
+pub mod keys;
+
 use alloc::vec::Vec;
 use threshold::taptree::{ControlBlock, TapLeaf, TapNode, UNSPENDABLE_KEY_X_ONLY};
 

@@ -1,6 +1,6 @@
 /// The owner's side of a payout: refusing to seal a policy that does not say what she agreed to.
 ///
-/// A payout platform writes the policy an escrow is committed to, and `openEscrowSession` seals
+/// A payout platform writes the policy an escrow is committed to, and `setUpEscrow` seals
 /// whatever map it is given — a platform could hand back `{"op":"always"}`, or a policy that checks
 /// somebody else's bank account, or one whose evidence comes from a provider the platform runs
 /// itself. So before anything is sealed, this reads the policy and holds it to what the owner was

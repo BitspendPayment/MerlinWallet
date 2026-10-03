@@ -8,7 +8,7 @@
 ///
 /// The first term is derived from the passkey's PRF (`key_derivation.dart`). The second is the one
 /// scalar the cosigner sealed at DKG and hands back — on `Recover` to a device that has nothing,
-/// and on the first round of every `Sign`, `Send` and `Settle` since the wallet stopped keeping a
+/// and on the first round of every `Sign`, `Send` and `Renew` since the wallet stopped keeping a
 /// share. Neither term is the key; the sum is, and it is held for one operation.
 ///
 /// **Nothing is taken on the cosigner's word.** What the sum is checked against — the identifier,

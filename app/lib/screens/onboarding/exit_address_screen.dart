@@ -1,7 +1,7 @@
 /// Where the money goes if this service disappears.
 ///
 /// Asked once, right after the wallet's key exists and before the wallet opens, because it is what
-/// every later signature is made out to: at the end of every send, settle and renewal the cosigner
+/// every later signature is made out to: at the end of every send and renewal the cosigner
 /// co-signs a spend of each VTXO to this address, and the phone keeps it. Without an address there
 /// is nothing to pre-sign to, and the wallet would depend on the cosigner answering forever.
 ///

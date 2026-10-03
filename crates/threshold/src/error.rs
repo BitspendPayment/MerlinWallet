@@ -55,3 +55,16 @@ impl fmt::Display for Error {
         }
     }
 }
+
+/// Hex that does not decode is malformed serialized data.
+impl From<hex_conservative::HexToBytesError> for Error {
+    fn from(_: hex_conservative::HexToBytesError) -> Self {
+        Error::SerializationError
+    }
+}
+
+impl From<hex_conservative::HexToArrayError> for Error {
+    fn from(_: hex_conservative::HexToArrayError) -> Self {
+        Error::SerializationError
+    }
+}

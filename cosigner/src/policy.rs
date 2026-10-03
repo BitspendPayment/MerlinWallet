@@ -51,14 +51,14 @@ pub enum Policy {
     /// amount, so a false one produces a signature that verifies against nothing. A service that
     /// understates its inputs to make a fee look small gets a signature the network will not
     /// accept. What is checked here is therefore the true figure, or the signature is worthless —
-    /// see [`crate::handlers::release`].
+    /// see [`crate::escrow`].
     FeeMax { sats: u64 },
     /// Cap on what one escrow may release IN TOTAL, across every release it has made.
     ///
     /// [`TotalOutMax`](Policy::TotalOutMax) bounds one transaction; a card escrow is spent against
     /// over days, so the thing an owner actually commits is a running total. Checked against what
     /// the session has already recorded — see
-    /// [`EscrowSession::released_sats`](crate::escrow_session::EscrowSession::released_sats).
+    /// [`EscrowSession::released_sats`](crate::escrow::EscrowSession::released_sats).
     ReleasedTotalMax { sats: u64 },
     /// Escape hatch for a named external evaluator. RESERVED: none is registered and an
     /// unrecognised one denies, so this grants nothing today — it exists so adding one later costs
@@ -88,12 +88,12 @@ pub struct OutputView {
 }
 
 /// What a predicate sees: OUTPUTS, not a transaction. A caller-supplied transaction is parsed into
-/// outputs; a settle the cosigner builds already has them. One evaluator serves both.
+/// outputs; a renewal the cosigner builds already has them. One evaluator serves both.
 ///
 /// No prevout values, so fees and balance fractions are inexpressible — a property of the call
 /// sites, not the IR.
 pub struct EvalContext<'a> {
-    /// The proposed outputs, or `None` — a settle sighash arrives with nothing to inspect.
+    /// The proposed outputs, or `None` — a renewal's sighash arrives with nothing to inspect.
     pub outputs: Option<&'a [OutputView]>,
     /// ScriptPubKeys (lowercase hex) belonging to this wallet. Outputs paying these are change,
     /// not egress.
@@ -423,7 +423,7 @@ impl Policy {
     ///
     /// Never from inside an `any_of`. A cap there binds one branch, and the deal can be satisfied
     /// down another without it — so it says nothing about when the deal has had everything it can
-    /// have. See [`EscrowSession::spent`](crate::escrow_session::EscrowSession::spent).
+    /// have. See [`EscrowSession::spent`](crate::escrow::EscrowSession::spent).
     pub fn released_total_cap(&self) -> Option<u64> {
         match self {
             Policy::ReleasedTotalMax { sats } => Some(*sats),
@@ -438,7 +438,7 @@ impl Policy {
 /// Over the parsed policy re-serialized, not over whatever text arrived, so the service that wrote
 /// a policy and the cosigner that sealed it reach the same value from the same terms however the
 /// JSON travelled in between. What a service compares against the policy it offered — see
-/// [`DealTerms`](crate::escrow_session::DealTerms).
+/// [`SealedTerms`](crate::escrow::SealedTerms).
 pub fn policy_sha256(policy: &Policy) -> String {
     use sha2::{Digest, Sha256};
     // Serializing a policy cannot fail — every term is plain data. If it ever did, the empty input
@@ -450,7 +450,7 @@ pub fn policy_sha256(policy: &Policy) -> String {
 /// Apply a policy to a caller-supplied transaction.
 ///
 /// An undecodable transaction denies; an ABSENT one becomes `outputs: None` and each predicate
-/// decides for itself — which is what lets `Always` hold for a settle sighash while
+/// decides for itself — which is what lets `Always` hold for a renewal's sighash while
 /// `OutputsOnlyTo` still refuses to guess.
 pub fn enforce(
     policy: &Policy,
@@ -468,7 +468,7 @@ pub fn enforce(
     enforce_outputs(policy, outputs.as_deref(), owned_scripts)
 }
 
-/// Apply a policy to outputs the cosigner built itself — the settle and send paths, which have
+/// Apply a policy to outputs the cosigner built itself — the renewal and send paths, which have
 /// outputs rather than a transaction to show.
 pub fn enforce_outputs(
     policy: &Policy,

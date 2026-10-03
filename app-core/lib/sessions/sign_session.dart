@@ -9,7 +9,7 @@
 /// The wallet used to commit first, in the open. It cannot any more: its nonce is hedged with its
 /// share, and it holds no share until the cosigner's first answer brings the half it dealt
 /// (`passkey/operation_secrets.dart`). So the cosigner commits first — as it always has on the
-/// `Send` and `Settle` streams, see `in_band_round.dart` — and nothing is lost by it: FROST needs
+/// `Send` and `Renew` streams, see `in_band_round.dart` — and nothing is lost by it: FROST needs
 /// both commitments before either share, not ours before theirs, and the binding factor covers
 /// every commitment whoever sent theirs last.
 ///
