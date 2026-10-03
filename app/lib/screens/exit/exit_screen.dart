@@ -2,9 +2,9 @@
 ///
 /// A VTXO can be spent two ways. The cooperative way needs the ASP, and the unilateral way needs
 /// only its owner — except that the owner here is a 2-of-2 with the cosigner, so the signature has
-/// to be collected while the cosigner is still answering. That is what every delegate renewal does:
-/// at the end of a send or a renewal it hands back one signed exit per VTXO, paying an
-/// address in a wallet this app does not control. They are kept on this phone.
+/// to be collected while the cosigner is still answering. That is what every delegate renewal does
+/// — at the end of a send, a refresh, and every entry to the app — handing back one signed exit per
+/// VTXO, paying an address in a wallet this app does not control. They are kept on this phone.
 ///
 /// This screen is the honest account of that: what is covered, what is not, when each becomes
 /// spendable, and what still has to happen for a full exit — because a pre-signed spend is the last
@@ -55,7 +55,7 @@ class ExitScreen extends StatelessWidget {
               _coverage(coveredSats, uncoveredSats),
               if (uncovered.isNotEmpty) ...[
                 const SizedBox(height: 12),
-                _protectPrompt(context, service, uncoveredSats),
+                _uncoveredNote(service),
               ],
               const SizedBox(height: 20),
               Text('Signed and yours',
@@ -175,51 +175,24 @@ class ExitScreen extends StatelessWidget {
         ),
       );
 
-  /// Funds arrive, and the cosigner renews funds on its own — both leave money no exit covers until
-  /// the next delegate renewal. One approval fixes it, and only the owner can give it.
-  Widget _protectPrompt(
-          BuildContext context, MpcService service, int uncoveredSats) =>
-      Container(
+  /// Money no exit covers yet: what the cosigner made by renewing on its own, or an escrow's leftover
+  /// taken back. Nothing to press — the next entry to the app signs an exit for everything held
+  /// (`MpcService.unlock`), as long as there is an address to pay.
+  Widget _uncoveredNote(MpcService service) => Container(
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
           color: Colors.orange.withOpacity(0.08),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(color: Colors.orangeAccent.withOpacity(0.3)),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Some of your money has no exit yet. This happens when funds arrive, and after the '
-              'service renews them for you — a renewal makes a new output, and only you can sign '
-              'its exit.',
-              style: GoogleFonts.inter(
-                  color: Colors.white70, fontSize: 13, height: 1.4),
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                key: const Key('exitProtectBtn'),
-                onPressed: service.hasExitAddress
-                    ? () async {
-                        final messenger = ScaffoldMessenger.of(context);
-                        try {
-                          await service.protectFunds();
-                          messenger.showSnackBar(const SnackBar(
-                              content:
-                                  Text('Exits signed for all your funds')));
-                        } catch (e) {
-                          messenger.showSnackBar(
-                              SnackBar(content: Text('Could not sign: $e')));
-                        }
-                      }
-                    : null,
-                icon: const Icon(Icons.lock_outline, size: 18),
-                label: const Text('Sign exits for these funds'),
-              ),
-            ),
-          ],
+        child: Text(
+          service.hasExitAddress
+              ? 'Some of your money has no exit yet. A renewal, or a leftover coming back, makes '
+                  'a new output, and only you can sign its exit. It is signed the next time you '
+                  'open the app.'
+              : 'Some of your money has no exit yet. Exits are signed once an exit address is '
+                  'set.',
+          style: GoogleFonts.inter(color: Colors.white70, fontSize: 13, height: 1.4),
         ),
       );
 

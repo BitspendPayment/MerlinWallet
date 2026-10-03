@@ -295,6 +295,14 @@ class MpcClient {
   ///
   /// [forWallet] is false for the two operations that have no wallet to check the passkey
   /// against yet: DKG, which makes one, and recovery, which finds one.
+  ///
+  /// [onApproved] is told once step 3 is done — the passkey given, and shown to be this wallet's —
+  /// and before [run] begins. It is how a caller stops waiting on the owner while the operation
+  /// goes on: an entry to the app unlocks on the fingerprint, not minutes later when a renewal's
+  /// round ends. It is told nothing else; no secret leaves the operation.
+  ///
+  /// [local] asks for the gesture without approving any call: the passkey asserts for nobody, and
+  /// the operation can open no stream. See [verifyPasskey].
   Future<T> _withOperation<P, T>(
     String method, {
     required Future<P> Function() prepare,
@@ -303,6 +311,8 @@ class MpcClient {
     WalletPublicState? escrow,
     Uint8List? escrowContext,
     Uint8List? pairingContext,
+    void Function()? onApproved,
+    bool local = false,
   }) {
     return _operations.synchronized(() async {
       // For this turn only: a cancel is of the operation running, never of one still in line.
@@ -316,7 +326,9 @@ class MpcClient {
             forWallet: forWallet,
             escrow: escrow,
             escrowContext: escrowContext,
-            pairingContext: pairingContext));
+            pairingContext: pairingContext,
+            onApproved: onApproved,
+            local: local));
       } finally {
         // Here rather than in [_runOperation], and that is the point: a cancel ends this frame
         // at once, while the work it was racing may take a moment to unwind — or, parked on a
@@ -345,6 +357,8 @@ class MpcClient {
     WalletPublicState? escrow,
     Uint8List? escrowContext,
     Uint8List? pairingContext,
+    void Function()? onApproved,
+    required bool local,
   }) async {
     final source = _seedSource;
     if (source == null) {
@@ -364,7 +378,7 @@ class MpcClient {
     final stale = _promptInFlight;
     if (stale != null) await cancel.guard(stale);
 
-    final taking = _takeSeed(source, method, cancel);
+    final taking = _takeSeed(source, method, cancel, local: local);
     // Everything [_takeSeed] does, cleanup included, and never an error: it is waited on by
     // whoever comes next, who has no interest in how it went.
     final settled = taking.then<void>((_) {}, onError: (_) {});
@@ -390,6 +404,9 @@ class MpcClient {
     // Disposed by [_withOperation] when the turn ends, however it ends.
     _operation = operation;
     debugOnOperation?.call(operation);
+    // Approved, and by this wallet's passkey: `begin` refused any other, and a cancel did not
+    // arrive first. Told now, before the work, so a caller can stop waiting on the owner.
+    onApproved?.call();
     return run(operation, prepared);
   }
 
@@ -412,10 +429,14 @@ class MpcClient {
   /// they had already cancelled. It is dropped whether the seed arrived or the passkey failed
   /// after approving. It cannot take a newer operation's approval with it: whoever is next waits
   /// for this to finish ([_promptInFlight]) before asking for its own.
-  Future<Uint8List> _takeSeed(SeedSource source, String method, CancelSignal cancel) async {
+  ///
+  /// [local] approves no call: the gesture asserts for nobody, so the source asks for the seed by
+  /// itself (`SeedSource.seedDuring`).
+  Future<Uint8List> _takeSeed(SeedSource source, String method, CancelSignal cancel,
+      {bool local = false}) async {
     final Uint8List seed;
     try {
-      seed = await source.seedDuring(() => _conn.approveAhead(method));
+      seed = await source.seedDuring(local ? () async {} : () => _conn.approveAhead(method));
     } catch (_) {
       if (cancel.isCancelled) _conn.discardApproval(method);
       rethrow;
@@ -1072,9 +1093,11 @@ class MpcClient {
   /// that carries this wallet's VTXO script but that no ASP ever made.
   ///
   /// One approval — for funds that arrived without an operation of ours; a send or a renewal
-  /// renews the delegate on its way out at no extra cost.
-  Future<DelegateStatus> protectFunds({List<IndexerVtxo>? over}) {
-    return _withOperation('Renew', prepare: () async {
+  /// renews the delegate on its way out at no extra cost. [onApproved] is told once it is given —
+  /// see [_withOperation].
+  Future<DelegateStatus> protectFunds(
+      {List<IndexerVtxo>? over, void Function()? onApproved}) {
+    return _withOperation('Renew', onApproved: onApproved, prepare: () async {
       final info = await _asp.getInfo();
       final held =
           over ?? await heldOnceIndexed(listVtxos, timeout: const Duration(seconds: 10));
@@ -1117,9 +1140,11 @@ class MpcClient {
   Future<String> _renewOrBoard({
     cs.BoardingUtxo? boardingUtxo,
     void Function(RenewPhase)? onProgress,
+    void Function()? onApproved,
   }) {
     // Named for the stream it opens: an approval obtained ahead is for one method's path.
     return _withOperation(boardingUtxo == null ? 'Renew' : 'Board',
+        onApproved: onApproved,
         prepare: () async => (
               info: await _asp.getInfo(),
               vtxos: boardingUtxo == null ? await listVtxos() : const <IndexerVtxo>[],
@@ -1156,8 +1181,21 @@ class MpcClient {
   /// the delegate arms a durable watch, and when its deadline arrives the cosigner either executes
   /// the delegate itself — where its image allowlists the ASP — or wakes this device, and then this
   /// is what runs.
-  Future<String> renewHeld({void Function(RenewPhase)? onProgress}) =>
-      _renewOrBoard(onProgress: onProgress);
+  ///
+  /// [onApproved] is told once the approval is given — the round after it takes minutes.
+  Future<String> renewHeld(
+          {void Function(RenewPhase)? onProgress, void Function()? onApproved}) =>
+      _renewOrBoard(onProgress: onProgress, onApproved: onApproved);
+
+  /// Show that the owner holds this wallet's passkey: one gesture, and nothing sent anywhere.
+  ///
+  /// A local assertion. Its PRF must derive this wallet's identifier, or `WalletOperation.begin`
+  /// refuses it as `WrongPasskey` — the same check every operation makes. No cosigner call and no
+  /// approval, so it works offline. It is what an entry to the app asks for when there is nothing
+  /// to renew, or nothing reachable to renew it with. Serialized like every operation, so it never
+  /// asks for a gesture while another is on the screen.
+  Future<void> verifyPasskey() => _withOperation<void, void>('VerifyPasskey',
+      local: true, prepare: _nothingToPrepare, run: (_, __) async {});
 
   // --- Devices ----------------------------------------------------------------------------------
   //

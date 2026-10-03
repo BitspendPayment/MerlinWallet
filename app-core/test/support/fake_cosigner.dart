@@ -362,9 +362,17 @@ class FakeCosigner extends cs.CosignerServiceBase {
 
   @override
   Stream<cs.SendServerMsg> send(ServiceCall call, Stream<cs.SendClientMsg> request) => _no('send');
+  /// How many `Renew` streams were opened. Each one is refused — renewing needs an ASP — but only
+  /// once it is open, so a test can tell whether an operation got as far as opening one.
+  int renewsOpened = 0;
+
   @override
-  Stream<cs.RenewServerMsg> renew(ServiceCall call, Stream<cs.RenewClientMsg> request) =>
-      _no('renew');
+  Stream<cs.RenewServerMsg> renew(ServiceCall call, Stream<cs.RenewClientMsg> request) async* {
+    // A generator, so the refusal is the stream's: thrown synchronously, it would escape the
+    // handler as an unhandled error instead of reaching the wallet as a gRPC status.
+    renewsOpened++;
+    throw GrpcError.unimplemented('the fake cosigner does not renew');
+  }
 
   // --- Board, as far as the wait -----------------------------------------------------------------
   //

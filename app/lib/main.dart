@@ -11,6 +11,7 @@ import 'screens/settings_screen.dart';
 import 'screens/exit/exit_screen.dart';
 import 'screens/onboarding/exit_address_screen.dart';
 import 'screens/splash_screen.dart';
+import 'screens/lock_screen.dart';
 import 'screens/ark/ark_screen.dart';
 import 'screens/ark/ark_board_screen.dart';
 import 'screens/send/send_hub_screen.dart';
@@ -69,6 +70,40 @@ class MerlinWalletApp extends StatefulWidget {
 
 class _MerlinWalletAppState extends State<MerlinWalletApp> {
   GoRouter? _router;
+  late final AppLifecycleListener _lifecycle;
+
+  /// Whether the app went to the background with nothing running — the departure a return locks.
+  bool _hidIdle = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _lifecycle = AppLifecycleListener(onHide: _wentAway, onShow: _cameBack);
+  }
+
+  @override
+  void dispose() {
+    _lifecycle.dispose();
+    super.dispose();
+  }
+
+  // Every return to the app is an entry, and every entry asks for the passkey — see
+  // `MpcService.unlock`. A return, precisely: `onHide` fires only once the app stops being visible,
+  // so the passkey's own sheet and the notification shade, which leave it showing behind them, are
+  // not a departure. Nor is leaving while something runs — an operation, or a payout or a board
+  // between its operations. It finishes where it is, and the next return locks.
+  void _wentAway() => _hidIdle = context.read<MpcService>().idle && !_onboarding;
+
+  void _cameBack() {
+    if (!_hidIdle) return;
+    _hidIdle = false;
+    context.read<MpcService>().lock();
+  }
+
+  /// Onboarding has just used the passkey, and sends the owner to other apps: the exit address
+  /// comes from another wallet.
+  bool get _onboarding =>
+      _router?.routeInformationProvider.value.uri.path.startsWith('/onboarding') ?? false;
 
   @override
   Widget build(BuildContext context) {
@@ -79,6 +114,16 @@ class _MerlinWalletAppState extends State<MerlinWalletApp> {
       theme: AppTheme.darkTheme,
       routerConfig: _router!,
       debugShowCheckedModeBanner: false,
+      // The lock is laid over the app, not routed to: a redirect or a refresh would rebuild the
+      // pages under it from their routes alone, and drop what the send screens were opened with.
+      // Offstage, the app keeps its state and takes no taps until the owner is back.
+      builder: (context, child) {
+        final locked = context.select<MpcService, bool>((s) => s.locked);
+        return Stack(fit: StackFit.expand, children: [
+          Offstage(offstage: locked, child: child),
+          if (locked) const LockScreen(),
+        ]);
+      },
     );
   }
 }

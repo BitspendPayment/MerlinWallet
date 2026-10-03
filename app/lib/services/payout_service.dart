@@ -368,7 +368,9 @@ class PayoutService extends ChangeNotifier {
       final Commitment sealed;
       try {
         bank = _need();
-        sealed = await bank.commit(
+        // Two operations — the escrow set up, then the send that funds it — and one flow: an entry
+        // to the app must not lock between them (`MpcService.runFlow`).
+        sealed = await _mpc.runFlow(() => bank.commit(
           q,
           fields: fields,
           onStep: (step) => unawaited(_update(
@@ -380,7 +382,7 @@ class PayoutService extends ChangeNotifier {
           // Remembered before anything is sent to it, so whatever the send does, what it holds can
           // be taken back.
           onSealed: (key) => _update(tag, (p) => p['escrow_key'] = key),
-        );
+        ));
       } catch (e) {
         // Not funded, so the platform pays nothing. An escrow that was set up holds what its send
         // got there, if anything — the owner's to take back once its deal is over.
@@ -489,8 +491,11 @@ class PayoutService extends ChangeNotifier {
   }
 
   /// Take back what [p]'s escrow still holds, into the wallet. One approval, refused while its deal
-  /// holds the escrow.
-  Future<int> returnLeftover(Payout p) async {
+  /// holds the escrow. A flow, so a return to the app cannot lock between reading what the escrow
+  /// holds and taking it back.
+  Future<int> returnLeftover(Payout p) => _mpc.runFlow(() => _returnLeftover(p));
+
+  Future<int> _returnLeftover(Payout p) async {
     final key = p.escrowKey;
     final bank = _need();
     final held = key == null

@@ -16,6 +16,8 @@ import 'package:app_core/cosigner/connection.dart' show CosignerException;
 import 'package:app_core/enclave/attestation.dart';
 import 'package:app_core/enclave/gate.dart';
 import 'package:app_core/enclave/manifest.dart' as manifest;
+import 'package:app_core/passkey/operation_secrets.dart' show OperationCancelled;
+import 'package:app_core/passkey/share_reconstruction.dart' show WrongPasskey;
 import 'package:app_core/persistence/wallet_store.dart'
     show IncompatibleWalletStateException, WalletStore;
 
@@ -87,10 +89,6 @@ class MpcService extends ChangeNotifier {
   int get boardingPendingBalance => _boardingPendingBalance;
   bool _arkAvailable = false;
   bool get arkAvailable => _arkAvailable;
-
-  void policyUpdated() {
-    notifyListeners();
-  }
 
   // Hardcoded for now, could be configurable
   String _host = '10.0.2.2'; // Default, will be overwritten by persistence
@@ -468,8 +466,10 @@ class MpcService extends ChangeNotifier {
 
   /// Restores a previously completed session without re-running DKG: the gate, the client, and
   /// the wallet's public state from Hive. No key is restored because none is stored — the share
-  /// is rebuilt from the passkey when something first needs to sign, which is also the first
-  /// fingerprint this asks for.
+  /// is rebuilt from the passkey when something first needs to sign.
+  ///
+  /// It opens [locked]: a cold start is an entry, and the first fingerprint is the entry's — see
+  /// [unlock].
   ///
   /// Throws [IncompatibleWalletStateException] when what is stored is from before shares were
   /// rebuilt per operation. It is not read and not replaced; see [resetLocalWallet].
@@ -488,6 +488,9 @@ class MpcService extends ChangeNotifier {
       }
       _isConnected = true;
       await initArk();
+      // Only on success: a session that failed to open shows its error, not a lock.
+      _locked = true;
+      _renewError = null;
       notifyListeners();
     } catch (_) {
       await _hangUp();
@@ -510,10 +513,115 @@ class MpcService extends ChangeNotifier {
   /// Whether an operation that signs is running. Another started now waits behind it.
   bool get operationInProgress => _client?.operationInProgress ?? false;
 
+  // --- Entering the app ---------------------------------------------------------------------------
+  //
+  // Every entry asks for the passkey once — a cold start, and every return from the background —
+  // and that one approval re-arms what the cosigner renews on its own. Its delegate is spent each
+  // time it runs, and only the owner can sign the next, so an entry is the moment the wallet is
+  // sure to have its owner, and it uses it.
+
+  bool _locked = false;
+
+  /// Whether the wallet is behind its passkey: from a cold start, and from every return to the app
+  /// ([lock]), until [unlock].
+  bool get locked => _locked;
+
+  bool _renewing = false;
+
+  /// Whether the renewal an entry started is still running after the lock lifted. A refresh's
+  /// round takes minutes.
+  bool get renewing => _renewing;
+
+  Object? _renewError;
+
+  /// Why the last entry's renewal did not happen. Nothing is lost by it: the next entry tries again.
+  Object? get renewError => _renewError;
+
+  int _flows = 0;
+
+  /// Run [flow] — several operations that belong together — with no lock landing between them.
+  ///
+  /// A payout is an escrow set up, then the send that funds it; a board is one operation per
+  /// deposit. A lock in the gap would wedge an entry's renewal into the middle of something the
+  /// owner has approved half of.
+  Future<T> runFlow<T>(Future<T> Function() flow) async {
+    _flows++;
+    try {
+      return await flow();
+    } finally {
+      _flows--;
+    }
+  }
+
+  /// Whether nothing is running: no operation that signs, and no flow under way. Only an idle
+  /// wallet is locked when the app goes to the background.
+  bool get idle => !operationInProgress && _flows == 0;
+
+  /// Put the wallet behind its passkey. Never while something runs: a lock does not interrupt the
+  /// owner mid-operation.
+  void lock() {
+    if (_client == null || _locked || !idle) return;
+    _locked = true;
+    notifyListeners();
+  }
+
+  /// One passkey prompt: the owner's way in, and the renewal re-armed with the same approval.
+  ///
+  ///  * Funds held: [MpcClient.protectFunds] re-signs the delegate, and the exits, over all of it.
+  ///  * Funds held and the cosigner's own renewal late, or expiry close ([refreshDue]):
+  ///    [MpcClient.renewHeld] refreshes them now, and re-arms on its way out.
+  ///  * Nothing held, or nothing reachable to renew with: [MpcClient.verifyPasskey], a local check.
+  ///
+  /// The lock lifts on the approval, not when the renewal ends — a refresh's round takes minutes,
+  /// and the owner has proved who they are. What fails after that is [renewError], and the next
+  /// entry tries again. What fails before the prompt — an indexer behind, an enclave out of reach —
+  /// falls back to the local check, so being offline never locks the owner out. A dismissed prompt,
+  /// or a passkey that is not this wallet's, keeps the lock: it throws.
+  Future<void> unlock() async {
+    final client = _client;
+    if (client == null) throw StateError('wallet not initialized');
+    _renewError = null;
+    var approved = false;
+    void open() {
+      approved = true;
+      _locked = false;
+      _renewing = true;
+      notifyListeners();
+    }
+
+    try {
+      final reachable = _arkAvailable && await refreshVtxos();
+      if (reachable && _held.isNotEmpty) {
+        if (refreshDue) {
+          await client.renewHeld(onApproved: open);
+        } else {
+          await client.protectFunds(onApproved: open);
+        }
+      } else {
+        await client.verifyPasskey();
+      }
+    } catch (e) {
+      if (approved) {
+        _renewError = e;
+      } else if (e is PlatformException || e is WrongPasskey || e is OperationCancelled) {
+        rethrow;
+      } else {
+        // The renewal could not start; the owner can still show who they are.
+        _renewError = e;
+        await client.verifyPasskey();
+      }
+    } finally {
+      _renewing = false;
+    }
+    _locked = false;
+    notifyListeners();
+    await refreshVtxos();
+  }
+
   /// Hang up on the cosigner and the ASP, without waiting on an operation that may never finish.
   ///
   /// `close` is graceful — it waits for calls in flight — so behind a renewal parked on a silent
-  /// ASP it would wait for ever, and so would the reconnect that was meant to fix exactly that.
+  /// ASP it would wait for ever.
   /// The operation is cancelled first: it fails, and lets go of what it held.
   Future<void> _hangUp() async {
     final client = _client;
@@ -549,29 +657,8 @@ class MpcService extends ChangeNotifier {
     _isConnected = false;
     await _identityBox!.put('dkgComplete', false);
     await _identityBox!.delete('exitAddress');
+    _locked = false;
     notifyListeners();
-  }
-
-  /// Reconnects to the server by tearing down the existing channel
-  /// and restoring the session fresh.
-  Future<void> reconnect() async {
-    if (!_dkgComplete) return;
-
-    _isConnected = false;
-    notifyListeners();
-
-    await _hangUp();
-    _client = null;
-    _boarding?.close();
-    _boarding = null;
-
-    try {
-      await restoreSession();
-    } catch (e) {
-      debugPrint("Reconnect failed: $e");
-      _isConnected = false;
-      notifyListeners();
-    }
   }
 
   // --- Ark methods ---
@@ -594,9 +681,6 @@ class MpcService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// A refresh round in progress — [delegateNow] refuses a second.
-  bool _delegateInFlight = false;
-
   /// Periodic VTXO poll. Off-chain receives don't trigger the on-chain electrs
   /// sync, so without this, received VTXOs only show up on a manual refresh.
   /// Runs while Ark is active; the OS pauses it when the app is backgrounded.
@@ -610,9 +694,10 @@ class MpcService extends ChangeNotifier {
   /// Whether a sealed delegate covers everything held — so the cosigner will refresh it on its own,
   /// from the enclave, before it expires.
   ///
-  /// Answered locally, from the indexer and the delegate the last send, renewal or [protectFunds]
+  /// Answered locally, from the indexer and the delegate the last send, refresh or entry ([unlock])
   /// renewed — no call to the cosigner, so no passkey prompt. It stops being true when funds arrive
-  /// that no delegate covers: a receive, or the VTXO the cosigner produced when it ran one.
+  /// that no delegate covers — an escrow's leftover taken back, or the VTXO the cosigner produced
+  /// when it ran one — and the next entry makes it true again.
   bool get fundsProtected {
     final delegate = _client?.delegateStatus;
     final held = _held.toList();
@@ -622,8 +707,8 @@ class MpcService extends ChangeNotifier {
   /// How long after a delegate's moment the cosigner is given before the owner is asked to step in.
   ///
   /// A batch round waits on the ASP's own schedule and can be retried, so the renewal is not late
-  /// the instant it is due. Asking sooner would mean asking every time the machinery is simply
-  /// working — the button would be on screen exactly when the cosigner was about to act.
+  /// the instant it is due. Stepping in sooner would have an entry refresh in person exactly when
+  /// the cosigner was about to.
   static const Duration _renewalGrace = Duration(minutes: 10);
 
   /// The last moment a renewal can wait: past this, ask rather than hope.
@@ -671,8 +756,8 @@ class MpcService extends ChangeNotifier {
   ///
   /// Anything received since the last delegate renewal, and — the one that matters — everything the
   /// cosigner made by running a delegate while nobody was here: a renewal spends the VTXOs the old
-  /// exits named and makes a new one, which cannot be pre-signed until it exists. Renewing it again
-  /// covers it, which is what [protectFunds] does.
+  /// exits named and makes a new one, which cannot be pre-signed until it exists. The next entry
+  /// covers it ([unlock]): its renewal signs an exit for everything held.
   List<IndexerVtxo> get vtxosWithoutExit {
     final covered = {for (final e in exits) e.outpoint};
     return _held
@@ -705,12 +790,6 @@ class MpcService extends ChangeNotifier {
     await _identityBox?.put('exitAddress', _exitAddress);
     notifyListeners();
   }
-
-  /// Whether the Ark tab should ask the user for something: to protect funds no delegate covers
-  /// ([protectFunds]), or to refresh funds that are due and were not ([delegateNow]). Never acted on
-  /// without them — each is a passkey approval, and an approval is a person.
-  bool get needsDelegateAction =>
-      _held.isNotEmpty && (refreshDue || !fundsProtected);
 
   /// Whether the last [refreshVtxos] failure was our credentials being refused
   /// rather than the ASP being unreachable. The poll loop must not treat the
@@ -762,52 +841,13 @@ class MpcService extends ChangeNotifier {
   }
 
   /// Have the cosigner enrol [token] for wakes — on the DKG, or on the next delegate renewal (a
-  /// send, a renewal, or "Renew automatically"), never as a call of its own. Every call is a
+  /// send, a refresh, or the one every entry signs), never as a call of its own. Every call is a
   /// passkey approval, and a separate enrolment was a fingerprint the user never asked for. Nothing
   /// is missed by waiting: a wake is only ever about a renewed delegate, and the renewal carries
   /// the token.
   void offerDeviceToken(String token) {
     _pushToken = token;
     _client?.offerDeviceToken(_unenrolledToken);
-  }
-
-  /// Renew the delegate over what is held, so the cosigner refreshes it on its own before it
-  /// expires.
-  /// One passkey approval.
-  ///
-  /// For funds no delegate covers — a receive, or what the cosigner produced by running one. A send
-  /// or a renewal renews it on its way out with no approval of its own, so this is only needed when
-  /// [fundsProtected] is false and nothing is being sent.
-  Future<void> protectFunds() async {
-    final client = _client;
-    if (client == null) throw StateError('wallet not initialized');
-    await client.protectFunds();
-    notifyListeners();
-  }
-
-  /// Refresh everything held in a batch round now — for funds past due that the cosigner could not
-  /// refresh itself. One passkey approval, and it renews the delegate on its way out. Throws on
-  /// failure so the UI can surface it.
-  /// Returns whether the renewal was re-armed on the way out. A refresh renews the delegate on
-  /// the same stream and the same approval, so this is normally true; it is false when the indexer
-  /// had not caught up in time, and then the owner has to renew it again — which is worth saying
-  /// rather than reporting success.
-  Future<bool> delegateNow() async {
-    final client = _client;
-    if (client == null) throw StateError('wallet not initialized');
-    // Throw rather than silently return: the button's success feedback must
-    // never fire for an attempt that didn't run.
-    if (_delegateInFlight)
-      throw StateError('a delegate is already in progress');
-    _delegateInFlight = true;
-    try {
-      await client.renewHeld();
-      await refreshVtxos();
-      notifyListeners();
-      return fundsProtected;
-    } finally {
-      _delegateInFlight = false;
-    }
   }
 
   /// Poll Ark availability and VTXOs, skipping overlapping ticks. A failed refresh is followed
@@ -876,7 +916,9 @@ class MpcService extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<String> boardFunds() async {
+  Future<String> boardFunds() => runFlow(_boardFunds);
+
+  Future<String> _boardFunds() async {
     if (_client == null) throw StateError("Client not initialized");
     // Scan the boarding deposits on-chain and hand them to the cosigner's renewal.
     //
@@ -897,27 +939,6 @@ class MpcService extends ChangeNotifier {
     await refreshVtxos();
     await refreshBoardingBalance();
     return txid!;
-  }
-
-  Future<String> sendArk(String recipientArkAddress, int amountSats) async {
-    final client = _client;
-    if (client == null || !arkAvailable) {
-      throw StateError('Ark is unavailable — cannot send.');
-    }
-    // One call, where there were three. `MpcArkWallet` built the transaction here, had it
-    // co-signed, then submitted it — a second implementation of the Ark send that derived the
-    // VTXO owner key from the share id, which the ASP rejected. The cosigner builds it now and
-    // hands back sighashes, so there is one path and it is the cosigner's.
-    final arkTxid = await client.sendVtxo(recipientArkAddress, amountSats);
-    await refreshVtxos();
-    return arkTxid;
-  }
-
-  Future<String> renewHeld() async {
-    if (_client == null) throw StateError("Client not initialized");
-    final txid = await _client!.renewHeld();
-    await refreshVtxos();
-    return txid;
   }
 
   String _generateSessionId() {

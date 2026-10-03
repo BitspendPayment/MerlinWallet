@@ -276,7 +276,6 @@ class ArkScreen extends StatelessWidget {
     // renewed VTXO, so the soonest-expiring VTXO is the whole wallet's next
     // renewal deadline (min expiresAt, skipping not-yet-backfilled 0s).
     final hasFunds = balance > BigInt.zero;
-    final delegated = !mpcService.needsDelegateAction;
     int? soonestExp;
     IndexerVtxo? soonest;
     for (final v in mpcService.vtxos) {
@@ -352,9 +351,7 @@ class ArkScreen extends StatelessWidget {
           ),
           if (hasFunds) ...[
             const SizedBox(height: 12),
-            delegated
-                ? _buildRenewalLine(context, mpcService, soonest)
-                : _buildEnableAutoRenew(context, mpcService),
+            _buildRenewalLine(context, mpcService, soonest),
           ],
           const SizedBox(height: 24),
           Row(
@@ -387,24 +384,28 @@ class ArkScreen extends StatelessWidget {
     );
   }
 
-  /// Wallet-wide auto-renew status line inside the balance card. When an expiry
-  /// is known it shows a countdown and taps through to the refresh/expiry sheet;
-  /// while the fresh expiry is still being backfilled it just reads "active".
+  /// Wallet-wide renewal status inside the balance card. Nothing to tap that renews: every entry
+  /// to the app re-arms the renewal with the passkey that opens it (`MpcService.unlock`), so this
+  /// only says where things stand.
   Widget _buildRenewalLine(
       BuildContext context, MpcService mpcService, IndexerVtxo? soonest) {
     String label;
     VoidCallback? onTap;
-    if (soonest == null) {
-      label = 'Auto-renew active';
+    if (mpcService.renewing) {
+      label = 'Renewing your funds…';
+    } else if (mpcService.fundsProtected && !mpcService.refreshDue) {
+      if (soonest == null) {
+        label = 'Renews itself';
+      } else {
+        // The ASP-reported expiry: the cosigner renews before it.
+        final nowSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        label = 'Renews itself within ${_formatTimeUntil(soonest.expiresAt - nowSecs)}';
+        onTap = () => _showDelegateInfo(context, soonest, mpcService);
+      }
+    } else if (mpcService.renewError != null) {
+      label = "Couldn't renew — trying again next time you open the app";
     } else {
-      // Show the ASP-reported expiry, not the delegate's scheduled renewal time.
-      final s = soonest;
-      final nowSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      final secsUntil = s.expiresAt - nowSecs;
-      label = secsUntil <= 0
-          ? 'Renew now'
-          : 'Renew within ${_formatTimeUntil(secsUntil)}';
-      onTap = () => _showDelegateInfo(context, s, mpcService);
+      label = 'Set to renew the next time you open the app';
     }
     return InkWell(
       onTap: onTap,
@@ -414,82 +415,18 @@ class ArkScreen extends StatelessWidget {
           Icon(Icons.autorenew,
               size: 14, color: Colors.tealAccent.withOpacity(0.8)),
           const SizedBox(width: 6),
-          Text(
-            label,
-            style: GoogleFonts.inter(
-              color: Colors.white54,
-              fontSize: 13,
-              fontWeight: FontWeight.w500,
+          Flexible(
+            child: Text(
+              label,
+              style: GoogleFonts.inter(
+                color: Colors.white54,
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+              ),
             ),
           ),
         ],
       ),
-    );
-  }
-
-  /// Shown when the user has to do something: refresh funds that are due, or be reminded about funds
-  /// that arrived since the watch was armed. Each is one passkey prompt, and only on this tap —
-  /// nothing here happens unasked.
-  Widget _buildEnableAutoRenew(BuildContext context, MpcService mpcService) {
-    final due = mpcService.refreshDue;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          due
-              ? 'Some of your funds need refreshing now'
-              : "New funds aren't set to renew themselves yet",
-          style: GoogleFonts.inter(color: Colors.white38, fontSize: 12),
-        ),
-        const SizedBox(height: 8),
-        SizedBox(
-          width: double.infinity,
-          child: OutlinedButton.icon(
-            key: const Key('arkEnableAutoRenewBtn'),
-            onPressed: () async {
-              final messenger = ScaffoldMessenger.of(context);
-              try {
-                if (due) {
-                  // A refresh renews the delegate on its way out, so one approval normally does
-                  // both. When the indexer was too slow for that, saying so beats reporting a
-                  // success that leaves the renewal un-armed.
-                  final armed = await mpcService.delegateNow();
-                  messenger.showSnackBar(SnackBar(
-                      content: Text(armed
-                          ? 'Funds refreshed, and set to renew themselves again'
-                          : 'Funds refreshed — tap "Renew automatically" in a moment to re-arm')));
-                } else {
-                  await mpcService.protectFunds();
-                  messenger.showSnackBar(const SnackBar(
-                      content: Text(
-                          'These funds will renew themselves before they expire')));
-                }
-              } catch (e) {
-                messenger.showSnackBar(SnackBar(
-                    content: Text(due
-                        ? 'Refresh failed: $e'
-                        : 'Could not protect these funds: $e')));
-              }
-            },
-            icon: Icon(Icons.shield_outlined,
-                size: 18, color: Colors.tealAccent.withOpacity(0.9)),
-            label: Text(
-              due ? 'Refresh funds' : 'Renew automatically',
-              style: GoogleFonts.inter(
-                color: Colors.tealAccent.withOpacity(0.9),
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            style: OutlinedButton.styleFrom(
-              side: BorderSide(color: Colors.tealAccent.withOpacity(0.5)),
-              padding: const EdgeInsets.symmetric(vertical: 12),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
-            ),
-          ),
-        ),
-      ],
     );
   }
 
@@ -592,9 +529,8 @@ class ArkScreen extends StatelessWidget {
                   ? 'You signed a renewal for these funds, and the secure enclave '
                       'holding the other half of your key will submit it before they '
                       'expire — nothing for you to do, even with your phone off.'
-                  : 'No signed renewal covers these funds yet. Tap "Renew '
-                      'automatically" on the Ark tab — or send or refresh, which '
-                      'sets it up on the way.',
+                  : 'No signed renewal covers these funds yet. The next time you '
+                      'open the app, the passkey that unlocks it signs one.',
               style: GoogleFonts.inter(
                 color: Colors.white60,
                 fontSize: 13,
