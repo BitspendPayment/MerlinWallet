@@ -660,8 +660,8 @@ class MpcClient {
   /// code. See `cosigner/src/escrow.rs`. One escrow, one deal: the next deal mints the next
   /// escrow. `agreed` is the policy rendered as a sentence — what the owner actually agreed to.
   ///
-  /// Nothing is escrowed yet: money goes in by an ordinary send to [escrowArkAddress]. Fund it once
-  /// the pairing is ready — the service can release nothing before.
+  /// Without [fundSats] nothing is escrowed yet: money goes in by an ordinary send to
+  /// [escrowArkAddress]. Either way the service can release nothing until its pairing is usable.
   ///
   /// [serviceIdentifier] names a service the **image** knows. The wallet never names a URL: the
   /// cosigner resolves one from its measured image, delivers its own half there, and returns the

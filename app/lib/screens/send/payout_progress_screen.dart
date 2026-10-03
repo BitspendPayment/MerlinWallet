@@ -71,7 +71,7 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
       );
     }
     final escrow = p.escrowKey;
-    if (p.failed && p.leftoverSats == null && escrow != null) _left ??= payouts.heldSats(escrow);
+    if (p.failed && p.leftoverSats == null && escrow != null) _left ??= payouts.leftIn(p);
 
     return Scaffold(
       appBar: AppBar(

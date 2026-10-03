@@ -20,6 +20,7 @@ import 'screens/send/payout_quote_screen.dart';
 import 'screens/send/payout_progress_screen.dart';
 
 import 'package:provider/provider.dart';
+import 'passkey/passkey_channel.dart';
 import 'services/mpc_service.dart';
 import 'services/payout_service.dart';
 import 'services/push_service.dart';
@@ -68,36 +69,43 @@ class MerlinWalletApp extends StatefulWidget {
   State<MerlinWalletApp> createState() => _MerlinWalletAppState();
 }
 
-class _MerlinWalletAppState extends State<MerlinWalletApp> {
+class _MerlinWalletAppState extends State<MerlinWalletApp> with WidgetsBindingObserver {
   GoRouter? _router;
   late final AppLifecycleListener _lifecycle;
 
-  /// Whether the app went to the background with nothing running — the departure a return locks.
-  bool _hidIdle = false;
+  /// Whether the app went to the background for somewhere else — the departure a return locks.
+  bool _departed = false;
 
   @override
   void initState() {
     super.initState();
+    // Before the router builds, so asked about back before it is: observers are asked in order.
+    WidgetsBinding.instance.addObserver(this);
     _lifecycle = AppLifecycleListener(onHide: _wentAway, onShow: _cameBack);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _lifecycle.dispose();
     super.dispose();
   }
 
+  // Back, while locked, is nobody's: the pages under the lock are not the owner's to leave yet.
+  @override
+  Future<bool> didPopRoute() async => context.read<MpcService>().locked;
+
   // Every return to the app is an entry, and every entry asks for the passkey — see
   // `MpcService.unlock`. A return, precisely: `onHide` fires only once the app stops being visible,
-  // so the passkey's own sheet and the notification shade, which leave it showing behind them, are
-  // not a departure. Nor is leaving while something runs — an operation, or a payout or a board
-  // between its operations. It finishes where it is, and the next return locks.
-  void _wentAway() => _hidIdle = context.read<MpcService>().idle && !_onboarding;
+  // so the notification shade, which leaves it showing, is no departure — nor a passkey's sheet,
+  // which can hide it. Leaving while something runs is one: the operation, or a payout or a board
+  // between its operations, finishes where it is, and the lock lands the moment it has.
+  void _wentAway() => _departed = !PasskeyChannel.prompting && !_onboarding;
 
   void _cameBack() {
-    if (!_hidIdle) return;
-    _hidIdle = false;
-    context.read<MpcService>().lock();
+    if (!_departed) return;
+    _departed = false;
+    context.read<MpcService>().lockWhenIdle();
   }
 
   /// Onboarding has just used the passkey, and sends the owner to other apps: the exit address
@@ -116,11 +124,16 @@ class _MerlinWalletAppState extends State<MerlinWalletApp> {
       debugShowCheckedModeBanner: false,
       // The lock is laid over the app, not routed to: a redirect or a refresh would rebuild the
       // pages under it from their routes alone, and drop what the send screens were opened with.
-      // Offstage, the app keeps its state and takes no taps until the owner is back.
+      // Under it the app keeps its state and is inert until the owner is back: offstage, it takes
+      // no taps; out of focus, no typing; and its snackbars go to a messenger of its own, so they
+      // show under the lock rather than on it. Back is [didPopRoute]'s.
       builder: (context, child) {
         final locked = context.select<MpcService, bool>((s) => s.locked);
         return Stack(fit: StackFit.expand, children: [
-          Offstage(offstage: locked, child: child),
+          ExcludeFocus(
+            excluding: locked,
+            child: Offstage(offstage: locked, child: ScaffoldMessenger(child: child!)),
+          ),
           if (locked) const LockScreen(),
         ]);
       },

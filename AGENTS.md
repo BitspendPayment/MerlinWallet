@@ -6,8 +6,9 @@
   stream), `passkey/` (key derivation, share reconstruction, operation secrets), `cosigner/`
   (the gRPC connection), `enclave/` (attested gate), `persistence/` (public state only).
 - `cosigner/` the Rust cosigner, a `wasm32-wasip2` component served by enclave-runtime — one
-  instance per tenant, no listener of its own. `cosigner/src/session.rs` routes; `handlers/` hold
-  the ceremonies; the seal (`store.rs`) is the only durable state.
+  instance per tenant, no listener of its own. `cosigner/src/session.rs` routes each stream to its
+  ceremony; `escrow.rs` holds everything that knows a service exists; the seal (`store.rs`) is
+  the only durable state.
 - `protocol/` shared Dart package; `protocol/protos/*.proto` are the source of truth. Generated Dart
   (`protocol/lib/src/generated`) is **not checked in** — run `make proto`.
 - `crates/threshold` FROST/DKG cryptography; `crates/ark` Ark protocol; `crates/enclave-client`

@@ -3,16 +3,14 @@
 /// ```text
 ///   quote    the platform prices the payout, writes the policy           none
 ///   commit   check the policy · mint an escrow, pair the platform into   1 approval
-///            it and seal the deal
-///            · send the escrow the price                                 1 approval
+///            it, seal the deal and send the escrow the price
 ///   fund     the platform asks the cosigner, then pays                   none
 ///   follow   the platform's word on how it is going                      none
 /// ```
 ///
 /// One escrow per payout, and nothing minted until the owner has seen the price and pressed send —
-/// a quote looked at and left costs nothing. One approval per cosigner call: the escrow's own
-/// session, which mints it, pairs the platform in and strikes the deal on one stream, and the send
-/// that funds it.
+/// a quote looked at and left costs nothing. One approval in all: the escrow's own session mints
+/// it, pairs the platform in, strikes the deal and funds it, on one stream.
 ///
 /// The app and the e2e walkthrough drive these same steps, so what the walkthrough proves is what
 /// the app does. Nothing here keeps state: each step returns what the caller should remember.
@@ -151,16 +149,16 @@ class BankSend {
 
   /// [fund], asked again while the pairing is not yet usable.
   ///
-  /// A pairing is usable once the platform's confirmation has reached the cosigner, which follows
-  /// the escrow's session by a moment — it cannot arrive while that stream holds the tenant. By
-  /// the time the funding send is approved it almost always has; if not, the cosigner tells the
-  /// platform so and this asks again. Asking the platform costs no approval.
+  /// A pairing is usable once the platform's confirmation has reached the cosigner. It cannot
+  /// while the escrow's stream holds the tenant, and that stream holds it until the escrow is
+  /// funded — so the go-ahead, asked for as the stream ends, often gets there first. The cosigner
+  /// tells the platform so, and this asks again for half a minute. Asking costs no approval.
   static Future<T> _untilPaired<T>(Future<T> Function() ask) async {
     for (var attempt = 1;; attempt++) {
       try {
         return await ask();
       } catch (e) {
-        if (attempt >= 3 || !'$e'.contains('pairing is not finished')) rethrow;
+        if (attempt >= 15 || !'$e'.contains('pairing is not finished')) rethrow;
         await Future<void>.delayed(const Duration(seconds: 2));
       }
     }
@@ -204,10 +202,11 @@ enum CommitStep {
   /// Reading the policy against what the owner was shown.
   policy,
 
-  /// Setting up the escrow — minted, the platform paired in, the deal sealed: one approval.
+  /// Setting up the escrow — minted, the platform paired in, the deal sealed — on the payout's one
+  /// approval.
   seal,
 
-  /// Sending the escrow the price: one approval.
+  /// Sending the escrow the price, on the same stream and the same approval.
   fund,
 }
 

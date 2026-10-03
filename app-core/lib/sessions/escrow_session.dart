@@ -265,8 +265,10 @@ class EscrowSession {
       // --- Funding it, on this stream ---------------------------------------------------------
       //
       // Told first, so a caller can remember the escrow before money is sent to it: whatever the
-      // send then does, what the escrow holds can be taken back.
-      await fund.beforeFunding?.call(derived);
+      // send then does, what the escrow holds can be taken back. The caller's wait is not the
+      // cosigner's, so a cancel ends it as it ends the service's.
+      final told = fund.beforeFunding?.call(derived);
+      if (told != null) await (pair.cancel?.guard(told) ?? told);
       final funded =
           await SendSession(_conn, fund.asp).drive<cs.EscrowClientMsg, cs.EscrowServerMsg>(
         duplex: duplex,

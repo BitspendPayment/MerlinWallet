@@ -47,6 +47,9 @@ import 'mpc_service.dart';
 class PushService {
   static bool _initialized = false;
 
+  /// Whether this isolate can show and take down notifications.
+  static bool _notifying = false;
+
   /// The live, logged-in service. Set by [onLoggedIn] so a wake can reach it
   /// while the app is open.
   static MpcService? _svc;
@@ -87,16 +90,33 @@ class PushService {
       );
       FirebaseMessaging.onBackgroundMessage(_handleBackgroundMessage);
       FirebaseMessaging.onMessage.listen(_handleForegroundMessage);
+      _initialized = true;
+    } catch (e) {
+      debugPrint('[push] permission/handler setup failed: $e');
+      return;
+    }
+    // Apart, and after: without it a wake is still enrolled and still shown — only its tap is lost.
+    try {
       // No `onMessageOpenedApp` or `getInitialMessage`: a wake is data-only, so FCM never shows
       // one for a user to tap. The notification a wake becomes is ours, and its tap lands here —
       // a backstop, since opening the app is already an entry that locks.
       await FlutterLocalNotificationsPlugin().initialize(
         settings: _notificationSettings,
-        onDidReceiveNotificationResponse: (_) => _svc?.lock(),
+        onDidReceiveNotificationResponse: (_) => _svc?.lockWhenIdle(),
       );
-      _initialized = true;
+      _notifying = true;
     } catch (e) {
-      debugPrint('[push] permission/handler setup failed: $e');
+      debugPrint('[push] notifications unavailable: $e');
+    }
+  }
+
+  /// Take a wake's notification down: the owner is in, which is all it asked for.
+  static Future<void> clearWake() async {
+    if (!_notifying) return;
+    try {
+      await FlutterLocalNotificationsPlugin().cancel(id: _wakeNotification);
+    } catch (e) {
+      debugPrint('[push] could not clear the wake: $e');
     }
   }
 
@@ -135,8 +155,10 @@ class PushService {
   // readable goes through FCM — and it says nothing about the wallet anyway: no amount, no time,
   // only that the owner is wanted.
 
+  // A mask: the status bar draws a small icon from its alpha alone. Kept from resource shrinking
+  // by `res/raw/keep.xml`, since only this names it.
   static const _notificationSettings =
-      InitializationSettings(android: AndroidInitializationSettings('@mipmap/ic_launcher'));
+      InitializationSettings(android: AndroidInitializationSettings('@drawable/ic_notification'));
 
   static const _reminders = AndroidNotificationDetails(
     'wakes',
@@ -174,10 +196,11 @@ class PushService {
   /// plus a branch here — not a branch here on its own, which is what they had
   /// become.
   ///
-  /// `settle-due` locks the wallet: the cosigner could not renew, the funds are
-  /// close to expiring, and only the owner's passkey can refresh them — which
-  /// the unlock does. `delegate-settled` is not urgent — the funds were just
-  /// renewed — so it only refreshes, and the next entry re-arms.
+  /// `settle-due` locks the wallet, or once what is running ends: the cosigner
+  /// could not renew, the funds are close to expiring, and only the owner's
+  /// passkey can refresh them — which the unlock does. `delegate-settled` is
+  /// not urgent — the funds were just renewed — so it only refreshes, and the
+  /// next entry re-arms.
   static Future<void> _handleForegroundMessage(RemoteMessage msg) async {
     debugPrint('[push] foreground: ${msg.data}');
     final svc = _svc;
@@ -187,7 +210,7 @@ class PushService {
     }
     if (!_isOurs(msg)) return;
     if (msg.data['category'] == categorySettleDue) {
-      svc.lock();
+      svc.lockWhenIdle();
       return;
     }
     try {

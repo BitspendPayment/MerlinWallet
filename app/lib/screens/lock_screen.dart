@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../services/mpc_service.dart';
 import '../services/payout_service.dart' show plainError;
+import '../services/push_service.dart';
 
 /// The wallet behind its passkey: on a cold start, and on every return to the app, until the owner
 /// gives it.
@@ -56,6 +57,8 @@ class _LockScreenState extends State<LockScreen> {
     });
     try {
       await context.read<MpcService>().unlock();
+      // The owner is in, which is what a wake's notification asked of them.
+      await PushService.clearWake();
     } catch (e) {
       if (mounted) setState(() => _error = plainError(e));
     } finally {

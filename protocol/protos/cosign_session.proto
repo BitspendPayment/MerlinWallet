@@ -110,12 +110,12 @@ service Cosigner {
   // service a share of the SAME key, so `{service, cosigner}` can sign it too. The cosigner's half
   // of that share goes straight to the service, over an origin THIS IMAGE names; the wallet sends
   // its own half to the same origin, then confirms here. The pairing is usable only once the
-  // service has confirmed as well. See `cosigner/src/handlers/delivery.rs`.
+  // service has confirmed as well.
   //
   // And with the pairing, the deal: what the service may take, and until when — struck once the
   // wallet has delivered its half, on the same approval. One escrow, one deal: an escrow is never
-  // committed again, so the next payment mints the next escrow. See
-  // `cosigner/src/escrow_session.rs`.
+  // committed again, so the next payment mints the next escrow. Then, optionally, the send that
+  // funds it, still on that approval — see `EscrowClientMsg.fund`. See `cosigner/src/escrow.rs`.
   rpc Escrow(stream EscrowClientMsg) returns (stream EscrowServerMsg);
 
   // The escrow keys this wallet holds. Public projection only — a device that keeps nothing asks

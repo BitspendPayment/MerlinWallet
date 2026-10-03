@@ -250,11 +250,19 @@ pub fn seed_escrow(
     .expect("install escrow");
 }
 
+/// Make the next seal filed under [name] in the file store at [dir] fail to write: a directory
+/// sits where its temporary goes, which to the code writing it looks like a full or failing disk.
+pub fn block_seal(dir: &std::path::Path, name: &str) {
+    let tree = dir.join(hex::encode("sealed_state"));
+    std::fs::create_dir_all(tree.join(format!("{}.writing", hex::encode(name)))).unwrap();
+}
+
 /// Driving `Session::route` with real framed bodies, as the runtime delivers them.
 ///
-/// A body here is written whole before the handler runs, so a test can open a stream and read
-/// what the cosigner says first — but cannot answer it. A stream opened and left is cut off
-/// mid-ceremony, and ends `Cancelled` with whatever went out before that.
+/// A body from [request] is written whole before the handler runs, so a test can open a stream and
+/// read what the cosigner says first — but cannot answer it; a stream opened and left is cut off
+/// mid-ceremony, and ends `Cancelled`. A [Wire] is fed as the test goes, for a ceremony whose
+/// rounds depend on the cosigner's.
 pub mod wire {
     use std::future::Future;
     use std::sync::{Arc, Mutex};
@@ -340,6 +348,98 @@ pub mod wire {
             Arc::new(Mutex::new(cosigner)),
             GetServerInfoResponse { bitcoin_network: "regtest".into() },
         )
+    }
+
+    /// The client's end of a stream: frames handed over as the test decides them. Empty is
+    /// `Pending`, as a connection with nothing in flight is — which is what makes a stream a
+    /// conversation rather than a batch, and lets a client answer what the cosigner said — until
+    /// the client ends its side.
+    #[derive(Clone, Default)]
+    pub struct Wire(Arc<Mutex<(std::collections::VecDeque<Bytes>, bool)>>);
+
+    impl Wire {
+        pub fn send<M: prost::Message>(&self, message: &M) {
+            self.0.lock().unwrap().0.push_back(frame(&message.encode_to_vec()));
+        }
+
+        /// The client's side, ended: it has nothing more to say.
+        pub fn close(&self) {
+            self.0.lock().unwrap().1 = true;
+        }
+    }
+
+    impl http_body::Body for Wire {
+        type Data = Bytes;
+        type Error = wstd::http::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            let mut wire = self.0.lock().unwrap();
+            match wire.0.pop_front() {
+                Some(bytes) => Poll::Ready(Some(Ok(http_body::Frame::data(bytes)))),
+                None if wire.1 => Poll::Ready(None),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// The cosigner's end of a stream, read one message at a time.
+    pub struct Reply {
+        body: http_body_util::combinators::UnsyncBoxBody<Bytes, wstd::http::Error>,
+        deframer: Deframer,
+    }
+
+    impl Reply {
+        /// Open the stream [method], with [wire] as its request body.
+        pub fn open(cosigner: Cosigner, method: &str, wire: &Wire) -> Self {
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("http://cosigner/cosigner.v1.Cosigner/{method}"))
+                .header("content-type", "application/grpc+proto")
+                .body(Body::from_http_body(wire.clone()))
+                .expect("request is well formed");
+            let response = block_on(service(cosigner).route(request));
+            Self { body: response.into_body().into_boxed_body(), deframer: Deframer::default() }
+        }
+
+        /// The cosigner's next message. It has been sent everything it asked for, so it has
+        /// something to say: waiting is a test that forgot to answer, and trailers are a stream
+        /// that failed.
+        pub fn next<M: prost::Message + Default>(&mut self) -> M {
+            use http_body::Body as _;
+            let mut cx = Context::from_waker(Waker::noop());
+            loop {
+                if let Some(bytes) = self.deframer.next().expect("well framed") {
+                    return M::decode(bytes).expect("decodable");
+                }
+                match std::pin::Pin::new(&mut self.body).poll_frame(&mut cx) {
+                    Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                        Ok(data) => self.deframer.push(&data),
+                        Err(frame) => panic!("the stream ended early: {:?}", frame.trailers_ref()),
+                    },
+                    Poll::Ready(Some(Err(e))) => panic!("the stream failed: {e}"),
+                    Poll::Ready(None) => panic!("the stream ended before its next message"),
+                    Poll::Pending => panic!("the cosigner is waiting for a message never sent"),
+                }
+            }
+        }
+
+        /// How the stream ended, as a client reads it from the trailers: status code and message.
+        pub fn finish(mut self) -> (String, String) {
+            use http_body::Body as _;
+            let mut cx = Context::from_waker(Waker::noop());
+            let Poll::Ready(Some(Ok(frame))) =
+                std::pin::Pin::new(&mut self.body).poll_frame(&mut cx)
+            else {
+                panic!("expected the trailers after the last message");
+            };
+            let trailers = frame.into_trailers().expect("trailers, and nothing more said");
+            let read =
+                |name: &str| trailers.get(name).map_or("", |v| v.to_str().unwrap()).to_string();
+            (read("grpc-status"), read("grpc-message"))
+        }
     }
 }
 

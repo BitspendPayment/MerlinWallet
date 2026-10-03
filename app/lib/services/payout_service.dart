@@ -176,12 +176,15 @@ int _sum(Iterable<IndexerVtxo> vtxos) =>
     vtxos.where((v) => !v.isSpent).fold<int>(0, (a, v) => a + v.amountSats);
 
 class PayoutService extends ChangeNotifier {
-  PayoutService(this._mpc) {
+  PayoutService(this._mpc, {@visibleForTesting BankSend? bank}) : _given = bank {
     _mpc.addListener(_onWallet);
     _onWallet();
   }
 
   final MpcService _mpc;
+
+  /// The steps, given by a test in place of the wallet's and the platform's — see [_need].
+  final BankSend? _given;
   Box? _box;
 
   /// The wallet [_bank] was built over. A reconnect makes a new one.
@@ -216,12 +219,14 @@ class PayoutService extends ChangeNotifier {
   }
 
   /// Follow what was still in flight when the app last stopped — and what failed while its deal
-  /// still held the escrow, to hear when the platform ends it.
+  /// still held the escrow, to hear when the platform ends it. Only a deal the platform was asked
+  /// to fund: one that failed setting up, at `policy` or `seal`, is nothing it can end.
   Future<void> _resume() async {
     await _open();
     final now = DateTime.now();
     for (final p in payouts) {
-      final held = p.failed && (p.holdUntil?.isAfter(now) ?? false);
+      final told = p.step != 'policy' && p.step != 'seal';
+      final held = p.failed && told && (p.holdUntil?.isAfter(now) ?? false);
       if ((!p.finished || held) && !_sending.contains(p.dealTag)) _follow(p.dealTag);
     }
     notifyListeners();
@@ -246,6 +251,8 @@ class PayoutService extends ChangeNotifier {
 
   /// The steps, over the wallet as it is connected now.
   BankSend _need() {
+    final given = _given;
+    if (given != null) return given;
     final client = _mpc.client;
     if (client == null) {
       throw StateError('Your wallet is not connected yet. Try again in a moment.');
@@ -329,6 +336,18 @@ class PayoutService extends ChangeNotifier {
 
   Future<int> heldSats(String escrowKeyHex) async => _sum(await _need().held(escrowKeyHex));
 
+  /// What the escrow of [p], a payout that failed, still holds. Empty once its deal is over, it is
+  /// recorded as settled — nothing to return, so nothing left to deal with. Not before: money a
+  /// send was still landing could arrive after a look.
+  Future<int> leftIn(Payout p) async {
+    final held = await heldSats(p.escrowKey!);
+    final until = p.holdUntil;
+    if (held == 0 && (until == null || until.isBefore(DateTime.now()))) {
+      await _update(p.dealTag, (json) => json['leftover_sats'] = 0);
+    }
+    return held;
+  }
+
   // --- Sending -----------------------------------------------------------------------------------
 
   /// Go ahead with [q]: remember it, then seal it and have the platform pay, in the background.
@@ -368,8 +387,8 @@ class PayoutService extends ChangeNotifier {
       final Commitment sealed;
       try {
         bank = _need();
-        // Two operations — the escrow set up, then the send that funds it — and one flow: an entry
-        // to the app must not lock between them (`MpcService.runFlow`).
+        // A policy check, then one operation that sets the escrow up and funds it: a flow, so an
+        // entry to the app cannot lock in between (`MpcService.runFlow`).
         sealed = await _mpc.runFlow(() => bank.commit(
           q,
           fields: fields,
@@ -385,11 +404,12 @@ class PayoutService extends ChangeNotifier {
         ));
       } catch (e) {
         // Not funded, so the platform pays nothing. An escrow that was set up holds what its send
-        // got there, if anything — the owner's to take back once its deal is over.
+        // got there, if anything — the owner's to take back once its deal is over, which is at its
+        // deadline: the platform never heard of it, so will not end it sooner.
         await _update(tag, (p) {
           p['state'] = 'failed';
           p['failure'] = plainError(e);
-          p.remove('hold_until');
+          if (p['escrow_key'] == null) p.remove('hold_until');
           if (e is PolicyRefused) p['step'] = 'policy';
         });
         return;

@@ -391,8 +391,13 @@ class ArkScreen extends StatelessWidget {
       BuildContext context, MpcService mpcService, IndexerVtxo? soonest) {
     String label;
     VoidCallback? onTap;
+    var color = Colors.white54;
     if (mpcService.renewing) {
       label = 'Renewing your funds…';
+    } else if (mpcService.renewRefusedAttestation) {
+      // First, over anything renewed before: the server could not show it is the one it should be.
+      label = 'Not renewed: the wallet server failed its security check';
+      color = Colors.redAccent;
     } else if (mpcService.fundsProtected && !mpcService.refreshDue) {
       if (soonest == null) {
         label = 'Renews itself';
@@ -419,7 +424,7 @@ class ArkScreen extends StatelessWidget {
             child: Text(
               label,
               style: GoogleFonts.inter(
-                color: Colors.white54,
+                color: color,
                 fontSize: 13,
                 fontWeight: FontWeight.w500,
               ),

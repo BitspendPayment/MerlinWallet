@@ -74,7 +74,7 @@ Do NOT fix yet — just record. Fix pass happens once, after this list is comple
 
 ### LOW / hygiene
 - [ ] NK-5 decide when the app cancels an operation. Wired today: the boarding screen's "Stop
-  waiting", and `reconnect()` / `resetLocalWallet()` (which would otherwise hang behind a stuck
+  waiting", and `restoreSession()` / `resetLocalWallet()` (which would otherwise hang behind a stuck
   operation on a graceful close). Deliberately NOT wired: app backgrounding, or any timer — a round
   abandoned after its intent is registered is one the ASP was counting on, and arkd may penalize it.
   Product/ASP-policy call. Also: send, protect and renew have no "Stop waiting" of their own.
@@ -149,8 +149,7 @@ escrow tests — the branch's first end-to-end run since the escrow commits.
   evidence is not cryptographically bound to amount or reference — the policy author binds it
   with `MatchesReference`/`MatchesAmount`; `MAX_RELEASED_REFERENCES` is fail-closed but
   permanent and burnable by a paired service under an `Always` policy; `now_secs()` falls back
-  to 0, fail-open for release; a cold start whose `restoreSession` fails has no retry
-  (`reconnect()` is unreachable); no in-process test drives a reclaim past its
+  to 0, fail-open for release; no in-process test drives a reclaim past its
   first message (`PairService` was removed 2026-10-02: the `Escrow` stream pairs; `EscrowReclaim`
   too: a reclaim is a `Send` naming the escrow); `app/integration_test` still
   targets the deleted PIN screens; `EscrowRecord` /

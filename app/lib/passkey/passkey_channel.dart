@@ -9,16 +9,30 @@ import 'package:flutter/services.dart';
 class PasskeyChannel {
   static const _ch = MethodChannel('com.mpcwallet.ap/passkey');
 
+  static int _prompts = 0;
+
+  /// Whether a passkey prompt is up. Its sheet can hide the app, and that is not the owner leaving.
+  static bool get prompting => _prompts > 0;
+
+  static Future<String> _prompt(String method, Map<String, Object> arguments) async {
+    _prompts++;
+    try {
+      return (await _ch.invokeMethod<String>(method, arguments))!;
+    } finally {
+      _prompts--;
+    }
+  }
+
   /// WebAuthn registration (create a passkey). Returns registrationResponseJson.
-  static Future<String> create(String requestJson) async =>
-      (await _ch.invokeMethod<String>('create', {'requestJson': requestJson}))!;
+  static Future<String> create(String requestJson) =>
+      _prompt('create', {'requestJson': requestJson});
 
   /// WebAuthn assertion (use a passkey). Returns authenticationResponseJson.
   ///
   /// With [immediate], a passkey that is not usable right now fails fast with [noCredential]
   /// rather than showing the "Sign in another way" sheet.
-  static Future<String> get(String requestJson, {bool immediate = false}) async =>
-      (await _ch.invokeMethod<String>('get', {'requestJson': requestJson, 'immediate': immediate}))!;
+  static Future<String> get(String requestJson, {bool immediate = false}) =>
+      _prompt('get', {'requestJson': requestJson, 'immediate': immediate});
 
   /// The error code for "no passkey on this device matches the request".
   static const noCredential = 'passkey_no_credential';

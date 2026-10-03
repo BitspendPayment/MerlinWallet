@@ -6,14 +6,22 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use rand::rngs::OsRng;
+
 use cosigner::grpc::Code;
 use cosigner::session::proto;
 use cosigner::wallet_proto::{GetServerInfoRequest, GetServerInfoResponse};
 use cosigner::Cosigner;
 
+use threshold::dkg::{self, Round1Package};
+use threshold::identifier::Identifier;
 use threshold::keys::KeyPackage;
+use threshold::random;
 
-use common::wire::{block_on, collect, request, service};
+use common::wire::{block_on, collect, request, service, Reply, Wire};
 
 /// A `SignOpen` from the wallet that owns [kp_user]. No commitments: the wallet has no share to
 /// hedge a nonce with until the cosigner's first answer brings the half it dealt.
@@ -105,4 +113,64 @@ fn a_second_dkg_is_refused_on_the_wire() {
     ));
     assert_eq!(answer.code, Code::FailedPrecondition as u32, "got {}", answer.message);
     assert!(answer.messages.is_empty(), "no round-one package may go out");
+}
+
+/// A key that could not be saved is never announced. The wallet would go on to fund a key the
+/// cosigner forgets on its next request, which reopens from the seal — so the ceremony fails.
+#[test]
+fn a_dkg_whose_key_cannot_be_sealed_does_not_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = cosigner::store::Store::open(dir.path().to_str().unwrap(), 1800).expect("a store");
+    common::block_seal(dir.path(), "tenant");
+    let cosigner =
+        Cosigner::open(Arc::new(store), "tenant".into(), Arc::new(cosigner::host::Detached))
+            .expect("a fresh tenant");
+
+    // The wallet's round one, and the cosigner's back.
+    let mut rng = OsRng;
+    let (secret, slope) = (random::mod_n_random(&mut rng), random::mod_n_random(&mut rng));
+    let (r1s, r1p) = dkg::dkg_part1(2, 2, &secret, &[slope], &mut rng).unwrap();
+    let me = hex::encode(r1s.identifier.serialize());
+    let say = |wire: &Wire, seq, body| {
+        wire.send(&proto::DkgClientMsg { session_id: "d1".into(), seq, body: Some(body) })
+    };
+    let wire = Wire::default();
+    let mut reply = Reply::open(cosigner, "Dkg", &wire);
+    say(
+        &wire,
+        1,
+        proto::dkg_client_msg::Body::Open(proto::DkgOpen {
+            identifier: r1s.identifier.serialize().to_vec(),
+            round1_package: r1p.to_json(),
+            ..Default::default()
+        }),
+    );
+    let Some(proto::dkg_server_msg::Body::Round1(round1)) = reply.next::<proto::DkgServerMsg>().body
+    else {
+        panic!("expected round one");
+    };
+
+    // The wallet's round two: everything the cosigner needs to finish the key.
+    let peers: BTreeMap<Identifier, Round1Package> = round1
+        .round1_packages
+        .iter()
+        .filter(|(id, _)| **id != me)
+        .map(|(id, package)| (id.parse().unwrap(), Round1Package::from_json(package).unwrap()))
+        .collect();
+    let (_, shares) = dkg::dkg_part2(&r1s, &peers, &[]).unwrap();
+    say(
+        &wire,
+        2,
+        proto::dkg_client_msg::Body::Round2(proto::DkgRound2 {
+            identifier: r1s.identifier.serialize().to_vec(),
+            round2_packages_for_others: shares
+                .iter()
+                .map(|(id, package)| (hex::encode(id.serialize()), package.to_json()))
+                .collect(),
+        }),
+    );
+
+    let (code, message) = reply.finish();
+    assert_eq!(code, (Code::Unavailable as u32).to_string(), "{message}");
+    assert!(message.contains("the ceremony did not finish"), "unexpected: {message}");
 }

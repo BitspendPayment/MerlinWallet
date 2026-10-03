@@ -1024,8 +1024,8 @@ void main() {
       }
     }, timeout: const Timeout(Duration(minutes: 15)));
 
-    /// An escrow is set up with its deal on ONE approval — minted, paired, committed — and funded
-    /// by an ordinary send to its address, on one more.
+    /// An escrow is set up with its deal and funded on ONE approval — minted, paired, committed,
+    /// and the price sent to it on the same stream.
     test('an escrow is set up, dealt and funded on one approval', () async {
       final grace = await wallet('fund_grace');
       try {
@@ -1189,8 +1189,9 @@ void main() {
         expect(afterwards['reason'], contains('deal is over'));
 
         // The other half of the same swap — the owner being able to take it back — needs an escrow
-        // that actually holds something. This one spends synthetic inputs, so a reclaim of real
-        // money is not proved end to end yet.
+        // that actually holds something, and this one spends synthetic inputs. The send
+        // walkthrough takes real money back, from the escrow of a payout the platform gave up on
+        // (`e2e/bin/send_walkthrough.dart`).
       } finally {
         await erin.close();
       }

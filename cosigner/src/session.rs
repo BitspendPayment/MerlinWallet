@@ -379,11 +379,15 @@ async fn escrow(
     let escrow_key = escrow.escrow_key.clone();
 
     // Sealed before it is announced. A wallet told about an escrow this cosigner cannot co-sign for
-    // would be a wallet that funds a key only half of which exists.
+    // would be a wallet that funds a key only half of which exists — so a seal that cannot be
+    // written fails the ceremony, and this instance, which the next request reopens from the seal,
+    // forgets it.
     {
         let mut c = lock(&cosigner);
         c.add_escrow(escrow).map_err(Status::failed_precondition)?;
-        c.seal();
+        c.try_seal().map_err(|e| {
+            Status::unavailable(format!("the escrow could not be saved ({e}); nothing was minted"))
+        })?;
     }
 
     duplex.send(proto::EscrowServerMsg {
@@ -596,7 +600,11 @@ async fn dkg(
             sess.wallet_dealt_share_hex.take(),
         )
         .map_err(Status::internal)?;
-        c.seal();
+        c.try_seal().map_err(|e| {
+            Status::unavailable(format!(
+                "the key could not be saved ({e}); the ceremony did not finish"
+            ))
+        })?;
     }
 
     // After the key, so a refused enrolment cannot cost the wallet its ceremony.

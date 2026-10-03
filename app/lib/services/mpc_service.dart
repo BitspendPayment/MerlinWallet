@@ -213,6 +213,7 @@ class MpcService extends ChangeNotifier {
   @override
   Future<void> dispose() async {
     _vtxoPollTimer?.cancel();
+    _lockWhenIdle?.cancel();
     try {
       await _identityBox?.close();
       _identityBox = null;
@@ -537,13 +538,19 @@ class MpcService extends ChangeNotifier {
   /// Why the last entry's renewal did not happen. Nothing is lost by it: the next entry tries again.
   Object? get renewError => _renewError;
 
+  /// Whether that was the enclave failing its attestation — not an outage, and not one to be told
+  /// as one. Read from the text, since over gRPC the [AttestationException] arrives wrapped.
+  bool get renewRefusedAttestation =>
+      _renewError != null && '$_renewError'.contains('attestation refused');
+
   int _flows = 0;
 
-  /// Run [flow] — several operations that belong together — with no lock landing between them.
+  /// Run [flow] — work that belongs together, an operation or more of it — with no lock landing
+  /// in between.
   ///
-  /// A payout is an escrow set up, then the send that funds it; a board is one operation per
-  /// deposit. A lock in the gap would wedge an entry's renewal into the middle of something the
-  /// owner has approved half of.
+  /// A payout checks its policy before its operation; taking a leftover back reads the escrow
+  /// first; a board is one operation per deposit. A lock in a gap would wedge an entry's renewal
+  /// into the middle of something the owner has started.
   Future<T> runFlow<T>(Future<T> Function() flow) async {
     _flows++;
     try {
@@ -563,6 +570,24 @@ class MpcService extends ChangeNotifier {
     if (_client == null || _locked || !idle) return;
     _locked = true;
     notifyListeners();
+  }
+
+  Timer? _lockWhenIdle;
+
+  /// [lock] now, or the moment what is running stops: an entry while work went on is still an
+  /// entry. Polled, because an operation ends inside the client, where nothing here hears it.
+  void lockWhenIdle() {
+    _lockWhenIdle?.cancel();
+    if (idle) {
+      lock();
+      return;
+    }
+    _lockWhenIdle = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!idle) return;
+      timer.cancel();
+      _lockWhenIdle = null;
+      lock();
+    });
   }
 
   /// One passkey prompt: the owner's way in, and the renewal re-armed with the same approval.
@@ -590,7 +615,9 @@ class MpcService extends ChangeNotifier {
     }
 
     try {
-      final reachable = _arkAvailable && await refreshVtxos();
+      // An indexer that does not answer is no reason to keep the owner from the prompt.
+      final reachable = _arkAvailable &&
+          await refreshVtxos().timeout(const Duration(seconds: 10), onTimeout: () => false);
       if (reachable && _held.isNotEmpty) {
         if (refreshDue) {
           await client.renewHeld(onApproved: open);

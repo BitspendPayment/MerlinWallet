@@ -35,6 +35,45 @@ class _LockedWallet extends MpcService {
   }
 }
 
+/// An open wallet whose work the test starts and stops: [busy] is an operation, or a flow, running.
+class _OpenWallet extends MpcService {
+  _OpenWallet() {
+    initFuture = Completer<void>().future;
+  }
+
+  bool busy = false;
+  bool _locked = false;
+
+  @override
+  bool get idle => !busy;
+
+  @override
+  bool get locked => _locked;
+
+  // As the real one, less its wallet check: a widget test has no client.
+  @override
+  void lock() {
+    if (_locked || !idle) return;
+    _locked = true;
+    notifyListeners();
+  }
+
+  @override
+  Future<void> unlock() async {}
+}
+
+/// Away from the app and back again, as the platform says it: hidden, then shown.
+void leaveAndReturn(WidgetTester tester) {
+  for (final state in [
+    AppLifecycleState.inactive,
+    AppLifecycleState.hidden,
+    AppLifecycleState.inactive,
+    AppLifecycleState.resumed,
+  ]) {
+    tester.binding.handleAppLifecycleStateChanged(state);
+  }
+}
+
 void main() {
   setUpAll(() => GoogleFonts.config.allowRuntimeFetching = false);
 
@@ -64,5 +103,67 @@ void main() {
     expect(wallet.unlocks, 2);
     expect(find.byType(LockScreen), findsNothing);
     expect(find.byType(SplashScreen), findsOneWidget);
+  });
+
+  testWidgets('under the lock the app is inert: back is nobody\'s, and its snackbars stay under',
+      (tester) async {
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    final wallet = _LockedWallet([PlatformException(code: PasskeyChannel.cancelled)]);
+    await tester.pumpWidget(ChangeNotifierProvider<MpcService>.value(
+      value: wallet,
+      child: const MerlinWalletApp(),
+    ));
+    await tester.pump();
+
+    expect(await tester.binding.handlePopRoute(), isTrue,
+        reason: 'the pages under the lock are not the owner\'s to leave yet');
+
+    final under = tester.element(find.byType(SplashScreen, skipOffstage: false));
+    ScaffoldMessenger.of(under).showSnackBar(const SnackBar(content: Text('from under the lock')));
+    await tester.pump();
+    expect(find.text('from under the lock'), findsNothing, reason: 'not drawn on the lock');
+    ScaffoldMessenger.of(under).clearSnackBars();
+    await tester.pump();
+  });
+
+  testWidgets('leaving while something runs is still leaving: the lock lands once it is done',
+      (tester) async {
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    final wallet = _OpenWallet()..busy = true;
+    await tester.pumpWidget(ChangeNotifierProvider<MpcService>.value(
+      value: wallet,
+      child: const MerlinWalletApp(),
+    ));
+
+    leaveAndReturn(tester);
+    await tester.pump();
+    expect(find.byType(LockScreen), findsNothing, reason: 'what runs is not interrupted');
+
+    wallet.busy = false;
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    expect(find.byType(LockScreen), findsOneWidget, reason: 'but the return was an entry');
+  });
+
+  testWidgets('a passkey sheet that hides the app is not the owner leaving', (tester) async {
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    final wallet = _OpenWallet();
+    await tester.pumpWidget(ChangeNotifierProvider<MpcService>.value(
+      value: wallet,
+      child: const MerlinWalletApp(),
+    ));
+
+    // A prompt is up — the platform has not answered — and its sheet hides the app.
+    const channel = MethodChannel('com.mpcwallet.ap/passkey');
+    final sheet = Completer<Object?>();
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (_) => sheet.future);
+    final prompt = PasskeyChannel.get('{}');
+    leaveAndReturn(tester);
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byType(LockScreen), findsNothing);
+
+    sheet.complete('{}');
+    await prompt;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null);
   });
 }

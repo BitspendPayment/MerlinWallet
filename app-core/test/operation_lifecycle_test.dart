@@ -20,7 +20,7 @@ import 'package:fixnum/fixnum.dart';
 import 'package:hive/hive.dart';
 import 'package:test/test.dart';
 
-import 'package:app_core/asp/ark_info.dart' show IndexerVtxo;
+import 'package:app_core/asp/ark_info.dart' show ArkInfo, IndexerVtxo;
 import 'package:app_core/asp/asp_client.dart' show AspClient;
 import 'package:app_core/client.dart';
 import 'package:app_core/cosigner/connection.dart';
@@ -90,6 +90,29 @@ class ScriptedDelivery implements DeliverToService {
     if (refuse) throw ServiceDeliveryException('the service turned it down', refused: true);
     taken.add(contribution);
   }
+}
+
+/// An ASP whose indexer says the wallet holds one VTXO — enough for a send to be prepared.
+class HoldingAsp extends SilentAsp {
+  @override
+  Future<List<IndexerVtxo>> getOwnedVtxos({
+    required String unilateralScript,
+    required String boardingScript,
+    required ArkInfo info,
+    bool includeSpent = false,
+  }) async =>
+      [
+        IndexerVtxo(
+          txid: 'cd' * 32,
+          vout: 0,
+          amountSats: 50000,
+          script: unilateralScript,
+          isSpent: false,
+          createdAt: 0,
+          expiresAt: 4102444800,
+          exitDelay: info.unilateralExitDelay,
+        ),
+      ];
 }
 
 class Device {
@@ -799,6 +822,35 @@ void main() {
       expect(d.operations.last.holdsSecrets, isFalse);
       expect(d.client.operationInProgress, isFalse, reason: 'its turn is released');
     });
+
+    test('a caller that never lets the funding start is cancelled, and takes the share with it',
+        () async {
+      final d = device(seed(43), newBox(), asp: HoldingAsp());
+      await d.client.doDkg();
+      final told = Completer<void>();
+
+      final setting = d.client.setUpEscrow(
+        serviceIdentifier: platform,
+        policy: policy,
+        deadline: deadline,
+        delivery: ScriptedDelivery(),
+        fundSats: 30000,
+        beforeFunding: (_) {
+          told.complete();
+          return Completer<void>().future;
+        },
+      );
+      await told.future;
+      expect(d.operations.last.holdsSecrets, isTrue,
+          reason: 'the minted share is held while the caller is waited on');
+
+      final outcome = expectLater(setting, throwsA(isA<OperationCancelled>()));
+      await d.client.cancelOperation();
+      await outcome;
+      expect(d.operations.last.isDisposed, isTrue);
+      expect(d.operations.last.holdsSecrets, isFalse);
+      expect(d.client.operationInProgress, isFalse, reason: 'its turn is released');
+    }, timeout: const Timeout(Duration(seconds: 20)));
   });
 
   group('opening the app', () {

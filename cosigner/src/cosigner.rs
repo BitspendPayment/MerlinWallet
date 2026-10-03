@@ -556,8 +556,9 @@ impl Cosigner {
         }
     }
 
-    /// Seal, and say whether it took. For the one place a change must not be acted on unless it
-    /// is durable: a release signed but not written down is a payment that can be asked for again.
+    /// Seal, and say whether it took. For a change that must not be acted on unless it is durable:
+    /// a release signed but not written down is a payment that can be asked for again, and a key
+    /// announced but not written down is one a wallet funds and the cosigner then forgets.
     pub fn try_seal(&mut self) -> Result<(), String> {
         let store = self.store.clone();
         let group_key = self.group_key.clone();

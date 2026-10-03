@@ -12,28 +12,21 @@
 
 mod common;
 
-use std::collections::{BTreeMap, VecDeque};
-use std::pin::Pin;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Once};
-use std::task::{Context, Poll, Waker};
 
-use bytes::Bytes;
-use http_body::{Body as _, Frame};
-use http_body_util::combinators::UnsyncBoxBody;
-use prost::Message as _;
 use rand::rngs::OsRng;
-use wstd::http::{Body, Request};
 
+use common::wire::{Reply, Wire};
 use common::Recorder;
 use cosigner::escrow::{service_stream_id, EscrowStage, PairingState, ToService};
-use cosigner::grpc::framing::{frame, Deframer};
 use cosigner::handlers::helpers::now_secs;
 use cosigner::session::proto::{self, EscrowClientMsg, EscrowServerMsg};
 use cosigner::session::proto::escrow_client_msg::Body as ToCosigner;
 use cosigner::session::proto::escrow_server_msg::Body as FromCosigner;
-use threshold::dkg::{self, Round1Package, Round2Package};
+use threshold::dkg::{self, Round1Package, Round2Package, Round2SecretPackage};
 use threshold::identifier::Identifier;
-use threshold::keys::KeyPackage;
+use threshold::keys::{KeyPackage, PublicKeyPackage};
 use threshold::{point, random, scalar};
 
 const ORIGIN: &str = "https://service.example";
@@ -41,105 +34,40 @@ const ORIGIN: &str = "https://service.example";
 /// What the payment costs, sent into the escrow out of the wallet's one VTXO.
 const PRICE: u64 = 30_000;
 
-/// The wallet's end of the stream: frames handed over as the test decides them. Empty is `Pending`,
-/// as a connection with nothing in flight is — which is what makes this a conversation rather than
-/// a batch — until the wallet ends its side.
-#[derive(Clone, Default)]
-struct Wire(Arc<Mutex<(VecDeque<Bytes>, bool)>>);
-
-impl Wire {
-    fn say(&self, seq: u64, body: ToCosigner) {
-        let message = EscrowClientMsg { session_id: "escrow".into(), seq, body: Some(body) };
-        self.0.lock().unwrap().0.push_back(frame(&message.encode_to_vec()));
-    }
-
-    /// The wallet's side, ended: it has nothing more to say.
-    fn close(&self) {
-        self.0.lock().unwrap().1 = true;
-    }
-
-    /// A message of the `Send` stream that funds the escrow, as `Escrow` carries it.
-    fn fund(&self, seq: u64, body: proto::send_client_msg::Body) {
-        self.say(
-            seq,
-            ToCosigner::Fund(proto::SendClientMsg {
-                session_id: "escrow".into(),
-                seq,
-                body: Some(body),
-            }),
-        );
-    }
+/// The wallet's message number `seq` on the `Escrow` stream.
+fn say(wire: &Wire, seq: u64, body: ToCosigner) {
+    wire.send(&EscrowClientMsg { session_id: "escrow".into(), seq, body: Some(body) });
 }
 
-impl http_body::Body for Wire {
-    type Data = Bytes;
-    type Error = wstd::http::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        let mut wire = self.0.lock().unwrap();
-        match wire.0.pop_front() {
-            Some(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
-            None if wire.1 => Poll::Ready(None),
-            None => Poll::Pending,
-        }
-    }
+/// A message of the `Send` stream that funds the escrow, as `Escrow` carries it.
+fn fund(wire: &Wire, seq: u64, body: proto::send_client_msg::Body) {
+    let send = proto::SendClientMsg { session_id: "escrow".into(), seq, body: Some(body) };
+    say(wire, seq, ToCosigner::Fund(send));
 }
 
-/// The cosigner's end, read one message at a time.
-struct Reply {
-    body: UnsyncBoxBody<Bytes, wstd::http::Error>,
-    deframer: Deframer,
+/// The cosigner's next message, which must be number `seq`.
+fn next(reply: &mut Reply, seq: u64) -> FromCosigner {
+    let message: EscrowServerMsg = reply.next();
+    assert_eq!(message.seq, seq, "the cosigner's messages arrive in order");
+    message.body.expect("a message with a body")
 }
 
-impl Reply {
-    /// Open the `Escrow` stream, with `wire` as its request body.
-    fn open(cosigner: cosigner::Cosigner, wire: &Wire) -> Self {
-        let request = Request::builder()
-            .method("POST")
-            .uri("http://cosigner/cosigner.v1.Cosigner/Escrow")
-            .header("content-type", "application/grpc+proto")
-            .body(Body::from_http_body(wire.clone()))
-            .expect("request is well formed");
-        let response = common::wire::block_on(common::wire::service(cosigner).route(request));
-        Self { body: response.into_body().into_boxed_body(), deframer: Deframer::default() }
-    }
-
-    /// The cosigner's next message, which must be number `seq`. It has been sent everything it
-    /// asked for, so it has something to say: waiting is a test that forgot to answer, and trailers
-    /// are a stream that failed.
-    fn next(&mut self, seq: u64) -> FromCosigner {
-        let mut cx = Context::from_waker(Waker::noop());
-        loop {
-            if let Some(bytes) = self.deframer.next().expect("well framed") {
-                let message = EscrowServerMsg::decode(bytes).expect("decodable");
-                assert_eq!(message.seq, seq, "the cosigner's messages arrive in order");
-                return message.body.expect("a message with a body");
-            }
-            match Pin::new(&mut self.body).poll_frame(&mut cx) {
-                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                    Ok(data) => self.deframer.push(&data),
-                    Err(frame) => panic!("the stream ended early: {:?}", frame.trailers_ref()),
-                },
-                Poll::Ready(Some(Err(e))) => panic!("the stream failed: {e}"),
-                Poll::Ready(None) => panic!("the stream ended before message {seq}"),
-                Poll::Pending => panic!("the cosigner is waiting for a message never sent"),
-            }
-        }
-    }
-
-    /// How the stream ended, as a client reads it from the trailers: status code and message.
-    fn finish(mut self) -> (String, String) {
-        let mut cx = Context::from_waker(Waker::noop());
-        let Poll::Ready(Some(Ok(frame))) = Pin::new(&mut self.body).poll_frame(&mut cx) else {
-            panic!("expected the trailers after the last message");
-        };
-        let trailers = frame.into_trailers().expect("trailers, and nothing more said");
-        let read = |name: &str| trailers.get(name).map_or("", |v| v.to_str().unwrap()).to_string();
-        (read("grpc-status"), read("grpc-message"))
-    }
+/// A wallet on the `Escrow` stream with its round two sent: the cosigner's next word is the
+/// escrow's key — once that key is sealed.
+struct Minting {
+    wire: Wire,
+    reply: Reply,
+    host: Arc<Recorder>,
+    store: Arc<cosigner::store::Store>,
+    group_key: String,
+    pkp: PublicKeyPackage,
+    wallet_kp: KeyPackage,
+    cosigner_id: Identifier,
+    service_id: Identifier,
+    peers: BTreeMap<Identifier, Round1Package>,
+    w_r2s: Round2SecretPackage,
+    attempt: [u8; 16],
+    deadline: i64,
 }
 
 /// A wallet that has run the `Escrow` stream as far as its deal — minted, paired, dealt — and is
@@ -169,9 +97,8 @@ fn the_platform() -> Identifier {
     service_id
 }
 
-/// Run the stream as a wallet would, as far as the deal, checking each of the cosigner's answers.
-fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
-
+/// Open the stream as a wallet would, and run it as far as the wallet's round two.
+fn mint(store: Arc<cosigner::store::Store>) -> Minting {
     // A wallet, its runtime, and the one service its image knows.
     let (kps, pkp) = common::dkg_2of2();
     let (wallet_kp, cosigner_kp) = (&kps[0], &kps[1]);
@@ -191,7 +118,6 @@ fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
         Some(hex::encode(dealt)),
     );
     let service_id = the_platform();
-    let service_hex = hex::encode(service_id.serialize());
 
     // --- Open: the wallet's dealing of its Δ, the service, and the deal it wants struck ----------
     let mut rng = OsRng;
@@ -201,8 +127,9 @@ fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
     let attempt = [0xaa; 16];
     let deadline = now_secs() + 3_600;
     let wire = Wire::default();
-    let mut reply = Reply::open(c.into_inner().unwrap(), &wire);
-    wire.say(
+    let mut reply = Reply::open(c.into_inner().unwrap(), "Escrow", &wire);
+    say(
+        &wire,
         1,
         ToCosigner::Open(proto::EscrowOpen {
             identifier: wallet_id.serialize().to_vec(),
@@ -216,25 +143,66 @@ fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
     );
 
     // --- Round one back, and the wallet's round two ----------------------------------------------
-    let FromCosigner::Round1(round1) = reply.next(1) else { panic!("expected round one") };
+    let FromCosigner::Round1(round1) = next(&mut reply, 1) else { panic!("expected round one") };
     assert_eq!(round1.wallet_dealt_share, dealt, "the half the wallet rebuilds its share from");
     let peers: BTreeMap<Identifier, Round1Package> =
         [(cosigner_id.clone(), Round1Package::from_json(&round1.round1_package).unwrap())].into();
     let (w_r2s, w_shares) = dkg::dkg_part2(&w_r1s, &peers, &[]).expect("the wallet's round two");
-    wire.say(
+    say(
+        &wire,
         2,
         ToCosigner::Round2(proto::EscrowRound2 {
             round2_package: w_shares[&cosigner_id].to_json(),
         }),
     );
 
+    Minting {
+        wire,
+        reply,
+        host,
+        store,
+        group_key,
+        pkp,
+        wallet_kp: wallet_kp.clone(),
+        cosigner_id,
+        service_id,
+        peers,
+        w_r2s,
+        attempt,
+        deadline,
+    }
+}
+
+/// Run the stream as a wallet would, as far as the deal, checking each of the cosigner's answers.
+fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
+    let Minting {
+        wire,
+        mut reply,
+        host,
+        store,
+        group_key,
+        pkp,
+        wallet_kp,
+        cosigner_id,
+        service_id,
+        peers,
+        w_r2s,
+        attempt,
+        deadline,
+    } = mint(store);
+    let wallet_id = wallet_kp.identifier.clone();
+    let service_hex = hex::encode(service_id.serialize());
+    let mut rng = OsRng;
+
     // --- The escrow key: the same on both sides --------------------------------------------------
-    let FromCosigner::Complete(complete) = reply.next(2) else { panic!("expected the escrow key") };
+    let FromCosigner::Complete(complete) = next(&mut reply, 2) else {
+        panic!("expected the escrow key")
+    };
     let peers_r2: BTreeMap<Identifier, Round2Package> =
         [(cosigner_id.clone(), Round2Package::from_json(&complete.round2_package).unwrap())].into();
     let receivers = [wallet_id.clone(), cosigner_id.clone()];
     let (escrow_kp, escrow_pkp) =
-        dkg::dkg_reshare_part3(&w_r2s, &peers, &peers_r2, &pkp, wallet_kp, &receivers)
+        dkg::dkg_reshare_part3(&w_r2s, &peers, &peers_r2, &pkp, &wallet_kp, &receivers)
             .expect("the wallet's escrow share");
     assert_eq!(complete.escrow_key, hex::encode(escrow_pkp.verifying_key.serialize()));
 
@@ -242,7 +210,8 @@ fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
     let pairing_ids = [service_id.clone(), cosigner_id.clone()];
     let dealing = dkg::refresh_to_ids(&escrow_kp, &receivers, &pairing_ids, 2, &mut rng);
     let a_at_service = dealing[&service_id];
-    wire.say(
+    say(
+        &wire,
         3,
         ToCosigner::Deal(proto::PairServiceDeal {
             contribution_to_cosigner: scalar::scalar_to_bytes(&dealing[&cosigner_id]).to_vec(),
@@ -253,7 +222,7 @@ fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
 
     // The cosigner's half went to the service, over the connection the runtime holds to the origin
     // the image names — once.
-    let FromCosigner::Paired(paired) = reply.next(3) else { panic!("expected the pairing") };
+    let FromCosigner::Paired(paired) = next(&mut reply, 3) else { panic!("expected the pairing") };
     assert_eq!(paired.service_origin, ORIGIN);
     let stream = service_stream_id(&service_hex);
     assert_eq!(host.opened(), vec![(stream.clone(), ORIGIN.to_string())]);
@@ -275,14 +244,17 @@ fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
     assert_eq!(hex::encode(point::serialize_compressed(&share)), paired.service_verifying_share);
 
     // --- Delivered: the wallet's word that its own half landed, and the deal with it -------------
-    wire.say(
+    say(
+        &wire,
         4,
         ToCosigner::Delivered(proto::PairServiceConfirmRequest {
             escrow_key: complete.escrow_key.clone(),
             attempt_id: attempt.to_vec(),
         }),
     );
-    let FromCosigner::Confirmed(confirmed) = reply.next(4) else { panic!("expected the deal") };
+    let FromCosigner::Confirmed(confirmed) = next(&mut reply, 4) else {
+        panic!("expected the deal")
+    };
     assert_eq!(confirmed.deadline_secs, deadline);
 
     Dealt {
@@ -290,7 +262,7 @@ fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
         reply,
         store,
         group_key,
-        wallet_kp: wallet_kp.clone(),
+        wallet_kp,
         escrow_key: complete.escrow_key,
         attempt,
         deadline,
@@ -326,6 +298,21 @@ fn an_escrow_is_minted_paired_and_dealt_on_one_stream() {
 
     drop(guard);
     let _ = store.delete("sealed_state", &group_key);
+}
+
+/// An escrow that could not be saved is never announced: the wallet would fund a key the cosigner
+/// forgets on its next request, which reopens from the seal. The stream fails instead, and says so.
+#[test]
+fn an_escrow_that_cannot_be_sealed_is_never_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = cosigner::store::Store::open(dir.path().to_str().unwrap(), 1800).expect("a store");
+    let Minting { reply, group_key, .. } = mint(Arc::new(store));
+
+    // The wallet's round two is on the wire and not yet read; the disk fails before it is.
+    common::block_seal(dir.path(), &group_key);
+    let (code, message) = reply.finish();
+    assert_eq!(code, (cosigner::grpc::Code::Unavailable as u32).to_string(), "{message}");
+    assert!(message.contains("nothing was minted"), "unexpected: {message}");
 }
 
 /// The ASP's terms, as a wallet relays them.
@@ -369,11 +356,11 @@ fn an_escrow_is_funded_on_the_same_approval() {
     let Some(store) = common::try_store() else { return };
     let Dealt { wire, mut reply, wallet_kp, escrow_key, .. } = deal(store);
 
-    wire.fund(5, funding_open(""));
+    fund(&wire, 5, funding_open(""));
     let FromCosigner::Funding(proto::SendServerMsg {
         body: Some(proto::send_server_msg::Body::Sighashes(sighashes)),
         ..
-    }) = reply.next(1)
+    }) = next(&mut reply, 1)
     else {
         panic!("expected the funding send's sighashes");
     };
@@ -393,7 +380,8 @@ fn an_escrow_is_funded_on_the_same_approval() {
         })
         .collect();
     let halves = common::wallet_answers(&wallet_kp, &sighashes.messages_to_sign, &commitments);
-    wire.fund(
+    fund(
+        &wire,
         6,
         proto::send_client_msg::Body::Signed(proto::SendSigned {
             rounds: halves
@@ -411,7 +399,7 @@ fn an_escrow_is_funded_on_the_same_approval() {
     let FromCosigner::Funding(proto::SendServerMsg {
         body: Some(proto::send_server_msg::Body::Submit(submit)),
         ..
-    }) = reply.next(2)
+    }) = next(&mut reply, 2)
     else {
         panic!("expected the funding send's transaction");
     };
@@ -442,7 +430,7 @@ fn a_funding_send_cannot_name_where_the_money_goes() {
     let Some(store) = common::try_store() else { return };
     let Dealt { wire, reply, .. } = deal(store);
 
-    wire.fund(5, funding_open("tark1somewhere-else"));
+    fund(&wire, 5, funding_open("tark1somewhere-else"));
     let (code, message) = reply.finish();
     assert_eq!(code, (cosigner::grpc::Code::InvalidArgument as u32).to_string(), "{message}");
     assert!(message.contains("names no recipient"), "unexpected: {message}");

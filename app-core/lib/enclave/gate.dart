@@ -206,13 +206,19 @@ class EnclaveGate {
     final nonce = nonceBytes();
     late HttpClientResponse resp;
     try {
-      final req = await _http.openUrl(method, Uri.parse('${endpoint.baseUrl}$path'));
-      req.headers.set('x-enclave-nonce', _b64u(nonce));
-      if (body != null) {
-        req.headers.contentType = ContentType.json;
-        req.write(jsonEncode(body));
-      }
-      resp = await req.close();
+      // Bounded: an enclave that does not answer is out of reach, and says so, rather than keeping
+      // whoever asked waiting on it — an owner looking at an unlock with no prompt, for one. The
+      // prompt itself comes between two exchanges, so this never cuts into the owner's time.
+      resp = await () async {
+        final req = await _http.openUrl(method, Uri.parse('${endpoint.baseUrl}$path'));
+        req.headers.set('x-enclave-nonce', _b64u(nonce));
+        if (body != null) {
+          req.headers.contentType = ContentType.json;
+          req.write(jsonEncode(body));
+        }
+        return req.close();
+      }()
+          .timeout(const Duration(seconds: 30));
     } catch (e) {
       throw GateException(path, 0, 'could not reach the enclave: $e');
     }
