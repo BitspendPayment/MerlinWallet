@@ -1,6 +1,6 @@
 //! Committing an escrow to its deal, through the cosigner that seals it.
 //!
-//! The state machine's own rules are unit-tested in `src/escrow_session.rs`. What is checked here
+//! The state machine's own rules are unit-tested in `src/escrow.rs`. What is checked here
 //! is what the cosigner does with them: that a deal cannot be struck over an escrow nobody could
 //! release from, that an escrow is committed to one deal and never again, and — the one that
 //! matters for a machine that is evicted and reseated constantly — that a deal survives the seal
@@ -8,9 +8,8 @@
 
 mod common;
 
-use cosigner::escrow::{DealTerms, EscrowSession, Refusal};
+use cosigner::escrow::{DealTerms, EscrowSession, EscrowStage, Refusal, ServicePairing};
 use cosigner::policy::Policy;
-use cosigner::types::ServicePairing;
 
 use common::seed_escrow;
 
@@ -30,7 +29,7 @@ fn open(
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let c = std::sync::Mutex::new(
-        cosigner::Cosigner::open_with_host(store.clone(), group_key.clone(), host).expect("open"),
+        cosigner::Cosigner::open(store.clone(), group_key.clone(), host).expect("open"),
     );
     common::seed_policy_with_dealt_share(
         &c,
@@ -125,8 +124,8 @@ fn a_deal_survives_the_seal_and_a_restored_instance_agrees_with_the_clock() {
     // A second instance over the same store: what the runtime does on every reseat.
     let reopened = common::open_cosigner(&store, &group_key);
     let guard = reopened.lock().unwrap();
-    let escrow = guard.escrow(&key).expect("the escrow came back");
-    let terms = escrow.terms.as_ref().expect("and so did its deal");
+    let escrow = guard.get_escrow_session(&key).expect("the escrow came back");
+    let terms = escrow.terms().expect("and so did its deal");
 
     assert_eq!(terms.deadline, NOW + HOUR);
     assert_eq!(terms.policy, Policy::TotalOutMax { sats: 50_000 });
@@ -168,8 +167,8 @@ fn an_older_seals_escrows_load_without_their_deals() {
     let mut snap: serde_json::Value =
         serde_json::from_slice(&guard.to_snapshot().unwrap()).unwrap();
     let escrow = snap["escrows"][0].as_object_mut().unwrap();
-    escrow.remove("terms");
-    escrow.remove("releases");
+    let stage = escrow.remove("stage").unwrap();
+    escrow.insert("pairing".into(), stage["paired"].clone());
     escrow.insert(
         "session".into(),
         serde_json::json!({
@@ -188,8 +187,8 @@ fn an_older_seals_escrows_load_without_their_deals() {
         .restore_snapshot(&serde_json::to_vec(&snap).unwrap())
         .expect("an older seal still opens");
 
-    let escrow = guard.escrow(&key).expect("its escrow came back");
-    assert!(escrow.terms.is_none(), "without its deal");
+    let escrow = guard.get_escrow_session(&key).expect("its escrow came back");
+    assert!(matches!(escrow.stage, EscrowStage::Paired(_)), "paired, without its deal");
     assert!(escrow.may_reclaim(NOW).is_ok(), "so its owner may take it back");
     assert_eq!(guard.release_count(), 0, "the old ledger is not read");
 }
@@ -258,7 +257,7 @@ fn the_deadline_decides_with_nothing_having_run_at_it() {
         .expect("commit it");
 
     let guard = c.lock().unwrap();
-    let escrow = guard.escrow(&key).unwrap();
+    let escrow = guard.get_escrow_session(&key).unwrap();
     assert!(escrow.may_release(NOW + HOUR - 1).is_ok());
     assert!(escrow.may_reclaim(NOW + HOUR - 1).is_err());
 
@@ -285,7 +284,7 @@ fn a_deal_is_struck_before_its_service_has_finished_pairing() {
     c.lock()
         .unwrap()
         .escrow_mut(&key)
-        .and_then(|e| e.confirm_by_wallet(&"aa".repeat(16)))
+        .and_then(|e| e.confirm_pairing(&"aa".repeat(16), |p| p.wallet_confirmed = true))
         .expect("the wallet's word, as the stream gives it");
 
     c.lock()
@@ -318,7 +317,7 @@ fn a_pairing_needs_both_parties_whichever_order_they_speak_in() {
     let attempt = "aa".repeat(16);
     c.lock()
         .unwrap()
-        .install_escrow(EscrowSession {
+        .add_escrow(EscrowSession {
             escrow_key: key.clone(),
             key_package_json: "{}".into(),
             public_key_package_json: "{}".into(),
@@ -326,7 +325,7 @@ fn a_pairing_needs_both_parties_whichever_order_they_speak_in() {
             context_hex: "66".repeat(16),
             wallet_delta_share_hex: "33".repeat(32),
             created_at: NOW,
-            pairing: Some(ServicePairing {
+            stage: EscrowStage::Paired(ServicePairing {
                 service_identifier_hex: "44".repeat(32),
                 key_package_json: "{}".into(),
                 public_key_package_json: "{}".into(),
@@ -336,29 +335,32 @@ fn a_pairing_needs_both_parties_whichever_order_they_speak_in() {
                 service_confirmed: false,
                 wallet_confirmed: false,
             }),
-            terms: None,
-            releases: Default::default(),
         })
         .expect("install escrow");
 
     let ready = |c: &std::sync::Mutex<cosigner::Cosigner>| {
         c.lock()
             .unwrap()
-            .escrow(&key)
-            .and_then(|e| e.pairing.as_ref().map(|p| p.state()))
+            .get_escrow_session(&key)
+            .and_then(|e| e.pairing().map(|p| p.state()))
             .unwrap()
-            == cosigner::types::PairingState::Ready
+            == cosigner::escrow::PairingState::Ready
     };
 
-    c.lock().unwrap().escrow_mut(&key).and_then(|e| e.confirm_by_service(&attempt)).unwrap();
+    // One party's word, as its own route delivers it.
+    let confirm = |set: fn(&mut ServicePairing)| {
+        c.lock().unwrap().escrow_mut(&key).and_then(|e| e.confirm_pairing(&attempt, set)).unwrap()
+    };
+
+    confirm(|p| p.service_confirmed = true);
     assert!(!ready(&c), "the service alone cannot finish a pairing");
-    c.lock().unwrap().escrow_mut(&key).and_then(|e| e.confirm_by_wallet(&attempt)).unwrap();
+    confirm(|p| p.wallet_confirmed = true);
     assert!(ready(&c), "with both, it is finished");
 
     // Idempotent in both directions: a redelivered message and a retried confirmation are what
     // both routes look like under a reconnect.
-    c.lock().unwrap().escrow_mut(&key).and_then(|e| e.confirm_by_service(&attempt)).unwrap();
-    c.lock().unwrap().escrow_mut(&key).and_then(|e| e.confirm_by_wallet(&attempt)).unwrap();
+    confirm(|p| p.service_confirmed = true);
+    confirm(|p| p.wallet_confirmed = true);
     assert!(ready(&c));
 }
 
@@ -375,7 +377,7 @@ fn a_confirmation_for_another_attempt_is_refused() {
         .lock()
         .unwrap()
         .escrow_mut(&key)
-        .and_then(|e| e.confirm_by_wallet(&"bb".repeat(16)))
+        .and_then(|e| e.confirm_pairing(&"bb".repeat(16), |p| p.wallet_confirmed = true))
         .expect_err("a confirmation naming another attempt must be refused");
     assert!(err.contains("different pairing attempt"), "unexpected: {err}");
 
@@ -385,7 +387,7 @@ fn a_confirmation_for_another_attempt_is_refused() {
         c.lock()
             .unwrap()
             .escrow_mut(&key)
-            .and_then(|e| e.confirm_by_wallet(&"aa".repeat(16)))
+            .and_then(|e| e.confirm_pairing(&"aa".repeat(16), |p| p.wallet_confirmed = true))
             .expect("the attempt this escrow holds");
     }
 }
@@ -423,7 +425,7 @@ fn an_unfinished_pairing_may_be_replaced_but_a_finished_one_may_not() {
     {
         let mut guard = c.lock().unwrap();
         guard
-            .install_escrow(EscrowSession {
+            .add_escrow(EscrowSession {
                 escrow_key: unfinished.clone(),
                 key_package_json: "{}".into(),
                 public_key_package_json: "{}".into(),
@@ -431,9 +433,7 @@ fn an_unfinished_pairing_may_be_replaced_but_a_finished_one_may_not() {
                 context_hex: "23".repeat(16),
                 wallet_delta_share_hex: "33".repeat(32),
                 created_at: NOW,
-                pairing: Some(second("dd")), // Pending
-                terms: None,
-                releases: Default::default(),
+                stage: EscrowStage::Paired(second("dd")), // Pending
             })
             .expect("install escrow");
         guard
@@ -441,7 +441,7 @@ fn an_unfinished_pairing_may_be_replaced_but_a_finished_one_may_not() {
             .and_then(|e| e.record_pairing(second("ee")))
             .expect("an attempt that did not finish may be paired again");
         assert_eq!(
-            guard.escrow(&unfinished).unwrap().pairing.as_ref().unwrap().attempt_id_hex,
+            guard.get_escrow_session(&unfinished).unwrap().pairing().unwrap().attempt_id_hex,
             "ee".repeat(16),
             "and the record that survives is the retry's, not the abandoned attempt's"
         );
@@ -467,7 +467,7 @@ fn a_reclaim_ignores_the_exit_delay_it_is_given() {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
     let c = std::sync::Mutex::new(
-        cosigner::Cosigner::open_with_host(
+        cosigner::Cosigner::open(
             store.clone(),
             group_key.clone(),
             std::sync::Arc::new(common::Recorder::default()),
@@ -485,7 +485,7 @@ fn a_reclaim_ignores_the_exit_delay_it_is_given() {
     let key = group_key.clone();
     c.lock()
         .unwrap()
-        .install_escrow(EscrowSession {
+        .add_escrow(EscrowSession {
             escrow_key: key.clone(),
             key_package_json: kps[1].to_json(),
             public_key_package_json: pkp.to_json(),
@@ -493,9 +493,7 @@ fn a_reclaim_ignores_the_exit_delay_it_is_given() {
             context_hex: "44".repeat(16),
             wallet_delta_share_hex: "33".repeat(32),
             created_at: NOW,
-            pairing: None,
-            terms: None,
-            releases: Default::default(),
+            stage: EscrowStage::Minted,
         })
         .expect("install escrow");
 
@@ -524,7 +522,7 @@ fn a_reclaim_ignores_the_exit_delay_it_is_given() {
     // The escrow has no session here, so nothing is holding it and a reclaim is permitted; what is
     // being checked is that it BUILDS, which it cannot at a zero delay.
     let reclaim = guard
-        .reclaim_open(&key, vtxos, &info, NOW)
+        .prepare_reclaim(&key, vtxos, &info, NOW)
         .expect("a reclaim must build from what an indexer actually reports");
     assert_eq!(reclaim.amount_sats, 80_000);
     drop(guard);

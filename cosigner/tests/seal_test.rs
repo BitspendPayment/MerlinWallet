@@ -8,6 +8,14 @@
 
 mod common;
 
+/// Open from the seal, with no runtime around it.
+fn open(
+    store: std::sync::Arc<cosigner::store::Store>,
+    group_key: String,
+) -> Result<cosigner::Cosigner, cosigner::grpc::Status> {
+    cosigner::Cosigner::open(store, group_key, std::sync::Arc::new(cosigner::host::Detached))
+}
+
 /// A seal that is there and cannot be read refuses to open — so nothing can be dealt over it.
 #[test]
 fn a_present_but_unreadable_seal_refuses_to_open_as_a_fresh_wallet() {
@@ -22,7 +30,7 @@ fn a_present_but_unreadable_seal_refuses_to_open_as_a_fresh_wallet() {
 
     // Not hex at all.
     store.put("sealed_state", &group_key, "not-hex").expect("put");
-    let err = cosigner::Cosigner::open(store.clone(), group_key.clone())
+    let err = open(store.clone(), group_key.clone())
         .err()
         .expect("a corrupt seal must not open as a fresh wallet");
     assert!(format!("{err:?}").contains("unreadable"), "{err:?}");
@@ -31,11 +39,11 @@ fn a_present_but_unreadable_seal_refuses_to_open_as_a_fresh_wallet() {
     store
         .put("sealed_state", &group_key, &hex::encode(b"{}"))
         .expect("put");
-    assert!(cosigner::Cosigner::open(store.clone(), group_key.clone()).is_err());
+    assert!(open(store.clone(), group_key.clone()).is_err());
 
     // No seal at all is a wallet that has not onboarded, and opens.
     store.delete("sealed_state", &group_key).expect("delete");
-    let fresh = cosigner::Cosigner::open(store, group_key).expect("no seal is a fresh wallet");
+    let fresh = open(store, group_key).expect("no seal is a fresh wallet");
     assert!(fresh.refuse_if_onboarded().is_ok(), "nothing sealed, so nothing to protect");
 }
 
@@ -78,7 +86,7 @@ fn a_seal_that_still_holds_contacts_and_payment_requests_opens() {
     let old = serde_json::to_vec(&snapshot).expect("json");
     store.put("sealed_state", &group_key, &hex::encode(old)).expect("put");
 
-    let reopened = cosigner::Cosigner::open(store, group_key.clone())
+    let reopened = open(store, group_key.clone())
         .expect("a seal from before the removal must still open");
     assert_eq!(reopened.owner_pk_hex().expect("its key came back"), &group_key[2..]);
 }

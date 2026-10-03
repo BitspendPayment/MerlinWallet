@@ -9,7 +9,7 @@ mod common;
 
 
 #[test]
-fn install_policy_seals_without_plaintext() {
+fn install_key_seals_without_plaintext() {
     let Some(store) = common::try_store() else {
         return;
     };

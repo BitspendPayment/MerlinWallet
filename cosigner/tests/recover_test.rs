@@ -173,7 +173,7 @@ fn recover_returns_the_escrows_a_new_device_needs_to_rebuild() {
     cosigner
         .lock()
         .unwrap()
-        .install_escrow(cosigner::escrow::EscrowSession {
+        .add_escrow(cosigner::escrow::EscrowSession {
             escrow_key: escrow_key.clone(),
             key_package_json: kps[1].to_json(),
             public_key_package_json: pkp.to_json(),
@@ -181,9 +181,7 @@ fn recover_returns_the_escrows_a_new_device_needs_to_rebuild() {
             context_hex: hex::encode(context),
             wallet_delta_share_hex: hex::encode([4u8; 32]),
             created_at: 1,
-            pairing: None,
-            terms: None,
-            releases: Default::default(),
+            stage: cosigner::escrow::EscrowStage::Minted,
         })
         .expect("install");
 

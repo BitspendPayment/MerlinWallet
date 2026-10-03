@@ -149,7 +149,7 @@ fn abandoned_ceremony_leaves_nothing() {
 
 /// A wallet that already has a key refuses a second ceremony.
 ///
-/// `install_policy` overwrites unconditionally, so a second DKG on the same tenant would replace the
+/// `install_key` overwrites unconditionally, so a second DKG on the same tenant would replace the
 /// key and strand everything held under the old one — 2-of-2 has no other way back. The e2e suite
 /// did exactly that without noticing, re-running DKG on one wallet name across tests, and got away
 /// with it only because nothing was funded in between.

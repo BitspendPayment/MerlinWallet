@@ -78,7 +78,7 @@ impl BoardingSettleSession {
     /// Take the caller's signatures for whichever round is open: after the intent round, the
     /// registration payload; after the commitment round, the signed commitment the ASP still needs.
     pub(crate) fn signed(&mut self, signed: &[Vec<u8>]) -> Result<RenewStep, String> {
-        let sigs = crate::cosigner::sigs_from_wire(signed)?;
+        let sigs = crate::util::sigs_from_wire(signed)?;
         match self.phase {
             Phase::Intent => {
                 self.session.insert_intent_signatures(sigs)?;

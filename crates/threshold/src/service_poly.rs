@@ -15,7 +15,7 @@
 //! sum, and the cosigner's half is drawn fresh from the OS CSPRNG on every pairing, so a collision
 //! requires that CSPRNG to repeat — at which point FROST nonce reuse has already broken the wallet,
 //! on exactly the same assumption. The wallet's half is derived rather than drawn, so the cosigner
-//! also refuses a repeated derivation context; see `handlers::escrow`.
+//! also refuses a repeated derivation context; see `cosigner::Cosigner::add_escrow`.
 //!
 //! The degenerate case is a slope of ZERO, which makes the polynomial constant and hands the
 //! service the group secret. That is not prevented by either half being random — a user that knew

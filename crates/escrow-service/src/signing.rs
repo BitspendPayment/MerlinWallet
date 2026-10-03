@@ -16,7 +16,7 @@
 //!
 //! FROST needs both parties' commitments before either can compute its share. The cosigner has no
 //! execution context between messages, so it cannot hold a nonce across a round trip — see
-//! `cosigner/src/handlers/release.rs`. The service can, because it is an ordinary long-running
+//! `cosigner/src/sign.rs`. The service can, because it is an ordinary long-running
 //! process. So the service commits first, the cosigner does both of its rounds inside one
 //! invocation, and no single-use nonce is ever written down by either side.
 //!
@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 
 use ark::client::send::{SendSession, SendVtxoInput};
 use ark::client::types::ArkInfo;
-use cosigner::handlers::release::{SignedHalf, WireCommitment};
+use cosigner::escrow::{SignedHalf, WireCommitment};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use threshold::commitment::SigningPackage;
@@ -191,7 +191,7 @@ impl PairedShare {
 ///
 /// Not `Clone`, and never serialized. Two signatures under one nonce give up the share by simple
 /// algebra, so a copy is a second use waiting to happen — the same rule the cosigner's
-/// `InBandRound` follows, for the same reason.
+/// `SigningSession` follows, for the same reason.
 pub struct Round {
     nonces: Vec<SigningNonce>,
 }

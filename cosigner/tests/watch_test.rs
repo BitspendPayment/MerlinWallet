@@ -27,7 +27,7 @@ fn open_with(
     host: Arc<Recorder>,
     group_key: &str,
 ) -> cosigner::Cosigner {
-    cosigner::Cosigner::open_with_host(store.clone(), group_key.to_string(), host)
+    cosigner::Cosigner::open(store.clone(), group_key.to_string(), host)
         .expect("open")
 }
 
@@ -41,7 +41,7 @@ fn a_watch_with_nothing_to_settle_cancels_itself() {
     let host = Arc::new(Recorder::default());
     let mut c = open_with(&store, host.clone(), "nothing");
 
-    let out = c.run_task(WATCH_TASK_ID, &payload(1)).expect("run");
+    let out = run_task(&mut c, WATCH_TASK_ID, &payload(1)).expect("run");
     assert_eq!(
         serde_json::from_slice::<Outcome>(&out).unwrap(),
         Outcome::NothingToSettle
@@ -62,13 +62,11 @@ fn an_undecodable_payload_is_an_error() {
     };
     let mut c = open_with(&store, Arc::new(Recorder::default()), "bad");
 
-    let err = c
-        .run_task(WATCH_TASK_ID, b"not json")
+    let err = run_task(&mut c, WATCH_TASK_ID, b"not json")
         .expect_err("an undecodable payload must not report success");
     assert!(err.contains("undecodable"), "unhelpful error: {err}");
 
-    let err = c
-        .run_task("not a valid id!", &payload(1))
+    let err = run_task(&mut c, "not a valid id!", &payload(1))
         .expect_err("a task id outside the runtime's alphabet must be refused");
     assert!(err.contains("tenant-local"), "unhelpful error: {err}");
 }
@@ -176,9 +174,9 @@ fn with_delegate(
 ) -> Option<(cosigner::Cosigner, String)> {
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
-    let mut c = cosigner::Cosigner::open_with_host(store.clone(), group_key.clone(), host)
+    let mut c = cosigner::Cosigner::open(store.clone(), group_key.clone(), host)
         .expect("open");
-    c.install_policy(
+    c.install_key(
         group_key.clone(),
         &kps[1].to_json(),
         &pkp.to_json(),
@@ -198,7 +196,7 @@ fn with_delegate(
     )
     .expect("accept vtxos");
     // Transport-free: the delegate is built from the cosigner's own key and the caller's ArkInfo.
-    match c.generate_delegate_for(&ark_info(), false) {
+    match c.generate_delegate(&ark_info(), false) {
         Ok(_) => Some((c, group_key)),
         Err(e) => {
             eprintln!("skip: could not build a delegate offline: {e}");
@@ -220,8 +218,7 @@ fn a_watch_before_the_deadline_does_not_wake() {
     };
 
     let far_future = 4_000_000_000u64;
-    let out = c
-        .run_task(WATCH_TASK_ID, &payload(far_future))
+    let out = run_task(&mut c, WATCH_TASK_ID, &payload(far_future))
         .expect("a watch that is not due is a conclusion, not a failure");
     assert!(matches!(
         serde_json::from_slice::<Outcome>(&out).unwrap(),
@@ -243,8 +240,7 @@ fn a_due_watch_wakes_the_owner() {
         return;
     };
 
-    let out = c
-        .run_task(WATCH_TASK_ID, &payload(1))
+    let out = run_task(&mut c, WATCH_TASK_ID, &payload(1))
         .expect("run");
     assert_eq!(
         serde_json::from_slice::<Outcome>(&out).unwrap(),
@@ -304,6 +300,12 @@ impl cosigner::asp::AspApi for ScriptedAsp {
     async fn submit_forfeits(&mut self, _: &[String], _: &str) -> Result<(), String> {
         Ok(())
     }
+}
+
+/// The guest's `run-task`, with no ASP to run a delegate against — so a due delegate wakes the
+/// owner instead.
+fn run_task(c: &mut cosigner::Cosigner, task_id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    block_on(c.run_task_with::<cosigner::asp::NoAsp>(task_id, payload, None))
 }
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -401,16 +403,14 @@ fn a_run_id_from_the_runtime_is_accepted() {
     };
 
     let run_id = format!("{WATCH_TASK_ID}:9773b23946c8f53906cda66263d0580b:0");
-    let out = c
-        .run_task(&run_id, &payload(4_000_000_000))
+    let out = run_task(&mut c, &run_id, &payload(4_000_000_000))
         .expect("the runtime's run id must be accepted");
     assert!(matches!(
         serde_json::from_slice::<Outcome>(&out).unwrap(),
         Outcome::NotDue { .. }
     ));
 
-    let err = c
-        .run_task("bad id!:00:0", &payload(1))
+    let err = run_task(&mut c, "bad id!:00:0", &payload(1))
         .expect_err("the id part is still checked");
     assert!(err.contains("tenant-local"), "unhelpful error: {err}");
 }

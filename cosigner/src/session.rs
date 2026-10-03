@@ -27,7 +27,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use wstd::http::{Body, Request, Response};
 
 use crate::cosigner::Cosigner;
+use crate::escrow::EscrowSession;
 use crate::renew::DelegateRenew;
+use crate::sign::SigningSession;
 use crate::grpc::{self, Duplex, SessionBody, Status};
 use crate::wallet_proto as wp;
 
@@ -169,7 +171,7 @@ impl Session {
         let now = crate::handlers::helpers::now_secs();
         let c = lock(&self.cosigner);
         Ok(proto::EscrowListResponse {
-            escrows: c.escrows().iter().map(|e| e.summary(now)).collect(),
+            escrows: c.list_escrow_sessions().iter().map(|e| e.summary(now)).collect(),
         })
     }
 }
@@ -187,16 +189,16 @@ pub(crate) fn lock(cosigner: &Arc<Mutex<Cosigner>>) -> MutexGuard<'_, Cosigner> 
 // The ceremonies
 // ===============================================================================================
 
-/// One signature, as one in-band round.
+/// One signature, as one signing session.
 ///
 /// The wallet used to commit first, in `SignOpen`. It cannot: its nonce is hedged with its share,
 /// and it holds no share until this stream's first answer brings the half the cosigner dealt it.
 /// So this is the round `Send` and `Renew` already run — the cosigner commits first, the wallet
 /// answers with its commitments and its share together — over a single message.
 ///
-/// Script-path only, like every in-band round: the cosigner signs untweaked and `aggregate` checks
-/// each share, so a key-path share could never have aggregated here. It is refused by name rather
-/// than left to fail as a bad share.
+/// Script-path only, like every signing session: the cosigner signs untweaked and `aggregate`
+/// checks each share, so a key-path share could never have aggregated here. It is refused by name
+/// rather than left to fail as a bad share.
 async fn sign(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<SignClientMsg, SignServerMsg>,
@@ -230,9 +232,8 @@ async fn sign(
     // The round is OURS, as an ordinary local. The lock is released before we wait on the client —
     // a slow client blocks nobody.
     let messages = vec![open.message_to_sign.clone()];
-    let (round, commitments) = lock(&cosigner)
-        .sign_in_band_begin(&messages)
-        .map_err(Status::internal)?;
+    let key = lock(&cosigner).signing_key().map_err(Status::internal)?;
+    let (signing, commitments) = SigningSession::begin(key, &messages);
 
     tracing::info!("Sign: returned the dealt share to the wallet's own identifier");
     duplex.send(SignServerMsg {
@@ -250,7 +251,7 @@ async fn sign(
 
     // --- Round 2: the wallet's commitments and share ----------------------------------------
     //
-    // If the client never sends it, or the stream dies here, `round` drops with this task and the
+    // If the client never sends it, or the stream dies here, `signing` drops with this task and the
     // nonce is gone. That is the safe failure: an abandoned round leaves nothing reusable.
     let share = match duplex.next_body("the share arrived").await? {
         sign_client_msg::Body::Share(s) => s,
@@ -258,8 +259,8 @@ async fn sign(
     };
 
     // A bad share is the caller's fault, and is reported as such rather than as ours.
-    let signature = lock(&cosigner)
-        .sign_in_band_finish(round, vec![share.into()])
+    let signature = signing
+        .finish(vec![share.into()])
         .map_err(Status::invalid_argument)?
         .pop()
         .ok_or_else(|| Status::internal("the round produced no signature"))?;
@@ -288,7 +289,7 @@ async fn sign(
 /// The same shape as [`dkg`] and for the same reason — the round-1 and round-2 secrets are what the
 /// key is born from, so they live on this frame and die with it. What differs is that both parties
 /// already have keys: the reshare is dealt under the identifiers they hold in the wallet key, and
-/// neither side's wallet share changes. See [`crate::handlers::escrow`].
+/// neither side's wallet share changes. See [`EscrowSession::begin_mint`].
 ///
 /// When the open names a service, the stream goes on to pair it into the new escrow, the wallet
 /// confirms on this stream, and the deal the open names is struck — so an escrow is set up for a
@@ -299,8 +300,6 @@ async fn escrow(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<proto::EscrowClientMsg, proto::EscrowServerMsg>,
 ) -> Result<(), Status> {
-    use crate::handlers::escrow as esc;
-
     let first = duplex.expect("it opened").await?;
     let session_id = first.session_id.clone();
     let open = match first.body {
@@ -318,7 +317,7 @@ async fn escrow(
         if open.attempt_id.len() != 16 {
             return Err(Status::invalid_argument("a pairing attempt id is 16 bytes"));
         }
-        Some(crate::service_stream::Service::named(&open.service_identifier)?)
+        Some(crate::escrow::Service::resolve(&open.service_identifier)?)
     };
     let attempt_id_hex = hex::encode(&open.attempt_id);
     // And its deal, with it and only with it — checked here too, so terms that could never be
@@ -339,30 +338,21 @@ async fn escrow(
 
     // There is nothing to reshare before there is a wallet. Taken once, up front, so the ceremony
     // runs against one consistent view of the key it is derived from.
-    //
-    // A wallet whose ceremony kept no dealt share is refused here rather than at release: its owner
-    // cannot rebuild the wallet share an escrow share is built on top of, so the escrow would be
-    // spendable by this cosigner's half and nobody else's.
-    let (old_kp, old_pkp) = {
-        let c = lock(&cosigner);
-        if c.wallet_dealt_share_hex().is_none() {
-            return Err(Status::failed_precondition(
-                "this wallet was made before recovery existed: its owner could not rebuild a share \
-                 for an escrow, so there is no safe escrow to mint",
-            ));
-        }
-        c.wallet_key_material().ok_or_else(|| {
-            Status::failed_precondition("this wallet has no key yet; there is nothing to escrow from")
-        })?
-    };
+    let wallet = lock(&cosigner).signing_key().map_err(Status::failed_precondition)?;
 
     // The wallet's half of its own share, before anything is dealt — see `dealt_share_for`. A
-    // reshare builds on the wallet share, so the wallet needs this to finalize its own side.
+    // reshare builds on the wallet share, so the wallet needs this to finalize its own side; and a
+    // wallet whose ceremony kept no dealt share is refused here rather than at release: its owner
+    // could not rebuild the share an escrow share is built on top of, so the escrow would be
+    // spendable by this cosigner's half and nobody else's.
     let dealt = lock(&cosigner).dealt_share_for(&open.identifier)?;
 
-    let mut sess = esc::EscrowSession::new();
-    let our_round1 =
-        sess.begin(&old_kp, &open.identifier, &open.round1_package, &open.context)?;
+    let (mint, our_round1) = EscrowSession::begin_mint(
+        &wallet.key_package,
+        &open.identifier,
+        &open.round1_package,
+        &open.context,
+    )?;
     duplex.send(proto::EscrowServerMsg {
         session_id: session_id.clone(),
         seq: 1,
@@ -378,30 +368,21 @@ async fn escrow(
         proto::escrow_client_msg::Body::Round2(r) => r,
         _ => return Err(Status::invalid_argument("expected EscrowRound2")),
     };
-    let for_wallet = sess.finalise(&old_kp, &old_pkp, &round2.round2_package)?;
-    let material = sess
-        .material
-        .take()
-        .ok_or_else(|| Status::internal("the reshare finished without key material"))?;
-    let escrow_key = material.escrow_key.clone();
+    let now = crate::handlers::helpers::now_secs();
+    let (for_wallet, escrow) = EscrowSession::finalise_mint(
+        mint,
+        &wallet.key_package,
+        &wallet.public_key_package,
+        &round2.round2_package,
+        now,
+    )?;
+    let escrow_key = escrow.escrow_key.clone();
 
     // Sealed before it is announced. A wallet told about an escrow this cosigner cannot co-sign for
     // would be a wallet that funds a key only half of which exists.
     {
         let mut c = lock(&cosigner);
-        c.install_escrow(crate::escrow::EscrowSession {
-            escrow_key: material.escrow_key,
-            key_package_json: material.key_package_json,
-            public_key_package_json: material.public_key_package_json,
-            wallet_identifier_hex: material.wallet_identifier_hex,
-            context_hex: material.context_hex,
-            wallet_delta_share_hex: material.wallet_delta_share_hex,
-            created_at: crate::handlers::helpers::now_secs(),
-            pairing: None,
-            terms: None,
-            releases: Default::default(),
-        })
-        .map_err(Status::failed_precondition)?;
+        c.add_escrow(escrow).map_err(Status::failed_precondition)?;
         c.seal();
     }
 
@@ -422,43 +403,26 @@ async fn escrow(
         proto::escrow_client_msg::Body::Deal(d) => d,
         _ => return Err(Status::invalid_argument("expected PairServiceDeal")),
     };
-    let escrow = lock(&cosigner)
-        .escrow(&escrow_key)
-        .and_then(crate::escrow::EscrowSession::details)
-        .ok_or_else(|| Status::internal("this escrow's sealed key material is unreadable"))?;
     // This cosigner's half, dealt from the wallet's dealing, handed to the service, and only then
-    // sealed pending — as `handlers::delivery` explains: this cosigner never keeps the service's
-    // half, so a pairing sealed before a failed delivery could never be completed.
-    let material = crate::handlers::pairing::pair_service(
-        &escrow.key_package,
-        &escrow.public_key_package,
-        &escrow.wallet_id,
-        &service.id,
-        &deal.contribution_to_cosigner,
-        &deal.contribution_to_service,
-    )?;
-    // Over the connection the runtime will go on holding after this call ends — that is what lets
-    // the service speak first later, when it asks for a release. See `handlers::delivery`.
+    // sealed pending — see "Deliver, then seal" in `crate::escrow`: this cosigner never keeps the
+    // service's half, so a pairing sealed before a failed delivery could never be completed.
+    let material = lock(&cosigner)
+        .get_escrow_session(&escrow_key)
+        .ok_or_else(|| Status::internal("the escrow this stream minted is gone"))?
+        .prepare_pairing(
+            &service.id,
+            &deal.contribution_to_cosigner,
+            &deal.contribution_to_service,
+        )?;
     let host = lock(&cosigner).host();
-    crate::handlers::delivery::deliver_pairing_half(
-        host.as_ref(),
-        &material.service_identifier_hex,
-        &service.origin,
-        &crate::service_stream::ToService::PairingHalf {
-            escrow_key: escrow_key.clone(),
-            attempt_id: attempt_id_hex.clone(),
-            service_identifier: material.service_identifier_hex.clone(),
-            half: hex::encode(&material.service_half),
-            public_key_package_json: material.public_key_package_json.clone(),
-            service_verifying_share: material.service_verifying_share_hex.clone(),
-        },
-    )
-    .await
-    .map_err(|e| {
-        Status::unavailable(format!(
-            "the service did not take its half, so nothing was paired: {e}"
-        ))
-    })?;
+    material
+        .deliver(host.as_ref(), &service.origin, &escrow_key, &attempt_id_hex)
+        .await
+        .map_err(|e| {
+            Status::unavailable(format!(
+                "the service did not take its half, so nothing was paired: {e}"
+            ))
+        })?;
     let paired = proto::PairServiceDone {
         public_key_package_json: material.public_key_package_json.clone(),
         service_verifying_share: material.service_verifying_share_hex.clone(),
@@ -466,18 +430,8 @@ async fn escrow(
         // could not: the list lives in the image.
         service_origin: service.origin.clone(),
     };
-    let pairing = crate::types::ServicePairing {
-        service_identifier_hex: material.service_identifier_hex,
-        key_package_json: material.key_package_json,
-        public_key_package_json: material.public_key_package_json,
-        service_verifying_share_hex: material.service_verifying_share_hex,
-        paired_at: crate::handlers::helpers::now_secs(),
-        attempt_id_hex: attempt_id_hex.clone(),
-        // Delivered, not yet shown to work: the service has one half of two, and neither party has
-        // vouched for it. See `handlers::delivery`.
-        service_confirmed: false,
-        wallet_confirmed: false,
-    };
+    let pairing =
+        material.into_pairing(attempt_id_hex.clone(), crate::handlers::helpers::now_secs());
     {
         let mut c = lock(&cosigner);
         c.escrow_mut(&escrow_key)
@@ -508,7 +462,7 @@ async fn escrow(
         let mut c = lock(&cosigner);
         c.escrow_mut(&escrow_key)
             .and_then(|e| {
-                e.confirm_by_wallet(&attempt_id_hex)?;
+                e.confirm_pairing(&attempt_id_hex, |p| p.wallet_confirmed = true)?;
                 e.strike_deal(terms)
             })
             .map_err(Status::failed_precondition)?;
@@ -517,7 +471,7 @@ async fn escrow(
         })?;
     }
     // Nothing is scheduled for the deadline, and nothing needs to be. A deadline is a fact about
-    // the clock that every decision reads out of the seal — see `crate::escrow_session`.
+    // the clock that every decision reads out of the seal — see `crate::escrow`.
     duplex.send(proto::EscrowServerMsg {
         session_id,
         seq: 4,
@@ -593,7 +547,7 @@ async fn dkg(
     // than leaving a wallet whose key exists only in a reply.
     {
         let mut c = lock(&cosigner);
-        c.install_policy(
+        c.install_key(
             group_key.clone(),
             &key_package_json,
             &public_key_package_json,
@@ -623,8 +577,8 @@ async fn dkg(
 /// `reclaim_escrow`.
 ///
 /// The same four steps a send takes, because it is one — of the escrow's key rather than the
-/// wallet's. See [`crate::handlers::reclaim`] for what is checked and what is derived rather than
-/// accepted.
+/// wallet's. See [`EscrowSession::prepare_reclaim`] for what is checked and what is derived rather
+/// than accepted.
 async fn reclaim(
     cosigner: Arc<Mutex<Cosigner>>,
     duplex: Duplex<proto::SendClientMsg, proto::SendServerMsg>,
@@ -644,7 +598,7 @@ async fn reclaim(
         .ok_or_else(|| Status::invalid_argument("SendOpen carried no ark_info"))?;
 
     let now = crate::handlers::helpers::now_secs();
-    let mut reclaim = lock(&cosigner).reclaim_open(
+    let mut reclaim = lock(&cosigner).prepare_reclaim(
         &open.reclaim_escrow,
         open.vtxos.into_iter().map(Into::into).collect(),
         &info,
@@ -656,8 +610,7 @@ async fn reclaim(
 
     // Round one, on this stream, as a send does it: the cosigner commits first so the whole batch
     // costs one round trip — but with the ESCROW's share, not the wallet's.
-    let (round, commitments) = lock(&cosigner)
-        .sign_in_band_begin_as(&reclaim.key_package, &reclaim.sighashes);
+    let (signing, commitments) = SigningSession::begin(reclaim.key, &reclaim.sighashes);
 
     duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
@@ -676,23 +629,12 @@ async fn reclaim(
         proto::send_client_msg::Body::Signed(s) => s,
         _ => return Err(Status::invalid_argument("expected SendSigned")),
     };
-    let signatures = lock(&cosigner)
-        .sign_in_band_finish_as(
-            &reclaim.key_package,
-            &reclaim.public_key_package,
-            &reclaim.wallet_identifier,
-            round,
-            signed.rounds.into_iter().map(Into::into).collect(),
-        )
+    let signatures = signing
+        .finish(signed.rounds.into_iter().map(Into::into).collect())
         .map_err(Status::invalid_argument)?;
-    let (ark_tx_b64, checkpoint_txs) = {
-        let sigs = crate::cosigner::sigs_from_wire(&signatures).map_err(Status::internal)?;
-        reclaim.session.sign_with_frost(sigs).map_err(Status::internal)?;
-        reclaim
-            .session
-            .prepare_submit()
-            .map_err(|e| Status::internal(format!("prepare submit: {e}")))?
-    };
+    let (ark_tx_b64, checkpoint_txs) =
+        crate::cosigner::sign_and_prepare(&mut reclaim.session, &signatures)
+            .map_err(Status::internal)?;
 
     duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
@@ -790,14 +732,13 @@ async fn send(
             amount: open.amount,
             vtxos: open.vtxos.iter().cloned().map(Into::into).collect(),
         };
-        lock(&cosigner).send_open(step1, &info).map_err(Status::internal)?
+        lock(&cosigner).create_send_session(step1, &info).map_err(Status::internal)?
     };
 
     // Round one of the FROST signature, on this stream. It used to be a nested `Sign` stream per
-    // sighash, which deadlocks inside enclave-runtime — see `Cosigner::sign_in_band_begin`.
-    let (round, commitments) = lock(&cosigner)
-        .sign_in_band_begin(&sighashes)
-        .map_err(Status::internal)?;
+    // sighash, which deadlocks inside enclave-runtime — see `crate::sign`.
+    let key = lock(&cosigner).signing_key().map_err(Status::internal)?;
+    let (signing, commitments) = SigningSession::begin(key, &sighashes);
 
     duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
@@ -815,17 +756,11 @@ async fn send(
         _ => return Err(Status::invalid_argument("expected SendSigned")),
     };
     // A bad share is the caller's fault, and is reported as such rather than as ours.
-    let signatures = lock(&cosigner)
-        .sign_in_band_finish(round, signed.rounds.into_iter().map(Into::into).collect())
+    let signatures = signing
+        .finish(signed.rounds.into_iter().map(Into::into).collect())
         .map_err(Status::invalid_argument)?;
-    let (ark_tx_b64, checkpoint_txs) = lock(&cosigner)
-        .send_prepare(
-            &mut session,
-            crate::types::SendVtxoStep2 {
-                signed_messages: signatures,
-            },
-        )
-        .map_err(Status::internal)?;
+    let (ark_tx_b64, checkpoint_txs) =
+        crate::cosigner::sign_and_prepare(&mut session, &signatures).map_err(Status::internal)?;
 
     duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
@@ -841,9 +776,9 @@ async fn send(
         proto::send_client_msg::Body::Submitted(s) => s,
         _ => return Err(Status::invalid_argument("expected SendSubmitted")),
     };
-    let final_checkpoint_txs = lock(&cosigner)
-        .send_finalize(&mut session, &submitted.signed_checkpoint_txs)
-        .map_err(Status::internal)?;
+    let final_checkpoint_txs = session
+        .finalize_checkpoints(&submitted.signed_checkpoint_txs)
+        .map_err(|e| Status::internal(format!("finalize checkpoints: {e}")))?;
 
     duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
@@ -859,19 +794,17 @@ async fn send(
         proto::send_client_msg::Body::Finalized(_) => {}
         _ => return Err(Status::invalid_argument("expected SendFinalized")),
     }
-    let resp = {
+    {
         let mut c = lock(&cosigner);
-        let submitted = c.send_complete((session, change_exit_delay), submitted.ark_txid);
-        let resp = c.apply_send(submitted);
+        c.finalise_send_session(session, change_exit_delay);
         c.seal();
-        resp
-    };
+    }
 
     duplex.send(proto::SendServerMsg {
         session_id: session_id.clone(),
         seq: 4,
         body: Some(proto::send_server_msg::Body::Complete(proto::SendComplete {
-            ark_txid: resp.ark_txid,
+            ark_txid: submitted.ark_txid,
             change: None,
         })),
     });
@@ -987,18 +920,17 @@ async fn drive_round(
     // sighashes go out and taken when the matching `Signed` comes back. Holding it here rather than
     // on the cosigner is what keeps the nonces on this stream's stack, where a dropped stream takes
     // them with it.
-    let mut pending_round: Option<crate::cosigner::InBandRound> = None;
+    let mut pending_round: Option<SigningSession> = None;
 
     loop {
         // Say what we need, then read what the caller did about it.
         let body = match step {
             RenewStep::Sighashes(messages_to_sign) => {
-                // Round one, on this stream — see `Cosigner::sign_in_band_begin` for why it cannot
-                // be a nested `Sign` any more.
-                let (round, commitments) = lock(cosigner)
-                    .sign_in_band_begin(&messages_to_sign)
-                    .map_err(Status::internal)?;
-                pending_round = Some(round);
+                // Round one, on this stream — see `crate::sign` for why it cannot be a nested
+                // `Sign` any more.
+                let key = lock(cosigner).signing_key().map_err(Status::internal)?;
+                let (signing, commitments) = SigningSession::begin(key, &messages_to_sign);
+                pending_round = Some(signing);
                 Some(proto::renew_server_msg::Body::Sighashes(proto::RenewSighashes {
                     wallet_dealt_share: dealt.take().unwrap_or_default(),
                     ..proto::RenewSighashes::round(messages_to_sign, commitments)
@@ -1064,16 +996,17 @@ async fn drive_round(
 
         // Scoped to this iteration, and released before the loop comes back around to
         // `recv().await`. That used to matter because the caller opened a nested `Sign` on its own
-        // connection while this stream was parked; signing is in-band now, so nothing else takes
-        // this lock mid-renewal — but holding a guard across an await is still the wrong habit.
+        // connection while this stream was parked; signing rides this stream now, so nothing else
+        // takes this lock mid-renewal — but holding a guard across an await is still the wrong
+        // habit.
         let mut c = lock(cosigner);
         step = match body {
             proto::renew_client_msg::Body::Signed(s) => {
                 let round = pending_round.take().ok_or_else(|| {
                     Status::invalid_argument("signatures arrived with no round waiting for them")
                 })?;
-                let signatures = c
-                    .sign_in_band_finish(round, s.rounds.into_iter().map(Into::into).collect())
+                let signatures = round
+                    .finish(s.rounds.into_iter().map(Into::into).collect())
                     .map_err(Status::invalid_argument)?;
                 c.renew_signed(signatures).map_err(Status::internal)?
             }

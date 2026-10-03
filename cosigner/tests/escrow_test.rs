@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use rand::rngs::OsRng;
 
-use cosigner::handlers::escrow::{self, EscrowSession};
+use cosigner::escrow::EscrowSession;
 use cosigner::onboarding::OnboardingSession;
 use cosigner::wallet_proto::{DkgStep1Request, DkgStep3Request};
 
@@ -135,7 +135,7 @@ fn onboard() -> Wallet {
 /// Run the reshare: the cosigner through its handler, the wallet's half played here.
 fn make_escrow(
     w: &Wallet,
-) -> (KeyPackage, PublicKeyPackage, escrow::EscrowMaterial, Vec<[u8; 32]>) {
+) -> (KeyPackage, PublicKeyPackage, EscrowSession, Vec<[u8; 32]>) {
     let mut rng = OsRng;
     let wallet_id = w.kp.identifier.clone();
     let cosigner_id = w.cosigner_kp.identifier.clone();
@@ -147,20 +147,23 @@ fn make_escrow(
     let (w_r1s, w_r1p) =
         dkg::dkg_reshare_part1(&wallet_id, 2, 2, &delta_secret, &delta_coeffs, &mut rng).unwrap();
 
-    let mut sess = EscrowSession::new();
-    let server_r1_json = sess
-        .begin(&w.cosigner_kp, &wallet_id.serialize(), &w_r1p.to_json(), &fresh_context())
-        .expect("begin");
+    let (mint, server_r1_json) = EscrowSession::begin_mint(
+        &w.cosigner_kp,
+        &wallet_id.serialize(),
+        &w_r1p.to_json(),
+        &fresh_context(),
+    )
+    .expect("begin");
     let server_r1 = Round1Package::from_json(&server_r1_json).unwrap();
 
     let peers: BTreeMap<Identifier, Round1Package> =
         [(cosigner_id.clone(), server_r1)].into_iter().collect();
     let (w_r2s, w_shares) = dkg::dkg_part2(&w_r1s, &peers, &[]).unwrap();
 
-    let server_r2_json = sess
-        .finalise(&w.cosigner_kp, &w.pkp, &w_shares.get(&cosigner_id).unwrap().to_json())
-        .expect("finalise");
-    let material = sess.material.take().expect("escrow material");
+    let wallet_r2 = w_shares.get(&cosigner_id).unwrap().to_json();
+    let (server_r2_json, material) =
+        EscrowSession::finalise_mint(mint, &w.cosigner_kp, &w.pkp, &wallet_r2, 0)
+            .expect("finalise");
 
     let peers_r2: BTreeMap<Identifier, Round2Package> = [(
         cosigner_id.clone(),
@@ -310,38 +313,6 @@ fn two_escrows_from_one_wallet_are_different_keys() {
     );
 }
 
-#[test]
-fn a_ceremony_that_has_not_opened_refuses_to_finish() {
-    let w = onboard();
-    let mut sess = EscrowSession::new();
-    let err = sess.finalise(&w.cosigner_kp, &w.pkp, "{}")
-        .expect_err("finishing what never opened must refuse");
-    assert!(format!("{err:?}").contains("has not opened"), "unexpected: {err:?}");
-}
-
-#[test]
-fn opening_twice_refuses_rather_than_dealing_a_second_delta() {
-    let w = onboard();
-    let mut rng = OsRng;
-    let id = w.kp.identifier.clone();
-    let (_, r1p) = dkg::dkg_reshare_part1(
-        &id,
-        2,
-        2,
-        &random::mod_n_random(&mut rng),
-        &[random::mod_n_random(&mut rng)],
-        &mut rng,
-    )
-    .unwrap();
-
-    let mut sess = EscrowSession::new();
-    let ctx = fresh_context();
-    sess.begin(&w.cosigner_kp, &id.serialize(), &r1p.to_json(), &ctx).expect("first");
-    let err = sess.begin(&w.cosigner_kp, &id.serialize(), &r1p.to_json(), &ctx)
-        .expect_err("a second open on one session must refuse");
-    assert!(format!("{err:?}").contains("already opened"), "unexpected: {err:?}");
-}
-
 /// A wallet claiming the cosigner's own identifier would collapse the reshare onto one point.
 #[test]
 fn a_wallet_claiming_the_cosigners_identifier_is_refused() {
@@ -358,10 +329,14 @@ fn a_wallet_claiming_the_cosigners_identifier_is_refused() {
     )
     .unwrap();
 
-    let mut sess = EscrowSession::new();
-    let err = sess
-        .begin(&w.cosigner_kp, &cosigner_id.serialize(), &r1p.to_json(), &fresh_context())
-        .expect_err("the cosigner's own identifier must be refused");
+    let err = EscrowSession::begin_mint(
+        &w.cosigner_kp,
+        &cosigner_id.serialize(),
+        &r1p.to_json(),
+        &fresh_context(),
+    )
+    .err()
+    .expect("the cosigner's own identifier must be refused");
     assert!(
         format!("{err:?}").contains("this cosigner's own"),
         "unexpected: {err:?}"
@@ -407,8 +382,8 @@ fn a_context_that_is_too_short_is_refused() {
     )
     .unwrap();
 
-    let mut sess = EscrowSession::new();
-    let err = sess.begin(&w.cosigner_kp, &id.serialize(), &r1p.to_json(), &[1, 2, 3])
-        .expect_err("a guessable context must be refused");
+    let err = EscrowSession::begin_mint(&w.cosigner_kp, &id.serialize(), &r1p.to_json(), &[1, 2, 3])
+        .err()
+        .expect("a guessable context must be refused");
     assert!(format!("{err:?}").contains("16 to 32 bytes"), "unexpected: {err:?}");
 }

@@ -87,7 +87,7 @@ pub struct SnapshotState {
 }
 
 /// One release an escrow made, filed under the payment that justified it — see
-/// [`EscrowSession::releases`](crate::escrow_session::EscrowSession::releases).
+/// [`EscrowSession::releases`](crate::escrow::EscrowSession::releases).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseRecord {
     /// The service's idempotency key for the request that asked.
@@ -120,91 +120,6 @@ pub enum Admission {
     AlreadyAnswered(Box<ReleaseRecord>),
 }
 
-/// Whether a pairing is finished.
-///
-/// A pairing is two deliveries by two routes, and it works only once the service holds both halves
-/// and has checked the share they sum to. Until then it is [`Pending`](PairingState::Pending):
-/// sealed, so a restart does not lose this cosigner's own share, and not usable, because a service
-/// with one half can sign nothing.
-///
-/// Derived from two acknowledgements rather than set by whichever arrives — see
-/// [`ServicePairing::state`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PairingState {
-    /// At most one of the two parties has said the pairing works.
-    Pending,
-    /// The service has both halves and its share checks out, and the wallet agrees it delivered.
-    Ready,
-}
-
-/// A service's way into one escrow: a second 2-of-2 over the same key `V'`.
-///
-/// Minted by a key-preserving refresh, so `V'` does not move — see `handlers::pairing`. What is
-/// kept is this cosigner's own half of the pairing and the public package the service's share is
-/// checked against. **Never the service's half**: it is handed over once at pairing and not
-/// retained, because a party holding both halves holds the service's share.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServicePairing {
-    /// The service's FROST identifier in this pairing, hex.
-    pub service_identifier_hex: String,
-    /// This cosigner's share of the `{service, cosigner}` pairing.
-    pub key_package_json: String,
-    /// The pairing's public package. Its verifying key is `V'`, unchanged.
-    pub public_key_package_json: String,
-    /// The verifying share the service's own share must match, hex. Public.
-    pub service_verifying_share_hex: String,
-    /// Unix seconds.
-    pub paired_at: i64,
-    /// Which pairing attempt this is, hex. Both halves carry it, so the service can tell which two
-    /// belong together — and a confirmation for another attempt is refused.
-    #[serde(default)]
-    pub attempt_id_hex: String,
-    /// The SERVICE said, over the connection the runtime holds to it, that it has both halves and
-    /// that the share they sum to matches the published verifying share.
-    ///
-    /// Only the service can know this: it is the only party that ever holds both halves. See
-    /// `crate::service_stream`.
-    #[serde(default)]
-    pub service_confirmed: bool,
-    /// The WALLET said it delivered its own half and the service took it.
-    ///
-    /// Only the wallet can know this: its half travels device-to-service and never through here.
-    #[serde(default)]
-    pub wallet_confirmed: bool,
-}
-
-impl ServicePairing {
-    /// Whether this pairing may be committed to a deal.
-    ///
-    /// **Both** parties, because neither can answer for the other. The service is the only one
-    /// that holds both halves, so only it can say the share checks out; the wallet is the only one
-    /// that knows whether its own delivery landed. A pairing reported usable on one voice would be
-    /// a pairing reported usable by a party that could not see the half it is vouching for — and
-    /// an escrow committed against it would lock the owner's money away with nobody able to take
-    /// it.
-    ///
-    /// `default` on both flags is false, so a seal that does not say is a pairing not shown to
-    /// work.
-    pub fn state(&self) -> PairingState {
-        if self.service_confirmed && self.wallet_confirmed {
-            PairingState::Ready
-        } else {
-            PairingState::Pending
-        }
-    }
-
-    /// What is still missing, for a message that has to say so.
-    pub fn awaiting(&self) -> &'static str {
-        match (self.service_confirmed, self.wallet_confirmed) {
-            (true, true) => "nothing",
-            (false, true) => "the service has not confirmed it holds both halves and can sign",
-            (true, false) => "the wallet has not confirmed it delivered its own half",
-            (false, false) => "neither the service nor the wallet has confirmed it",
-        }
-    }
-}
-
 // ===========================================================================
 // Actor method inputs. Plain-data request structs passed to the `Cosigner` signing/session
 // methods the registry calls (`sign_step1`, `send_vtxo_step1`, `generate_delegate`, …).
@@ -218,12 +133,6 @@ pub struct SendVtxoStep1 {
     /// The current spendable VTXO set, supplied by the host from its persisted projection. The
     /// actor selects from these + checks the balance itself (no separate `SetVtxos` push).
     pub vtxos: Vec<VtxoInput>,
-}
-
-/// SendVtxo phase 2 — the client's FROST signatures over the phase-1 sighashes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SendVtxoStep2 {
-    pub signed_messages: Vec<Vec<u8>>,
 }
 
 /// One participant's signing commitments, keyed by FROST identifier (hex).
@@ -270,9 +179,3 @@ pub enum BoardingSettleOutcome {
     Submitted(BoardingSettleSubmitted),
 }
 
-/// Output of `send_vtxo_step2`: the submitted Ark txid and the change VTXO if the send made one.
-#[derive(Debug)]
-pub struct SendVtxoSubmitted {
-    pub ark_txid: String,
-    pub change: Option<(String, u32, u64, u32)>,
-}

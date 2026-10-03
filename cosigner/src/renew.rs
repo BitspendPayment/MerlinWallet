@@ -7,8 +7,8 @@
 //! refresh all of it (valid from the earliest expiry less the safety margin) and the forfeits it
 //! will need (`ALL|ANYONECANPAY`, so the round's connector can be added later), and the wallet
 //! FROST-signs them. That signed delegate is sealed, and the settle watch is armed for the moment
-//! it becomes valid — see `Cosigner::run_task` for what runs it. `RenewOpen.delegate_only` does
-//! the same on its own, for funds that arrived by a receive.
+//! it becomes valid — see `Cosigner::run_task_with` for what runs it. `RenewOpen.delegate_only`
+//! does the same on its own, for funds that arrived by a receive.
 //!
 //! **Running a round.** What the cosigner contributes to an ASP round is signatures: the intent
 //! proof, the MuSig2 tree nonces and signatures, the forfeit transactions. Every step that produces
@@ -86,7 +86,7 @@ impl Cosigner {
         // The set the caller supplies, validated against what this wallet could own.
         self.accept_vtxos(vtxos, &info)?;
         // Now, not deferred: the owner is here asking for a refresh.
-        let sighashes = self.generate_delegate_for(&info, false)?;
+        let sighashes = self.generate_delegate(&info, false)?;
         let exit_delay = info.unilateral_exit_delay as u32;
         self.renew_session = self.renew_session.take().map(|d| d.in_flight(exit_delay));
         Ok(sighashes)
@@ -270,7 +270,7 @@ impl RenewSession {
     /// renewing's business (`DelegateRenew::finalise`), not signing's: a delegate signed for a
     /// refresh the owner asked for now is spent in the same round.
     pub(crate) fn sign(&mut self, signed: &[Vec<u8>]) -> Result<(), String> {
-        self.session_mut().sign_with_frost(crate::cosigner::sigs_from_wire(signed)?)?;
+        self.session_mut().sign_with_frost(crate::util::sigs_from_wire(signed)?)?;
         Ok(())
     }
 
@@ -363,7 +363,7 @@ pub struct ToSign {
 /// A delegate being renewed: the round that signs it, open, and the exits it signs alongside —
 /// each exit's outpoint and spend, in the order their sighashes were offered.
 pub struct DelegateRenew {
-    round: crate::cosigner::InBandRound,
+    signing: crate::sign::SigningSession,
     exits: Vec<(String, ExitSpend)>,
 }
 
@@ -413,7 +413,7 @@ impl DelegateRenew {
                  for",
             ));
         }
-        let delegate = c.generate_delegate_for(&info, true).map_err(Status::failed_precondition)?;
+        let delegate = c.generate_delegate(&info, true).map_err(Status::failed_precondition)?;
 
         // One exit transaction per held VTXO, paying `exit_script_pubkey`.
         //
@@ -457,8 +457,9 @@ impl DelegateRenew {
         // signatures come back the same way.
         let exit_sighashes: Vec<Vec<u8>> = exits.iter().map(|(_, s)| s.sighash.to_vec()).collect();
         let all: Vec<Vec<u8>> = delegate.iter().chain(exit_sighashes.iter()).cloned().collect();
-        let (round, commitments) = c.sign_in_band_begin(&all).map_err(Status::internal)?;
-        Ok((Self { round, exits }, ToSign { delegate, exits: exit_sighashes, commitments }))
+        let key = c.signing_key().map_err(Status::internal)?;
+        let (signing, commitments) = crate::sign::SigningSession::begin(key, &all);
+        Ok((Self { signing, exits }, ToSign { delegate, exits: exit_sighashes, commitments }))
     }
 
     /// Finish the round, keep the delegate, and arm the watch — and enrol [device_token] for the
@@ -472,8 +473,9 @@ impl DelegateRenew {
         let device_enrolled = enrol_device(cosigner, device_token);
         let mut c = lock(cosigner);
         // A bad share is the caller's fault, and is reported as such.
-        let signatures = c
-            .sign_in_band_finish(self.round, rounds.into_iter().map(Into::into).collect())
+        let signatures = self
+            .signing
+            .finish(rounds.into_iter().map(Into::into).collect())
             .map_err(Status::invalid_argument)?;
 
         // The round signed the delegate's messages and then the exits', in that order.
@@ -515,7 +517,7 @@ impl DelegateRenew {
 
         // Arm the watch for that deadline. Here, because `enqueue` is interactive only: background
         // work cannot grant itself standing work, so arming rides the call that signed the
-        // delegate. It is the only thing this queue is used for — `crate::escrow_session` says why
+        // delegate. It is the only thing this queue is used for — `crate::escrow` says why
         // an escrow's deadline needs no task.
         debug_assert!(valid_label(CATEGORY_SETTLE_DUE));
         let payload = serde_json::to_vec(&Task::SettleDue { deadline_secs: valid_at })

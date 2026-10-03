@@ -90,7 +90,7 @@ Merlin is a concrete consumer of the runtime's capabilities. Its [`Host` trait](
 | Preserve state beyond an invocation or restart | Copy-on-write encrypted filesystem and durable sync/rename operations | [`SnapshotState`](cosigner/src/types.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
 | Execute an already authorized renewal later | `enclave:tasks/queue` and the `run-task` callback | [`renew.rs`](cosigner/src/renew.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
 | Reach the ASP during unattended work | Exact-origin guest egress policy | [`asp/`](cosigner/src/asp/), [`up-enclave.sh`](scripts/up-enclave.sh) |
-| Let a paired service initiate an exchange | `enclave:streams/connection` and `on-message` | [`service_stream.rs`](cosigner/src/service_stream.rs), [`release.rs`](cosigner/src/handlers/release.rs) |
+| Let a paired service initiate an exchange | `enclave:streams/connection` and `on-message` | [`escrow.rs`](cosigner/src/escrow.rs) |
 | Notify the owner without putting private details in a push | Runtime-owned device enrollment and FCM wake queue | [`host.rs`](cosigner/src/host.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
 
 ### Persistent wallet state
@@ -107,7 +107,7 @@ The service connection solves a separate problem from a timer. An escrow counter
 
 The guest checks that the sending service is paired to the named escrow and evaluates the stored session, transaction policy, remaining allowance, and required evidence. It tracks request IDs and consumed payment references in persistent state. Runtime reconnection does not itself provide exactly-once payments; the application-level accounting is essential.
 
-Service destinations are configured in the measured image. The guest selects a service identity from that configuration; the wallet does not gain arbitrary outbound access by supplying a URL. See [`delivery.rs`](cosigner/src/handlers/delivery.rs), [`escrow_session.rs`](cosigner/src/escrow_session.rs), and the [service-stream tests](cosigner/tests/service_stream_test.rs).
+Service destinations are configured in the measured image. The guest selects a service identity from that configuration; the wallet does not gain arbitrary outbound access by supplying a URL. See [`escrow.rs`](cosigner/src/escrow.rs) and the [service-stream tests](cosigner/tests/service_stream_test.rs).
 
 ## A concrete demonstration: renew while the phone is offline
 

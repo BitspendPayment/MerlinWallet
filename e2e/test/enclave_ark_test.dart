@@ -1244,7 +1244,7 @@ final _random = Random.secure();
 
 /// The id the enclave opens its connection to a service under.
 ///
-/// Derived the same way `cosigner::service_stream::service_stream_id` derives it, and duplicated
+/// Derived the same way `cosigner::escrow::service_stream_id` derives it, and duplicated
 /// here on purpose: a test that computed it by asking the thing it is testing would prove nothing.
 String _streamIdFor(ark_threshold.Identifier identifier) =>
     'svc-${_hex(identifier.serialize()).toLowerCase().substring(0, 40)}';

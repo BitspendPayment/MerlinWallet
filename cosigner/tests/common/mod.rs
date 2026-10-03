@@ -93,7 +93,9 @@ pub fn dkg_2of2() -> (Vec<KeyPackage>, PublicKeyPackage) {
 
 /// Open the cosigner this process serves, loading whatever its seal already holds.
 pub fn open_cosigner(store: &Arc<Store>, group_key: &str) -> Mutex<Cosigner> {
-    Mutex::new(Cosigner::open(store.clone(), group_key.to_string()).expect("open cosigner"))
+    let detached = std::sync::Arc::new(cosigner::host::Detached);
+    let cosigner = Cosigner::open(store.clone(), group_key.to_string(), detached);
+    Mutex::new(cosigner.expect("open cosigner"))
 }
 
 /// Install a wallet's key material and seal it, as DKG's final round does: the cosigner key
@@ -120,7 +122,7 @@ pub fn seed_policy_with_dealt_share(
 ) {
     let mut actor = cosigner.lock().unwrap();
     actor
-        .install_policy(
+        .install_key(
             group_key.to_string(),
             &kp_cosigner.to_json(),
             &pkp.to_json(),
@@ -170,13 +172,13 @@ pub fn group_sign(
         .serialize()
 }
 
-/// The wallet's half of an in-band round over [messages]: a fresh nonce for each, then a share
+/// The wallet's half of a signing session over [messages]: a fresh nonce for each, then a share
 /// over both commitments. What `answerRound` does in the app.
 pub fn wallet_answers(
     kp_user: &KeyPackage,
     messages: &[Vec<u8>],
     cosigner_commitments: &[cosigner::types::Commitment],
-) -> Vec<cosigner::cosigner::WalletHalf> {
+) -> Vec<cosigner::sign::WalletHalf> {
     use threshold::commitment::SigningPackage;
     use threshold::nonce::{self, SigningCommitments};
     use threshold::point;
@@ -205,7 +207,7 @@ pub fn wallet_answers(
             commitments.insert(kp_user.identifier.clone(), ours.commitments.clone());
             let package = SigningPackage::new(commitments, message.clone());
             let share = signing::sign(&package, &ours, kp_user).expect("wallet share");
-            cosigner::cosigner::WalletHalf {
+            cosigner::sign::WalletHalf {
                 hiding: point::serialize_compressed(&ours.commitments.hiding).to_vec(),
                 binding: point::serialize_compressed(&ours.commitments.binding).to_vec(),
                 share: scalar_to_bytes(&share.s).to_vec(),
@@ -221,7 +223,7 @@ pub fn seed_escrow(
     paired: bool,
 ) {
     let mut c = cosigner.lock().unwrap();
-    c.install_escrow(cosigner::escrow::EscrowSession {
+    c.add_escrow(cosigner::escrow::EscrowSession {
         escrow_key: escrow_key.to_string(),
         key_package_json: "{}".into(),
         public_key_package_json: "{}".into(),
@@ -229,20 +231,21 @@ pub fn seed_escrow(
         context_hex: "22".repeat(16),
         wallet_delta_share_hex: "33".repeat(32),
         created_at: 1_700_000_000,
-        pairing: paired.then(|| cosigner::types::ServicePairing {
-            service_identifier_hex: "44".repeat(32),
-            key_package_json: "{}".into(),
-            public_key_package_json: "{}".into(),
-            service_verifying_share_hex: "55".repeat(33),
-            paired_at: 1_700_000_000,
-            attempt_id_hex: "aa".repeat(16),
-            // Seeded finished: these tests are about the DEAL, and a pending pairing is refused a
-            // deal for reasons of its own — proved in `escrow_session_test.rs`.
-            service_confirmed: true,
-            wallet_confirmed: true,
-        }),
-        terms: None,
-        releases: Default::default(),
+        stage: match paired {
+            false => cosigner::escrow::EscrowStage::Minted,
+            true => cosigner::escrow::EscrowStage::Paired(cosigner::escrow::ServicePairing {
+                service_identifier_hex: "44".repeat(32),
+                key_package_json: "{}".into(),
+                public_key_package_json: "{}".into(),
+                service_verifying_share_hex: "55".repeat(33),
+                paired_at: 1_700_000_000,
+                attempt_id_hex: "aa".repeat(16),
+                // Seeded finished: these tests are about the DEAL, and a pending pairing is refused
+                // a deal for reasons of its own — proved in `escrow_session_test.rs`.
+                service_confirmed: true,
+                wallet_confirmed: true,
+            }),
+        },
     })
     .expect("install escrow");
 }

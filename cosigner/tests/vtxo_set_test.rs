@@ -1,9 +1,10 @@
 //! The owned VTXO set survives boarding and reaches a send.
 //!
-//! There were two sets until recently: one in the seal that `send_open` selected from, and one
-//! loaded from storage that boarding wrote. Nothing bridged them — `set_vtxos` had no callers — so
-//! a freshly boarded VTXO was invisible to a send and the funds could not be spent. These tests
-//! pin the two halves of that: what boarding writes is what a send reads, and it survives a reopen.
+//! There were two sets until recently: one in the seal that `create_send_session` selected from,
+//! and one loaded from storage that boarding wrote. Nothing bridged them — `set_vtxos` had no
+//! callers — so a freshly boarded VTXO was invisible to a send and the funds could not be spent.
+//! These tests pin the two halves of that: what boarding writes is what a send reads, and it
+//! survives a reopen.
 
 mod common;
 
@@ -63,7 +64,8 @@ fn a_boarded_vtxo_is_visible_to_a_send() {
         assert!(c.vtxos().is_empty(), "a fresh wallet owns nothing");
         c.apply_boarding_settle(boarded("aa", 50_000, 144));
 
-        // `vtxos()` is what `send_open` selects from. Before the collapse this stayed empty.
+        // `vtxos()` is what `create_send_session` selects from. Before the collapse this stayed
+        // empty.
         let spendable = c.vtxos();
         assert_eq!(spendable.len(), 1, "the boarded VTXO must be spendable");
         assert_eq!(spendable[0].txid, "aa");

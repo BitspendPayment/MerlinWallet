@@ -8,7 +8,7 @@ mod common;
 
 use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
-use cosigner::cosigner::WalletHalf;
+use cosigner::sign::WalletHalf;
 use cosigner::renew::DelegateRenew;
 use cosigner::session::proto;
 use std::sync::{Arc, Mutex};
@@ -169,7 +169,7 @@ fn reopen_at(
     store: &std::sync::Arc<cosigner::store::Store>,
     group_key: &str,
 ) -> cosigner::Cosigner {
-    cosigner::Cosigner::open_with_host(
+    cosigner::Cosigner::open(
         store.clone(),
         group_key.to_string(),
         std::sync::Arc::new(Accepting),

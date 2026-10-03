@@ -123,7 +123,7 @@ escrow tests — the branch's first end-to-end run since the escrow commits.
   copy now, sliced only when ASCII. Unit test in `cosigner.rs`.
 - [x] **P55-M2** a seal that was present but unreadable opened as a wallet with no key, so a store
   read fault would have let a DKG re-key the tenant over sealed funds. `restore_snapshot` now
-  distinguishes "no seal" from "unreadable seal" and `open_with_host` refuses the latter. Test:
+  distinguishes "no seal" from "unreadable seal" and `Cosigner::open` refuses the latter. Test:
   `seal_test.rs`. (Pre-existing; RC-3 made the seal the only copy of anything.)
 - [x] **P55-M3** the plain-HTTP exception for the pairing contribution was a hostname prefix
   match (`10.attacker.com` passed). `isLocalDevelopmentHost` parses an address: loopback or

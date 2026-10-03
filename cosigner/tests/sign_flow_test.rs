@@ -1,6 +1,6 @@
 //! The 2-of-2 cooperative sign, driven the way the `Sign` stream drives it: the cosigner commits
 //! first, the wallet answers with its commitments and its share together, the cosigner aggregates.
-//! It is the in-band round `Send` and `Renew` run, over one message — the wallet cannot commit
+//! It is the signing session `Send` and `Renew` run, over one message — the wallet cannot commit
 //! first any more, because it holds no share until the stream's first answer brings the half the
 //! cosigner dealt it. The user/client half is simulated host-side.
 //!
@@ -12,6 +12,7 @@
 
 mod common;
 
+use cosigner::sign::SigningSession;
 use threshold::point;
 use threshold::scalar::scalar_from_bytes;
 use threshold::signature::Signature;
@@ -37,21 +38,16 @@ fn sign_session_restores_seal_and_verifies() {
     let cosigner = common::open_cosigner(&store, &group_key);
 
     // Round 1. The round leaves the cosigner with the reply; nothing is parked behind it.
-    let (round, theirs) = cosigner
-        .lock()
-        .unwrap()
-        .sign_in_band_begin(std::slice::from_ref(&message))
-        .expect("begin");
+    let key = cosigner.lock().unwrap().signing_key().expect("a key");
+    let (round, theirs) = SigningSession::begin(key, std::slice::from_ref(&message));
     assert_eq!(theirs.len(), 1, "one message, one commitment");
 
     // The client's round-trip, with no lock held on the cosigner.
     let ours = common::wallet_answers(kp_user, std::slice::from_ref(&message), &theirs);
 
     // Round 2. The round goes back in by value and is consumed.
-    let signature = cosigner
-        .lock()
-        .unwrap()
-        .sign_in_band_finish(round, ours)
+    let signature = round
+        .finish(ours)
         .expect("finish")
         .pop()
         .expect("one signature");
@@ -90,17 +86,11 @@ fn abandoned_ceremony_leaves_no_reusable_nonce() {
     common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
 
     // Open a round and abandon it, as an interrupted stream does.
-    let (_, first) = cosigner
-        .lock()
-        .unwrap()
-        .sign_in_band_begin(std::slice::from_ref(&message))
-        .expect("first open");
+    let key = cosigner.lock().unwrap().signing_key().expect("a key");
+    let (_, first) = SigningSession::begin(key, std::slice::from_ref(&message));
     // Same cosigner, same message: a second round must not reuse the first one's nonce.
-    let (_, second) = cosigner
-        .lock()
-        .unwrap()
-        .sign_in_band_begin(std::slice::from_ref(&message))
-        .expect("second open");
+    let key = cosigner.lock().unwrap().signing_key().expect("a key");
+    let (_, second) = SigningSession::begin(key, std::slice::from_ref(&message));
 
     assert_ne!(first[0].hiding, second[0].hiding, "hiding commitment must not repeat");
     assert_ne!(first[0].binding, second[0].binding, "binding commitment must not repeat");

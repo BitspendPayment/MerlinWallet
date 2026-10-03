@@ -636,7 +636,7 @@ class MpcClient {
   /// early: a commitment the owner can revoke is not one, and [deadline] is the whole of her
   /// control. Nothing in Bitcoin enforces that — both pairings sign the same key — so what holds it
   /// up is the cosigner declining to co-sign with the wrong party at the wrong time, in attested
-  /// code. See `cosigner/src/escrow_session.rs`. One escrow, one deal: the next deal mints the next
+  /// code. See `cosigner/src/escrow.rs`. One escrow, one deal: the next deal mints the next
   /// escrow. `agreed` is the policy rendered as a sentence — what the owner actually agreed to.
   ///
   /// Nothing is escrowed yet: money goes in by an ordinary send to [escrowArkAddress]. Fund it once

@@ -12,7 +12,7 @@ mod common;
 
 use rand::rngs::OsRng;
 
-use cosigner::handlers::pairing;
+use cosigner::escrow::{EscrowSession, EscrowStage, PairingMaterial};
 
 use threshold::dkg;
 use threshold::identifier::Identifier;
@@ -39,6 +39,21 @@ fn escrow() -> Escrow {
     }
 }
 
+/// The cosigner's record of an escrow made of [cosigner]'s share and [pkp], with [wallet] in it —
+/// the key material a pairing reads, and nothing else.
+fn session(cosigner: &KeyPackage, pkp: &PublicKeyPackage, wallet: &Identifier) -> EscrowSession {
+    EscrowSession {
+        escrow_key: hex::encode(pkp.verifying_key.serialize()),
+        key_package_json: cosigner.to_json(),
+        public_key_package_json: pkp.to_json(),
+        wallet_identifier_hex: hex::encode(wallet.serialize()),
+        context_hex: String::new(),
+        wallet_delta_share_hex: String::new(),
+        created_at: 0,
+        stage: EscrowStage::Minted,
+    }
+}
+
 /// The wallet's side: deal onto `{service, cosigner}` and hand over a scalar and a point.
 fn wallet_deals(e: &Escrow, service_id: &Identifier) -> (Vec<u8>, Vec<u8>, k256::Scalar) {
     let dealt = dkg::refresh_to_ids(
@@ -57,18 +72,12 @@ fn wallet_deals(e: &Escrow, service_id: &Identifier) -> (Vec<u8>, Vec<u8>, k256:
     )
 }
 
-fn pair(e: &Escrow, label: &[u8]) -> (Identifier, pairing::PairingMaterial, k256::Scalar) {
+fn pair(e: &Escrow, label: &[u8]) -> (Identifier, PairingMaterial, k256::Scalar) {
     let service_id = Identifier::derive(label).unwrap();
     let (to_cosigner, to_service, a_at_service) = wallet_deals(e, &service_id);
-    let material = pairing::pair_service(
-        &e.cosigner,
-        &e.pkp,
-        &e.wallet.identifier,
-        &service_id,
-        &to_cosigner,
-        &to_service,
-    )
-    .expect("an honest pairing");
+    let material = session(&e.cosigner, &e.pkp, &e.wallet.identifier)
+        .prepare_pairing(&service_id, &to_cosigner, &to_service)
+        .expect("an honest pairing");
     (service_id, material, a_at_service)
 }
 
@@ -156,15 +165,9 @@ fn a_tampered_contribution_to_the_service_is_refused() {
     )))
     .to_vec();
 
-    let err = pairing::pair_service(
-        &e.cosigner,
-        &e.pkp,
-        &e.wallet.identifier,
-        &service_id,
-        &to_cosigner,
-        &lie,
-    )
-    .expect_err("a contribution that does not check out must be refused");
+    let err = session(&e.cosigner, &e.pkp, &e.wallet.identifier)
+        .prepare_pairing(&service_id, &to_cosigner, &lie)
+        .expect_err("a contribution that does not check out must be refused");
     assert!(
         format!("{err:?}").contains("does not check out"),
         "unexpected: {err:?}"
@@ -179,15 +182,9 @@ fn a_service_claiming_an_identifier_already_in_the_escrow_is_refused() {
         ("the wallet's", e.wallet.identifier.clone()),
     ] {
         let (to_cosigner, to_service, _) = wallet_deals(&e, &id);
-        let err = pairing::pair_service(
-            &e.cosigner,
-            &e.pkp,
-            &e.wallet.identifier,
-            &id,
-            &to_cosigner,
-            &to_service,
-        )
-        .expect_err("a service may not claim an identifier the escrow already has");
+        let err = session(&e.cosigner, &e.pkp, &e.wallet.identifier)
+            .prepare_pairing(&id, &to_cosigner, &to_service)
+            .expect_err("a service may not claim an identifier the escrow already has");
         assert!(
             format!("{err:?}").contains("identifier of its own"),
             "{who}: unexpected {err:?}"
@@ -203,7 +200,7 @@ fn two_pairings_have_different_slopes() {
     let (id_a, mat_a, _) = pair(&e, b"service-a");
     let (id_b, mat_b, _) = pair(&e, b"service-b");
 
-    let slope = |mat: &pairing::PairingMaterial, id: &Identifier| {
+    let slope = |mat: &PairingMaterial, id: &Identifier| {
         let pkp = PublicKeyPackage::from_json(&mat.public_key_package_json).unwrap();
         threshold::service_poly::service_poly_commitment(&pkp, id, MIN_SIGNERS).unwrap()
     };
@@ -220,7 +217,7 @@ fn the_sealed_pairing_holds_the_cosigners_half_and_not_the_services() {
     let e = escrow();
     let (service_id, material, a_at_service) = pair(&e, b"service-a");
 
-    let sealed = cosigner::types::ServicePairing {
+    let sealed = cosigner::escrow::ServicePairing {
         service_identifier_hex: material.service_identifier_hex.clone(),
         key_package_json: material.key_package_json.clone(),
         public_key_package_json: material.public_key_package_json.clone(),
@@ -261,15 +258,9 @@ fn a_pairing_against_the_wrong_escrow_is_refused() {
     let service_id = Identifier::derive(b"service-a").unwrap();
     let (to_cosigner, to_service, _) = wallet_deals(&mine, &service_id);
 
-    let err = pairing::pair_service(
-        &mine.cosigner,
-        &theirs.pkp,
-        &mine.wallet.identifier,
-        &service_id,
-        &to_cosigner,
-        &to_service,
-    )
-    .expect_err("a contribution dealt against one escrow must not pair into another");
+    let err = session(&mine.cosigner, &theirs.pkp, &mine.wallet.identifier)
+        .prepare_pairing(&service_id, &to_cosigner, &to_service)
+        .expect_err("a contribution dealt against one escrow must not pair into another");
     // It fails for the right reason: the contribution is checked against the escrow's own verifying
     // shares, so one dealt elsewhere cannot satisfy them.
     assert!(

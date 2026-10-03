@@ -82,13 +82,13 @@ fn open_cosigner(cfg: &config::Config) -> Result<Cosigner, Status> {
     // the guest to set it and the instance refused to start at all.
     //
     // Safe to default because it is *not* the wallet's identity. DKG installs the real group key
-    // into the policy inside the seal (`install_policy` writes `policy.group_key`, not this), so
+    // into the policy inside the seal (`install_key` writes `key.group_key`, not this), so
     // the identity survives and a restart still finds its snapshot under the same bootstrap name.
     // The env var stays for a deployment that runs several wallets over one filesystem.
     let group_key =
         std::env::var("COSIGNER_GROUP_KEY").unwrap_or_else(|_| DEFAULT_GROUP_KEY.to_string());
 
-    Cosigner::open_with_host(store, group_key, host())
+    Cosigner::open(store, group_key, host())
 }
 
 /// The runtime, if we are running inside one.
@@ -180,7 +180,7 @@ mod runtime {
     /// The runtime calls this on its own schedule with no request in flight, so it opens the wallet
     /// itself rather than sharing one — there is no instance kept between a request and a task to
     /// share. When the sealed delegate has come due it runs it against the ASP the image names —
-    /// see `Cosigner::run_task` — and wakes the owner only when it cannot.
+    /// see `Cosigner::run_task_with` — and wakes the owner only when it cannot.
     struct Background;
 
     impl bindings::Guest for Background {
@@ -208,23 +208,23 @@ mod runtime {
         /// as the reply.
         ///
         /// An `Err` has the runtime redeliver the message, so a refusal is NOT an error: it comes
-        /// back as `Ok` carrying a `Refused`. See `cosigner::service_stream`.
+        /// back as `Ok` carrying a `Refused`. See `cosigner::escrow::handle_service_message`.
         ///
         /// The runtime holds this tenant's lock for the whole call, exactly as it does for a
         /// request — so two messages on one connection cannot interleave here, and a release
         /// cannot race another release of the same escrow.
         fn on_message(
             id: String,
-            message_id: String,
+            _message_id: String,
             payload: Vec<u8>,
         ) -> Result<Vec<u8>, String> {
             let run = || {
                 let cfg = cosigner::config::Config::from_environment();
                 let mut wallet = super::open_cosigner(&cfg).map_err(|e| e.to_string())?;
                 let asp = cosigner::asp::rest::AspRest::from_env();
-                wstd::runtime::block_on(wallet.on_service_message_with(
+                wstd::runtime::block_on(cosigner::escrow::handle_service_message(
+                    &mut wallet,
                     &id,
-                    &message_id,
                     &payload,
                     asp,
                     &cosigner::evidence::HttpEvidence,

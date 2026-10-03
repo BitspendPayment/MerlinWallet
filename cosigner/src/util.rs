@@ -5,57 +5,24 @@ use crate::grpc::Status;
 use crate::session::proto;
 use crate::wallet_proto as wp;
 
-impl crate::escrow::EscrowSession {
-    /// This escrow as a caller may see it: the public projection, as of [now]. What `EscrowList`
-    /// returns, and what `Recover` hands a new device so it can rebuild its escrows the way it
-    /// rebuilt the wallet.
-    pub(crate) fn summary(&self, now: i64) -> proto::EscrowSummary {
-        proto::EscrowSummary {
-            escrow_key: self.escrow_key.clone(),
-            wallet_identifier: hex::decode(&self.wallet_identifier_hex).unwrap_or_default(),
-            public_key_package_json: self.public_key_package_json.clone(),
-            created_at: self.created_at,
-            service_identifier: self
-                .pairing
-                .as_ref()
-                .map(|p| p.service_identifier_hex.clone())
-                .unwrap_or_default(),
-            service_ready: self
-                .pairing
-                .as_ref()
-                .is_some_and(|p| p.state() == crate::types::PairingState::Ready),
-            // Reported apart as well as together: they arrive by different routes, at
-            // different moments, and a caller waiting on one wants to know which.
-            service_confirmed: self
-                .pairing
-                .as_ref()
-                .is_some_and(|p| p.service_confirmed),
-            wallet_confirmed: self
-                .pairing
-                .as_ref()
-                .is_some_and(|p| p.wallet_confirmed),
-            session: self.terms.as_ref().map(|t| proto::EscrowSessionSummary {
-                // Whether it can still release: running, and not yet spent.
-                open: self.holds_the_escrow(now),
-                deadline_secs: t.deadline,
-                opened_at: t.opened_at,
-                released_sats: self.released_sats(),
-                policy_description: t.policy.describe(),
-            }),
-            context: hex::decode(&self.context_hex).unwrap_or_default(),
-        }
-    }
+/// Signatures off the wire, each a BIP-340 signature of exactly 64 bytes.
+pub(crate) fn sigs_from_wire(wire: &[Vec<u8>]) -> Result<Vec<[u8; 64]>, String> {
+    wire.iter()
+        .map(|v| {
+            <[u8; 64]>::try_from(v.as_slice()).map_err(|_| "signature must be 64 bytes".to_string())
+        })
+        .collect()
 }
 
-/// The wallet's half of an in-band round, off the wire.
-impl From<proto::WalletRound> for crate::cosigner::WalletHalf {
+/// The wallet's half of a round, off the wire.
+impl From<proto::WalletRound> for crate::sign::WalletHalf {
     fn from(r: proto::WalletRound) -> Self {
         Self { hiding: r.hiding, binding: r.binding, share: r.share }
     }
 }
 
 /// The wallet's half of a single-message round, as `Sign` carries it.
-impl From<proto::SignShare> for crate::cosigner::WalletHalf {
+impl From<proto::SignShare> for crate::sign::WalletHalf {
     fn from(s: proto::SignShare) -> Self {
         Self { hiding: s.hiding_commitment, binding: s.binding_commitment, share: s.signature_share }
     }
@@ -74,8 +41,7 @@ fn identifier_of(commitments: &[crate::types::Commitment]) -> String {
 
 impl proto::SendSighashes {
     /// A send's sighashes with the cosigner's half of round one. Always script-path: the cosigner
-    /// signs untweaked, and in-band signing cannot compensate a tweak — see
-    /// `Cosigner::sign_in_band_begin`.
+    /// signs untweaked, and a round on the stream cannot compensate a tweak — see `crate::sign`.
     pub(crate) fn round(messages_to_sign: Vec<Vec<u8>>, commitments: Vec<crate::types::Commitment>) -> Self {
         Self {
             messages_to_sign,
