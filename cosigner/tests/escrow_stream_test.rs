@@ -14,7 +14,7 @@ mod common;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
@@ -33,20 +33,41 @@ use cosigner::session::proto::escrow_client_msg::Body as ToCosigner;
 use cosigner::session::proto::escrow_server_msg::Body as FromCosigner;
 use threshold::dkg::{self, Round1Package, Round2Package};
 use threshold::identifier::Identifier;
+use threshold::keys::KeyPackage;
 use threshold::{point, random, scalar};
 
 const ORIGIN: &str = "https://service.example";
 
+/// What the payment costs, sent into the escrow out of the wallet's one VTXO.
+const PRICE: u64 = 30_000;
+
 /// The wallet's end of the stream: frames handed over as the test decides them. Empty is `Pending`,
 /// as a connection with nothing in flight is — which is what makes this a conversation rather than
-/// a batch.
+/// a batch — until the wallet ends its side.
 #[derive(Clone, Default)]
-struct Wire(Arc<Mutex<VecDeque<Bytes>>>);
+struct Wire(Arc<Mutex<(VecDeque<Bytes>, bool)>>);
 
 impl Wire {
     fn say(&self, seq: u64, body: ToCosigner) {
         let message = EscrowClientMsg { session_id: "escrow".into(), seq, body: Some(body) };
-        self.0.lock().unwrap().push_back(frame(&message.encode_to_vec()));
+        self.0.lock().unwrap().0.push_back(frame(&message.encode_to_vec()));
+    }
+
+    /// The wallet's side, ended: it has nothing more to say.
+    fn close(&self) {
+        self.0.lock().unwrap().1 = true;
+    }
+
+    /// A message of the `Send` stream that funds the escrow, as `Escrow` carries it.
+    fn fund(&self, seq: u64, body: proto::send_client_msg::Body) {
+        self.say(
+            seq,
+            ToCosigner::Fund(proto::SendClientMsg {
+                session_id: "escrow".into(),
+                seq,
+                body: Some(body),
+            }),
+        );
     }
 }
 
@@ -58,8 +79,10 @@ impl http_body::Body for Wire {
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        match self.0.lock().unwrap().pop_front() {
+        let mut wire = self.0.lock().unwrap();
+        match wire.0.pop_front() {
             Some(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+            None if wire.1 => Poll::Ready(None),
             None => Poll::Pending,
         }
     }
@@ -119,11 +142,35 @@ impl Reply {
     }
 }
 
-/// One approval, one stream: the escrow is minted, its service paired in, and its deal struck — and
-/// what is sealed at the end is exactly that, with nobody's word recorded as anybody else's.
-#[test]
-fn an_escrow_is_minted_paired_and_dealt_on_one_stream() {
-    let Some(store) = common::try_store() else { return };
+/// A wallet that has run the `Escrow` stream as far as its deal — minted, paired, dealt — and is
+/// still on it: the cosigner waits to hear whether the escrow is funded on the same approval.
+struct Dealt {
+    wire: Wire,
+    reply: Reply,
+    store: Arc<cosigner::store::Store>,
+    group_key: String,
+    wallet_kp: KeyPackage,
+    escrow_key: String,
+    attempt: [u8; 16],
+    deadline: i64,
+}
+
+/// The one service this image knows, named once for the whole process: the environment is shared
+/// by every test in it.
+fn the_platform() -> Identifier {
+    static NAMED: Once = Once::new();
+    let service_id = Identifier::derive(b"the platform").unwrap();
+    NAMED.call_once(|| {
+        std::env::set_var(
+            "SERVICE_ORIGINS",
+            format!("{}={ORIGIN}", hex::encode(service_id.serialize())),
+        );
+    });
+    service_id
+}
+
+/// Run the stream as a wallet would, as far as the deal, checking each of the cosigner's answers.
+fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
 
     // A wallet, its runtime, and the one service its image knows.
     let (kps, pkp) = common::dkg_2of2();
@@ -143,9 +190,8 @@ fn an_escrow_is_minted_paired_and_dealt_on_one_stream() {
         &pkp,
         Some(hex::encode(dealt)),
     );
-    let service_id = Identifier::derive(b"the platform").unwrap();
+    let service_id = the_platform();
     let service_hex = hex::encode(service_id.serialize());
-    std::env::set_var("SERVICE_ORIGINS", format!("{service_hex}={ORIGIN}"));
 
     // --- Open: the wallet's dealing of its Δ, the service, and the deal it wants struck ----------
     let mut rng = OsRng;
@@ -238,6 +284,28 @@ fn an_escrow_is_minted_paired_and_dealt_on_one_stream() {
     );
     let FromCosigner::Confirmed(confirmed) = reply.next(4) else { panic!("expected the deal") };
     assert_eq!(confirmed.deadline_secs, deadline);
+
+    Dealt {
+        wire,
+        reply,
+        store,
+        group_key,
+        wallet_kp: wallet_kp.clone(),
+        escrow_key: complete.escrow_key,
+        attempt,
+        deadline,
+    }
+}
+
+/// One approval, one stream: the escrow is minted, its service paired in, and its deal struck — and
+/// what is sealed at the end is exactly that, with nobody's word recorded as anybody else's.
+#[test]
+fn an_escrow_is_minted_paired_and_dealt_on_one_stream() {
+    let Some(store) = common::try_store() else { return };
+    let Dealt { wire, reply, store, group_key, escrow_key, attempt, deadline, .. } = deal(store);
+
+    // A wallet that funds the escrow with a send of its own ends its side here.
+    wire.close();
     assert_eq!(reply.finish(), ("0".to_string(), String::new()), "the stream ends cleanly");
 
     // What was sealed: an escrow committed to the deal it was opened with, its service paired in,
@@ -245,7 +313,7 @@ fn an_escrow_is_minted_paired_and_dealt_on_one_stream() {
     // connection — so the pairing is not usable yet, and must not look it.
     let reopened = common::open_cosigner(&store, &group_key);
     let guard = reopened.lock().unwrap();
-    let escrow = guard.get_escrow_session(&complete.escrow_key).expect("the escrow was sealed");
+    let escrow = guard.get_escrow_session(&escrow_key).expect("the escrow was sealed");
     let EscrowStage::Dealt { pairing, terms, releases } = &escrow.stage else {
         panic!("expected the escrow committed to its deal");
     };
@@ -258,4 +326,124 @@ fn an_escrow_is_minted_paired_and_dealt_on_one_stream() {
 
     drop(guard);
     let _ = store.delete("sealed_state", &group_key);
+}
+
+/// The ASP's terms, as a wallet relays them.
+fn ark_info() -> cosigner::wallet_proto::ArkInfo {
+    cosigner::wallet_proto::ArkInfo {
+        signer_pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+        forfeit_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into(),
+        forfeit_address: "bcrt1qq5rjlmqartxjyh6vnmjrhrqnc58q2hqr5asln0".into(),
+        checkpoint_tapscript: String::new(),
+        network: "regtest".into(),
+        session_duration: 0,
+        unilateral_exit_delay: 512,
+        boarding_exit_delay: 144,
+        vtxo_min_amount: 0,
+        dust: 330,
+    }
+}
+
+/// The send that funds the escrow: the price, out of the one VTXO the wallet holds, paid to
+/// [recipient] — which a funding send must leave empty.
+fn funding_open(recipient: &str) -> proto::send_client_msg::Body {
+    proto::send_client_msg::Body::Open(proto::SendOpen {
+        recipient_ark_address: recipient.into(),
+        amount: PRICE,
+        ark_info: Some(ark_info()),
+        vtxos: vec![proto::VtxoInput {
+            txid: "11".repeat(32),
+            vout: 0,
+            amount_sats: 100_000,
+            exit_delay: 512,
+            expires_at: 0,
+        }],
+        ..Default::default()
+    })
+}
+
+/// A payment on one approval: the escrow minted, paired and dealt, then funded on the same stream —
+/// the money going where the cosigner says, to the escrow it minted, and nowhere the wallet named.
+#[test]
+fn an_escrow_is_funded_on_the_same_approval() {
+    let Some(store) = common::try_store() else { return };
+    let Dealt { wire, mut reply, wallet_kp, escrow_key, .. } = deal(store);
+
+    wire.fund(5, funding_open(""));
+    let FromCosigner::Funding(proto::SendServerMsg {
+        body: Some(proto::send_server_msg::Body::Sighashes(sighashes)),
+        ..
+    }) = reply.next(1)
+    else {
+        panic!("expected the funding send's sighashes");
+    };
+    assert!(
+        sighashes.wallet_dealt_share.is_empty(),
+        "the wallet rebuilt its share on this stream's first round; one stream, one reconstruction"
+    );
+
+    // The wallet's half of the round, with the share it rebuilt for the reshare.
+    let commitments: Vec<cosigner::types::Commitment> = sighashes
+        .cosigner_commitments
+        .iter()
+        .map(|c| cosigner::types::Commitment {
+            identifier_hex: sighashes.cosigner_identifier.clone(),
+            hiding: c.hiding.clone(),
+            binding: c.binding.clone(),
+        })
+        .collect();
+    let halves = common::wallet_answers(&wallet_kp, &sighashes.messages_to_sign, &commitments);
+    wire.fund(
+        6,
+        proto::send_client_msg::Body::Signed(proto::SendSigned {
+            rounds: halves
+                .into_iter()
+                .map(|h| proto::WalletRound {
+                    hiding: h.hiding,
+                    binding: h.binding,
+                    share: h.share,
+                })
+                .collect(),
+        }),
+    );
+
+    // What to submit to the ASP pays the escrow this stream minted, at the address its key gives.
+    let FromCosigner::Funding(proto::SendServerMsg {
+        body: Some(proto::send_server_msg::Body::Submit(submit)),
+        ..
+    }) = reply.next(2)
+    else {
+        panic!("expected the funding send's transaction");
+    };
+    let escrow_xonly = &escrow_key[2..];
+    let address = ark::client::ark_address(
+        escrow_xonly,
+        &ark_info().signer_pubkey,
+        512,
+        ark::client::parse_network("regtest").unwrap(),
+    )
+    .unwrap();
+    let escrow_script = ark::client::address::ark_address_script_pubkey_hex(&address).unwrap();
+    let psbt: bitcoin::Psbt = submit.ark_tx_b64.parse().expect("a PSBT");
+    assert!(
+        psbt.unsigned_tx
+            .output
+            .iter()
+            .any(|o| hex::encode(o.script_pubkey.as_bytes()) == escrow_script
+                && o.value.to_sat() == PRICE),
+        "the price goes to the escrow's own address"
+    );
+}
+
+/// Where a payment's money goes is the cosigner's to derive, never the wallet's to name: a funding
+/// send that names a recipient is refused before anything is built.
+#[test]
+fn a_funding_send_cannot_name_where_the_money_goes() {
+    let Some(store) = common::try_store() else { return };
+    let Dealt { wire, reply, .. } = deal(store);
+
+    wire.fund(5, funding_open("tark1somewhere-else"));
+    let (code, message) = reply.finish();
+    assert_eq!(code, (cosigner::grpc::Code::InvalidArgument as u32).to_string(), "{message}");
+    assert!(message.contains("names no recipient"), "unexpected: {message}");
 }

@@ -67,8 +67,8 @@ class BankSend {
   }
 
   /// How many times the owner is asked to approve a payout, so the app can say so before it
-  /// starts: the escrow's session, and the send that funds it.
-  static const approvals = 2;
+  /// starts: the escrow's session, which sets the escrow up and funds it on the same stream.
+  static const approvals = 1;
 
   /// What an escrow holds right now, from the indexer.
   Future<List<IndexerVtxo>> held(String escrowKeyHex) =>
@@ -121,23 +121,25 @@ class BankSend {
 
     onStep?.call(CommitStep.seal);
     final deadline = DateTime.now().add(Duration(seconds: quote.dealSeconds));
+    // Set up, sealed and funded on one stream and one approval. The escrow is remembered before
+    // the money moves, so whatever the send does, what the escrow holds can be taken back.
     final set = await wallet.setUpEscrow(
       serviceIdentifier: platformId,
       policy: quote.policy,
       deadline: deadline,
       delivery: delivery,
+      fundSats: quote.sats,
+      beforeFunding: (escrowKeyHex) async {
+        await onSealed?.call(escrowKeyHex);
+        onStep?.call(CommitStep.fund);
+      },
     );
-    final escrowKeyHex = set.escrow.escrowKeyHex;
-    await onSealed?.call(escrowKeyHex);
-
-    onStep?.call(CommitStep.fund);
-    final txid = await wallet.sendVtxo(await wallet.escrowArkAddress(escrowKeyHex), quote.sats);
     return Commitment(
-      escrowKeyHex: escrowKeyHex,
+      escrowKeyHex: set.escrow.escrowKeyHex,
       agreed: set.agreed,
       deadline: deadline,
       fundedSats: quote.sats,
-      fundTxid: txid,
+      fundTxid: set.fundTxid!,
     );
   }
 

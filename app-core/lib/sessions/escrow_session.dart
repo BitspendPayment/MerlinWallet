@@ -29,17 +29,19 @@ import 'dart:convert';
 import 'package:fixnum/fixnum.dart';
 import 'package:protocol/cosigner_v1.dart' as cs;
 
+import '../asp/asp_client.dart';
 import '../cosigner/connection.dart';
 import '../passkey/key_derivation.dart';
 import '../passkey/operation_secrets.dart';
 import '../threshold_types.dart' as threshold;
 import 'pairing_session.dart';
+import 'send_session.dart';
 import 'service_delivery.dart';
 
 /// What a completed reshare hands back.
 class EscrowResult {
   EscrowResult(this.keyPackage, this.publicKeyPackage, this.escrowKeyHex,
-      {this.pairing, this.agreed});
+      {this.pairing, this.agreed, this.funded});
 
   /// The wallet's share of `V'` — held for this operation only, never stored.
   final threshold.KeyPackage keyPackage;
@@ -54,7 +56,25 @@ class EscrowResult {
   /// Its deal as the cosigner sealed it, rendered for consent — what the owner agreed to. Null
   /// when no service was paired, and so no deal struck.
   final String? agreed;
+
+  /// The send that funded it on the same stream, when one was asked for.
+  final SendResult? funded;
 }
+
+/// The send that funds the escrow a stream mints, on the same stream and its one approval — see
+/// `MpcClient.setUpEscrow`. What it sends is the wallet's to say; where it goes is the cosigner's
+/// to derive, so there is no recipient here.
+typedef EscrowFunding = ({
+  int amountSats,
+  List<IndexerVtxo> vtxos,
+  ArkInfo info,
+  AspClient asp,
+  Future<List<IndexerVtxo>> Function()? readHeld,
+  String deviceToken,
+  String exitScriptPubkeyHex,
+  String ownerXOnlyHex,
+  Future<void> Function(String escrowKeyHex)? beforeFunding,
+});
 
 /// A service to pair into the escrow a stream mints, what pairing it takes, and the deal it is
 /// paired in for — see `MpcClient.setUpEscrow`.
@@ -87,6 +107,10 @@ class EscrowSession {
   /// strike its deal, and [onMinted] is told of the escrow first — before anything is dealt on it —
   /// so a pairing that fails leaves an escrow the caller knows it holds.
   ///
+  /// With [fund] as well, the stream then funds the escrow: a send's rounds, carried on it, with
+  /// the share the reshare already rebuilt — so a payment costs the owner one approval.
+  /// `fund.beforeFunding` is told the escrow before any money moves to it.
+  ///
   /// The cosigner's identifier is taken from [walletPkp] — the one holder in the wallet key that
   /// is not this wallet — and **not** derived from the dealing it sends back.
   ///
@@ -104,6 +128,7 @@ class EscrowSession {
     required WalletPolynomial delta,
     required List<int> context,
     EscrowPairing? pair,
+    EscrowFunding? fund,
     Future<void> Function(EscrowResult minted)? onMinted,
     int maxSigners = 2,
     int minSigners = 2,
@@ -233,7 +258,38 @@ class EscrowSession {
           agreed = confirmed.confirmed.policyDescription;
         },
       );
-      return EscrowResult(keyPkg, pkp, derived, pairing: pairing, agreed: agreed);
+      if (fund == null) {
+        return EscrowResult(keyPkg, pkp, derived, pairing: pairing, agreed: agreed);
+      }
+
+      // --- Funding it, on this stream ---------------------------------------------------------
+      //
+      // Told first, so a caller can remember the escrow before money is sent to it: whatever the
+      // send then does, what the escrow holds can be taken back.
+      await fund.beforeFunding?.call(derived);
+      final funded =
+          await SendSession(_conn, fund.asp).drive<cs.EscrowClientMsg, cs.EscrowServerMsg>(
+        duplex: duplex,
+        // Its own seq numbers, after the escrow's.
+        carry: (msg) => cs.EscrowClientMsg(sessionId: '', seq: Int64(4) + msg.seq, fund: msg),
+        uncarry: (msg) => msg.hasFunding() ? msg.funding : cs.SendServerMsg(),
+        // The cosigner pays the escrow it minted; naming somewhere else is refused.
+        recipientArkAddress: '',
+        amountSats: fund.amountSats,
+        vtxos: fund.vtxos,
+        info: fund.info,
+        identifier: walletId.serialize(),
+        // The share this stream already rebuilt: the funding's sighashes bring no dealt share.
+        resolve: resolveWallet,
+        groupPubKey: walletPkp,
+        cancel: pair.cancel,
+        readHeld: fund.readHeld,
+        deviceToken: fund.deviceToken,
+        exitScriptPubkeyHex: fund.exitScriptPubkeyHex,
+        ownerXOnlyHex: fund.ownerXOnlyHex,
+      );
+      return EscrowResult(keyPkg, pkp, derived,
+          pairing: pairing, agreed: agreed, funded: funded);
     } finally {
       await duplex.close();
     }

@@ -199,8 +199,8 @@ class _PayoutQuoteScreenState extends State<PayoutQuoteScreen> {
               ]),
               const SizedBox(height: 12),
               Text(
-                "You'll approve ${approvalTimes(BankSend.approvals)} with your passkey: to set up "
-                'an escrow for this payment and seal the deal, then to send it the price.',
+                "You'll approve ${approvalTimes(BankSend.approvals)} with your passkey: that sets "
+                'up an escrow for this payment, seals the deal and sends it the price.',
                 style: GoogleFonts.inter(color: Colors.white54, fontSize: 13),
               ),
               if (!affordable) ...[

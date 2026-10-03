@@ -28,9 +28,9 @@ use wstd::http::{Body, Request, Response};
 
 use crate::cosigner::Cosigner;
 use crate::escrow::EscrowSession;
-use crate::renew::DelegateRenew;
+use crate::renew::{DelegateRenew, DelegateStream};
 use crate::sign::SigningSession;
-use crate::grpc::{self, Duplex, SessionBody, Status};
+use crate::grpc::{self, Duplex, HasBody, SessionBody, Status};
 use crate::wallet_proto as wp;
 
 pub mod proto {
@@ -473,11 +473,52 @@ async fn escrow(
     // Nothing is scheduled for the deadline, and nothing needs to be. A deadline is a fact about
     // the clock that every decision reads out of the seal — see `crate::escrow`.
     duplex.send(proto::EscrowServerMsg {
-        session_id,
+        session_id: session_id.clone(),
         seq: 4,
         body: Some(proto::escrow_server_msg::Body::Confirmed(confirmed)),
     });
-    Ok(())
+
+    // --- Funding it, on this same approval ------------------------------------------------------
+    //
+    // Optional: a wallet that closes now funds the escrow with a send of its own. One that goes on
+    // sends the price here, and the stream does what a `Send` would — except choose where the money
+    // goes. That is not the wallet's to say: it is the escrow this stream minted, at the address
+    // derived from the key this cosigner holds.
+    let Some(next) = duplex.recv().await else { return Ok(()) };
+    let open = match next.into_body().and_then(proto::EscrowServerMsg::uncarry) {
+        Some(proto::send_client_msg::Body::Open(open)) => open,
+        _ => {
+            return Err(Status::invalid_argument(
+                "after the deal only the send that funds the escrow may follow",
+            ))
+        }
+    };
+    if !open.recipient_ark_address.is_empty() || !open.reclaim_escrow.is_empty() {
+        return Err(Status::invalid_argument(
+            "a funding send names no recipient: it pays the escrow this stream minted",
+        ));
+    }
+    let info = open
+        .ark_info
+        .map(ark::client::types::ArkInfo::from)
+        .ok_or_else(|| Status::invalid_argument("the funding send carried no ark_info"))?;
+    let (session, change_exit_delay, sighashes) = {
+        let mut c = lock(&cosigner);
+        let escrow_address = c
+            .get_escrow_session(&escrow_key)
+            .ok_or_else(|| Status::internal("the escrow this stream minted is gone"))?
+            .funding_address(&info)?;
+        let step1 = crate::types::SendVtxoStep1 {
+            recipient_ark_address: escrow_address,
+            amount: open.amount,
+            vtxos: open.vtxos.into_iter().map(Into::into).collect(),
+        };
+        c.create_send_session(step1, &info).map_err(Status::internal)?
+    };
+    // No dealt share: the wallet rebuilt its own on this stream's first round, and one stream is
+    // one reconstruction.
+    drive_send(&cosigner, &duplex, &session_id, session, change_exit_delay, sighashes, vec![])
+        .await
 }
 
 /// DKG as one session.
@@ -726,7 +767,7 @@ async fn send(
     // The caller names its inputs, and the cosigner validates every one against the scriptPubKey it
     // derives from its own owner key before selecting — so naming a VTXO here cannot widen what the
     // wallet owns.
-    let (mut session, change_exit_delay, sighashes) = {
+    let (session, change_exit_delay, sighashes) = {
         let step1 = crate::types::SendVtxoStep1 {
             recipient_ark_address: open.recipient_ark_address.clone(),
             amount: open.amount,
@@ -735,23 +776,42 @@ async fn send(
         lock(&cosigner).create_send_session(step1, &info).map_err(Status::internal)?
     };
 
+    drive_send(&cosigner, &duplex, &session_id, session, change_exit_delay, sighashes, dealt).await
+}
+
+/// A send's rounds, from its sighashes to its change recorded and an optional delegate renewal —
+/// on whichever stream carries them ([`SendStream`]): `Send` itself, or `Escrow` funding the escrow
+/// it has just minted. [dealt] rides the first sighashes: the wallet's dealt share when this is the
+/// stream's first reconstruction of it, empty when the wallet has already rebuilt its share.
+async fn drive_send<S: SendStream>(
+    cosigner: &Arc<Mutex<Cosigner>>,
+    duplex: &Duplex<S::In, S>,
+    session_id: &str,
+    mut session: ark::client::send::SendSession,
+    change_exit_delay: u32,
+    sighashes: Vec<Vec<u8>>,
+    dealt: Vec<u8>,
+) -> Result<(), Status> {
+    let say = |seq, body| {
+        duplex.send(S::carry(proto::SendServerMsg {
+            session_id: session_id.to_string(),
+            seq,
+            body: Some(body),
+        }))
+    };
+
     // Round one of the FROST signature, on this stream. It used to be a nested `Sign` stream per
     // sighash, which deadlocks inside enclave-runtime — see `crate::sign`.
-    let key = lock(&cosigner).signing_key().map_err(Status::internal)?;
+    let key = lock(cosigner).signing_key().map_err(Status::internal)?;
     let (signing, commitments) = SigningSession::begin(key, &sighashes);
 
-    duplex.send(proto::SendServerMsg {
-        session_id: session_id.clone(),
-        seq: 1,
-        body: Some(proto::send_server_msg::Body::Sighashes(proto::SendSighashes {
-            wallet_dealt_share: dealt,
-            ..proto::SendSighashes::round(sighashes, commitments)
-        })),
-    });
-    tracing::info!("Send: returned the dealt share to the wallet's own identifier");
+    say(1, proto::send_server_msg::Body::Sighashes(proto::SendSighashes {
+        wallet_dealt_share: dealt,
+        ..proto::SendSighashes::round(sighashes, commitments)
+    }));
 
     // --- The wallet's half of the round, then what it must submit --------------------------
-    let signed = match duplex.next_body("mid-send").await? {
+    let signed = match next_send(duplex).await? {
         proto::send_client_msg::Body::Signed(s) => s,
         _ => return Err(Status::invalid_argument("expected SendSigned")),
     };
@@ -762,17 +822,13 @@ async fn send(
     let (ark_tx_b64, checkpoint_txs) =
         crate::cosigner::sign_and_prepare(&mut session, &signatures).map_err(Status::internal)?;
 
-    duplex.send(proto::SendServerMsg {
-        session_id: session_id.clone(),
-        seq: 2,
-        body: Some(proto::send_server_msg::Body::Submit(proto::SendSubmit {
-            ark_tx_b64,
-            checkpoint_txs,
-        })),
-    });
+    say(2, proto::send_server_msg::Body::Submit(proto::SendSubmit {
+        ark_tx_b64,
+        checkpoint_txs,
+    }));
 
     // --- What the ASP returned, turned into the finalize call ------------------------------
-    let submitted = match duplex.next_body("mid-send").await? {
+    let submitted = match next_send(duplex).await? {
         proto::send_client_msg::Body::Submitted(s) => s,
         _ => return Err(Status::invalid_argument("expected SendSubmitted")),
     };
@@ -780,41 +836,33 @@ async fn send(
         .finalize_checkpoints(&submitted.signed_checkpoint_txs)
         .map_err(|e| Status::internal(format!("finalize checkpoints: {e}")))?;
 
-    duplex.send(proto::SendServerMsg {
-        session_id: session_id.clone(),
-        seq: 3,
-        body: Some(proto::send_server_msg::Body::Finalize(proto::SendFinalize {
-            ark_txid: submitted.ark_txid.clone(),
-            final_checkpoint_txs,
-        })),
-    });
+    say(3, proto::send_server_msg::Body::Finalize(proto::SendFinalize {
+        ark_txid: submitted.ark_txid.clone(),
+        final_checkpoint_txs,
+    }));
 
     // --- Accepted. Only now is it ours to record -------------------------------------------
-    match duplex.next_body("mid-send").await? {
+    match next_send(duplex).await? {
         proto::send_client_msg::Body::Finalized(_) => {}
         _ => return Err(Status::invalid_argument("expected SendFinalized")),
     }
     {
-        let mut c = lock(&cosigner);
+        let mut c = lock(cosigner);
         c.finalise_send_session(session, change_exit_delay);
         c.seal();
     }
 
-    duplex.send(proto::SendServerMsg {
-        session_id: session_id.clone(),
-        seq: 4,
-        body: Some(proto::send_server_msg::Body::Complete(proto::SendComplete {
-            ark_txid: submitted.ark_txid,
-            change: None,
-        })),
-    });
+    say(4, proto::send_server_msg::Body::Complete(proto::SendComplete {
+        ark_txid: submitted.ark_txid,
+        change: None,
+    }));
 
     // --- Optionally, renew the delegate over what the wallet holds now ---------------------
     //
     // On this stream so it rides the approval — and the passkey seed — the send already had. A
     // caller that closes instead has simply not asked for it.
     if let Some(msg) = duplex.recv().await {
-        let request = match msg.body {
+        let request = match msg.into_body().and_then(S::uncarry) {
             Some(proto::send_client_msg::Body::RenewDelegate(r)) => r,
             _ => {
                 return Err(Status::invalid_argument(
@@ -822,9 +870,75 @@ async fn send(
                 ))
             }
         };
-        DelegateRenew::run(&cosigner, &duplex, request, &session_id, 5, vec![]).await?;
+        DelegateRenew::run(cosigner, duplex, request, session_id, 5, vec![]).await?;
     }
     Ok(())
+}
+
+/// The next step of a send, out of whatever its stream carries.
+async fn next_send<S: SendStream>(
+    duplex: &Duplex<S::In, S>,
+) -> Result<proto::send_client_msg::Body, Status> {
+    S::uncarry(duplex.next_body("mid-send").await?)
+        .ok_or_else(|| Status::invalid_argument("expected the send's next step"))
+}
+
+/// A stream a send's rounds can ride, and how it carries a `Send` stream's messages: as they are,
+/// or inside its own. Every one that does also carries the delegate renewal that may follow.
+pub(crate) trait SendStream: DelegateStream {
+    fn carry(msg: proto::SendServerMsg) -> Self;
+
+    /// The `Send` stream's message in [body], or None if [body] is something else.
+    fn uncarry(body: <Self::In as HasBody>::Body) -> Option<proto::send_client_msg::Body>;
+}
+
+impl SendStream for proto::SendServerMsg {
+    fn carry(msg: proto::SendServerMsg) -> Self {
+        msg
+    }
+
+    fn uncarry(body: proto::send_client_msg::Body) -> Option<proto::send_client_msg::Body> {
+        Some(body)
+    }
+}
+
+/// `Escrow`, funding the escrow it minted: a `Send` stream's messages, inside its own.
+impl SendStream for proto::EscrowServerMsg {
+    fn carry(msg: proto::SendServerMsg) -> Self {
+        Self {
+            session_id: msg.session_id.clone(),
+            seq: msg.seq,
+            body: Some(proto::escrow_server_msg::Body::Funding(msg)),
+        }
+    }
+
+    fn uncarry(body: proto::escrow_client_msg::Body) -> Option<proto::send_client_msg::Body> {
+        match body {
+            proto::escrow_client_msg::Body::Fund(msg) => msg.body,
+            _ => None,
+        }
+    }
+}
+
+impl DelegateStream for proto::EscrowServerMsg {
+    type In = proto::EscrowClientMsg;
+
+    fn sighashes(
+        session_id: &str,
+        seq: u64,
+        to_sign: crate::renew::ToSign,
+        wallet_dealt_share: Vec<u8>,
+    ) -> Self {
+        Self::carry(proto::SendServerMsg::sighashes(session_id, seq, to_sign, wallet_dealt_share))
+    }
+
+    fn signed(body: proto::escrow_client_msg::Body) -> Option<Vec<proto::WalletRound>> {
+        Self::uncarry(body).and_then(proto::SendServerMsg::signed)
+    }
+
+    fn renewed(session_id: &str, seq: u64, renewed: proto::DelegateRenewed) -> Self {
+        Self::carry(proto::SendServerMsg::renewed(session_id, seq, renewed))
+    }
 }
 
 /// Renewing the VTXOs held, with the caller driving the ASP round.

@@ -190,7 +190,7 @@ class _PayoutProgressScreenState extends State<PayoutProgressScreen> {
                   ? p.failure ?? 'It did not go through.'
                   : switch (s) {
                       'policy' => 'That it holds the platform to what you agreed',
-                      'seal' => 'Approve twice with your passkey',
+                      'seal' => 'Approve once with your passkey',
                       'fund' => p.note ?? 'It checks it will be repaid, then pays',
                       'pay' => p.gridStatus == null
                           ? 'Waiting for the money to arrive'

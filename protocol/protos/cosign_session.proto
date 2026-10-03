@@ -716,7 +716,7 @@ message DkgComplete {
 //
 // A reshare between the wallet and this cosigner, producing a key only they hold. Both deal a fresh
 // non-zero delta under the identifiers they already have, both finalize, and neither side's wallet
-// share changes. See `cosigner/src/handlers/escrow.rs`.
+// share changes. See `cosigner/src/escrow.rs`.
 
 message EscrowClientMsg {
   string session_id = 1;
@@ -728,6 +728,12 @@ message EscrowClientMsg {
     // this same approval — the wallet's dealing, then word that its own half was delivered.
     PairServiceDeal deal = 5;
     PairServiceConfirmRequest delivered = 6;
+    // After the deal, optionally: the send that funds the escrow, on this same approval. A `Send`
+    // stream's messages, carried as they are, and the rounds are a send's. Its open names no
+    // recipient: what it funds is the escrow this stream minted, whose address the cosigner derives
+    // from the key it holds — so a payment's money cannot be pointed anywhere else. No dealt share
+    // rides its sighashes: the wallet rebuilt its share on this stream's first round.
+    SendClientMsg fund = 7;
   }
 }
 
@@ -778,6 +784,8 @@ message EscrowServerMsg {
     // pending, then the wallet's confirmation taken.
     PairServiceDone paired = 5;
     PairServiceConfirmResponse confirmed = 6;
+    // The funding send's answers, as a `Send` stream gives them — see `fund`.
+    SendServerMsg funding = 7;
   }
 }
 

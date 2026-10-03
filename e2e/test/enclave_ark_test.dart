@@ -1026,7 +1026,7 @@ void main() {
 
     /// An escrow is set up with its deal on ONE approval — minted, paired, committed — and funded
     /// by an ordinary send to its address, on one more.
-    test('an escrow is set up with its deal on one approval and funded by a plain send', () async {
+    test('an escrow is set up, dealt and funded on one approval', () async {
       final grace = await wallet('fund_grace');
       try {
         await grace.client.doDkg();
@@ -1039,16 +1039,25 @@ void main() {
                 .toList()
                 .totalSats;
 
-        var before = passkey.counter;
-        final set = await grace.client.setUpEscrow(
-          serviceIdentifier: serviceIdentifier,
-          policy: const {'op': 'always'},
-          deadline: deadline,
-          delivery: delivery,
+        final before = passkey.counter;
+        String? toldBeforeFunding;
+        final set = await whileMining(
+          btc,
+          () => grace.client.setUpEscrow(
+            serviceIdentifier: serviceIdentifier,
+            policy: const {'op': 'always'},
+            deadline: deadline,
+            delivery: delivery,
+            fundSats: 20000,
+            beforeFunding: (escrowKeyHex) async => toldBeforeFunding = escrowKeyHex,
+          ),
         );
-        expect(passkey.counter - before, 1, reason: 'the escrow and its deal are one approval');
+        expect(passkey.counter - before, 1,
+            reason: 'the escrow, its deal and its funding are one approval');
         expect(set.agreed, isNotEmpty, reason: 'the owner is told what she agreed to');
         final key = set.escrow.escrowKeyHex;
+        expect(toldBeforeFunding, key, reason: 'the escrow is known before any money moves to it');
+        expect(set.fundTxid, isNotEmpty);
         expect(await readyWithin(grace, key), 'ready');
 
         final row = (await grace.client.escrowStatus())
@@ -1056,10 +1065,7 @@ void main() {
         expect(row.session.open, isTrue, reason: 'the escrow is committed to the deal');
         expect(row.session.deadlineSecs.toInt(), deadline.millisecondsSinceEpoch ~/ 1000);
 
-        before = passkey.counter;
-        final address = await grace.client.escrowArkAddress(key);
-        await whileMining(btc, () => grace.client.sendVtxo(address, 20000));
-        expect(passkey.counter - before, 1, reason: 'funding it is a send like any other');
+        // The price went to the escrow the cosigner minted, at the address its key gives.
         await eventually(
             'the escrow to hold what was sent', () => heldBy(key), (int s) => s == 20000);
       } finally {

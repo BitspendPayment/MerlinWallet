@@ -3,8 +3,8 @@ import 'package:test/test.dart';
 
 void main() {
   test('the owner is told how many approvals a send will take', () {
-    // Setting the payout's escrow up is one stream, and funding it is another.
-    expect(BankSend.approvals, 2);
+    // One stream sets the payout's escrow up and funds it, on one approval.
+    expect(BankSend.approvals, 1);
   });
 
   test('a deal tag is 16 random bytes, and never the same twice', () {

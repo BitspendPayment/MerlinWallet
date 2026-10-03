@@ -674,38 +674,57 @@ class MpcClient {
   /// Returns once the service has both halves and this wallet has confirmed. The pairing is usable
   /// a moment later, when the service's own confirmation reaches the cosigner — it cannot while
   /// this stream holds the tenant.
-  Future<({EscrowPublicState escrow, PairingResult pairing, String agreed})> setUpEscrow({
+  ///
+  /// With [fundSats], the escrow is funded on the same stream and the same approval: the price
+  /// sent out of what the wallet holds, to the escrow the cosigner minted and nowhere else. A
+  /// payment then costs the owner one fingerprint. [beforeFunding] is told the escrow before any
+  /// money moves to it, so a caller remembers it whatever the send does; `fundTxid` is the send's.
+  Future<({EscrowPublicState escrow, PairingResult pairing, String agreed, String? fundTxid})>
+      setUpEscrow({
     required threshold.Identifier serviceIdentifier,
     required Map<String, dynamic> policy,
     required DateTime deadline,
     DeliverToService? delivery,
+    int? fundSats,
+    Future<void> Function(String escrowKeyHex)? beforeFunding,
   }) async {
     final set = await _mintEscrow(
       pairWith: (service: serviceIdentifier, policy: policy, deadline: deadline),
       delivery: delivery,
+      fund: fundSats == null ? null : (sats: fundSats, beforeFunding: beforeFunding),
     );
-    return (escrow: set.escrow, pairing: set.pairing!, agreed: set.agreed!);
+    return (
+      escrow: set.escrow,
+      pairing: set.pairing!,
+      agreed: set.agreed!,
+      fundTxid: set.fundTxid,
+    );
   }
 
-  Future<({EscrowPublicState escrow, PairingResult? pairing, String? agreed})> _mintEscrow({
+  Future<({EscrowPublicState escrow, PairingResult? pairing, String? agreed, String? fundTxid})>
+      _mintEscrow({
     ({
       threshold.Identifier service,
       Map<String, dynamic> policy,
       DateTime deadline,
     })? pairWith,
     DeliverToService? delivery,
+    ({int sats, Future<void> Function(String escrowKeyHex)? beforeFunding})? fund,
   }) async {
     final context = _random16();
     // Both drawn before the approval: the operation reads the passkey once, before the escrow key
     // exists, so the slope is derived under the escrow's context — see `pairingSlope`.
     final attempt = pairWith == null ? null : _random16();
-    return _withOperation<void,
-        ({EscrowPublicState escrow, PairingResult? pairing, String? agreed})>(
+    return _withOperation<({ArkInfo info, List<IndexerVtxo> vtxos})?,
+        ({EscrowPublicState escrow, PairingResult? pairing, String? agreed, String? fundTxid})>(
       'Escrow',
       escrowContext: context,
       pairingContext: attempt == null ? null : Uint8List.fromList([...context, ...attempt]),
-      prepare: _nothingToPrepare,
-      run: (operation, _) async {
+      // A funding send reads what it spends and the ASP's terms first — slow, and secret-free, so
+      // before the fingerprint, as any send's are.
+      prepare: () async =>
+          fund == null ? null : (info: await _asp.getInfo(), vtxos: await listVtxos()),
+      run: (operation, prepared) async {
         final wallet = _wallet!;
         EscrowPublicState? escrow;
         final result = await EscrowSession(_conn).run(
@@ -725,6 +744,19 @@ class MpcClient {
                   policy: pairWith.policy,
                   deadline: pairWith.deadline,
                 ),
+          fund: fund == null
+              ? null
+              : (
+                  amountSats: fund.sats,
+                  vtxos: prepared!.vtxos,
+                  info: prepared.info,
+                  asp: _asp,
+                  readHeld: listVtxos,
+                  deviceToken: _deviceToken ?? '',
+                  exitScriptPubkeyHex: exitScriptPubkeyHex,
+                  ownerXOnlyHex: _ownerXOnly,
+                  beforeFunding: fund.beforeFunding,
+                ),
           onMinted: (minted) async {
             // The share lives in the operation, so it is let go with it — never in this frame.
             operation.holdEscrowKeyPackage(minted.keyPackage);
@@ -743,7 +775,18 @@ class MpcClient {
           },
         );
         _stillRunning(operation);
-        return (escrow: escrow!, pairing: result.pairing, agreed: result.agreed);
+        if (fund != null) {
+          _deviceTokenCarried(result.funded?.delegate?.deviceEnrolled ?? false);
+          // A send spends what the old delegate covered, so the cosigner dropped it: the delegate
+          // now is whatever this one renewed, or none.
+          await _recordDelegate(result.funded?.delegate);
+        }
+        return (
+          escrow: escrow!,
+          pairing: result.pairing,
+          agreed: result.agreed,
+          fundTxid: result.funded?.arkTxid,
+        );
       },
     );
   }

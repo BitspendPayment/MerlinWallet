@@ -2371,6 +2371,22 @@ impl EscrowSession {
             .collect()
     }
 
+    /// Where money for this escrow goes: its key's Ark address under the ASP's terms, the one the
+    /// wallet and its service compute for it too. Derived here from the key this cosigner holds, so
+    /// a send that funds the escrow cannot be pointed anywhere else.
+    pub(crate) fn funding_address(&self, info: &ArkInfo) -> Result<String, Status> {
+        let network = ark::client::parse_network(&info.network).map_err(|e| {
+            Status::invalid_argument(format!("the ASP names a network we do not know: {e}"))
+        })?;
+        ark::client::ark_address(
+            &x_only(&self.escrow_key),
+            &info.signer_pubkey,
+            info.unilateral_exit_delay as u32,
+            network,
+        )
+        .map_err(|e| Status::internal(format!("deriving this escrow's address: {e}")))
+    }
+
     /// Build the reclaim of what this escrow holds, to [to_ark_address], or say why there is not
     /// one to build.
     pub fn prepare_reclaim(
