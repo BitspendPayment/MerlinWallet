@@ -1,7 +1,7 @@
 /// The wallet's half of a FROST signing round, independent of how it is carried.
 ///
 /// These were inline in `MpcClient.signWithContext`, which was fine while signing was the only
-/// thing that signed. It is not: a send and a settle both pause for the wallet to sign sighashes
+/// thing that signed. It is not: a send and a renewal both pause for the wallet to sign sighashes
 /// the cosigner hands back, and each did it by calling the whole of `signWithContext` again. Here
 /// the three steps are separate so a driver can run round 1, wait for whatever it is waiting for,
 /// and run round 2.

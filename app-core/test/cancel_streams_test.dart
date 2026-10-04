@@ -14,10 +14,8 @@ void main() {
       conn.openSign(),
       conn.openDkg(),
       conn.openSend(),
-      conn.openSettle(),
+      conn.openRenew(),
       conn.openEscrow(),
-      conn.openPairService(),
-      conn.openEscrowReclaim(),
     ];
     expect(conn.streamsInFlight, opened.length);
     await conn.cancelOpenStreams();

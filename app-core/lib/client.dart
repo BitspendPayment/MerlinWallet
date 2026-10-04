@@ -16,7 +16,7 @@ import 'package:app_core/sessions/pairing_session.dart';
 import 'package:app_core/sessions/reclaim_session.dart';
 import 'package:app_core/sessions/service_delivery.dart';
 import 'package:app_core/sessions/send_session.dart';
-import 'package:app_core/sessions/settle_session.dart';
+import 'package:app_core/sessions/renew_session.dart';
 import 'package:app_core/sessions/sign_session.dart';
 import 'package:app_core/sessions/delegate.dart';
 import 'package:app_core/sessions/exit_plan.dart' show ExitTx;
@@ -31,7 +31,6 @@ import 'package:app_core/threshold/threshold.dart' as threshold;
 // `ArkInfo` is hidden: the proto one is the wire shape, and `asp/ark_info.dart` has the value type
 // the wallet actually passes around. `SendSession.arkInfoToProto` converts at the boundary.
 import 'package:protocol/protocol.dart' hide ArkInfo;
-import 'package:fixnum/fixnum.dart';
 import 'package:hive/hive.dart';
 import 'package:synchronized/synchronized.dart';
 import 'dart:io';
@@ -248,7 +247,7 @@ class MpcClient {
   /// The way out of an [IncompatibleWalletStateException], and the only one: there is no
   /// migration. **It deletes no key** — none is stored — so a wallet with a passkey is restored
   /// afterwards with [recover]. What does not come back is what only this device had: the exit
-  /// address, and the pre-signed exits, until the next seal reissues them.
+  /// address, and the pre-signed exits, until the next delegate renewal reissues them.
   Future<void> resetLocalState() async {
     await _store.destroy();
     _userId = null;
@@ -263,7 +262,7 @@ class MpcClient {
   /// One at a time. See [_withOperation].
   final Lock _operations = Lock();
 
-  /// Whether an operation that holds the wallet's secrets is running — a settle can be minutes. A
+  /// Whether an operation that holds the wallet's secrets is running — a renewal can be minutes. A
   /// second one started now waits its turn, and is approved only once it has it.
   bool get operationInProgress => _operations.locked;
 
@@ -290,12 +289,20 @@ class MpcClient {
   ///     approval nothing used.
   ///
   /// The whole of it is cancellable, from the first read to the last round — see
-  /// [cancelOperation]. That matters most where it is least obvious: a settle spends minutes
+  /// [cancelOperation]. That matters most where it is least obvious: a renewal spends minutes
   /// waiting on the ASP with the share already rebuilt, and an ASP that went quiet would otherwise
   /// hold the share in memory and this lock against every later operation, indefinitely.
   ///
   /// [forWallet] is false for the two operations that have no wallet to check the passkey
   /// against yet: DKG, which makes one, and recovery, which finds one.
+  ///
+  /// [onApproved] is told once step 3 is done — the passkey given, and shown to be this wallet's —
+  /// and before [run] begins. It is how a caller stops waiting on the owner while the operation
+  /// goes on: an entry to the app unlocks on the fingerprint, not minutes later when a renewal's
+  /// round ends. It is told nothing else; no secret leaves the operation.
+  ///
+  /// [local] asks for the gesture without approving any call: the passkey asserts for nobody, and
+  /// the operation can open no stream. See [verifyPasskey].
   Future<T> _withOperation<P, T>(
     String method, {
     required Future<P> Function() prepare,
@@ -304,6 +311,8 @@ class MpcClient {
     WalletPublicState? escrow,
     Uint8List? escrowContext,
     Uint8List? pairingContext,
+    void Function()? onApproved,
+    bool local = false,
   }) {
     return _operations.synchronized(() async {
       // For this turn only: a cancel is of the operation running, never of one still in line.
@@ -317,7 +326,9 @@ class MpcClient {
             forWallet: forWallet,
             escrow: escrow,
             escrowContext: escrowContext,
-            pairingContext: pairingContext));
+            pairingContext: pairingContext,
+            onApproved: onApproved,
+            local: local));
       } finally {
         // Here rather than in [_runOperation], and that is the point: a cancel ends this frame
         // at once, while the work it was racing may take a moment to unwind — or, parked on a
@@ -346,6 +357,8 @@ class MpcClient {
     WalletPublicState? escrow,
     Uint8List? escrowContext,
     Uint8List? pairingContext,
+    void Function()? onApproved,
+    required bool local,
   }) async {
     final source = _seedSource;
     if (source == null) {
@@ -365,7 +378,7 @@ class MpcClient {
     final stale = _promptInFlight;
     if (stale != null) await cancel.guard(stale);
 
-    final taking = _takeSeed(source, method, cancel);
+    final taking = _takeSeed(source, method, cancel, local: local);
     // Everything [_takeSeed] does, cleanup included, and never an error: it is waited on by
     // whoever comes next, who has no interest in how it went.
     final settled = taking.then<void>((_) {}, onError: (_) {});
@@ -391,6 +404,9 @@ class MpcClient {
     // Disposed by [_withOperation] when the turn ends, however it ends.
     _operation = operation;
     debugOnOperation?.call(operation);
+    // Approved, and by this wallet's passkey: `begin` refused any other, and a cancel did not
+    // arrive first. Told now, before the work, so a caller can stop waiting on the owner.
+    onApproved?.call();
     return run(operation, prepared);
   }
 
@@ -413,10 +429,14 @@ class MpcClient {
   /// they had already cancelled. It is dropped whether the seed arrived or the passkey failed
   /// after approving. It cannot take a newer operation's approval with it: whoever is next waits
   /// for this to finish ([_promptInFlight]) before asking for its own.
-  Future<Uint8List> _takeSeed(SeedSource source, String method, CancelSignal cancel) async {
+  ///
+  /// [local] approves no call: the gesture asserts for nobody, so the source asks for the seed by
+  /// itself (`SeedSource.seedDuring`).
+  Future<Uint8List> _takeSeed(SeedSource source, String method, CancelSignal cancel,
+      {bool local = false}) async {
     final Uint8List seed;
     try {
-      seed = await source.seedDuring(() => _conn.approveAhead(method));
+      seed = await source.seedDuring(local ? () async {} : () => _conn.approveAhead(method));
     } catch (_) {
       if (cancel.isCancelled) _conn.discardApproval(method);
       rethrow;
@@ -447,7 +467,7 @@ class MpcClient {
   ///
   ///  * **The cosigner.** Its streams are ended, so a driver parked on the cosigner's next message
   ///    is told the stream closed. [close] alone does not do this — it is graceful, and waits.
-  ///  * **Everybody else.** A settle spends most of its life waiting on the ASP — the batch
+  ///  * **Everybody else.** A renewal spends most of its life waiting on the ASP — the batch
   ///    schedule, the event stream — and a send on `SubmitTx`; closing the cosigner interrupts
   ///    none of it. Those waits go through the operation's `CancelSignal`, so they end here too.
   ///    Without that an ASP that went quiet would keep the share in memory, and the lock against
@@ -455,9 +475,10 @@ class MpcClient {
   ///
   /// Operations still waiting their turn are untouched: they hold nothing yet, and run next.
   ///
-  /// **What cancelling a settle costs is the ASP's business, not this method's.** A round abandoned
-  /// after the intent is registered is a round the ASP was counting on; arkd may hold that against
-  /// the wallet. This is for an owner who has decided to stop, not something to call on a timer.
+  /// **What cancelling a renewal costs is the ASP's business, not this method's.** A round
+  /// abandoned after the intent is registered is a round the ASP was counting on; arkd may hold
+  /// that against the wallet. This is for an owner who has decided to stop, not something to call
+  /// on a timer.
   Future<void> cancelOperation() async {
     _cancel?.cancel();
     await _conn.cancelOpenStreams();
@@ -624,37 +645,86 @@ class MpcClient {
   /// One approval, which is also where the seed comes from.
   Future<EscrowPublicState> createEscrow() async => (await _mintEscrow()).escrow;
 
-  /// Mint an escrow and pair [serviceIdentifier] into it, on ONE approval — what [createEscrow]
-  /// and then [pairService] do, on one stream.
+  /// Mint an escrow, pair [serviceIdentifier] into it and commit it to a deal, on ONE approval.
+  ///
+  /// Pairing is a second 2-of-2 over the same key: afterwards `{service, cosigner}` can sign the
+  /// escrow as well as `{wallet, cosigner}`. The wallet and the service share no pairing, so they
+  /// cannot sign together; the cosigner is in both, which is what makes its policy the thing an
+  /// escrow rests on.
+  ///
+  /// The deal: until [deadline] the service may release from the escrow, judged against [policy],
+  /// and this wallet may **not** take it back; afterwards those swap. There is no way to end it
+  /// early: a commitment the owner can revoke is not one, and [deadline] is the whole of her
+  /// control. Nothing in Bitcoin enforces that — both pairings sign the same key — so what holds it
+  /// up is the cosigner declining to co-sign with the wrong party at the wrong time, in attested
+  /// code. See `cosigner/src/escrow.rs`. One escrow, one deal: the next deal mints the next
+  /// escrow. `agreed` is the policy rendered as a sentence — what the owner actually agreed to.
+  ///
+  /// Without [fundSats] nothing is escrowed yet: money goes in by an ordinary send to
+  /// [escrowArkAddress]. Either way the service can release nothing until its pairing is usable.
+  ///
+  /// [serviceIdentifier] names a service the **image** knows. The wallet never names a URL: the
+  /// cosigner resolves one from its measured image, delivers its own half there, and returns the
+  /// origin so this wallet sends its half to the same place. A service this enclave was not built
+  /// to reach is refused before anything is minted.
   ///
   /// The escrow is saved the moment it exists, before anything is dealt on it, so a pairing that
-  /// fails leaves an escrow this wallet knows it holds; pairing it again is [pairService].
+  /// fails leaves an escrow this wallet knows it holds — unpaired, and set up anew next time.
   ///
   /// Returns once the service has both halves and this wallet has confirmed. The pairing is usable
   /// a moment later, when the service's own confirmation reaches the cosigner — it cannot while
-  /// this stream holds the tenant. See [pairService].
-  Future<({EscrowPublicState escrow, PairingResult pairing})> setUpEscrow({
+  /// this stream holds the tenant.
+  ///
+  /// With [fundSats], the escrow is funded on the same stream and the same approval: the price
+  /// sent out of what the wallet holds, to the escrow the cosigner minted and nowhere else. A
+  /// payment then costs the owner one fingerprint. [beforeFunding] is told the escrow before any
+  /// money moves to it, so a caller remembers it whatever the send does; `fundTxid` is the send's.
+  Future<({EscrowPublicState escrow, PairingResult pairing, String agreed, String? fundTxid})>
+      setUpEscrow({
     required threshold.Identifier serviceIdentifier,
+    required Map<String, dynamic> policy,
+    required DateTime deadline,
     DeliverToService? delivery,
+    int? fundSats,
+    Future<void> Function(String escrowKeyHex)? beforeFunding,
   }) async {
-    final set = await _mintEscrow(pairWith: serviceIdentifier, delivery: delivery);
-    return (escrow: set.escrow, pairing: set.pairing!);
+    final set = await _mintEscrow(
+      pairWith: (service: serviceIdentifier, policy: policy, deadline: deadline),
+      delivery: delivery,
+      fund: fundSats == null ? null : (sats: fundSats, beforeFunding: beforeFunding),
+    );
+    return (
+      escrow: set.escrow,
+      pairing: set.pairing!,
+      agreed: set.agreed!,
+      fundTxid: set.fundTxid,
+    );
   }
 
-  Future<({EscrowPublicState escrow, PairingResult? pairing})> _mintEscrow({
-    threshold.Identifier? pairWith,
+  Future<({EscrowPublicState escrow, PairingResult? pairing, String? agreed, String? fundTxid})>
+      _mintEscrow({
+    ({
+      threshold.Identifier service,
+      Map<String, dynamic> policy,
+      DateTime deadline,
+    })? pairWith,
     DeliverToService? delivery,
+    ({int sats, Future<void> Function(String escrowKeyHex)? beforeFunding})? fund,
   }) async {
     final context = _random16();
     // Both drawn before the approval: the operation reads the passkey once, before the escrow key
     // exists, so the slope is derived under the escrow's context — see `pairingSlope`.
     final attempt = pairWith == null ? null : _random16();
-    return _withOperation<void, ({EscrowPublicState escrow, PairingResult? pairing})>(
+    return _withOperation<({ArkInfo info, List<IndexerVtxo> vtxos})?,
+        ({EscrowPublicState escrow, PairingResult? pairing, String? agreed, String? fundTxid})>(
       'Escrow',
       escrowContext: context,
       pairingContext: attempt == null ? null : Uint8List.fromList([...context, ...attempt]),
-      prepare: _nothingToPrepare,
-      run: (operation, _) async {
+      // A funding send reads what it spends and the ASP's terms first — slow, and secret-free, so
+      // before the fingerprint, as any send's are.
+      prepare: () async =>
+          fund == null ? null : (info: await _asp.getInfo(), vtxos: await listVtxos()),
+      run: (operation, prepared) async {
         final wallet = _wallet!;
         EscrowPublicState? escrow;
         final result = await EscrowSession(_conn).run(
@@ -666,11 +736,26 @@ class MpcClient {
           pair: pairWith == null
               ? null
               : (
-                  service: pairWith,
+                  service: pairWith.service,
                   attemptId: attempt!,
                   slope: operation.takePairingSlope(),
                   delivery: delivery ?? HttpServiceDelivery(),
                   cancel: operation.cancel,
+                  policy: pairWith.policy,
+                  deadline: pairWith.deadline,
+                ),
+          fund: fund == null
+              ? null
+              : (
+                  amountSats: fund.sats,
+                  vtxos: prepared!.vtxos,
+                  info: prepared.info,
+                  asp: _asp,
+                  readHeld: listVtxos,
+                  deviceToken: _deviceToken ?? '',
+                  exitScriptPubkeyHex: exitScriptPubkeyHex,
+                  ownerXOnlyHex: _ownerXOnly,
+                  beforeFunding: fund.beforeFunding,
                 ),
           onMinted: (minted) async {
             // The share lives in the operation, so it is let go with it — never in this frame.
@@ -690,82 +775,24 @@ class MpcClient {
           },
         );
         _stillRunning(operation);
-        return (escrow: escrow!, pairing: result.pairing);
+        if (fund != null) {
+          _deviceTokenCarried(result.funded?.delegate?.deviceEnrolled ?? false);
+          // A send spends what the old delegate covered, so the cosigner dropped it: the delegate
+          // now is whatever this one renewed, or none.
+          await _recordDelegate(result.funded?.delegate);
+        }
+        return (
+          escrow: escrow!,
+          pairing: result.pairing,
+          agreed: result.agreed,
+          fundTxid: result.funded?.arkTxid,
+        );
       },
     );
   }
 
   static Uint8List _random16() =>
       Uint8List.fromList(List<int>.generate(16, (_) => _secureRandom.nextInt(256)));
-
-  /// Pair a service into an escrow: a second 2-of-2 over the same key.
-  ///
-  /// Afterwards `{service, cosigner}` can sign the escrow as well as `{wallet, cosigner}` — and the
-  /// escrow key does not move, so money already in it stays reachable both ways. The wallet and the
-  /// service share no pairing, so they cannot sign together; the cosigner is in both, which is what
-  /// makes its policy the thing an escrow rests on.
-  ///
-  /// [serviceIdentifier] names a service the **image** knows. The wallet never names a URL: the
-  /// cosigner resolves one from its measured image, delivers its own half there, and returns the
-  /// origin so this wallet sends its half to the same place. A service this enclave was not built
-  /// to reach is refused before anything is dealt.
-  ///
-  /// **Not usable until the service says so.** Two halves travel by two routes, and a service
-  /// holding one of them can sign nothing — so the cosigner seals the pairing `pending` and marks
-  /// it usable only once this wallet has delivered its own half and the service has checked the
-  /// share they sum to.
-  ///
-  /// [attemptId] resumes a pairing that got as far as the cosigner's delivery and no further. The
-  /// wallet's contribution is derived from the attempt, so naming the same one reproduces the same
-  /// contribution instead of dealing a second, incompatible one. Omit it to start fresh.
-  ///
-  /// One approval, which is also where the seed comes from.
-  Future<PairingResult> pairService({
-    required String escrowKeyHex,
-    required threshold.Identifier serviceIdentifier,
-    List<int>? attemptId,
-    DeliverToService? delivery,
-  }) async {
-    final escrow = _escrows.firstWhere(
-      (e) => e.escrowKeyHex.toLowerCase() == escrowKeyHex.toLowerCase(),
-      orElse: () => throw StateError('this wallet holds no escrow $escrowKeyHex'),
-    );
-    final attempt = Uint8List.fromList(
-      attemptId ?? List<int>.generate(16, (_) => _secureRandom.nextInt(256)),
-    );
-    if (attempt.length != 16) {
-      throw ArgumentError('a pairing attempt id is 16 bytes');
-    }
-    // The escrow's context and the attempt together: one attempt reproduces, and a second attempt
-    // deals a different line. Two pairings on one slope are two points on it.
-    final pairingContext = Uint8List.fromList([
-      ...hex.decode(escrow.contextHex),
-      ...attempt,
-    ]);
-
-    return _withOperation<void, PairingResult>(
-      'PairService',
-      escrow: escrow.wallet,
-      escrowContext: Uint8List.fromList(hex.decode(escrow.contextHex)),
-      pairingContext: pairingContext,
-      prepare: _nothingToPrepare,
-      run: (operation, _) async {
-        final result = await PairingSession(_conn, delivery: delivery).run(
-          escrowKeyHex: escrow.escrowKeyHex,
-          escrowPkp: escrow.wallet.publicKeyPackage,
-          serviceIdentifier: serviceIdentifier,
-          walletIdentifier: operation.identifier,
-          attemptId: attempt,
-          slope: operation.takePairingSlope(),
-          // Rebuilt inside the operation, so it is let go with it — never in a closure here.
-          resolveEscrow: operation.escrowKeyPackage,
-          cancel: operation.cancel,
-        );
-        _stillRunning(operation);
-        return result;
-      },
-    );
-  }
 
   /// Take back what is left of an escrow, once its deal is over.
   ///
@@ -787,8 +814,9 @@ class MpcClient {
     );
     final arkInfo = info ?? await _asp.getInfo();
 
+    // A reclaim is a send — of the escrow's key, to this wallet — on the `Send` stream.
     return _withOperation<void, ReclaimResult>(
-      'EscrowReclaim',
+      'Send',
       escrow: escrow.wallet,
       escrowContext: Uint8List.fromList(hex.decode(escrow.contextHex)),
       prepare: _nothingToPrepare,
@@ -798,6 +826,7 @@ class MpcClient {
           vtxos: vtxos,
           info: arkInfo,
           escrowPubKey: escrow.wallet.publicKeyPackage,
+          identifier: operation.identifier.serialize(),
           // Rebuilt inside the operation, so it is let go with it — never in a closure here.
           resolveEscrow: operation.escrowKeyPackage,
           cancel: operation.cancel,
@@ -842,28 +871,6 @@ class MpcClient {
     );
   }
 
-  /// Commit an escrow to a deal.
-  ///
-  /// Until [deadline] the paired service may release from it, judged against [policy], and this
-  /// wallet may **not** take it back; afterwards those swap. There is no way to end it early:
-  /// a commitment the owner can revoke is not one, and [deadline] is the whole of her control. Nothing in Bitcoin enforces that —
-  /// both pairings sign the same key — so what holds it up is the cosigner declining to co-sign
-  /// with the wrong party at the wrong time, in attested code. See `cosigner/src/escrow_session.rs`.
-  ///
-  /// Returns the policy rendered as a sentence, which is what an owner is actually agreeing to.
-  Future<String> openEscrowSession({
-    required String escrowKeyHex,
-    required Map<String, dynamic> policy,
-    required DateTime deadline,
-  }) async {
-    final response = await _conn.escrowOpenSession(cs.EscrowOpenSessionRequest(
-      escrowKey: escrowKeyHex,
-      policyJson: jsonEncode(policy),
-      deadlineSecs: Int64(deadline.millisecondsSinceEpoch ~/ 1000),
-    ));
-    return response.policyDescription;
-  }
-
   /// What the cosigner holds for this wallet's escrows, including any live deal. Asked rather than
   /// remembered: this device keeps the public shape of an escrow, never the state of its deal.
   Future<List<cs.EscrowSummary>> escrowStatus() async =>
@@ -876,9 +883,10 @@ class MpcClient {
 
   // --- The way out ---
   //
-  // Where this wallet's money goes if the cosigner is never heard from again. Every seal signs one
-  // exit per VTXO to it, and the wallet keeps them — see `sessions/exit_plan.dart`. Without an
-  // address there is nothing to pre-sign to, which is why the app asks for one before it opens.
+  // Where this wallet's money goes if the cosigner is never heard from again. Every delegate
+  // renewal signs one exit per VTXO to it, and the wallet keeps them — see
+  // `sessions/exit_plan.dart`. Without an address there is nothing to pre-sign to, which is why the
+  // app asks for one before it opens.
 
   String? _exitScriptPubkeyHex;
 
@@ -891,7 +899,8 @@ class MpcClient {
   ///
   /// Throws if it is not an address, or belongs to another chain — a mistake here is only
   /// discovered on the day nothing else works, so it is caught on the day it is typed. Exits
-  /// already signed still pay the old address; the next seal reissues them to this one.
+  /// already signed still pay the old address; the next delegate renewal reissues them to this
+  /// one.
   Future<void> setExitAddress(String address) async {
     final info = await _asp.getInfo();
     _exitScriptPubkeyHex =
@@ -905,7 +914,8 @@ class MpcClient {
     await _saveState();
   }
 
-  /// The exits this wallet holds, newest issue first: one per VTXO the last seal covered.
+  /// The exits this wallet holds, newest issue first: one per VTXO the last delegate renewal
+  /// covered.
   List<ExitTx> get exits => _delegate?.exits ?? const [];
 
   /// The whole path one exit has to take: every transaction from the commitment on-chain down to
@@ -945,15 +955,15 @@ class MpcClient {
   //
   // The cosigner wakes this device when a sealed delegate needs it, and for that has to be given the
   // device's push token. Not with a `RegisterDevice` of its own — every call is a passkey approval —
-  // but carried on a call the user already made: the DKG, or the next seal.
+  // but carried on a call the user already made: the DKG, or the next delegate renewal.
 
   String? _deviceToken;
 
   /// Called with a token once the cosigner has enrolled it, so the caller can stop offering it.
   void Function(String token)? onDeviceEnrolled;
 
-  /// Carry [token] on the next DKG or delegate seal, until one enrolls it. Null offers nothing — the
-  /// token is already enrolled, or there is none.
+  /// Carry [token] on the next DKG or delegate renewal, until one enrolls it. Null offers nothing —
+  /// the token is already enrolled, or there is none.
   void offerDeviceToken(String? token) => _deviceToken = token;
 
   void _deviceTokenCarried(bool enrolled) {
@@ -1075,38 +1085,7 @@ class MpcClient {
   Future<String> sendVtxo(String recipientArkAddress, int amountSats) async =>
       (await _send(recipientArkAddress, amountSats)).arkTxid;
 
-  /// Top an escrow up by [amountSats] and commit it to a deal, on ONE approval — [sendVtxo] to
-  /// the escrow's address and then [openEscrowSession], on one stream.
-  ///
-  /// A deal the cosigner could not strike right now — no service ready in the escrow, a deal still
-  /// holding it — is refused before anything is built, so a refusal moves no money.
-  ///
-  /// `agreed` is the policy as the cosigner renders it, which is what the owner agreed to. Null
-  /// means the escrow was topped up but NOT committed — a cosigner from before sends could commit
-  /// one — and [openEscrowSession] commits it.
-  Future<({String arkTxid, String? agreed})> fundEscrowDeal({
-    required String escrowKeyHex,
-    required int amountSats,
-    required Map<String, dynamic> policy,
-    required DateTime deadline,
-  }) async {
-    final result = await _send(
-      await escrowArkAddress(escrowKeyHex),
-      amountSats,
-      escrowCommit: cs.EscrowOpenSessionRequest(
-        escrowKey: escrowKeyHex,
-        policyJson: jsonEncode(policy),
-        deadlineSecs: Int64(deadline.millisecondsSinceEpoch ~/ 1000),
-      ),
-    );
-    return (arkTxid: result.arkTxid, agreed: result.committed?.policyDescription);
-  }
-
-  Future<SendResult> _send(
-    String recipientArkAddress,
-    int amountSats, {
-    cs.EscrowOpenSessionRequest? escrowCommit,
-  }) {
+  Future<SendResult> _send(String recipientArkAddress, int amountSats) {
     return _withOperation('Send',
         prepare: () async => (info: await _asp.getInfo(), vtxos: await listVtxos()),
         run: (operation, prepared) async {
@@ -1123,12 +1102,11 @@ class MpcClient {
         deviceToken: _deviceToken ?? '',
         exitScriptPubkeyHex: exitScriptPubkeyHex,
         ownerXOnlyHex: _ownerXOnly,
-        escrowCommit: escrowCommit,
       );
       _stillRunning(operation);
       _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
-      // A send spends what the old delegate covered, so the cosigner dropped it: what is sealed
-      // now is whatever this send sealed, or nothing.
+      // A send spends what the old delegate covered, so the cosigner dropped it: the delegate now
+      // is whatever this send renewed, or none.
       await _recordDelegate(result.delegate);
       return result;
     });
@@ -1138,27 +1116,31 @@ class MpcClient {
 
   DelegateStatus? _delegate;
 
-  /// The delegate last sealed for this wallet — what the cosigner will refresh on its own, and when.
-  /// Null until a send, a settle or [protectFunds] sealed one. See `sessions/delegate.dart`.
+  /// The delegate last renewed for this wallet — what the cosigner will refresh on its own, and
+  /// when. Null until a send, a renewal or [protectFunds] renewed it. See `sessions/delegate.dart`.
   DelegateStatus? get delegateStatus => _delegate;
 
-  /// Held VTXOs no sealed delegate covers: arrived since it was sealed (a receive), or produced by
-  /// the cosigner running it. Answered from the indexer alone; asks the cosigner nothing.
+  /// Held VTXOs no sealed delegate covers: arrived since it was renewed (a receive), or produced
+  /// by the cosigner running it. Answered from the indexer alone; asks the cosigner nothing.
   Future<List<IndexerVtxo>> unprotectedVtxos() async {
     final held = (await listVtxos()).where((v) => !v.isSpent).toList();
     final delegate = _delegate;
     return delegate == null ? held : held.where((v) => !delegate.covers(v)).toList();
   }
 
-  /// Seal a delegate over everything held now, so the cosigner refreshes it on its own before it
-  /// expires.
+  /// Renew the delegate over everything held now, so the cosigner refreshes it on its own before
+  /// it expires.
   ///
   /// [over] replaces the indexer's answer with a set the caller names. Only a test has any business
-  /// doing that — it is how an exit can be proven against bitcoind, by sealing over an output that
-  /// carries this wallet's VTXO script but that no ASP ever made. One approval — for funds that arrived without an operation of ours; a send or a settle
-  /// seals on its way out at no extra cost.
-  Future<DelegateStatus> protectFunds({List<IndexerVtxo>? over}) {
-    return _withOperation('Settle', prepare: () async {
+  /// doing that — it is how an exit can be proven against bitcoind, by renewing over an output
+  /// that carries this wallet's VTXO script but that no ASP ever made.
+  ///
+  /// One approval — for funds that arrived without an operation of ours; a send or a renewal
+  /// renews the delegate on its way out at no extra cost. [onApproved] is told once it is given —
+  /// see [_withOperation].
+  Future<DelegateStatus> protectFunds(
+      {List<IndexerVtxo>? over, void Function()? onApproved}) {
+    return _withOperation('Renew', onApproved: onApproved, prepare: () async {
       final info = await _asp.getInfo();
       final held =
           over ?? await heldOnceIndexed(listVtxos, timeout: const Duration(seconds: 10));
@@ -1169,7 +1151,7 @@ class MpcClient {
       if (held.isEmpty) throw StateError('nothing is held, so there is nothing to protect');
       return (info: info, held: held);
     }, run: (operation, prepared) async {
-      final sealed = await SettleSession(_conn, _asp).seal(
+      final renewed = await RenewSession(_conn, _asp).renewDelegate(
         info: prepared.info,
         identifier: operation.identifier.serialize(),
         resolve: operation.keyPackage,
@@ -1180,9 +1162,9 @@ class MpcClient {
         ownerXOnlyHex: _ownerXOnly,
       );
       _stillRunning(operation);
-      _deviceTokenCarried(sealed.deviceEnrolled);
-      await _recordDelegate(sealed);
-      return sealed;
+      _deviceTokenCarried(renewed.deviceEnrolled);
+      await _recordDelegate(renewed);
+      return renewed;
     });
   }
 
@@ -1191,33 +1173,32 @@ class MpcClient {
     await _saveState();
   }
 
-  /// Board an on-chain output into Ark, or refresh what is already held.
-  ///
-  /// One boarding output at a time: a longer list used to be silently truncated to its first
-  /// element, boarding one deposit and stranding the rest while the caller was told the whole batch
-  /// settled.
-  Future<String> settle({
-    List<cs.BoardingUtxo> boardingUtxos = const [],
-    void Function(SettlePhase)? onProgress,
-  }) async {
-    if (boardingUtxos.length > 1) {
-      throw ArgumentError(
-        'settle takes one boarding UTXO at a time, got ${boardingUtxos.length} — '
-        'settle them individually',
-      );
-    }
-    return _withOperation('Settle',
+  /// Board one on-chain output into Ark, on the `Board` stream. One per call: the cosigner builds
+  /// its boarding intent proof for a single outpoint.
+  Future<String> board(cs.BoardingUtxo utxo, {void Function(RenewPhase)? onProgress}) =>
+      _renewOrBoard(boardingUtxo: utxo, onProgress: onProgress);
+
+  /// The round boarding and a refresh share: [boardingUtxo] boards it, its absence refreshes what is
+  /// held.
+  Future<String> _renewOrBoard({
+    cs.BoardingUtxo? boardingUtxo,
+    void Function(RenewPhase)? onProgress,
+    void Function()? onApproved,
+  }) {
+    // Named for the stream it opens: an approval obtained ahead is for one method's path.
+    return _withOperation(boardingUtxo == null ? 'Renew' : 'Board',
+        onApproved: onApproved,
         prepare: () async => (
               info: await _asp.getInfo(),
-              vtxos: boardingUtxos.isEmpty ? await listVtxos() : const <IndexerVtxo>[],
+              vtxos: boardingUtxo == null ? await listVtxos() : const <IndexerVtxo>[],
             ),
         run: (operation, prepared) async {
-      final result = await SettleSession(_conn, _asp).settle(
+      final result = await RenewSession(_conn, _asp).renew(
         info: prepared.info,
         identifier: operation.identifier.serialize(),
         resolve: operation.keyPackage,
         groupPubKey: _wallet!.publicKeyPackage,
-        boardingUtxo: boardingUtxos.isEmpty ? null : boardingUtxos.first,
+        boardingUtxo: boardingUtxo,
         vtxos: prepared.vtxos,
         cancel: operation.cancel,
         onProgress: onProgress,
@@ -1228,9 +1209,9 @@ class MpcClient {
       );
       _stillRunning(operation);
       _deviceTokenCarried(result.delegate?.deviceEnrolled ?? false);
-      // A refresh spends the old delegate's inputs; boarding leaves it standing. Either way what
-      // this settle sealed, when it sealed, supersedes it.
-      if (result.delegate != null || boardingUtxos.isEmpty) {
+      // A refresh spends the old delegate's inputs; boarding leaves it standing. Either way the
+      // delegate this renewal renewed, when it did, supersedes it.
+      if (result.delegate != null || boardingUtxo == null) {
         await _recordDelegate(result.delegate);
       }
       return result.commitmentTxid;
@@ -1239,12 +1220,25 @@ class MpcClient {
 
   /// Refresh the held VTXOs before they expire.
   ///
-  /// The same `Settle` stream with no boarding output. There is no `storeOnly` any more: sealing a
-  /// delegate arms a durable watch, and when its deadline arrives the cosigner either executes the
-  /// delegate itself — where its image allowlists the ASP — or wakes this device, and then this is
-  /// what runs.
-  Future<String> settleDelegate({void Function(SettlePhase)? onProgress}) =>
-      settle(onProgress: onProgress);
+  /// The `Renew` stream. There is no `storeOnly` any more: renewing
+  /// the delegate arms a durable watch, and when its deadline arrives the cosigner either executes
+  /// the delegate itself — where its image allowlists the ASP — or wakes this device, and then this
+  /// is what runs.
+  ///
+  /// [onApproved] is told once the approval is given — the round after it takes minutes.
+  Future<String> renewHeld(
+          {void Function(RenewPhase)? onProgress, void Function()? onApproved}) =>
+      _renewOrBoard(onProgress: onProgress, onApproved: onApproved);
+
+  /// Show that the owner holds this wallet's passkey: one gesture, and nothing sent anywhere.
+  ///
+  /// A local assertion. Its PRF must derive this wallet's identifier, or `WalletOperation.begin`
+  /// refuses it as `WrongPasskey` — the same check every operation makes. No cosigner call and no
+  /// approval, so it works offline. It is what an entry to the app asks for when there is nothing
+  /// to renew, or nothing reachable to renew it with. Serialized like every operation, so it never
+  /// asks for a gesture while another is on the screen.
+  Future<void> verifyPasskey() => _withOperation<void, void>('VerifyPasskey',
+      local: true, prepare: _nothingToPrepare, run: (_, __) async {});
 
   // --- Devices ----------------------------------------------------------------------------------
   //

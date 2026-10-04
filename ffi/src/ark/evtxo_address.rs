@@ -10,7 +10,6 @@ use bitcoin::{Network, XOnlyPublicKey};
 
 use serde::Deserialize;
 
-use super::hex_to_32;
 
 #[derive(Deserialize)]
 pub struct EvtxoArkAddressParams {
@@ -22,9 +21,9 @@ pub struct EvtxoArkAddressParams {
 pub fn evtxo_ark_address(params_json: &str) -> Result<String, String> {
     let p: EvtxoArkAddressParams =
         serde_json::from_str(params_json).map_err(|e| format!("JSON parse: {e}"))?;
-    let server = XOnlyPublicKey::from_slice(&hex_to_32(&p.server_pk)?)
+    let server = XOnlyPublicKey::from_slice(&crate::from_hex::<[u8; 32]>(&p.server_pk)?)
         .map_err(|e| format!("invalid server_pk: {e}"))?;
-    let q = XOnlyPublicKey::from_slice(&hex_to_32(&p.q_evtxo)?)
+    let q = XOnlyPublicKey::from_slice(&crate::from_hex::<[u8; 32]>(&p.q_evtxo)?)
         .map_err(|e| format!("invalid q_evtxo: {e}"))?;
     let network = match p.network.as_str() {
         "bitcoin" | "mainnet" => Network::Bitcoin,
@@ -57,7 +56,7 @@ mod tests {
         let decoded = ArkAddress::decode(&addr).unwrap();
         assert_eq!(
             decoded.to_p2tr_script_pubkey().as_bytes()[2..].to_vec(),
-            hex_to_32(q).unwrap().to_vec()
+            crate::from_hex::<[u8; 32]>(q).unwrap().to_vec()
         );
     }
 }

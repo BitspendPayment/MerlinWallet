@@ -191,10 +191,10 @@ pub fn build_send_tx(params_json: &str) -> Result<String, String> {
         };
         match vi.evtxo.as_ref() {
             Some(e) => {
-                let contract_id = hex_to_32(&e.contract_id)?;
-                let server = hex_to_32(&e.server_pk)?;
-                let evtxo_pk = hex_to_32(&e.evtxo_pk)?;
-                let owner = hex_to_32(&e.owner_pk)?;
+                let contract_id = crate::from_hex::<[u8; 32]>(&e.contract_id)?;
+                let server = crate::from_hex::<[u8; 32]>(&e.server_pk)?;
+                let evtxo_pk = crate::from_hex::<[u8; 32]>(&e.evtxo_pk)?;
+                let owner = crate::from_hex::<[u8; 32]>(&e.owner_pk)?;
                 let commit: [u8; 32] =
                     bitcoin::hashes::sha256::Hash::hash(&contract_id).to_byte_array();
                 let (coop_script, th_cb) = ark::evtxo_cooperative_spend_info(
@@ -226,7 +226,7 @@ pub fn build_send_tx(params_json: &str) -> Result<String, String> {
                         .map_err(|err| format!("invalid evtxo_pk: {err}"))?,
                 );
                 let args = match e.contract_args.as_deref() {
-                    Some(a) if !a.is_empty() => Some(hex_decode(a)?),
+                    Some(a) if !a.is_empty() => Some(crate::from_hex::<Vec<u8>>(a)?),
                     _ => None,
                 };
                 evtxo_inputs.push((i, contract_id, args));
@@ -314,11 +314,11 @@ pub fn build_send_tx(params_json: &str) -> Result<String, String> {
     }
 
     // Serialize ark_tx (after attaching condition fields) for fullTransaction passthrough.
-    let ark_tx_bytes_hex = hex_encode(&ark_tx.serialize());
+    let ark_tx_bytes_hex = hex::encode(ark_tx.serialize());
     // The gate fires on the PSBT whose input carries the eVTXO witness_utxo — the
     // checkpoint. Fall back to the ark tx for normal (non-eVTXO) sends.
     let gate_tx_bytes_hex = match evtxo_inputs.first() {
-        Some((i, _, _)) => hex_encode(&checkpoint_txs[*i].serialize()),
+        Some((i, _, _)) => hex::encode(checkpoint_txs[*i].serialize()),
         None => ark_tx_bytes_hex.clone(),
     };
 
@@ -333,7 +333,7 @@ pub fn build_send_tx(params_json: &str) -> Result<String, String> {
 
     let result = BuildSendResult {
         handle,
-        sighashes: sighashes.iter().map(|s| hex_encode(s)).collect(),
+        sighashes: sighashes.iter().map(|s| hex::encode(s)).collect(),
         ark_tx_bytes: ark_tx_bytes_hex,
         gate_tx_bytes: gate_tx_bytes_hex,
     };
@@ -392,7 +392,7 @@ pub fn insert_send_signatures(handle: u64, signatures_json: &str) -> Result<Stri
 
     // Parse and insert signatures
     for (hex_sig, entry) in sig_hexes.iter().zip(state.sighash_entries.iter()) {
-        let sig_bytes = hex_decode(hex_sig)?;
+        let sig_bytes = crate::from_hex::<Vec<u8>>(hex_sig)?;
         if sig_bytes.len() != 64 {
             return Err(format!("expected 64-byte sig, got {}", sig_bytes.len()));
         }
@@ -595,7 +595,7 @@ fn build_server_info(info: &ArkInfoParam, network: Network) -> Result<server::In
     } else {
         info.signer_pubkey.clone()
     };
-    let signer_pk = bitcoin::secp256k1::PublicKey::from_slice(&hex_decode(&signer_pk_hex)?)
+    let signer_pk = bitcoin::secp256k1::PublicKey::from_slice(&crate::from_hex::<Vec<u8>>(&signer_pk_hex)?)
         .map_err(|e| format!("invalid signer_pubkey: {e}"))?;
 
     let forfeit_pk_hex = if info.forfeit_pubkey.len() == 64 {
@@ -603,7 +603,7 @@ fn build_server_info(info: &ArkInfoParam, network: Network) -> Result<server::In
     } else {
         info.forfeit_pubkey.clone()
     };
-    let forfeit_pk = bitcoin::secp256k1::PublicKey::from_slice(&hex_decode(&forfeit_pk_hex)?)
+    let forfeit_pk = bitcoin::secp256k1::PublicKey::from_slice(&crate::from_hex::<Vec<u8>>(&forfeit_pk_hex)?)
         .map_err(|e| format!("invalid forfeit_pubkey: {e}"))?;
 
     let forfeit_address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = info
@@ -614,7 +614,7 @@ fn build_server_info(info: &ArkInfoParam, network: Network) -> Result<server::In
         .require_network(network)
         .map_err(|e| format!("forfeit_address network mismatch: {e}"))?;
 
-    let checkpoint_tapscript = ScriptBuf::from_bytes(hex_decode(&info.checkpoint_tapscript)?);
+    let checkpoint_tapscript = ScriptBuf::from_bytes(crate::from_hex::<Vec<u8>>(&info.checkpoint_tapscript)?);
 
     let exit_delay = server::parse_sequence_number(info.unilateral_exit_delay)
         .map_err(|e| format!("invalid unilateral_exit_delay: {e}"))?;
@@ -668,28 +668,6 @@ fn parse_network(network: &str) -> Result<Network, String> {
         "regtest" => Ok(Network::Regtest),
         _ => Err(format!("unknown network: {network}")),
     }
-}
-
-fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
-    // Use the `hex` crate: rejects odd length + invalid chars and NEVER panics.
-    // The old `&hex[i..i+2]` slicing panicked on odd-length input (out-of-range
-    // final slice) and on multi-byte UTF-8 (non-char-boundary) — both reachable
-    // from ASP-supplied strings. Shared by the ark send / evtxo-spend paths.
-    hex::decode(hex).map_err(|e| format!("hex: {e}"))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn hex_to_32(hex: &str) -> Result<[u8; 32], String> {
-    let bytes = hex_decode(hex)?;
-    if bytes.len() != 32 {
-        return Err(format!("expected 32 bytes, got {}", bytes.len()));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
 }
 
 #[cfg(test)]

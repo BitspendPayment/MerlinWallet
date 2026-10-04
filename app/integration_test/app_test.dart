@@ -1,5 +1,6 @@
 // One end-to-end testWidgets covering the user lifecycle:
-//   server → passkey → DKG → exit address → Ark board/send/receive.
+//   server → passkey → DKG → exit address → Ark board → the cosigner renews on its own → an entry
+//   to the app re-arms the renewal.
 
 // ignore_for_file: avoid_print
 
@@ -9,7 +10,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:provider/provider.dart';
 
-import 'test_helpers/bob_client.dart';
 import 'test_helpers/flows.dart';
 import 'test_helpers/page_objects.dart';
 import 'test_helpers/regtest_helper.dart';
@@ -28,7 +28,7 @@ void main() {
       //
       // The wallet is Ark-only now: there is no on-chain balance, no on-chain send, and no home
       // screen for either. What onboarding gained instead is the exit address, which is asked for
-      // before the wallet opens because every later seal pre-signs a spend to it.
+      // before the wallet opens because every later renewal pre-signs a spend to it.
       await resetAppState();
       await bootApp(tester);
       final exitAddress = await btc.getNewAddress();
@@ -70,11 +70,8 @@ void main() {
         expect(svcBoard.arkBalance > BigInt.zero, isTrue,
             reason: 'ark balance should be non-zero after boarding');
 
-        // Auto-delegate regression guard. MpcService.refreshVtxos() ends
-        // with _delegateIfNeeded, which calls settleDelegate(storeOnly:
-        // true) when vtxos are non-empty and no delegate is yet stored.
-        // After boarding settles, both conditions are true → delegate
-        // should be stored within seconds.
+        // Boarding re-arms the renewal on its way out, on the same approval: the board stream
+        // renews the delegate once the indexer shows the new VTXO.
         await svcBoard.refreshVtxos();
         final delegDeadline =
             DateTime.now().add(const Duration(seconds: 30));
@@ -83,75 +80,56 @@ void main() {
           await tester.pump(const Duration(seconds: 1));
         }
         expect(svcBoard.fundsProtected, isTrue,
-            reason:
-                'after boarding + refresh, _delegateIfNeeded must have '
-                'stored a delegate intent. If false, the foreground '
-                'auto-delegate path regressed.');
+            reason: 'boarding should have renewed the delegate on its way out. If false, its '
+                'trailing renewal gave up: the indexer was slow, or the renewal failed.');
 
         // ── The exits are real ───────────────────────────────────────
         //
-        // Sealing a delegate also signs one unilateral exit per VTXO. This is the thing the
+        // Renewing a delegate also signs one unilateral exit per VTXO. This is the thing the
         // cosigner cannot be asked for later: if it stops answering, these are the money.
         expect(svcBoard.exits, isNotEmpty,
-            reason: 'boarding sealed a delegate, which must also have signed an exit');
+            reason: 'boarding renewed the delegate, which must also have signed an exit');
         expect(svcBoard.vtxosWithoutExit, isEmpty,
-            reason: 'every held VTXO should have an exit after a seal');
+            reason: 'every held VTXO should have an exit after a renewal');
         final boardedExit = svcBoard.exits.first;
         expect(boardedExit.rawTx, isNotEmpty);
         expect(boardedExit.amountSats, greaterThan(0));
         expect(boardedExit.sequence, greaterThan(0),
             reason: 'an exit waits out its VTXO\'s exit delay');
 
-        final bob = BobClient();
-
-        // ── Ark receive (Bob → App) ─────────────────────────────────
-        // Send small (3000 sats) — Bob's boarding-output settle into VTXO is
-        // currently flaky in ark-client-sample, so he only has the change/
-        // received VTXOs. 3000 fits comfortably under that.
-        final myArkAddress = svcBoard.arkAddress!;
-        final appArkBalanceMid = svcBoard.arkBalance;
-        await bob.sendTo(myArkAddress, 3000);
-        await waitForArkBalance(
-          tester,
-          appArkBalanceMid + BigInt.from(2500),
-          timeout: const Duration(seconds: 60),
-        );
-
-        // ── A receive re-arms the renewal ───────────────────────────
+        // ── The cosigner renews on its own, and the next entry re-arms ──
         //
-        // This used to drive PushService.handleBackgroundMessageForTest and
-        // assert the background isolate had stored a delegate. Both ends of
-        // that are gone: the isolate cannot drive an ASP batch round, and the
-        // cosigner could not have used a stored delegate by itself anyway —
-        // a Wasm guest has no egress, so waking its owner is what it does
-        // instead. The renewal happens in the foreground now, which is what
-        // this exercises.
-        //
-        // 1500 sats fits Bob's residual budget after the 3000-sat send above.
-        final preBgArkBalance = svcBoard.arkBalance;
-        await bob.sendTo(myArkAddress, 1500);
-        await Future<void>.delayed(const Duration(seconds: 15));
+        // The delegate boarding signed is worth one renewal. The cosigner runs it before the VTXO
+        // expires — on regtest, about five minutes after the VTXO was made — and the VTXO that
+        // produces has no delegate: only the owner's passkey can sign the next. Every entry to the
+        // app asks for that passkey, and re-arms with it.
+        final renewedBy = DateTime.now().add(const Duration(minutes: 8));
+        while (svcBoard.fundsProtected && DateTime.now().isBefore(renewedBy)) {
+          await tester.pump(const Duration(seconds: 5));
+          await svcBoard.refreshVtxos();
+        }
+        expect(svcBoard.fundsProtected, isFalse,
+            reason: 'the cosigner should have run its delegate, leaving a VTXO nothing covers');
 
-        // A fresh outpoint makes the sealed renewal stale, so refreshVtxos ->
-        // _delegateIfNeeded settles again and re-arms it.
-        await svcBoard.refreshVtxos();
-        final bgDeadline = DateTime.now().add(const Duration(minutes: 3));
-        while (!svcBoard.fundsProtected &&
-            DateTime.now().isBefore(bgDeadline)) {
+        // An entry. The lock asks for the passkey by itself — approve it on the device — and the
+        // approval re-arms the renewal.
+        svcBoard.lock();
+        await pumpUntilFound(tester, find.byKey(const Key('unlockBtn')));
+        final unlockedBy = DateTime.now().add(const Duration(minutes: 2));
+        while (svcBoard.locked && DateTime.now().isBefore(unlockedBy)) {
+          await tester.pump(const Duration(seconds: 1));
+        }
+        expect(svcBoard.locked, isFalse, reason: 'the passkey given, the lock lifts');
+        final armedBy = DateTime.now().add(const Duration(minutes: 1));
+        while ((!svcBoard.fundsProtected || svcBoard.vtxosWithoutExit.isNotEmpty) &&
+            DateTime.now().isBefore(armedBy)) {
           await tester.pump(const Duration(seconds: 1));
           await svcBoard.refreshVtxos();
         }
-        expect(svcBoard.arkBalance, greaterThanOrEqualTo(
-            preBgArkBalance + BigInt.from(1000)),
-            reason: 'Alice should hold Bob\'s 1500-sat VTXO (after fees)');
         expect(svcBoard.fundsProtected, isTrue,
-            reason:
-                'a fresh outpoint should have triggered a settle, leaving a '
-                'renewal that covers it. If false, _delegateIfNeeded did not '
-                'run or the settle round failed — the round waits on the ASP\'s '
-                'own schedule, so give it longer before suspecting the wiring.');
+            reason: 'the entry re-armed the renewal over what the cosigner produced');
         expect(svcBoard.vtxosWithoutExit, isEmpty,
-            reason: 'the seal that covered the received funds also signed their exit');
+            reason: 'and signed its exit with the same approval');
 
         // ── The Exit tab shows them ─────────────────────────────────
         await ExitPage.open(tester);
@@ -161,6 +139,7 @@ void main() {
             reason: 'each signed exit can be copied out of the app');
       }
     },
-    timeout: const Timeout(Duration(minutes: 12)),
+    // Boarding, then the cosigner's own renewal about five minutes after it, then an entry.
+    timeout: const Timeout(Duration(minutes: 20)),
   );
 }

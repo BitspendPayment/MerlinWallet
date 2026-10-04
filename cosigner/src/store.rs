@@ -299,7 +299,7 @@ pub(crate) fn seal_snapshot(
 /// keys from the sealed blob, so the caller can SKIP `InstallPolicy` (no plaintext key read).
 /// `false` when there's no stored blob (first run) or restore failed.
 /// `Ok(false)` is a wallet that has never sealed anything. `Err` is a seal that is there and
-/// cannot be read — which is not that, and must not be treated as it: see `Cosigner::open_with_host`.
+/// cannot be read — which is not that, and must not be treated as it: see `Cosigner::open`.
 pub(crate) fn restore_snapshot(
     actor: &mut Cosigner,
     store: &Store,

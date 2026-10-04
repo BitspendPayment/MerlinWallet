@@ -24,14 +24,22 @@
 ///    read `msg.data['type']`, which the runtime never sets — so every one of
 ///    them early-returned and the whole push path was dead.
 ///
+/// What a wake becomes is a local notification, composed on the device —
+/// [_handleBackgroundMessage] — saying only that the owner is wanted. Opening
+/// the app is an entry, and an entry re-arms the renewal.
+///
 /// Safe to call on platforms or builds without Firebase config: any
 /// initialization error is logged and the rest of the app continues without
-/// push (the foreground refresh still catches up for users who open the app).
+/// push (every entry to the app still re-arms the renewal).
 library;
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
+
+import 'dart:ui' show DartPluginRegistrant;
+
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import '../firebase_options.dart';
 import 'mpc_service.dart';
@@ -39,14 +47,17 @@ import 'mpc_service.dart';
 class PushService {
   static bool _initialized = false;
 
-  /// The live, logged-in service. Set by [onLoggedIn] so the foreground push
-  /// handler can refresh while the app is open.
+  /// Whether this isolate can show and take down notifications.
+  static bool _notifying = false;
+
+  /// The live, logged-in service. Set by [onLoggedIn] so a wake can reach it
+  /// while the app is open.
   static MpcService? _svc;
 
   /// The cosigner's watch found its sealed delegate due and could not run it
   /// itself — no ASP reachable, or the round failed — so it woke its owner to
   /// refresh in person. Mirrors `CATEGORY_SETTLE_DUE` in
-  /// `cosigner/src/handlers/watch.rs`.
+  /// `cosigner/src/cosigner.rs`.
   static const String categorySettleDue = 'settle-due';
 
   /// The cosigner ran its sealed delegate: the funds were refreshed, and the
@@ -58,9 +69,6 @@ class PushService {
       msg.data['category'] == categorySettleDue ||
       msg.data['category'] == categoryDelegateSettled;
 
-  /// Set when a wake reached us before the service was ready; acted on in
-  /// [onLoggedIn] once it is.
-  static bool _pendingWake = false;
 
   /// Foreground init. Called from `main()` before runApp.
   static Future<void> initialize() async {
@@ -82,15 +90,33 @@ class PushService {
       );
       FirebaseMessaging.onBackgroundMessage(_handleBackgroundMessage);
       FirebaseMessaging.onMessage.listen(_handleForegroundMessage);
-      // "boarding_deposit" is a visible notification; tapping it opens the app.
-      FirebaseMessaging.onMessageOpenedApp.listen(_handleOpenedApp);
-      final initial = await FirebaseMessaging.instance.getInitialMessage();
-      if (initial != null) {
-        await _handleOpenedApp(initial);
-      }
       _initialized = true;
     } catch (e) {
       debugPrint('[push] permission/handler setup failed: $e');
+      return;
+    }
+    // Apart, and after: without it a wake is still enrolled and still shown — only its tap is lost.
+    try {
+      // No `onMessageOpenedApp` or `getInitialMessage`: a wake is data-only, so FCM never shows
+      // one for a user to tap. The notification a wake becomes is ours, and its tap lands here —
+      // a backstop, since opening the app is already an entry that locks.
+      await FlutterLocalNotificationsPlugin().initialize(
+        settings: _notificationSettings,
+        onDidReceiveNotificationResponse: (_) => _svc?.lockWhenIdle(),
+      );
+      _notifying = true;
+    } catch (e) {
+      debugPrint('[push] notifications unavailable: $e');
+    }
+  }
+
+  /// Take a wake's notification down: the owner is in, which is all it asked for.
+  static Future<void> clearWake() async {
+    if (!_notifying) return;
+    try {
+      await FlutterLocalNotificationsPlugin().cancel(id: _wakeNotification);
+    } catch (e) {
+      debugPrint('[push] could not clear the wake: $e');
     }
   }
 
@@ -121,18 +147,44 @@ class PushService {
   /// The wallet is open: wakes can be acted on.
   static Future<void> onLoggedIn(MpcService svc) async {
     _svc = svc;
+  }
 
-    // A wake reached us before the service was ready. Refreshing is the whole
-    // response: it recomputes whether the sealed delegate still covers what we
-    // hold, and raises the Ark-tab banner if it does not.
-    if (_pendingWake) {
-      _pendingWake = false;
-      try {
-        await svc.refreshVtxos();
-      } catch (e) {
-        debugPrint('[push] pending wake refresh failed: $e');
-      }
-    }
+  // --- Telling the owner -------------------------------------------------------------------------
+  //
+  // A wake is data-only, so FCM shows nothing; this does. Composed here, on the device, so nothing
+  // readable goes through FCM — and it says nothing about the wallet anyway: no amount, no time,
+  // only that the owner is wanted.
+
+  // A mask: the status bar draws a small icon from its alpha alone. Kept from resource shrinking
+  // by `res/raw/keep.xml`, since only this names it.
+  static const _notificationSettings =
+      InitializationSettings(android: AndroidInitializationSettings('@drawable/ic_notification'));
+
+  static const _reminders = AndroidNotificationDetails(
+    'wakes',
+    'Reminders',
+    channelDescription: 'When your funds need you to open the app',
+    importance: Importance.high,
+    priority: Priority.high,
+    onlyAlertOnce: true,
+  );
+
+  /// One notification for every wake: a `settle-due` repeats every half hour until it is answered,
+  /// and each replaces the last.
+  static const int _wakeNotification = 1;
+
+  static Future<void> _show(String? category) async {
+    final plugin = FlutterLocalNotificationsPlugin();
+    await plugin.initialize(settings: _notificationSettings);
+    await plugin.show(
+      id: _wakeNotification,
+      title: 'Merlin Wallet',
+      // `settle-due`: the cosigner could not renew, so it is the owner's to do, and soon.
+      body: category == categorySettleDue
+          ? 'Open Merlin Wallet soon to keep your funds protected.'
+          : 'Open Merlin Wallet to keep your funds protected.',
+      notificationDetails: const NotificationDetails(android: _reminders),
+    );
   }
 
   /// A wake arriving while the app is open.
@@ -143,6 +195,12 @@ class PushService {
   /// one category. Bringing any of them back is a `wake` call in the cosigner
   /// plus a branch here — not a branch here on its own, which is what they had
   /// become.
+  ///
+  /// `settle-due` locks the wallet, or once what is running ends: the cosigner
+  /// could not renew, the funds are close to expiring, and only the owner's
+  /// passkey can refresh them — which the unlock does. `delegate-settled` is
+  /// not urgent — the funds were just renewed — so it only refreshes, and the
+  /// next entry re-arms.
   static Future<void> _handleForegroundMessage(RemoteMessage msg) async {
     debugPrint('[push] foreground: ${msg.data}');
     final svc = _svc;
@@ -151,54 +209,35 @@ class PushService {
       return;
     }
     if (!_isOurs(msg)) return;
-    // Refreshing is the response: it recomputes whether a sealed delegate
-    // still covers what we hold and raises the Ark-tab banner if it does not.
-    try {
-      await svc.refreshVtxos();
-      debugPrint('[push] foreground settle-due: refreshed');
-    } catch (e) {
-      debugPrint('[push] foreground settle-due refresh failed: $e');
-    }
-  }
-
-  /// The app was opened from a message.
-  ///
-  /// Reachable today only via `getInitialMessage()` on a cold start, not via a
-  /// tap: nothing the runtime sends is displayable, so there is no notification
-  /// for a user to tap. Kept because the cold-start path is real and because
-  /// this is where a tap would land once wakes are surfaced locally.
-  static Future<void> _handleOpenedApp(RemoteMessage msg) async {
-    if (!_isOurs(msg)) return;
-    final svc = _svc;
-    if (svc == null) {
-      // Opened before the service was ready; acted on in onLoggedIn.
-      _pendingWake = true;
+    if (msg.data['category'] == categorySettleDue) {
+      svc.lockWhenIdle();
       return;
     }
     try {
       await svc.refreshVtxos();
-      debugPrint('[push] opened on settle-due: refreshed');
     } catch (e) {
-      debugPrint('[push] opened settle-due refresh failed: $e');
+      debugPrint('[push] foreground wake refresh failed: $e');
     }
   }
-
 }
 
 /// Top-level background handler. Flutter requires this to be a top-level
 /// (non-class) function and annotated with `@pragma('vm:entry-point')` so the
 /// background isolate can resolve it after Tree Shaking.
 ///
-/// # There is nothing for it to do
+/// # It tells the owner
 ///
 /// Renewal is the cosigner's: it runs the sealed delegate itself, from the
 /// enclave, against the ASP. The wakes that reach this isolate say that it did
 /// (`delegate-settled`) or that it could not (`settle-due`), and either way what
-/// follows needs the user — sealing a new delegate, or refreshing in person —
-/// which a background isolate cannot ask for. The wake is data-only, so there is
-/// nothing to display; the next foreground refresh raises the Ark-tab banner.
+/// follows needs the owner's passkey — a new delegate, or a refresh in person —
+/// which a background isolate cannot ask for. So it shows a notification, and
+/// the owner opening the app is the entry that does the rest.
 @pragma('vm:entry-point')
 Future<void> _handleBackgroundMessage(RemoteMessage msg) async {
   if (!PushService._isOurs(msg)) return;
-  debugPrint('[push:bg] ${msg.data['category']} wake — the next foreground refreshes');
+  // FlutterFire's dispatcher starts the binding, not the plugin registrant, and the notification
+  // plugin is one.
+  DartPluginRegistrant.ensureInitialized();
+  await PushService._show(msg.data['category'] as String?);
 }

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The status-bar icon: the logo as a mask. Android draws a small icon from its alpha alone, so
+     the launcher icon, which is opaque, shows as a blank square. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="100"
+    android:viewportHeight="100">
+    <!-- The hat, its star cut out. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M 26 74 C 28 58, 36 40, 56 22 C 64 14, 70 12, 66 22 C 62 30, 60 36, 60 42 C 60 52, 66 64, 74 74 Z M 51 38 L 54 47 L 63 50 L 54 53 L 51 62 L 48 53 L 39 50 L 48 47 Z" />
+    <!-- The brim. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M 14 78 A 36 5 0 1 0 86 78 A 36 5 0 1 0 14 78 Z" />
+</vector>

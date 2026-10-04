@@ -16,7 +16,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// but a stream is never hashed and never buffered, so nothing upstream is counting: the guest is
 /// the only thing between a client and an allocation as large as it cares to claim.
 ///
-/// Sized for the largest real message, which is a settle's relayed `GetEventStreamResponse` — an
+/// Sized for the largest real message, which is a renewal's relayed `GetEventStreamResponse` — an
 /// ASP batch round carries a whole VTXO tree in one event.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 

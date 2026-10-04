@@ -36,7 +36,7 @@ import 'package:app_core/threshold/threshold.dart' as threshold;
 ///
 /// Called by a session driver with the `wallet_dealt_share` of **every** sighashes message it
 /// receives. The first call rebuilds the share; the later ones must bring nothing, and return the
-/// same package — a settle signs two or three rounds, and they are one reconstruction.
+/// same package — a renewal signs two or three rounds, and they are one reconstruction.
 typedef KeyResolver = threshold.KeyPackage Function(List<int> dealtShare);
 
 /// The cosigner broke the one-contribution-per-stream rule. Not a wrong share — a wrong protocol.
@@ -57,7 +57,7 @@ class OperationCancelled implements Exception {
 
 /// The owner's way of stopping an operation that is waiting on somebody else.
 ///
-/// An operation holds the wallet's rebuilt share for as long as it runs, and much of a settle's
+/// An operation holds the wallet's rebuilt share for as long as it runs, and much of a renewal's
 /// running is waiting — on the ASP's batch schedule, on its event stream, on the indexer. Closing
 /// the cosigner's stream interrupts none of those: a driver parked on an ASP that has gone quiet
 /// would keep its share, and its turn, for as long as the silence lasted. So every wait a driver
@@ -203,7 +203,7 @@ class WalletOperation {
   }
 
   /// The key package for one ESCROW, from the two halves the cosigner sends on the first round of
-  /// a pairing or a reclaim — see [keyPackage] for the contract, which is the same: rebuilt once,
+  /// a reclaim — see [keyPackage] for the contract, which is the same: rebuilt once,
   /// held for the stream, released with the operation. Both polynomials are dropped as soon as
   /// the share exists.
   ///
@@ -253,8 +253,8 @@ class WalletOperation {
     return _escrowKeyPackage = minted;
   }
 
-  /// The slope this operation deals a service pairing on. Derived under the escrow's context and
-  /// the attempt id, so retrying one attempt's delivery reproduces the same contribution.
+  /// The slope this operation deals a service pairing on, derived under the escrow's context and
+  /// the attempt id.
   BigInt takePairingSlope() {
     _ensureLive();
     final slope = _pairingSlope;

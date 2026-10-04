@@ -71,7 +71,7 @@ class ExitTx {
   final DateTime issuedAt;
 }
 
-/// The exits a seal is about to sign, from the wallet's side.
+/// The exits a delegate renewal is about to sign, from the wallet's side.
 class ExitPlan {
   ExitPlan({
     required this.ownerXOnlyHex,
@@ -104,7 +104,7 @@ class ExitPlan {
         ));
       } catch (_) {
         // Dust, or anything else that cannot be exited. The cosigner skips it too; the wallet
-        // shows it as uncovered rather than failing the seal over it.
+        // shows it as uncovered rather than failing the renewal over it.
       }
     }
     return spends;
@@ -154,7 +154,7 @@ class ExitPlan {
   List<ExitTx> accept(List<cs.ExitTx> returned) {
     if (returned.length != _spends.length) {
       throw CosignerException(
-        'the seal returned ${returned.length} exits for ${_spends.length} signed',
+        'the renewal returned ${returned.length} exits for ${_spends.length} signed',
       );
     }
     final now = DateTime.now();
@@ -163,7 +163,7 @@ class ExitPlan {
       final (outpoint, spend) = _spends[i];
       final exit = returned[i];
       if (exit.outpoint != outpoint) {
-        throw CosignerException('the seal returned an exit for ${exit.outpoint}, not $outpoint');
+        throw CosignerException('the renewal returned an exit for ${exit.outpoint}, not $outpoint');
       }
       final rawTx = _hex(exit.rawTx);
       // The whole check: same transaction, signed by this wallet's key, over the sighash it built.

@@ -1,6 +1,6 @@
 /// The wallet's connection to its cosigner.
 ///
-/// One service, `cosigner.v1.Cosigner`: seven bidirectional streams for the ceremonies and eight
+/// One service, `cosigner.v1.Cosigner`: six bidirectional streams for the ceremonies and seven
 /// single-round calls beside them. This owns the channel and the generated stub, and hands the
 /// session drivers a duplex to work over.
 ///
@@ -27,7 +27,7 @@ import '../enclave/pinned_transport.dart';
 ///
 /// `StreamQueue` rather than `await for`, because every one of these protocols is strict ping-pong
 /// — say a thing, read the answer — and a queue is the shape that reads as. It also buffers from
-/// the moment the stream opens, which is what lets the Settle driver subscribe to the ASP before
+/// the moment the stream opens, which is what lets the Renew driver subscribe to the ASP before
 /// telling the cosigner the intent is registered without losing what arrives in between.
 class Duplex<Q, R> {
   Duplex(this._out, Stream<R> inbound, {void Function(Duplex<Q, R>)? onClose})
@@ -208,30 +208,23 @@ class CosignerConnection {
     return _track(out, _stream('Send', (o) => _stub.send(out.stream, options: o)));
   }
 
-  /// Minting an escrow key: one reshare between this wallet and its cosigner. See
-  /// `sessions/escrow_session.dart`.
+  /// Minting an escrow key: one reshare between this wallet and its cosigner, and optionally
+  /// pairing a service into it. See `sessions/escrow_session.dart`.
   Duplex<cs.EscrowClientMsg, cs.EscrowServerMsg> openEscrow() {
     final out = StreamController<cs.EscrowClientMsg>();
     return _track(out, _stream('Escrow', (o) => _stub.escrow(out.stream, options: o)));
   }
 
-  /// Pairing a service into an escrow. See `sessions/pairing_session.dart`.
-  Duplex<cs.PairServiceClientMsg, cs.PairServiceServerMsg> openPairService() {
-    final out = StreamController<cs.PairServiceClientMsg>();
-    return _track(
-        out, _stream('PairService', (o) => _stub.pairService(out.stream, options: o)));
+  Duplex<cs.RenewClientMsg, cs.RenewServerMsg> openRenew() {
+    final out = StreamController<cs.RenewClientMsg>();
+    return _track(out, _stream('Renew', (o) => _stub.renew(out.stream, options: o)));
   }
 
-  /// Taking back what is left of an escrow. See `sessions/reclaim_session.dart`.
-  Duplex<cs.EscrowReclaimClientMsg, cs.EscrowReclaimServerMsg> openEscrowReclaim() {
-    final out = StreamController<cs.EscrowReclaimClientMsg>();
-    return _track(
-        out, _stream('EscrowReclaim', (o) => _stub.escrowReclaim(out.stream, options: o)));
-  }
-
-  Duplex<cs.SettleClientMsg, cs.SettleServerMsg> openSettle() {
-    final out = StreamController<cs.SettleClientMsg>();
-    return _track(out, _stream('Settle', (o) => _stub.settle(out.stream, options: o)));
+  /// Boarding one on-chain output: [openRenew]'s round and messages, on a stream of its own that
+  /// opens with `BoardOpen`. See `sessions/renew_session.dart`.
+  Duplex<cs.RenewClientMsg, cs.RenewServerMsg> openBoard() {
+    final out = StreamController<cs.RenewClientMsg>();
+    return _track(out, _stream('Board', (o) => _stub.board(out.stream, options: o)));
   }
 
   // --- The single-round calls -------------------------------------------------------------------
@@ -261,17 +254,6 @@ class CosignerConnection {
   /// ask what exists rather than remembering.
   Future<cs.EscrowListResponse> escrowList() async =>
       _stub.escrowList(cs.EscrowListRequest(), options: await _approved('EscrowList'));
-
-  /// Mark a pairing usable, once the service has both halves and its share checks out.
-  /// Cancellable: it is the last step of an operation that holds the escrow share.
-  Future<cs.PairServiceConfirmResponse> pairServiceConfirm(
-          cs.PairServiceConfirmRequest r) async =>
-      _cancellable(_stub.pairServiceConfirm(r, options: await _approved('PairServiceConfirm')));
-
-  /// Commit an escrow to a deal: what the paired service may take, and until when.
-  Future<cs.EscrowOpenSessionResponse> escrowOpenSession(
-          cs.EscrowOpenSessionRequest r) async =>
-      _stub.escrowOpenSession(r, options: await _approved('EscrowOpenSession'));
 
   Future<void> shutdown() => _channel.shutdown();
 }

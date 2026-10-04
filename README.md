@@ -88,10 +88,10 @@ Merlin is a concrete consumer of the runtime's capabilities. Its [`Host` trait](
 | Carry multiple signing rounds under one approved interaction | Passkey-minted interaction token, HTTP/2, bidirectional request/response bodies | [`connection.dart`](app-core/lib/cosigner/connection.dart), [`session.rs`](cosigner/src/session.rs), [`grpc/`](cosigner/src/grpc/) |
 | Keep each wallet's files and execution separate | Tenant-scoped preopen and per-tenant execution lock | [`open_cosigner`](cosigner/src/main.rs), [`store.rs`](cosigner/src/store.rs) |
 | Preserve state beyond an invocation or restart | Copy-on-write encrypted filesystem and durable sync/rename operations | [`SnapshotState`](cosigner/src/types.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
-| Execute an already authorized renewal later | `enclave:tasks/queue` and the `run-task` callback | [`delegate.rs`](cosigner/src/handlers/delegate.rs), [`watch.rs`](cosigner/src/handlers/watch.rs) |
+| Execute an already authorized renewal later | `enclave:tasks/queue` and the `run-task` callback | [`renew.rs`](cosigner/src/renew.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
 | Reach the ASP during unattended work | Exact-origin guest egress policy | [`asp/`](cosigner/src/asp/), [`up-enclave.sh`](scripts/up-enclave.sh) |
-| Let a paired service initiate an exchange | `enclave:streams/connection` and `on-message` | [`service_stream.rs`](cosigner/src/service_stream.rs), [`release.rs`](cosigner/src/handlers/release.rs) |
-| Notify the owner without putting private details in a push | Runtime-owned device enrollment and FCM wake queue | [`host.rs`](cosigner/src/host.rs), [`watch.rs`](cosigner/src/handlers/watch.rs) |
+| Let a paired service initiate an exchange | `enclave:streams/connection` and `on-message` | [`escrow.rs`](cosigner/src/escrow.rs) |
+| Notify the owner without putting private details in a push | Runtime-owned device enrollment and FCM wake queue | [`host.rs`](cosigner/src/host.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
 
 ### Persistent wallet state
 
@@ -107,7 +107,7 @@ The service connection solves a separate problem from a timer. An escrow counter
 
 The guest checks that the sending service is paired to the named escrow and evaluates the stored session, transaction policy, remaining allowance, and required evidence. It tracks request IDs and consumed payment references in persistent state. Runtime reconnection does not itself provide exactly-once payments; the application-level accounting is essential.
 
-Service destinations are configured in the measured image. The guest selects a service identity from that configuration; the wallet does not gain arbitrary outbound access by supplying a URL. See [`delivery.rs`](cosigner/src/handlers/delivery.rs), [`escrow_session.rs`](cosigner/src/escrow_session.rs), and the [service-stream tests](cosigner/tests/service_stream_test.rs).
+Service destinations are configured in the measured image. The guest selects a service identity from that configuration; the wallet does not gain arbitrary outbound access by supplying a URL. See [`escrow.rs`](cosigner/src/escrow.rs) and the [service-stream tests](cosigner/tests/service_stream_test.rs).
 
 ## A concrete demonstration: renew while the phone is offline
 
@@ -348,19 +348,19 @@ sealed at DKG. Neither is the key. An operation that signs goes like this
    (`SeedSource.seedDuring`). The seed becomes the polynomial and is overwritten at once. A passkey
    that does not derive this wallet's identifier is refused here, before anything is opened.
 4. **Open the stream.** Its open names the wallet's identifier; the cosigner's first answer carries
-   `wallet_dealt_share`, on `Sign`, `Send` and `Settle` alike — once per stream, and never the
-   cosigner's own share (`cosigner/src/handlers/recover.rs`, `dealt_share_for`). No second call, so
+   `wallet_dealt_share`, on `Sign`, `Send` and `Renew` alike — once per stream, and never the
+   cosigner's own share (`cosigner/src/cosigner.rs`, `dealt_share_for`). No second call, so
    no second approval.
 5. **Add, fix the sign, check.** The sum is accepted only if `s·G` is the verifying share this
    device stored when the wallet was made — not one that arrived with the contribution
    (`app-core/lib/passkey/share_reconstruction.dart`). The share signs every round of that stream:
-   a settle's intent proof, its commitment, the trailing seal.
+   a renewal's intent proof, its commitment, the trailing seal.
 6. **Let go**, in a `finally`: on success, on failure, and on cancellation
    (`MpcClient.cancelOperation`).
 
 `Sign` had to change shape for this. The wallet used to commit first, and its nonce is hedged with
 its share — which it no longer has until the cosigner answers. So the cosigner commits first, as it
-always did on `Send` and `Settle`; FROST's binding factor covers every commitment whoever sent
+always did on `Send` and `Renew`; FROST's binding factor covers every commitment whoever sent
 theirs last. `Sign` is also now script-path only by name: it always was in effect, since the
 cosigner signs untweaked and checks every share.
 
@@ -403,9 +403,10 @@ operation gives an attacker who has both nothing they could not already ask for.
 
 **Escrows follow the same rule.** An escrow share is the wallet share plus two deltas — the
 wallet's, derived from the passkey under a per-escrow context, and the cosigner's, sealed — and is
-rebuilt inside the same operation, from the two halves the `PairService` or `EscrowReclaim` stream
-brings on its first round, checked against the escrow's stored verifying share, and released with
-the operation (`WalletOperation.escrowKeyPackage`). What the device keeps of an escrow is its key,
+rebuilt inside the same operation, from the two halves a reclaim (a `Send` naming the escrow)
+brings on its first round, checked against the escrow's stored verifying share, and released with the operation
+(`WalletOperation.escrowKeyPackage`). The operation that mints an escrow holds the share it made
+(`WalletOperation.holdEscrowKeyPackage`) instead. What the device keeps of an escrow is its key,
 its public package and that context; `Recover` hands a new device all three. An escrow minted
 before its context was recorded cannot be rebuilt by any passkey and is left out of recovery.
 
@@ -524,7 +525,7 @@ funds not yet settled — is not in the app yet; the exit is the last hop, and t
 obtained later.
 
 Implementation: [`exit.rs`](crates/ark/src/exit.rs) (shared transaction construction),
-[`FFI exit verification`](ffi/src/ark/exit.rs), [`delegate.rs`](cosigner/src/handlers/delegate.rs),
+[`FFI exit verification`](ffi/src/ark/exit.rs), [`renew.rs`](cosigner/src/renew.rs),
 [`exit_plan.dart`](app-core/lib/sessions/exit_plan.dart), and
 [`exit_screen.dart`](app/lib/screens/exit/exit_screen.dart).
 

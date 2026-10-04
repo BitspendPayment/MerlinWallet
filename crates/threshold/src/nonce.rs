@@ -1,3 +1,4 @@
+use crate::error::Error;
 use crate::hash::h3;
 use crate::point;
 use crate::scalar::scalar_to_bytes;
@@ -11,6 +12,22 @@ pub struct SigningCommitments {
     pub binding: ProjectivePoint,
     /// Hiding commitment: hiding * G
     pub hiding: ProjectivePoint,
+}
+
+impl SigningCommitments {
+    /// From the two 33-byte compressed points, as they travel.
+    pub fn from_bytes(hiding: &[u8], binding: &[u8]) -> Result<Self, Error> {
+        let point = |b: &[u8]| -> Result<ProjectivePoint, Error> {
+            point::deserialize_compressed(b.try_into().map_err(|_| Error::InvalidPoint)?)
+        };
+        Ok(Self { hiding: point(hiding)?, binding: point(binding)? })
+    }
+
+    /// From the two compressed points as hex.
+    pub fn from_hex(hiding: &str, binding: &str) -> Result<Self, Error> {
+        use hex_conservative::FromHex;
+        Self::from_bytes(&<[u8; 33]>::from_hex(hiding)?, &<[u8; 33]>::from_hex(binding)?)
+    }
 }
 
 /// A signing nonce (secret scalars + public commitments).

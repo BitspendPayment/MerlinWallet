@@ -508,7 +508,7 @@ fn lookup<'a>(body: &'a serde_json::Value, at: &str) -> Option<&'a serde_json::V
 
 /// Going and asking.
 ///
-/// A trait for the same reason [`crate::handlers::delivery::DeliverPairing`] is one: the transport
+/// A trait for the same reason [`Host`](crate::host::Host) is one: the transport
 /// exists only on `wasm32`, and everything worth testing about evidence — what is asked, what a
 /// redirect means, what an unusable answer does — is about the decision rather than the socket.
 #[allow(async_fn_in_trait)]

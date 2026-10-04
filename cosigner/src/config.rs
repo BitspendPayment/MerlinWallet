@@ -9,7 +9,7 @@ use std::env;
 /// instance serves — is read in `main` rather than here, because a missing one is a refusal to
 /// serve rather than a default.
 #[derive(Debug, Clone)]
-pub struct ServerConfig {
+pub struct Config {
     /// Directory the KV store lives in, e.g. `/var/lib/cosigner`. Created at open, so a fresh
     /// deployment needs no setup. `:memory:` gives an ephemeral store (tests). Env `STORE_DIR`.
     pub store_dir: String,
@@ -21,7 +21,7 @@ pub struct ServerConfig {
     pub auto_settle_safety_margin_secs: i64,
 }
 
-impl ServerConfig {
+impl Config {
     /// Load configuration from environment variables.
     pub fn from_environment() -> Self {
         Self {

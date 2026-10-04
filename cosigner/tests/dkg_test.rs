@@ -12,8 +12,7 @@ use std::collections::BTreeMap;
 
 use rand::rngs::OsRng;
 
-use cosigner::handlers::onboarding as ob;
-use cosigner::handlers::onboarding::OnboardingSession;
+use cosigner::onboarding::OnboardingSession;
 use cosigner::wallet_proto::{DkgStep1Request, DkgStep3Request};
 
 use threshold::dkg::{self, Round1Package, Round2Package};
@@ -48,8 +47,7 @@ fn ceremony_derives_one_group_key() {
     let mut sess = OnboardingSession::new();
 
     // --- The wallet's round 1 in, everybody's out -------------------------------------------
-    let r1 = ob::dkg_open(
-        &mut sess,
+    let r1 = sess.begin(
         DkgStep1Request {
             identifier: wallet_id.serialize().to_vec(),
             round1_package: w_r1_pub.to_json(),
@@ -68,8 +66,7 @@ fn ceremony_derives_one_group_key() {
     let (w_r2_secret, w_r2_out) = dkg::dkg_part2(&w_r1_secret, &others_r1, &[]).unwrap();
 
     // --- Its round 2 in, ours out with the key ----------------------------------------------
-    let r3 = ob::dkg_finish(
-        &mut sess,
+    let r3 = sess.finalise(
         DkgStep3Request {
             identifier: wallet_id.serialize().to_vec(),
             round2_packages_for_others: w_r2_out
@@ -80,10 +77,7 @@ fn ceremony_derives_one_group_key() {
     )
     .expect("finish");
 
-    let mat = sess
-        .seed_material
-        .take()
-        .expect("the ceremony must yield key material");
+    let group_key = sess.group_key.clone().expect("the ceremony must yield key material");
 
     // The wallet finalizes with the cosigner's round2 package addressed to it.
     let our_r2: BTreeMap<Identifier, Round2Package> = r3
@@ -102,11 +96,11 @@ fn ceremony_derives_one_group_key() {
 
     assert_eq!(
         hex::encode(wallet_pkp.into_even_y().verifying_key.serialize()),
-        mat.group_key,
+        group_key,
         "the wallet and the cosigner must derive the same group key"
     );
 
-    let _ = store.delete("sealed_state", &mat.group_key);
+    let _ = store.delete("sealed_state", &group_key);
 }
 
 /// An abandoned ceremony leaves no key material anywhere.
@@ -133,12 +127,12 @@ fn abandoned_ceremony_leaves_nothing() {
 
     // Open a ceremony, take the cosigner's round1 package, then abandon it.
     let mut first = OnboardingSession::new();
-    let a = ob::dkg_open(&mut first, req(w_r1_pub.to_json())).expect("first");
+    let a = first.begin(req(w_r1_pub.to_json())).expect("first");
     drop(first);
 
     // A fresh ceremony deals a fresh secret: the cosigner's package must differ.
     let mut second = OnboardingSession::new();
-    let b = ob::dkg_open(&mut second, req(w_r1_pub.to_json())).expect("second");
+    let b = second.begin(req(w_r1_pub.to_json())).expect("second");
 
     let cosigner_pkg = |wire: &std::collections::HashMap<String, String>| {
         wire.iter()
@@ -155,7 +149,7 @@ fn abandoned_ceremony_leaves_nothing() {
 
 /// A wallet that already has a key refuses a second ceremony.
 ///
-/// `install_policy` overwrites unconditionally, so a second DKG on the same tenant would replace the
+/// `install_key` overwrites unconditionally, so a second DKG on the same tenant would replace the
 /// key and strand everything held under the old one — 2-of-2 has no other way back. The e2e suite
 /// did exactly that without noticing, re-running DKG on one wallet name across tests, and got away
 /// with it only because nothing was funded in between.
@@ -171,7 +165,7 @@ fn a_wallet_with_a_key_refuses_a_second_dkg() {
     );
 
     let (kps, pkp) = common::dkg_2of2();
-    common::seed_policy(&fresh, "wallet", &kps[1], &kps[0], &pkp, None);
+    common::seed_policy(&fresh, "wallet", &kps[1], &kps[0], &pkp);
     drop(fresh);
 
     // Reopened, so the refusal comes from the seal and not from memory.
@@ -206,8 +200,7 @@ fn the_sealed_dealt_share_rebuilds_the_wallet_share() {
     let wallet_id = w_r1_secret.identifier.clone();
     let mut sess = OnboardingSession::new();
 
-    let r1 = ob::dkg_open(
-        &mut sess,
+    let r1 = sess.begin(
         DkgStep1Request {
             identifier: wallet_id.serialize().to_vec(),
             round1_package: w_r1_pub.to_json(),
@@ -222,8 +215,7 @@ fn the_sealed_dealt_share_rebuilds_the_wallet_share() {
         .collect();
     let (w_r2_secret, w_r2_out) = dkg::dkg_part2(&w_r1_secret, &others_r1, &[]).unwrap();
 
-    let r3 = ob::dkg_finish(
-        &mut sess,
+    let r3 = sess.finalise(
         DkgStep3Request {
             identifier: wallet_id.serialize().to_vec(),
             round2_packages_for_others: w_r2_out
@@ -233,7 +225,7 @@ fn the_sealed_dealt_share_rebuilds_the_wallet_share() {
         },
     )
     .expect("finish");
-    let mat = sess.seed_material.take().expect("key material");
+    let group_key = sess.group_key.clone().expect("key material");
 
     let our_r2: BTreeMap<Identifier, Round2Package> = r3
         .round2_packages_for_me
@@ -250,8 +242,9 @@ fn the_sealed_dealt_share_rebuilds_the_wallet_share() {
         .expect("wallet part3");
 
     // What the cosigner sealed, and what the wallet can work out on its own.
-    let dealt_hex = mat
+    let dealt_hex = sess
         .wallet_dealt_share_hex
+        .clone()
         .expect("the ceremony must seal the share dealt to the wallet");
     let dealt = threshold::scalar::scalar_from_bytes(
         &hex::decode(&dealt_hex).unwrap().try_into().unwrap(),
@@ -272,5 +265,5 @@ fn the_sealed_dealt_share_rebuilds_the_wallet_share() {
         "the wallet's own half alone is not its share — the sealed half is what makes it one"
     );
 
-    let _ = store.delete("sealed_state", &mat.group_key);
+    let _ = store.delete("sealed_state", &group_key);
 }

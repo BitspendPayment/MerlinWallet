@@ -1,7 +1,42 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:app/screens/send/payout_form_screen.dart';
+import 'package:app/services/mpc_service.dart';
 import 'package:app/services/payout_service.dart';
+import 'package:app_core/asp/ark_info.dart' show IndexerVtxo;
+import 'package:app_core/platform/bank_send.dart';
 import 'package:app_core/platform/platform_client.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:hive/hive.dart';
+
+/// A payout's steps that set its escrow up and then fail to fund it — the ASP refusing the send, or
+/// the connection dropping — after the deal was [sealed], or before.
+class _FailsToFund implements BankSend {
+  _FailsToFund({required this.sealed});
+  final bool sealed;
+
+  static final escrow = '02${'ab' * 32}';
+
+  @override
+  Future<Commitment> commit(
+    PayoutQuote quote, {
+    required Map<String, String> fields,
+    void Function(CommitStep step)? onStep,
+    Future<void> Function(String escrowKeyHex)? onSealed,
+  }) async {
+    onStep?.call(CommitStep.seal);
+    if (sealed) await onSealed?.call(escrow);
+    throw StateError('the ASP refused the funding send');
+  }
+
+  /// Empty: the send that would have funded it never went.
+  @override
+  Future<List<IndexerVtxo>> held(String escrowKeyHex) async => const [];
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 void main() {
   group('amounts', () {
@@ -105,15 +140,79 @@ void main() {
     });
   });
 
-  /// A platform that lost its share of the escrow is the one refusal that means "set up again":
-  /// told apart from a refusal about the payee, and from a platform that is merely down.
-  test('the platform losing its share of the escrow is told apart from other refusals', () {
-    const lost = 'this platform holds no share of that escrow, so it is not paired into it';
-    expect(platformHoldsNoShare(PlatformException(lost, status: 400)), isTrue);
-    expect(platformHoldsNoShare(PlatformException(lost, status: 503)), isFalse);
-    expect(
-        platformHoldsNoShare(PlatformException('the account belongs to someone else', status: 400)),
-        isFalse);
-    expect(platformHoldsNoShare(StateError(lost)), isFalse);
+  group('a payout whose escrow is set up and never funded', () {
+    late Directory dir;
+    setUp(() async {
+      dir = await Directory.systemTemp.createTemp('payouts');
+      Hive.init(dir.path);
+    });
+    tearDown(() async {
+      await Hive.close();
+      await dir.delete(recursive: true);
+    });
+
+    final draft = PayoutDraft(
+      corridor: Corridor({'country': 'NG', 'currency': 'NGN', 'decimals': 2}),
+      rail: Rail({'rail': 'bank'}),
+      fields: const {'accountNumber': '0123456789', 'bankName': 'OPay'},
+      fullName: 'Ada Obi',
+      amountMinor: 3000000,
+    );
+    PayoutQuote quote(String tag, {required int dealSeconds}) => PayoutQuote({
+          'request_id': 'reimb-$tag',
+          'deal_tag': tag,
+          'external_account_id': 'ExternalAccount:1',
+          'currency': 'NGN',
+          'amount_minor': 3000000,
+          'sats': 22580,
+          'expires_at': '2026-10-03T12:00:00Z',
+          'deal_seconds': dealSeconds,
+          'policy': {'op': 'never'},
+        });
+
+    /// [q] sent through [payouts], once its send has failed.
+    Future<Payout> failed(PayoutService payouts, PayoutQuote q) async {
+      final over = Completer<void>();
+      void check() {
+        if ((payouts.payout(q.dealTag)?.failed ?? false) && !over.isCompleted) over.complete();
+      }
+
+      payouts.addListener(check);
+      await payouts.start(draft, q);
+      await over.future;
+      payouts.removeListener(check);
+      return payouts.payout(q.dealTag)!;
+    }
+
+    test('sealed: its deal holds the escrow, and an empty one is settled only once that ends',
+        () async {
+      final payouts = PayoutService(MpcService(), bank: _FailsToFund(sealed: true));
+
+      final held = await failed(payouts, quote('held', dealSeconds: 1800));
+      expect(held.escrowKey, _FailsToFund.escrow);
+      expect(held.holdUntil?.isAfter(DateTime.now()), isTrue,
+          reason: 'the deal holds the escrow whatever its send did, and the platform never heard '
+              'of it, so will not end it sooner');
+      expect(await payouts.leftIn(held), 0);
+      expect(payouts.payout('held')!.leftoverSats, isNull,
+          reason: 'empty for now, but money a send was still landing could yet arrive');
+
+      final over = await failed(payouts, quote('over', dealSeconds: 0));
+      await Future<void>.delayed(const Duration(milliseconds: 5)); // Past its deadline.
+      expect(await payouts.leftIn(over), 0);
+      expect(payouts.payout('over')!.leftoverSats, 0, reason: 'nothing to return, so settled');
+
+      expect(payouts.pending.map((p) => p.dealTag), ['held'],
+          reason: 'what is left to deal with is the escrow its deal still holds');
+    });
+
+    test('not sealed: nothing is held, and nothing is left to deal with', () async {
+      final payouts = PayoutService(MpcService(), bank: _FailsToFund(sealed: false));
+
+      final p = await failed(payouts, quote('unsealed', dealSeconds: 1800));
+      expect(p.escrowKey, isNull);
+      expect(p.holdUntil, isNull);
+      expect(payouts.pending, isEmpty);
+    });
   });
 }

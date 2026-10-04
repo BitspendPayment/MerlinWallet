@@ -90,8 +90,6 @@ class ExitPage {
     ));
     await tester.pumpAndSettle();
   }
-
-  static Future<void> signExits(WidgetTester tester) => _tapKey(tester, 'exitProtectBtn');
 }
 
 class ArkPage {

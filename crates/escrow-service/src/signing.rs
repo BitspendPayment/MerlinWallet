@@ -16,7 +16,7 @@
 //!
 //! FROST needs both parties' commitments before either can compute its share. The cosigner has no
 //! execution context between messages, so it cannot hold a nonce across a round trip — see
-//! `cosigner/src/handlers/release.rs`. The service can, because it is an ordinary long-running
+//! `cosigner/src/sign.rs`. The service can, because it is an ordinary long-running
 //! process. So the service commits first, the cosigner does both of its rounds inside one
 //! invocation, and no single-use nonce is ever written down by either side.
 //!
@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 
 use ark::client::send::{SendSession, SendVtxoInput};
 use ark::client::types::ArkInfo;
-use cosigner::handlers::release::{SignedHalf, WireCommitment};
+use cosigner::escrow::{SignedHalf, WireCommitment};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use threshold::commitment::SigningPackage;
@@ -172,7 +172,7 @@ impl PairedShare {
     }
 
     pub fn identifier(&self) -> Result<Identifier, String> {
-        identifier_from_hex(&self.service_identifier_hex)
+        self.service_identifier_hex.parse().map_err(|e| format!("bad identifier: {e}"))
     }
 
     /// The cosigner's identifier in this pairing — the other of the two.
@@ -191,7 +191,7 @@ impl PairedShare {
 ///
 /// Not `Clone`, and never serialized. Two signatures under one nonce give up the share by simple
 /// algebra, so a copy is a second use waiting to happen — the same rule the cosigner's
-/// `InBandRound` follows, for the same reason.
+/// `SigningSession` follows, for the same reason.
 pub struct Round {
     nonces: Vec<SigningNonce>,
 }
@@ -257,8 +257,8 @@ impl Round {
             .enumerate()
             .map(|(i, ((message, nonce), half))| {
                 let at = |e: String| format!("message {i}: {e}");
-                let their_commitment =
-                    commitments_from_hex(&half.hiding, &half.binding).map_err(at)?;
+                let their_commitment = SigningCommitments::from_hex(&half.hiding, &half.binding)
+                    .map_err(|e| at(e.to_string()))?;
 
                 let mut commitments = BTreeMap::new();
                 commitments.insert(mine.clone(), nonce.commitments.clone());
@@ -358,28 +358,6 @@ fn scalar_from_hex(s: &str) -> Result<k256::Scalar, String> {
         .try_into()
         .map_err(|_| "a scalar is 32 bytes".to_string())?;
     scalar::scalar_from_bytes(&bytes).map_err(|e| format!("not a usable scalar: {e}"))
-}
-
-fn identifier_from_hex(s: &str) -> Result<Identifier, String> {
-    let bytes: [u8; 32] = hex::decode(s)
-        .map_err(|e| format!("not hex: {e}"))?
-        .try_into()
-        .map_err(|_| "an identifier is 32 bytes".to_string())?;
-    Identifier::deserialize(&bytes).map_err(|e| format!("{e}"))
-}
-
-fn commitments_from_hex(hiding: &str, binding: &str) -> Result<SigningCommitments, String> {
-    let point = |what: &str, s: &str| -> Result<_, String> {
-        let bytes: [u8; 33] = hex::decode(s)
-            .map_err(|e| format!("{what} is not hex: {e}"))?
-            .try_into()
-            .map_err(|_| format!("{what} must be a 33-byte compressed point"))?;
-        point::deserialize_compressed(&bytes).map_err(|e| format!("bad {what}: {e}"))
-    };
-    Ok(SigningCommitments {
-        hiding: point("hiding commitment", hiding)?,
-        binding: point("binding commitment", binding)?,
-    })
 }
 
 /// A compressed key without its parity byte, lowercased.

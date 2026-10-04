@@ -121,7 +121,8 @@ class EnclaveHarness {
           '--guest-env', 'SERVICE_ORIGINS=$serviceOrigins',
           for (final entry in serviceOrigins.split(RegExp(r'[,_]')))
             // The origin is whatever follows the first separator; an origin's own `://` comes
-            // later. See `cosigner/src/handlers/delivery.rs` for why both spellings exist.
+            // later. See `ServiceRegistry` in `cosigner/src/escrow.rs` for why both spellings
+            // exist.
             ...['--guest-egress', entry.replaceFirst(RegExp(r'^[0-9a-fA-F]+[:=]'), '')],
         ],
         for (final origin in extraEgress) ...['--guest-egress', origin],

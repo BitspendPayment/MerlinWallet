@@ -93,28 +93,21 @@ pub fn dkg_2of2() -> (Vec<KeyPackage>, PublicKeyPackage) {
 
 /// Open the cosigner this process serves, loading whatever its seal already holds.
 pub fn open_cosigner(store: &Arc<Store>, group_key: &str) -> Mutex<Cosigner> {
-    Mutex::new(Cosigner::open(store.clone(), group_key.to_string()).expect("open cosigner"))
+    let detached = std::sync::Arc::new(cosigner::host::Detached);
+    let cosigner = Cosigner::open(store.clone(), group_key.to_string(), detached);
+    Mutex::new(cosigner.expect("open cosigner"))
 }
 
 /// Install a wallet's key material and seal it, as DKG's final round does: the cosigner key
-/// package, the group PKP, the user's signing identifier and the Ark cosigner secret.
+/// package, the group PKP and the user's signing identifier.
 pub fn seed_policy(
     cosigner: &Mutex<Cosigner>,
     group_key: &str,
     kp_cosigner: &KeyPackage,
     kp_user: &KeyPackage,
     pkp: &PublicKeyPackage,
-    ark_cosigner_secret_hex: Option<String>,
 ) {
-    seed_policy_with_dealt_share(
-        cosigner,
-        group_key,
-        kp_cosigner,
-        kp_user,
-        pkp,
-        ark_cosigner_secret_hex,
-        None,
-    );
+    seed_policy_with_dealt_share(cosigner, group_key, kp_cosigner, kp_user, pkp, None);
 }
 
 /// As [`seed_policy`], plus the share the cosigner dealt the wallet at DKG — what `Recover` hands
@@ -125,17 +118,15 @@ pub fn seed_policy_with_dealt_share(
     kp_cosigner: &KeyPackage,
     kp_user: &KeyPackage,
     pkp: &PublicKeyPackage,
-    ark_cosigner_secret_hex: Option<String>,
     wallet_dealt_share_hex: Option<String>,
 ) {
     let mut actor = cosigner.lock().unwrap();
     actor
-        .install_policy(
+        .install_key(
             group_key.to_string(),
             &kp_cosigner.to_json(),
             &pkp.to_json(),
             Some(&hex::encode(kp_user.identifier.serialize())),
-            ark_cosigner_secret_hex,
             wallet_dealt_share_hex,
             )
         .expect("install policy");
@@ -181,13 +172,13 @@ pub fn group_sign(
         .serialize()
 }
 
-/// The wallet's half of an in-band round over [messages]: a fresh nonce for each, then a share
+/// The wallet's half of a signing session over [messages]: a fresh nonce for each, then a share
 /// over both commitments. What `answerRound` does in the app.
 pub fn wallet_answers(
     kp_user: &KeyPackage,
     messages: &[Vec<u8>],
     cosigner_commitments: &[cosigner::types::Commitment],
-) -> Vec<cosigner::cosigner::WalletHalf> {
+) -> Vec<cosigner::sign::WalletHalf> {
     use threshold::commitment::SigningPackage;
     use threshold::nonce::{self, SigningCommitments};
     use threshold::point;
@@ -216,7 +207,7 @@ pub fn wallet_answers(
             commitments.insert(kp_user.identifier.clone(), ours.commitments.clone());
             let package = SigningPackage::new(commitments, message.clone());
             let share = signing::sign(&package, &ours, kp_user).expect("wallet share");
-            cosigner::cosigner::WalletHalf {
+            cosigner::sign::WalletHalf {
                 hiding: point::serialize_compressed(&ours.commitments.hiding).to_vec(),
                 binding: point::serialize_compressed(&ours.commitments.binding).to_vec(),
                 share: scalar_to_bytes(&share.s).to_vec(),
@@ -232,7 +223,7 @@ pub fn seed_escrow(
     paired: bool,
 ) {
     let mut c = cosigner.lock().unwrap();
-    c.install_escrow(cosigner::types::EscrowRecord {
+    c.add_escrow(cosigner::escrow::EscrowSession {
         escrow_key: escrow_key.to_string(),
         key_package_json: "{}".into(),
         public_key_package_json: "{}".into(),
@@ -240,29 +231,38 @@ pub fn seed_escrow(
         context_hex: "22".repeat(16),
         wallet_delta_share_hex: "33".repeat(32),
         created_at: 1_700_000_000,
-        pairing: paired.then(|| cosigner::types::ServicePairing {
-            service_identifier_hex: "44".repeat(32),
-            key_package_json: "{}".into(),
-            public_key_package_json: "{}".into(),
-            service_verifying_share_hex: "55".repeat(33),
-            paired_at: 1_700_000_000,
-            attempt_id_hex: "aa".repeat(16),
-            // Seeded finished: these tests are about the DEAL, and a pending pairing is refused a
-            // deal for reasons of its own — proved in `escrow_session_test.rs`.
-            service_confirmed: true,
-            wallet_confirmed: true,
-        }),
-        session: None,
-        reclaim_opened_at: None,
+        stage: match paired {
+            false => cosigner::escrow::EscrowStage::Minted,
+            true => cosigner::escrow::EscrowStage::Paired(cosigner::escrow::ServicePairing {
+                service_identifier_hex: "44".repeat(32),
+                key_package_json: "{}".into(),
+                public_key_package_json: "{}".into(),
+                service_verifying_share_hex: "55".repeat(33),
+                paired_at: 1_700_000_000,
+                attempt_id_hex: "aa".repeat(16),
+                // Seeded finished: these tests are about the DEAL, and a pending pairing is refused
+                // a deal for reasons of its own — proved in `escrow_session_test.rs`.
+                service_confirmed: true,
+                wallet_confirmed: true,
+            }),
+        },
     })
     .expect("install escrow");
 }
 
-/// Driving `CosignerService::route` with real framed bodies, as the runtime delivers them.
+/// Make the next seal filed under [name] in the file store at [dir] fail to write: a directory
+/// sits where its temporary goes, which to the code writing it looks like a full or failing disk.
+pub fn block_seal(dir: &std::path::Path, name: &str) {
+    let tree = dir.join(hex::encode("sealed_state"));
+    std::fs::create_dir_all(tree.join(format!("{}.writing", hex::encode(name)))).unwrap();
+}
+
+/// Driving `Session::route` with real framed bodies, as the runtime delivers them.
 ///
-/// A body here is written whole before the handler runs, so a test can open a stream and read
-/// what the cosigner says first — but cannot answer it. A stream opened and left is cut off
-/// mid-ceremony, and ends `Cancelled` with whatever went out before that.
+/// A body from [request] is written whole before the handler runs, so a test can open a stream and
+/// read what the cosigner says first — but cannot answer it; a stream opened and left is cut off
+/// mid-ceremony, and ends `Cancelled`. A [Wire] is fed as the test goes, for a ceremony whose
+/// rounds depend on the cosigner's.
 pub mod wire {
     use std::future::Future;
     use std::sync::{Arc, Mutex};
@@ -272,13 +272,10 @@ pub mod wire {
     use http_body_util::BodyExt;
 
     use cosigner::grpc::framing::{frame, Deframer};
-    use cosigner::session::{CosignerService, TENANT_HEADER};
+    use cosigner::session::Session;
     use cosigner::wallet_proto::GetServerInfoResponse;
     use cosigner::Cosigner;
     use wstd::http::{Body, Request, Response};
-
-    /// What the runtime puts on an approved request: sixteen bytes, lowercase hex.
-    pub const TENANT: &str = "0123456789abcdef0123456789abcdef";
 
     /// Drive a future to completion on this thread.
     ///
@@ -297,25 +294,16 @@ pub mod wire {
         panic!("the future never completed");
     }
 
-    /// A gRPC request carrying `messages`, addressed at `method`, as the runtime would deliver it
-    /// — or, with `tenant: None`, as it would never deliver it.
-    pub fn request<M: prost::Message>(
-        method: &str,
-        messages: &[M],
-        tenant: Option<&str>,
-    ) -> Request<Body> {
+    /// A gRPC request carrying `messages`, addressed at `method`, as the runtime would deliver it.
+    pub fn request<M: prost::Message>(method: &str, messages: &[M]) -> Request<Body> {
         let mut buf = Vec::new();
         for message in messages {
             buf.extend_from_slice(&frame(&message.encode_to_vec()));
         }
-        let mut builder = Request::builder()
+        Request::builder()
             .method("POST")
             .uri(format!("http://cosigner/cosigner.v1.Cosigner/{method}"))
-            .header("content-type", "application/grpc+proto");
-        if let Some(tenant) = tenant {
-            builder = builder.header(TENANT_HEADER, tenant);
-        }
-        builder
+            .header("content-type", "application/grpc+proto")
             .body(Body::from_http_body(
                 http_body_util::Full::new(Bytes::from(buf))
                     .map_err(|e: std::convert::Infallible| -> wstd::http::Error { match e {} }),
@@ -355,11 +343,103 @@ pub mod wire {
         Answer { messages, code, message }
     }
 
-    pub fn service(cosigner: Cosigner) -> CosignerService {
-        CosignerService::new(
+    pub fn service(cosigner: Cosigner) -> Session {
+        Session::new(
             Arc::new(Mutex::new(cosigner)),
             GetServerInfoResponse { bitcoin_network: "regtest".into() },
         )
+    }
+
+    /// The client's end of a stream: frames handed over as the test decides them. Empty is
+    /// `Pending`, as a connection with nothing in flight is — which is what makes a stream a
+    /// conversation rather than a batch, and lets a client answer what the cosigner said — until
+    /// the client ends its side.
+    #[derive(Clone, Default)]
+    pub struct Wire(Arc<Mutex<(std::collections::VecDeque<Bytes>, bool)>>);
+
+    impl Wire {
+        pub fn send<M: prost::Message>(&self, message: &M) {
+            self.0.lock().unwrap().0.push_back(frame(&message.encode_to_vec()));
+        }
+
+        /// The client's side, ended: it has nothing more to say.
+        pub fn close(&self) {
+            self.0.lock().unwrap().1 = true;
+        }
+    }
+
+    impl http_body::Body for Wire {
+        type Data = Bytes;
+        type Error = wstd::http::Error;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            let mut wire = self.0.lock().unwrap();
+            match wire.0.pop_front() {
+                Some(bytes) => Poll::Ready(Some(Ok(http_body::Frame::data(bytes)))),
+                None if wire.1 => Poll::Ready(None),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// The cosigner's end of a stream, read one message at a time.
+    pub struct Reply {
+        body: http_body_util::combinators::UnsyncBoxBody<Bytes, wstd::http::Error>,
+        deframer: Deframer,
+    }
+
+    impl Reply {
+        /// Open the stream [method], with [wire] as its request body.
+        pub fn open(cosigner: Cosigner, method: &str, wire: &Wire) -> Self {
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("http://cosigner/cosigner.v1.Cosigner/{method}"))
+                .header("content-type", "application/grpc+proto")
+                .body(Body::from_http_body(wire.clone()))
+                .expect("request is well formed");
+            let response = block_on(service(cosigner).route(request));
+            Self { body: response.into_body().into_boxed_body(), deframer: Deframer::default() }
+        }
+
+        /// The cosigner's next message. It has been sent everything it asked for, so it has
+        /// something to say: waiting is a test that forgot to answer, and trailers are a stream
+        /// that failed.
+        pub fn next<M: prost::Message + Default>(&mut self) -> M {
+            use http_body::Body as _;
+            let mut cx = Context::from_waker(Waker::noop());
+            loop {
+                if let Some(bytes) = self.deframer.next().expect("well framed") {
+                    return M::decode(bytes).expect("decodable");
+                }
+                match std::pin::Pin::new(&mut self.body).poll_frame(&mut cx) {
+                    Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                        Ok(data) => self.deframer.push(&data),
+                        Err(frame) => panic!("the stream ended early: {:?}", frame.trailers_ref()),
+                    },
+                    Poll::Ready(Some(Err(e))) => panic!("the stream failed: {e}"),
+                    Poll::Ready(None) => panic!("the stream ended before its next message"),
+                    Poll::Pending => panic!("the cosigner is waiting for a message never sent"),
+                }
+            }
+        }
+
+        /// How the stream ended, as a client reads it from the trailers: status code and message.
+        pub fn finish(mut self) -> (String, String) {
+            use http_body::Body as _;
+            let mut cx = Context::from_waker(Waker::noop());
+            let Poll::Ready(Some(Ok(frame))) =
+                std::pin::Pin::new(&mut self.body).poll_frame(&mut cx)
+            else {
+                panic!("expected the trailers after the last message");
+            };
+            let trailers = frame.into_trailers().expect("trailers, and nothing more said");
+            let read =
+                |name: &str| trailers.get(name).map_or("", |v| v.to_str().unwrap()).to_string();
+            (read("grpc-status"), read("grpc-message"))
+        }
     }
 }
 

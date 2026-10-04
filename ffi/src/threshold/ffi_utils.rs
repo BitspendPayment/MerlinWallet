@@ -10,43 +10,6 @@ use threshold::polynomial;
 use threshold::random;
 use threshold::scalar::{scalar_from_bytes, scalar_from_bytes_allow_zero, scalar_to_bytes};
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
-        return Err("odd hex length".into());
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for i in (0..s.len()).step_by(2) {
-        let byte =
-            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("bad hex at {i}: {e}"))?;
-        out.push(byte);
-    }
-    Ok(out)
-}
-
-fn hex_decode_32(s: &str) -> Result<[u8; 32], String> {
-    let bytes = hex_decode(s)?;
-    if bytes.len() != 32 {
-        return Err(format!("expected 32 bytes, got {}", bytes.len()));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-fn hex_decode_33(s: &str) -> Result<[u8; 33], String> {
-    let bytes = hex_decode(s)?;
-    if bytes.len() != 33 {
-        return Err(format!("expected 33 bytes, got {}", bytes.len()));
-    }
-    let mut out = [0u8; 33];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------------
 // Identifier
 // ---------------------------------------------------------------------------
@@ -64,7 +27,7 @@ pub extern "C" fn threshold_identifier_derive(
     let result = (|| -> Result<String, String> {
         let msg = read_bytes(msg_ptr, msg_len).ok_or("null or empty msg")?;
         let id = Identifier::derive(&msg).map_err(|e| format!("derive failed: {e}"))?;
-        Ok(hex_encode(&id.serialize()))
+        Ok(hex::encode(id.serialize()))
     })();
 
     match result {
@@ -82,9 +45,9 @@ pub extern "C" fn threshold_identifier_from_bigint(
 ) -> *mut FfiResult {
     let result = (|| -> Result<String, String> {
         let s = read_cstr(hex_str).ok_or("null hex_str")?;
-        let bytes = hex_decode_32(&s)?;
+        let bytes = crate::from_hex::<[u8; 32]>(&s)?;
         let id = Identifier::deserialize(&bytes).map_err(|e| format!("bad identifier: {e}"))?;
-        Ok(hex_encode(&id.serialize()))
+        Ok(hex::encode(id.serialize()))
     })();
 
     match result {
@@ -119,7 +82,7 @@ pub extern "C" fn threshold_generate_coefficients(
 
         let arr: Vec<serde_json::Value> = coeffs
             .iter()
-            .map(|c| serde_json::Value::String(hex_encode(&scalar_to_bytes(c))))
+            .map(|c| serde_json::Value::String(hex::encode(scalar_to_bytes(c))))
             .collect();
         Ok(serde_json::Value::Array(arr).to_string())
     })();
@@ -145,7 +108,7 @@ pub extern "C" fn threshold_evaluate_polynomial(
         let id_str = read_cstr(id_hex).ok_or("null id_hex")?;
         let coeffs_str = read_cstr(coeffs_json).ok_or("null coeffs_json")?;
 
-        let id_bytes = hex_decode_32(&id_str)?;
+        let id_bytes = crate::from_hex::<[u8; 32]>(&id_str)?;
         let id = Identifier::deserialize(&id_bytes).map_err(|e| format!("bad identifier: {e}"))?;
 
         let v: serde_json::Value =
@@ -154,12 +117,12 @@ pub extern "C" fn threshold_evaluate_polynomial(
         let mut coeffs = Vec::new();
         for item in arr {
             let hex = item.as_str().ok_or("coefficient must be hex string")?;
-            let bytes = hex_decode_32(hex)?;
+            let bytes = crate::from_hex::<[u8; 32]>(hex)?;
             coeffs.push(scalar_from_bytes_allow_zero(&bytes).map_err(|e| format!("bad scalar: {e}"))?);
         }
 
         let result = polynomial::evaluate_polynomial(&id, &coeffs);
-        Ok(hex_encode(&scalar_to_bytes(&result)))
+        Ok(hex::encode(scalar_to_bytes(&result)))
     })();
 
     match result {
@@ -175,7 +138,7 @@ pub extern "C" fn threshold_evaluate_polynomial(
 pub extern "C" fn threshold_mod_n_random() -> *mut FfiResult {
     let mut rng = OsRng;
     let s = random::mod_n_random(&mut rng);
-    FfiResult::ok(&hex_encode(&scalar_to_bytes(&s)))
+    FfiResult::ok(&hex::encode(scalar_to_bytes(&s)))
 }
 
 // ---------------------------------------------------------------------------
@@ -191,10 +154,10 @@ pub extern "C" fn threshold_mod_n_random() -> *mut FfiResult {
 pub extern "C" fn threshold_elem_base_mul(scalar_hex: *const c_char) -> *mut FfiResult {
     let result = (|| -> Result<String, String> {
         let s_str = read_cstr(scalar_hex).ok_or("null scalar_hex")?;
-        let bytes = hex_decode_32(&s_str)?;
+        let bytes = crate::from_hex::<[u8; 32]>(&s_str)?;
         let scalar = scalar_from_bytes(&bytes).map_err(|e| format!("bad scalar: {e}"))?;
         let p = point::base_mul(&scalar);
-        Ok(hex_encode(&point::serialize_compressed(&p)))
+        Ok(hex::encode(point::serialize_compressed(&p)))
     })();
 
     match result {
@@ -215,9 +178,9 @@ pub extern "C" fn threshold_elem_serialize_compressed(
 ) -> *mut FfiResult {
     let result = (|| -> Result<String, String> {
         let s = read_cstr(point_hex).ok_or("null point_hex")?;
-        let bytes = hex_decode_33(&s)?;
+        let bytes = crate::from_hex::<[u8; 33]>(&s)?;
         let p = point::deserialize_compressed(&bytes).map_err(|e| format!("bad point: {e}"))?;
-        Ok(hex_encode(&point::serialize_compressed(&p)))
+        Ok(hex::encode(point::serialize_compressed(&p)))
     })();
 
     match result {
@@ -237,9 +200,9 @@ pub extern "C" fn threshold_elem_deserialize_compressed(
 ) -> *mut FfiResult {
     let result = (|| -> Result<String, String> {
         let s = read_cstr(hex_str).ok_or("null hex_str")?;
-        let bytes = hex_decode_33(&s)?;
+        let bytes = crate::from_hex::<[u8; 33]>(&s)?;
         let p = point::deserialize_compressed(&bytes).map_err(|e| format!("bad point: {e}"))?;
-        Ok(hex_encode(&point::serialize_compressed(&p)))
+        Ok(hex::encode(point::serialize_compressed(&p)))
     })();
 
     match result {

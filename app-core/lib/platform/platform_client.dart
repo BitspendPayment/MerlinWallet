@@ -141,29 +141,36 @@ class PlatformClient {
     return [for (final b in list) b is Map ? b['bank_name'] as String : b as String];
   }
 
+  /// A price for one payout, under [dealTag] — the app's name for it, which the policy the quote
+  /// carries is bound to. A quote back under any other tag is refused: the tag would then be the
+  /// platform's choice, and one it could give two customers.
   Future<PayoutQuote> quote({
-    required String escrowKeyHex,
     required String country,
     required String rail,
     required Map<String, String> fields,
     required String fullName,
     required int amountMinor,
     required String dealTag,
-  }) async =>
-      PayoutQuote(await _post('/payouts', {
-        'escrow_key': escrowKeyHex,
-        'country': country,
-        'rail': rail,
-        'fields': fields,
-        'full_name': fullName,
-        'amount_minor': amountMinor,
-        'deal_tag': dealTag,
-      }) as Map<String, dynamic>);
+  }) async {
+    final quote = PayoutQuote(await _post('/payouts', {
+      'country': country,
+      'rail': rail,
+      'fields': fields,
+      'full_name': fullName,
+      'amount_minor': amountMinor,
+      'deal_tag': dealTag,
+    }) as Map<String, dynamic>);
+    if (quote.dealTag != dealTag) {
+      throw PlatformException('the platform quoted under a deal tag it was not given');
+    }
+    return quote;
+  }
 
-  /// The go-ahead: the escrow is committed, so the platform may pay. It checks that for itself —
-  /// asking the cosigner before it spends anything — so this is a request, not a promise.
-  Future<void> fund(String requestId) =>
-      _send(() => _http.post(base.resolve('/payouts/$requestId/fund')), 'POST /fund');
+  /// The go-ahead: [escrowKeyHex] is committed to this payout, so the platform may pay. It checks
+  /// that for itself — asking the cosigner before it spends anything — so this is a request, not a
+  /// promise.
+  Future<void> fund(String requestId, {required String escrowKeyHex}) =>
+      _post('/payouts/$requestId/fund', {'escrow_key': escrowKeyHex});
 
   Future<PayoutStatus> status(String dealTag) async =>
       PayoutStatus(await _get('/payouts/$dealTag') as Map<String, dynamic>);

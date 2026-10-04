@@ -74,7 +74,7 @@ Do NOT fix yet — just record. Fix pass happens once, after this list is comple
 
 ### LOW / hygiene
 - [ ] NK-5 decide when the app cancels an operation. Wired today: the boarding screen's "Stop
-  waiting", and `reconnect()` / `resetLocalWallet()` (which would otherwise hang behind a stuck
+  waiting", and `restoreSession()` / `resetLocalWallet()` (which would otherwise hang behind a stuck
   operation on a graceful close). Deliberately NOT wired: app backgrounding, or any timer — a round
   abandoned after its intent is registered is one the ASP was counting on, and arkd may penalize it.
   Product/ASP-policy call. Also: send, protect and renew have no "Stop waiting" of their own.
@@ -123,7 +123,7 @@ escrow tests — the branch's first end-to-end run since the escrow commits.
   copy now, sliced only when ASCII. Unit test in `cosigner.rs`.
 - [x] **P55-M2** a seal that was present but unreadable opened as a wallet with no key, so a store
   read fault would have let a DKG re-key the tenant over sealed funds. `restore_snapshot` now
-  distinguishes "no seal" from "unreadable seal" and `open_with_host` refuses the latter. Test:
+  distinguishes "no seal" from "unreadable seal" and `Cosigner::open` refuses the latter. Test:
   `seal_test.rs`. (Pre-existing; RC-3 made the seal the only copy of anything.)
 - [x] **P55-M3** the plain-HTTP exception for the pairing contribution was a hostname prefix
   match (`10.attacker.com` passed). `isLocalDevelopmentHost` parses an address: loopback or
@@ -143,18 +143,20 @@ escrow tests — the branch's first end-to-end run since the escrow commits.
   uncounted; `provider[8..]` / `origin[8..]` use `get`; `threshold_dkg_reshare_part1` exports
   again (a misplaced `#[no_mangle]`); `resetLocalWallet` clears the mirrored contact and request
   lists, as its copy says.
-- [ ] **P55-open** — not fixed, recorded: `PairService`/`EscrowReclaim` check the identifier
-  against the sealed one, so the check cannot fail (design; the client-side check runs first);
+- [ ] **P55-open** — not fixed, recorded: ~~a reclaim checks the identifier against the sealed
+  one, so the check cannot fail~~ — fixed 2026-10-02: a reclaim is a `Send`, which checks the
+  caller's identifier first;
   evidence is not cryptographically bound to amount or reference — the policy author binds it
   with `MatchesReference`/`MatchesAmount`; `MAX_RELEASED_REFERENCES` is fail-closed but
   permanent and burnable by a paired service under an `Always` policy; `now_secs()` falls back
-  to 0, fail-open for release; a cold start whose `restoreSession` fails has no retry
-  (`reconnect()` is unreachable); no in-process test drives the `PairService`/`EscrowReclaim`
-  streams; `app/integration_test` still targets the deleted PIN screens; `EscrowRecord` /
+  to 0, fail-open for release; no in-process test drives a reclaim past its
+  first message (`PairService` was removed 2026-10-02: the `Escrow` stream pairs; `EscrowReclaim`
+  too: a reclaim is a `Send` naming the escrow); `app/integration_test` still
+  targets the deleted PIN screens; `EscrowRecord` /
   `ServicePairing` derive an un-redacted `Debug`; dead Makefile targets (`runtime-run` and what
   depends on it); wallet-level `SpendingPolicy` and `ServiceList`/`ServiceRevoke` have no
   equivalent on this branch.
-- [ ] TH-7 reject non-canonical signature `s ≥ n`; TH-4 constant-time ECIES MAC compare; TH-9 PoK domain tag / seeded-zero / into_even_y.
+- [ ] TH-7 reject non-canonical signature `s ≥ n`; TH-9 PoK domain tag / seeded-zero / into_even_y.
 - [ ] CL-2 encrypted store + shorter TTL for the session token (the store no longer holds key material — see RC-3 — so this is now about privacy of outpoints and the exit address; the two-minute PRF seed cache is gone); CR-6 bounds-check compose.rs:80-87; CR-7 tighten CORS / remove unauth redeem; EC-2/EC-4 doc-timestamp recency + attestation catch_unwind.
 - [ ] IN-5 SHA-pin CI actions; ignore committed empty terraform.tfstate; Firebase API-key restrictions; docker-compose 0.0.0.0 bind comment.
 
@@ -177,13 +179,14 @@ escrow tests — the branch's first end-to-end run since the escrow commits.
   `SigningCommitments` and `SigningNonce` (holds secret `hiding`/`binding` scalars). Debug can
   leak secrets into logs/panics. *Fix:* custom redacted `Debug` + `ZeroizeOnDrop`. (Review also
   named keys.rs/dkg.rs/auth.rs — verify each.)
-- **[TH-4] LOW CONFIRMED** — `crates/threshold/src/ecies.rs:88` — MAC compared with `!=`
-  (non-constant-time). *Fix:* constant-time compare (`subtle`).
+- **[TH-4] LOW — RESOLVED 2026-10-02 by deletion.** `crates/threshold/src/ecies.rs` compared its
+  MAC with `!=` (non-constant-time). The module had no caller left once the eVTXO onboarding that
+  used it was removed (`2a86be70`), so it went, with its FFI exports and Dart wrappers.
 
 ## ACCEPTED BY DESIGN (recorded so it is not re-raised as a finding)
 
 - **[RC-1] The passkey is now the single factor.** `app-core/lib/passkey/key_derivation.dart`,
-  `cosigner/src/handlers/recover.rs`. The wallet's FROST dealer polynomial is derived from the
+  `cosigner/src/cosigner.rs`. The wallet's FROST dealer polynomial is derived from the
   passkey's PRF, and the cosigner seals `f_cosigner(wallet_id)` — the half it dealt — so `Recover`
   plus the passkey reconstructs the share on any device. Before this, an attacker needed the
   device's Hive box **and** the PRF; now the passkey alone is enough. That is the stated goal
@@ -209,7 +212,7 @@ escrow tests — the branch's first end-to-end run since the escrow commits.
   loudly (`WrongPasskey`), where it used to stop only the unblinding.
 - **[RC-3] The device stores no private-key material; the share is rebuilt per operation.**
   `app-core/lib/client.dart` (`_withOperation`), `app-core/lib/passkey/operation_secrets.dart`,
-  `app-core/lib/passkey/share_reconstruction.dart`, `cosigner/src/handlers/recover.rs`
+  `app-core/lib/passkey/share_reconstruction.dart`, `cosigner/src/cosigner.rs`
   (`dealt_share_for`), `cosigner/src/session.rs`. Development architecture; not production-ready.
   - *What changed.* The phone used to persist a blinded share (δ) and — in the clear — the DKG
     dealer secret `a0` as `onchainSecret`, in an unencrypted append-only Hive box, and kept the PRF

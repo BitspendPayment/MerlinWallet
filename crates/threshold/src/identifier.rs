@@ -55,6 +55,25 @@ impl Identifier {
     }
 }
 
+/// 32 bytes, big-endian — what [`Identifier::serialize`] produces.
+impl TryFrom<&[u8]> for Identifier {
+    type Error = Error;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Error> {
+        let bytes: &[u8; 32] = bytes.try_into().map_err(|_| Error::SerializationError)?;
+        Self::deserialize(bytes)
+    }
+}
+
+/// 64 hex characters: [`Identifier::serialize`], in hex.
+impl core::str::FromStr for Identifier {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Error> {
+        Self::deserialize(&<[u8; 32] as hex_conservative::FromHex>::from_hex(s)?)
+    }
+}
+
 impl PartialEq for Identifier {
     fn eq(&self, other: &Self) -> bool {
         self.s.ct_eq(&other.s).into()

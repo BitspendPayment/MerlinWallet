@@ -1,24 +1,23 @@
 /// Sending to a bank account or a mobile-money wallet, paid for out of an escrow.
 ///
 /// ```text
-///   ensureEscrow   an escrow the platform is paired into          first time: 1 approval
-///   quote          the platform prices the payout, writes the policy
-///   commit         check the policy · top the escrow up to the price and seal the deal
-///                                                                  1 approval
-///   fund           the platform asks the cosigner, then pays       none
-///   follow         the platform's word on how it is going          none
+///   quote    the platform prices the payout, writes the policy           none
+///   commit   check the policy · mint an escrow, pair the platform into   1 approval
+///            it, seal the deal and send the escrow the price
+///   fund     the platform asks the cosigner, then pays                   none
+///   follow   the platform's word on how it is going                      none
 /// ```
 ///
-/// One approval per cosigner call, so each step that needs the cosigner is one call: minting the
-/// escrow and pairing the platform into it are one stream, and so are the top-up and the seal.
+/// One escrow per payout, and nothing minted until the owner has seen the price and pressed send —
+/// a quote looked at and left costs nothing. One approval in all: the escrow's own session mints
+/// it, pairs the platform in, strikes the deal and funds it, on one stream.
 ///
 /// The app and the e2e walkthrough drive these same steps, so what the walkthrough proves is what
 /// the app does. Nothing here keeps state: each step returns what the caller should remember.
 ///
-/// **Why the escrow is topped up per send.** Money in an escrow is not renewed, and a VTXO that is
-/// not renewed is swept when it expires. So the escrow holds what the next payout needs and no
-/// more: what it already holds (a failed payout's leftover, say) counts toward the price, and only
-/// the shortfall is sent to it.
+/// **What a failed payout leaves.** Money in an escrow is not renewed, and a VTXO that is not
+/// renewed is swept when it expires — so the price a failed payout leaves in its escrow is taken
+/// back by reclaiming that escrow, which its platform frees by ending the deal.
 library;
 
 import 'dart:math';
@@ -65,33 +64,15 @@ class BankSend {
     return hex.encode(List<int>.generate(16, (_) => random.nextInt(256)));
   }
 
-  /// What must be sent to the escrow for it to hold [price]: nothing if it already does, and never
-  /// less than the ASP's dust, which is the smallest output it accepts.
-  static int shortfall(int price, List<IndexerVtxo> held, {int dust = 330}) {
-    final have = held.where((v) => !v.isSpent).fold<int>(0, (a, v) => a + v.amountSats);
-    final short = price - have;
-    return short <= 0 ? 0 : max(short, dust);
-  }
+  /// How many times the owner is asked to approve a payout, so the app can say so before it
+  /// starts: the escrow's session, which sets the escrow up and funds it on the same stream.
+  static const approvals = 1;
 
-  /// How many times the owner will be asked to approve, so the app can say so before it starts.
-  static int approvalsNeeded({required bool hasEscrow}) => (hasEscrow ? 0 : 1) + 1;
-
-  /// The escrow payouts are paid from: [known] if this wallet still holds it, otherwise a new one,
-  /// minted and paired with the platform.
-  ///
-  /// The caller forgets [known] once it reclaims from it — a reclaim retires an escrow for good.
-  Future<String> ensureEscrow({String? known}) async {
-    if (known != null && wallet.escrows.any((e) => _same(e.escrowKeyHex, known))) return known;
-    final set = await wallet.setUpEscrow(serviceIdentifier: platformId, delivery: delivery);
-    return set.escrow.escrowKeyHex;
-  }
-
-  /// What the escrow holds right now, from the indexer.
+  /// What an escrow holds right now, from the indexer.
   Future<List<IndexerVtxo>> held(String escrowKeyHex) =>
       wallet.vtxosAtArkAddress(_xOnly(escrowKeyHex));
 
   Future<PayoutQuote> quote({
-    required String escrowKeyHex,
     required String country,
     required String rail,
     required Map<String, String> fields,
@@ -100,7 +81,6 @@ class BankSend {
     String? dealTag,
   }) =>
       platform.quote(
-        escrowKeyHex: escrowKeyHex,
         country: country,
         rail: rail,
         fields: fields,
@@ -109,16 +89,18 @@ class BankSend {
         dealTag: dealTag ?? newDealTag(),
       );
 
-  /// Commit the escrow to this payout: refuse a policy that is not what the owner was shown, top the
-  /// escrow up to the price, and seal the deal.
+  /// Commit to this payout: refuse a policy that is not what the owner was shown, set up an escrow
+  /// with the platform paired in and the deal sealed, and send it the price.
   ///
   /// [fields] are what the owner typed — the policy must hold the payee to every one of them.
-  /// [onStep] is told as each step begins, for a screen to show where it has got to.
+  /// [onStep] is told as each step begins, for a screen to show where it has got to. [onSealed] is
+  /// told the escrow once its deal is sealed, before any money moves to it — so a caller remembers
+  /// it whatever the send that funds it does.
   Future<Commitment> commit(
     PayoutQuote quote, {
-    required String escrowKeyHex,
     required Map<String, String> fields,
     void Function(CommitStep step)? onStep,
+    Future<void> Function(String escrowKeyHex)? onSealed,
   }) async {
     onStep?.call(CommitStep.policy);
     checkPayoutPolicy(
@@ -135,63 +117,59 @@ class BankSend {
       ),
     );
 
-    final info = await wallet.getArkInfo();
-    final topUp = shortfall(quote.sats, await held(escrowKeyHex), dust: info.dust);
     onStep?.call(CommitStep.seal);
-
     final deadline = DateTime.now().add(Duration(seconds: quote.dealSeconds));
-    String? topUpTxid;
-    String? agreed;
-    if (topUp > 0) {
-      final funded = await _untilPaired(() => wallet.fundEscrowDeal(
-            escrowKeyHex: escrowKeyHex,
-            amountSats: topUp,
-            policy: quote.policy,
-            deadline: deadline,
-          ));
-      topUpTxid = funded.arkTxid;
-      agreed = funded.agreed;
-    }
-    // Nothing to top up — or a cosigner from before a send could commit, which topped up only.
-    final sealed = agreed ??
-        await _untilPaired<String>(() => wallet.openEscrowSession(
-              escrowKeyHex: escrowKeyHex,
-              policy: quote.policy,
-              deadline: deadline,
-            ));
-    return Commitment(agreed: sealed, deadline: deadline, topUpSats: topUp, topUpTxid: topUpTxid);
+    // Set up, sealed and funded on one stream and one approval. The escrow is remembered before
+    // the money moves, so whatever the send does, what the escrow holds can be taken back.
+    final set = await wallet.setUpEscrow(
+      serviceIdentifier: platformId,
+      policy: quote.policy,
+      deadline: deadline,
+      delivery: delivery,
+      fundSats: quote.sats,
+      beforeFunding: (escrowKeyHex) async {
+        await onSealed?.call(escrowKeyHex);
+        onStep?.call(CommitStep.fund);
+      },
+    );
+    return Commitment(
+      escrowKeyHex: set.escrow.escrowKeyHex,
+      agreed: set.agreed,
+      deadline: deadline,
+      fundedSats: quote.sats,
+      fundTxid: set.fundTxid!,
+    );
   }
 
-  /// [commit], asked again while the pairing is not yet usable.
+  /// The go-ahead, for the escrow [commit] set up. The platform asks the cosigner before it pays,
+  /// and pays only if the deal it offered is the one sealed on that escrow, with time enough left
+  /// to be repaid in.
+  Future<void> fund(PayoutQuote quote, Commitment commitment) =>
+      _untilPaired(() => platform.fund(quote.requestId, escrowKeyHex: commitment.escrowKeyHex));
+
+  /// [fund], asked again while the pairing is not yet usable.
   ///
-  /// A pairing is usable once the platform's confirmation has reached the cosigner, which follows
-  /// the pairing itself by a moment. By the time an owner has read a quote it almost always has;
-  /// if not, the cosigner says so and this asks again, rather than polling for it beforehand.
-  ///
-  /// Safe to repeat because the cosigner refuses that way only before anything is built: a send
-  /// that commits is checked when it opens, and whatever fails once its money has moved says so in
-  /// other words. Each ask is one more approval.
-  static Future<T> _untilPaired<T>(Future<T> Function() commit) async {
+  /// A pairing is usable once the platform's confirmation has reached the cosigner. It cannot
+  /// while the escrow's stream holds the tenant, and that stream holds it until the escrow is
+  /// funded — so the go-ahead, asked for as the stream ends, often gets there first. The cosigner
+  /// tells the platform so, and this asks again for half a minute. Asking costs no approval.
+  static Future<T> _untilPaired<T>(Future<T> Function() ask) async {
     for (var attempt = 1;; attempt++) {
       try {
-        return await commit();
+        return await ask();
       } catch (e) {
-        if (attempt >= 3 || !'$e'.contains('pairing is not finished')) rethrow;
+        if (attempt >= 15 || !'$e'.contains('pairing is not finished')) rethrow;
         await Future<void>.delayed(const Duration(seconds: 2));
       }
     }
   }
 
-  /// The go-ahead. The platform asks the cosigner before it pays, and pays only if the deal it
-  /// offered is the one sealed, with time enough left to be repaid in.
-  Future<void> fund(PayoutQuote quote) => platform.fund(quote.requestId);
-
   /// How the payout is going, until it is repaid or has failed. Asks the platform, never the
   /// cosigner: the platform costs no approval to ask.
   ///
   /// A failed payout is given up, and its deal ended, a moment after Grid says it failed — and the
-  /// deal ending is what frees the escrow. So after a failure this waits, up to [settle], for the
-  /// platform to say the deal has ended, and the last status says whether it has.
+  /// deal ending is what lets its escrow be taken back. So after a failure this waits, up to
+  /// [settle], for the platform to say the deal has ended, and the last status says whether it has.
   Stream<PayoutStatus> follow(String dealTag,
       {Duration every = const Duration(seconds: 3),
       Duration settle = const Duration(seconds: 60)}) async* {
@@ -213,8 +191,6 @@ class BankSend {
     }
   }
 
-  static bool _same(String a, String b) => _xOnly(a) == _xOnly(b);
-
   static String _xOnly(String key) {
     final k = key.toLowerCase();
     return k.length == 66 ? k.substring(2) : k;
@@ -226,26 +202,32 @@ enum CommitStep {
   /// Reading the policy against what the owner was shown.
   policy,
 
-  /// Sending the escrow what it is short of the price, if anything, and committing it to the deal:
-  /// one approval.
+  /// Setting up the escrow — minted, the platform paired in, the deal sealed — on the payout's one
+  /// approval.
   seal,
+
+  /// Sending the escrow the price, on the same stream and the same approval.
+  fund,
 }
 
 /// What committing a payout did.
 class Commitment {
   Commitment({
+    required this.escrowKeyHex,
     required this.agreed,
     required this.deadline,
-    required this.topUpSats,
-    this.topUpTxid,
+    required this.fundedSats,
+    required this.fundTxid,
   });
+
+  /// The payout's own escrow.
+  final String escrowKeyHex;
 
   /// The sealed policy, as the cosigner renders it: what the owner agreed to.
   final String agreed;
   final DateTime deadline;
 
-  /// What was sent to the escrow to reach the price, and the send's txid. 0 and null when the
-  /// escrow already held it.
-  final int topUpSats;
-  final String? topUpTxid;
+  /// What was sent to the escrow — the price — and the send's txid.
+  final int fundedSats;
+  final String fundTxid;
 }

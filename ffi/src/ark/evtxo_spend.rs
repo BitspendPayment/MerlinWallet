@@ -30,7 +30,6 @@ use bitcoin::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{hex_decode, hex_encode, hex_to_32};
 
 /// PSBT proprietary key carrying off-chain contract args, mirrored from
 /// `cosigner`'s `tx_parser::{CONTRACT_ARGS_PREFIX, CONTRACT_ARGS_SUBTYPE}`.
@@ -120,10 +119,10 @@ pub fn build_evtxo_spend(params_json: &str) -> Result<String, String> {
     let params: BuildEvtxoSpendParams =
         serde_json::from_str(params_json).map_err(|e| format!("JSON parse: {e}"))?;
 
-    let contract_id = hex_to_32(&params.contract_id)?;
-    let server_pk = hex_to_32(&params.server_pk)?;
-    let evtxo_pk = hex_to_32(&params.evtxo_pk)?;
-    let owner_pk = hex_to_32(&params.owner_pk)?;
+    let contract_id = crate::from_hex::<[u8; 32]>(&params.contract_id)?;
+    let server_pk = crate::from_hex::<[u8; 32]>(&params.server_pk)?;
+    let evtxo_pk = crate::from_hex::<[u8; 32]>(&params.evtxo_pk)?;
+    let owner_pk = crate::from_hex::<[u8; 32]>(&params.owner_pk)?;
     let server_pk_xonly = XOnlyPublicKey::from_slice(&server_pk)
         .map_err(|e| format!("invalid server_pk x-only: {e}"))?;
 
@@ -147,7 +146,7 @@ pub fn build_evtxo_spend(params_json: &str) -> Result<String, String> {
         .txid
         .parse()
         .map_err(|e| format!("invalid input txid: {e}"))?;
-    let out_spk = ScriptBuf::from_bytes(hex_decode(&params.output.script_pubkey)?);
+    let out_spk = ScriptBuf::from_bytes(crate::from_hex::<Vec<u8>>(&params.output.script_pubkey)?);
     if params.output.amount > params.input.amount {
         return Err(format!(
             "output {} exceeds input {}",
@@ -194,7 +193,7 @@ pub fn build_evtxo_spend(params_json: &str) -> Result<String, String> {
     psbt.inputs[0].witness_utxo = Some(prevout);
     if let Some(args_hex) = params.contract_args.as_deref() {
         if !args_hex.is_empty() {
-            let args = hex_decode(args_hex)?;
+            let args = crate::from_hex::<Vec<u8>>(args_hex)?;
             psbt.inputs[0].proprietary.insert(
                 bitcoin::psbt::raw::ProprietaryKey {
                     prefix: CONTRACT_ARGS_PREFIX.to_vec(),
@@ -205,7 +204,7 @@ pub fn build_evtxo_spend(params_json: &str) -> Result<String, String> {
             );
         }
     }
-    let psbt_hex = hex_encode(&psbt.serialize());
+    let psbt_hex = hex::encode(psbt.serialize());
 
     let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     get_sessions().as_mut().unwrap().insert(
@@ -222,9 +221,9 @@ pub fn build_evtxo_spend(params_json: &str) -> Result<String, String> {
 
     let result = BuildEvtxoSpendResult {
         handle,
-        sighash: hex_encode(&sighash),
+        sighash: hex::encode(sighash),
         psbt: psbt_hex,
-        evtxo_spk: hex_encode(&evtxo_spk),
+        evtxo_spk: hex::encode(evtxo_spk),
     };
     serde_json::to_string(&result).map_err(|e| format!("JSON serialize: {e}"))
 }
@@ -249,14 +248,14 @@ pub fn finalize_evtxo_spend(
         .get_mut(&handle)
         .ok_or("invalid session handle")?;
 
-    let v_prime_sig = hex_decode(v_prime_sig_hex)?;
+    let v_prime_sig = crate::from_hex::<Vec<u8>>(v_prime_sig_hex)?;
     if v_prime_sig.len() != 64 {
         return Err(format!("expected 64-byte V′ sig, got {}", v_prime_sig.len()));
     }
 
     // Server leg: sign the same script-path sighash with the ASP signer key.
     let secp = Secp256k1::new();
-    let sk_bytes = hex_to_32(signer_sk_hex)?;
+    let sk_bytes = crate::from_hex::<[u8; 32]>(signer_sk_hex)?;
     let sk = SecretKey::from_slice(&sk_bytes).map_err(|e| format!("invalid signer_sk: {e}"))?;
     let keypair = Keypair::from_secret_key(&secp, &sk);
     let (signer_xonly, _parity) = XOnlyPublicKey::from_keypair(&keypair);
@@ -280,7 +279,7 @@ pub fn finalize_evtxo_spend(
 
     let mut tx = state.unsigned_tx.clone();
     tx.input[0].witness = witness;
-    Ok(hex_encode(&serialize(&tx)))
+    Ok(hex::encode(serialize(&tx)))
 }
 
 pub fn free_evtxo_spend(handle: u64) {
@@ -300,9 +299,9 @@ mod tests {
 
     fn server_pk_hex() -> String {
         let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&hex_to_32(SIGNER_SK).unwrap()).unwrap();
+        let sk = SecretKey::from_slice(&crate::from_hex::<[u8; 32]>(SIGNER_SK).unwrap()).unwrap();
         let kp = Keypair::from_secret_key(&secp, &sk);
-        hex_encode(&XOnlyPublicKey::from_keypair(&kp).0.serialize())
+        hex::encode(&XOnlyPublicKey::from_keypair(&kp).0.serialize())
     }
 
     fn build_params() -> String {
@@ -325,7 +324,7 @@ mod tests {
             ow = "03".repeat(32),
             txid = "11".repeat(32),
             out = out_spk,
-            args = hex_encode(b"ORACLE-OK"),
+            args = hex::encode(b"ORACLE-OK"),
         )
     }
 
@@ -343,15 +342,15 @@ mod tests {
 
         // Independently recompute the cooperative-leaf sighash from the PSBT and
         // assert it matches what build returned (both legs will sign this).
-        let psbt = Psbt::deserialize(&hex_decode(psbt_hex).unwrap()).unwrap();
+        let psbt = Psbt::deserialize(&crate::from_hex::<Vec<u8>>(psbt_hex).unwrap()).unwrap();
         let prevout = psbt.inputs[0].witness_utxo.clone().unwrap();
 
         let commit: [u8; 32] =
-            sha256::Hash::hash(&hex_to_32(&"cd".repeat(32)).unwrap()).to_byte_array();
+            sha256::Hash::hash(&crate::from_hex::<[u8; 32]>(&"cd".repeat(32)).unwrap()).to_byte_array();
         let coop = ark::contract_cooperative_script(
             &commit,
-            &hex_to_32(&server_pk_hex()).unwrap(),
-            &hex_to_32(&"02".repeat(32)).unwrap(),
+            &crate::from_hex::<[u8; 32]>(&server_pk_hex()).unwrap(),
+            &crate::from_hex::<[u8; 32]>(&"02".repeat(32)).unwrap(),
         );
         let leaf_hash =
             TapLeafHash::from_script(&ScriptBuf::from_bytes(coop), LeafVersion::TapScript);
@@ -364,7 +363,7 @@ mod tests {
             )
             .unwrap()
             .to_byte_array();
-        assert_eq!(hex_encode(&recomputed), sighash_hex);
+        assert_eq!(hex::encode(&recomputed), sighash_hex);
 
         // The contract args ride the PSBT proprietary map under EVTXO/0x01.
         let args = psbt.inputs[0]
@@ -389,10 +388,10 @@ mod tests {
 
         // A dummy V′ sig is fine: witness assembly doesn't verify it (consensus
         // does, at broadcast). We only check the witness shape here.
-        let dummy_v_prime = hex_encode(&[0x11u8; 64]);
+        let dummy_v_prime = hex::encode(&[0x11u8; 64]);
         let raw_hex = finalize_evtxo_spend(handle, &dummy_v_prime, SIGNER_SK).unwrap();
         let tx: Transaction =
-            bitcoin::consensus::deserialize(&hex_decode(&raw_hex).unwrap()).unwrap();
+            bitcoin::consensus::deserialize(&crate::from_hex::<Vec<u8>>(&raw_hex).unwrap()).unwrap();
 
         let w: Vec<&[u8]> = tx.input[0].witness.iter().collect();
         assert_eq!(w.len(), 5, "witness items");
@@ -413,7 +412,7 @@ mod tests {
             .as_u64()
             .unwrap();
         let wrong_sk = "11".repeat(32);
-        let err = finalize_evtxo_spend(handle, &hex_encode(&[0x11u8; 64]), &wrong_sk).unwrap_err();
+        let err = finalize_evtxo_spend(handle, &hex::encode(&[0x11u8; 64]), &wrong_sk).unwrap_err();
         assert!(err.contains("server_pk"), "got: {err}");
         free_evtxo_spend(handle);
     }

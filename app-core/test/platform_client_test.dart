@@ -31,7 +31,6 @@ void main() {
       );
     }));
     final quote = await platform.quote(
-      escrowKeyHex: '02aa',
       country: 'NG',
       rail: 'bank',
       fields: const {'accountNumber': '0123456789', 'bankName': 'OPay'},
@@ -41,10 +40,33 @@ void main() {
     );
     expect(sent['fields'], {'accountNumber': '0123456789', 'bankName': 'OPay'});
     expect(sent['amount_minor'], 3000000);
+    expect(sent.containsKey('escrow_key'), isFalse, reason: 'a quote comes before any escrow');
     expect(quote.sats, 23010);
     expect(quote.nameAtBank, 'ADA OBI');
     expect(quote.nameCheck, 'MATCHED');
     expect(quote.dealTag, 'tag');
+  });
+
+  test('a quote under a deal tag the app did not choose is refused', () async {
+    final platform = PlatformClient(base, client: MockClient((_) async => http.Response(
+        jsonEncode({
+          'request_id': 'reimb-0001',
+          'deal_tag': 'another-customers-tag',
+          'sats': 23010,
+          'policy': {'op': 'never'},
+        }),
+        200)));
+    await expectLater(
+      platform.quote(
+        country: 'NG',
+        rail: 'bank',
+        fields: const {'accountNumber': '0123456789', 'bankName': 'OPay'},
+        fullName: 'Ada Obi',
+        amountMinor: 3000000,
+        dealTag: 'tag',
+      ),
+      throwsA(isA<PlatformException>()),
+    );
   });
 
   test('a refusal is told apart from a platform that is down', () async {

@@ -231,7 +231,7 @@ void main() {
 
       final first = operation.keyPackage(bytesOf(c.dealtToWallet));
       expect(first.secretShare, c.walletKp.secretShare);
-      // A settle's second sighashes, or a trailing seal: no share with it, same key.
+      // A renewal's second sighashes, or the delegate's after them: no share with it, same key.
       expect(identical(operation.keyPackage(const []), first), isTrue);
       operation.dispose();
     });

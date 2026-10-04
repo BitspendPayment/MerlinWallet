@@ -43,7 +43,7 @@ The MPC Wallet has working cryptography (FROST 2-of-2, Ark integration, MutinyNe
 - **Impact**: Single point of failure for all funds
 - **Note (client-side recovery):** the *phone* half is now recoverable — it is derived from the
   passkey's PRF, and the cosigner seals the half it dealt so a new device can rebuild the share
-  (`cosigner/src/handlers/recover.rs`). That makes this item **more** load-bearing, not less: the
+  (`cosigner/src/cosigner.rs`). That makes this item **more** load-bearing, not less: the
   cosigner's seal is now the only copy of anything, and losing it loses both the cosigner's share
   and the half a user would recover with.
   It is heavier again now that the phone keeps no share at all: the sealed contribution is read on

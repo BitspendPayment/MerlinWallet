@@ -29,8 +29,7 @@ use std::time::Duration;
 use ark::client::send::SendVtxoInput;
 use ark::client::AspClient;
 use super::{PersistedInput, PersistedProposal};
-use cosigner::handlers::release::{ProposedInput, ReleaseRequest};
-use cosigner::service_stream::{FromService, ToService};
+use cosigner::escrow::{FromService, ProposedInput, ReleaseRequest, ToService};
 
 use super::signing::{x_only, Proposal, Round};
 use super::wire::{say, Wire};
@@ -72,7 +71,7 @@ pub enum Asked {
     /// from something other than the escrow's own cosigner.
     Refused {
         reason: String,
-        deal: Option<cosigner::escrow_session::DealTerms>,
+        deal: Option<cosigner::escrow::SealedTerms>,
     },
     /// Something went wrong on this side. Worth retrying.
     Failed { reason: String },
@@ -149,10 +148,10 @@ pub async fn ask_against(
 /// Tell the cosigner this service is done with a deal — a payout that failed, say — so the escrow
 /// is free at once rather than at a deadline that may be hours away.
 ///
-/// `policy_sha256` names the deal (see [`cosigner::escrow_session::DealTerms`]), so an end that
-/// arrives late cannot close the next deal struck over the same escrow. The deal protects this
-/// service, so this gives up nothing but its own claim: only give up on a payment first, and never
-/// one that has been signed for. `Ok` once the cosigner acknowledged it.
+/// `policy_sha256` names the deal (see [`cosigner::escrow::SealedTerms`]), so an end can
+/// close only the deal it was meant for. The deal protects this service, so this gives up nothing
+/// but its own claim: only give up on a payment first, and never one that has been signed for. `Ok`
+/// once the cosigner acknowledged it.
 pub async fn end_deal(wire: &Arc<Wire>, escrow_key: &str, policy_sha256: &str) -> Result<(), String> {
     let stream_id = wire
         .service
@@ -401,7 +400,7 @@ async fn refused(
     wire: &Arc<Wire>,
     request_id: &str,
     reason: String,
-    deal: Option<cosigner::escrow_session::DealTerms>,
+    deal: Option<cosigner::escrow::SealedTerms>,
 ) -> Result<Asked, String> {
     let mut store = wire.service.store.lock().await;
     if let Some(r) = store.reimbursements.get_mut(request_id) {

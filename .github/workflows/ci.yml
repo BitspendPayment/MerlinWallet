@@ -40,7 +40,6 @@ jobs:
             crates/threshold/target
             crates/enclave-client/target
             crates/escrow-service/target
-            examples/card-escrow/target
             ffi/target
           key: rust-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: rust-
@@ -49,12 +48,11 @@ jobs:
       - name: threshold tests
         run: cd crates/threshold && cargo test --features std
       # What a settlement service runs: the attestation check on everything the enclave sends it,
-      # the service's own share and claims, and the card example built on both.
+      # and the service's own share and claims.
       - name: escrow service tests
         run: |
           (cd crates/enclave-client && cargo test)
           (cd crates/escrow-service && cargo test)
-          (cd examples/card-escrow && cargo test)
       - name: ffi build and tests
         run: |
           cargo build --release --manifest-path ffi/Cargo.toml

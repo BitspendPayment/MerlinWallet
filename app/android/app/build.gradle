@@ -50,6 +50,9 @@ android {
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
+        // flutter_local_notifications needs core-library desugaring, even for the immediate
+        // notifications this app shows (PushService).
+        coreLibraryDesugaringEnabled true
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
@@ -115,4 +118,6 @@ dependencies {
     // with Google Play services.
     implementation "androidx.credentials:credentials:1.3.0"
     implementation "androidx.credentials:credentials-play-services-auth:1.3.0"
+    // flutter_local_notifications, through desugaring — see compileOptions.
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.4"
 }

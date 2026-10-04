@@ -1,4 +1,4 @@
-//! The unilateral exits a seal hands back.
+//! The unilateral exits a renewal hands back.
 //!
 //! What matters here is that the exit is *complete* when the wallet gets it: a real 2-of-2
 //! signature over the VTXO's exit leaf, in a transaction anybody can broadcast. That is the only
@@ -8,7 +8,10 @@ mod common;
 
 use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
-use cosigner::cosigner::WalletHalf;
+use cosigner::sign::WalletHalf;
+use cosigner::renew::DelegateRenew;
+use cosigner::session::proto;
+use std::sync::{Arc, Mutex};
 use cosigner::types::{Commitment, VtxoInput};
 use std::collections::BTreeMap;
 
@@ -22,8 +25,8 @@ use threshold::scalar::scalar_to_bytes;
 use threshold::commitment::SigningPackage;
 use threshold::signing;
 
-/// A host that accepts whatever the seal schedules. Sealing arms the settle watch, and that needs
-/// somewhere to enqueue it; outside the enclave there is no runtime, so this stands in.
+/// A host that accepts whatever the renewal schedules. Renewing arms the settle watch, and that
+/// needs somewhere to enqueue it; outside the enclave there is no runtime, so this stands in.
 #[derive(Default)]
 struct Accepting;
 
@@ -140,63 +143,98 @@ fn wallet_answers(
         .collect()
 }
 
-struct Sealed {
-    exits: Vec<cosigner::handlers::delegate::SignedExit>,
+struct Renewed {
+    exits: Vec<proto::ExitTx>,
 }
 
-/// Run a whole seal: open it, answer its round as the wallet would, and finish.
-fn seal(vtxos: Vec<VtxoInput>, exit_script: &[u8]) -> Option<Sealed> {
+/// A wallet as DKG leaves it, on a host that accepts whatever its renewals schedule.
+struct Wallet {
+    cosigner: Arc<Mutex<cosigner::Cosigner>>,
+    kps: Vec<KeyPackage>,
+    store: std::sync::Arc<cosigner::store::Store>,
+    group_key: String,
+}
+
+fn wallet() -> Option<Wallet> {
     let store = common::try_store()?;
     let (kps, pkp) = common::dkg_2of2();
     let group_key = hex::encode(pkp.verifying_key.serialize());
-    let cosigner = std::sync::Mutex::new(
-        cosigner::Cosigner::open_with_host(
-            store.clone(),
-            group_key.clone(),
-            std::sync::Arc::new(Accepting),
-        )
-        .expect("open"),
-    );
-    // With an Ark cosigner secret, or `generate_delegate_for` has nothing to sign the delegate with
-    // and the whole test skips silently.
-    common::seed_policy(
-        &cosigner,
-        &group_key,
-        &kps[1],
-        &kps[0],
-        &pkp,
-        Some(hex::encode([9u8; 32])),
-    );
-    let mut c = cosigner.into_inner().unwrap();
+    let cosigner = Arc::new(Mutex::new(reopen_at(&store, &group_key)));
+    common::seed_policy(&cosigner, &group_key, &kps[1], &kps[0], &pkp);
+    Some(Wallet { cosigner, kps, store, group_key })
+}
 
-    let (delegate_sighashes, exits) = match c.seal_delegate_open(vtxos, &ark_info(), exit_script) {
-        Ok(opened) => opened,
-        Err(e) => panic!("the seal must work offline: {e}"),
+/// A new instance over the store: what the runtime does on every request.
+fn reopen_at(
+    store: &std::sync::Arc<cosigner::store::Store>,
+    group_key: &str,
+) -> cosigner::Cosigner {
+    cosigner::Cosigner::open(
+        store.clone(),
+        group_key.to_string(),
+        std::sync::Arc::new(Accepting),
+    )
+    .expect("open")
+}
+
+/// Run a whole renewal on [w]: open it, answer its round as the wallet would, and finish.
+fn renew_on(w: &mut Wallet, vtxos: Vec<VtxoInput>, exit_script: &[u8]) -> Renewed {
+    let request = proto::RenewDelegate {
+        vtxos: vtxos.into_iter().map(proto_vtxo).collect(),
+        ark_info: Some((&ark_info()).into()),
+        exit_script_pubkey: exit_script.to_vec(),
+        device_token: String::new(),
     };
-    let all: Vec<Vec<u8>> = delegate_sighashes
-        .iter()
-        .cloned()
-        .chain(exits.sighashes())
-        .collect();
-    let (round, theirs) = c.sign_in_band_begin(&all).expect("begin");
-    assert_eq!(theirs.len(), all.len(), "one commitment per message");
+    let (renew, to_sign) = match DelegateRenew::build(&w.cosigner, request) {
+        Ok(opened) => opened,
+        Err(e) => panic!("the renewal must work offline: {e}"),
+    };
+    let all: Vec<Vec<u8>> = to_sign.delegate.iter().chain(&to_sign.exits).cloned().collect();
+    assert_eq!(to_sign.commitments.len(), all.len(), "one commitment per message");
 
-    let ours = wallet_answers(&kps[0], &all, &theirs);
-    let signatures = c.sign_in_band_finish(round, ours).expect("finish");
-    let sealed = c.seal_delegate_finish(signatures, exits).expect("seal");
-    Some(Sealed { exits: sealed.exits })
+    let rounds = wallet_answers(&w.kps[0], &all, &to_sign.commitments)
+        .into_iter()
+        .map(|h| proto::WalletRound { hiding: h.hiding, binding: h.binding, share: h.share })
+        .collect();
+    let renewed = renew.finalise(&w.cosigner, rounds, "").expect("renew");
+    Renewed { exits: renewed.exit_txs }
+}
+
+fn proto_vtxo(v: VtxoInput) -> proto::VtxoInput {
+    proto::VtxoInput {
+        txid: v.txid,
+        vout: v.vout,
+        amount_sats: v.amount_sats,
+        exit_delay: v.exit_delay,
+        expires_at: v.expires_at,
+    }
+}
+
+/// Run a whole renewal on a wallet of its own.
+fn renew(vtxos: Vec<VtxoInput>, exit_script: &[u8]) -> Option<Renewed> {
+    Some(renew_on(&mut wallet()?, vtxos, exit_script))
+}
+
+/// What [c] would seal now, parsed.
+fn snapshot(c: &cosigner::Cosigner) -> serde_json::Value {
+    serde_json::from_slice(&c.to_snapshot().expect("snapshot")).expect("json")
+}
+
+/// The delegate inside a snapshot, as `to_persisted` wrote it.
+fn delegate_in(snapshot: &serde_json::Value) -> serde_json::Value {
+    serde_json::from_str(snapshot["delegate_json"].as_str().expect("a delegate")).expect("json")
 }
 
 /// One exit per VTXO, each spending its own outpoint and paying the whole amount to the address
 /// the wallet named. Signed: the witness is complete, so nothing else is needed to broadcast it.
 #[test]
-fn a_seal_returns_one_signed_exit_per_vtxo() {
-    let Some(sealed) = seal(vec![vtxo('a', 100_000), vtxo('b', 50_000)], &destination()) else {
+fn a_renewal_returns_one_signed_exit_per_vtxo() {
+    let Some(renewed) = renew(vec![vtxo('a', 100_000), vtxo('b', 50_000)], &destination()) else {
         return;
     };
-    assert_eq!(sealed.exits.len(), 2);
+    assert_eq!(renewed.exits.len(), 2);
 
-    for (exit, amount) in sealed.exits.iter().zip([100_000u64, 50_000]) {
+    for (exit, amount) in renewed.exits.iter().zip([100_000u64, 50_000]) {
         assert_eq!(exit.amount_sats, amount);
         let tx: Transaction = deserialize(&exit.raw_tx).expect("an exit must be a transaction");
         assert_eq!(tx.input.len(), 1);
@@ -214,20 +252,82 @@ fn a_seal_returns_one_signed_exit_per_vtxo() {
     }
 }
 
-/// A wallet with no exit address yet still seals a delegate — it just gets no exits.
+/// A wallet with no exit address yet still renews its delegate — it just gets no exits.
 #[test]
-fn without_an_exit_address_a_seal_still_works() {
-    let Some(sealed) = seal(vec![vtxo('a', 100_000)], &[]) else { return };
-    assert!(sealed.exits.is_empty());
+fn without_an_exit_address_a_renewal_still_works() {
+    let Some(renewed) = renew(vec![vtxo('a', 100_000)], &[]) else { return };
+    assert!(renewed.exits.is_empty());
 }
 
-/// Too small to leave a non-dust output: no exit for that VTXO, and the seal still happens. The
+/// Too small to leave a non-dust output: no exit for that VTXO, and the renewal still happens. The
 /// delegate protects it; an exit could not be relayed.
 #[test]
-fn dust_gets_no_exit_but_does_not_fail_the_seal() {
-    let Some(sealed) = seal(vec![vtxo('a', 100_000), vtxo('b', 200)], &destination()) else {
+fn dust_gets_no_exit_but_does_not_fail_the_renewal() {
+    let Some(renewed) = renew(vec![vtxo('a', 100_000), vtxo('b', 200)], &destination()) else {
         return;
     };
-    assert_eq!(sealed.exits.len(), 1);
-    assert_eq!(sealed.exits[0].amount_sats, 100_000);
+    assert_eq!(renewed.exits.len(), 1);
+    assert_eq!(renewed.exits[0].amount_sats, 100_000);
+}
+
+/// Each delegate signs its round with a tree-signing key of its own, drawn when it is built. It
+/// used to be one key for the wallet's life — the cosigner's own DKG secret — which every round
+/// showed the ASP, and which joined to the wallet's half of the DKG would have been the whole key.
+#[test]
+fn every_delegate_has_a_tree_signing_key_of_its_own() {
+    let Some(mut w) = wallet() else { return };
+    renew_on(&mut w, vec![vtxo('a', 100_000)], &destination());
+    let first = delegate_in(&snapshot(&w.cosigner.lock().unwrap()));
+    renew_on(&mut w, vec![vtxo('a', 100_000)], &destination());
+    let second = delegate_in(&snapshot(&w.cosigner.lock().unwrap()));
+    assert_ne!(first["delegate_cosigner_pk_hex"], second["delegate_cosigner_pk_hex"]);
+    assert!(
+        snapshot(&w.cosigner.lock().unwrap()).get("ark_cosigner_secret_hex").is_none(),
+        "no wallet-wide key is sealed beside the delegate"
+    );
+}
+
+/// The watch runs a delegate long after the request that built it, from the seal alone, so the
+/// delegate's key has to come back with it.
+#[test]
+fn a_delegate_comes_back_from_the_seal_with_its_key() {
+    let Some(mut w) = wallet() else { return };
+    renew_on(&mut w, vec![vtxo('a', 100_000)], &destination());
+    w.cosigner.lock().unwrap().seal();
+    let sealed = delegate_in(&snapshot(&w.cosigner.lock().unwrap()));
+    let reopened = reopen_at(&w.store, &w.group_key);
+    assert_eq!(delegate_in(&snapshot(&reopened)), sealed, "the delegate came back, key and all");
+}
+
+/// A seal from before: its delegate was built under the wallet-wide key, and its registration's id
+/// sat beside it too. It still restores, and the next seal moves both into the delegate.
+#[test]
+fn a_delegate_sealed_the_old_way_still_restores() {
+    let Some(mut w) = wallet() else { return };
+    renew_on(&mut w, vec![vtxo('a', 100_000)], &destination());
+
+    // The seal as the old cosigner wrote it.
+    let mut old = snapshot(&w.cosigner.lock().unwrap());
+    let mut delegate = delegate_in(&old);
+    let fields = delegate.as_object_mut().unwrap();
+    let key = fields.remove("delegate_cosigner_secret_hex").expect("the delegate's key");
+    fields.remove("intent_id");
+    old["delegate_json"] = delegate.to_string().into();
+    old["ark_cosigner_secret_hex"] = key.clone();
+    old["delegate_intent_id"] = "intent-1".into();
+    w.store
+        .put("sealed_state", &w.group_key, &hex::encode(old.to_string()))
+        .expect("put");
+
+    let mut reopened = reopen_at(&w.store, &w.group_key);
+    let now = snapshot(&reopened);
+    assert_eq!(delegate_in(&now)["delegate_cosigner_secret_hex"], key);
+    assert_eq!(delegate_in(&now)["intent_id"], "intent-1");
+    assert!(now.get("ark_cosigner_secret_hex").is_none(), "the old key is not kept");
+    assert!(now.get("delegate_intent_id").is_none(), "nor the id beside the delegate");
+
+    // And from the seal it writes now.
+    reopened.seal();
+    let again = delegate_in(&snapshot(&reopen_at(&w.store, &w.group_key)));
+    assert_eq!(again["intent_id"], "intent-1");
 }

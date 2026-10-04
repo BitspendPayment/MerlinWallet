@@ -84,29 +84,6 @@ fn read_cstr(ptr: *const c_char) -> Option<String> {
     unsafe { CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string()) }
 }
 
-/// Helper: decode hex string to bytes.
-fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    // `hex::decode` rejects odd length + invalid chars and never panics (the old
-    // `&s[i..i+2]` slicing could panic on a non-char-boundary multi-byte UTF-8 input).
-    hex::decode(s).map_err(|e| format!("invalid hex: {e}"))
-}
-
-/// Helper: decode hex to 32-byte array.
-fn hex_to_32(s: &str) -> Result<[u8; 32], String> {
-    let bytes = hex_decode(s)?;
-    if bytes.len() != 32 {
-        return Err(format!("expected 32 bytes, got {}", bytes.len()));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-/// Helper: encode bytes as hex string.
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
 // ---------------------------------------------------------------------------
 // Ark protocol FFI functions
 // ---------------------------------------------------------------------------
@@ -123,13 +100,13 @@ pub extern "C" fn ark_default_vtxo_script_pubkey(
     let result = (|| -> Result<String, String> {
         let server_hex = read_cstr(server_pk_hex).ok_or("null server_pk_hex")?;
         let owner_hex = read_cstr(owner_pk_hex).ok_or("null owner_pk_hex")?;
-        let server_pk = hex_to_32(&server_hex)?;
-        let owner_pk = hex_to_32(&owner_hex)?;
+        let server_pk = crate::from_hex::<[u8; 32]>(&server_hex)?;
+        let owner_pk = crate::from_hex::<[u8; 32]>(&owner_hex)?;
 
         let tree = ark::default_vtxo_tree(&server_pk, &owner_pk, exit_delay);
         let spk = ark::vtxo_script_pubkey(&tree)
             .map_err(|e| format!("vtxo_script_pubkey: {e}"))?;
-        Ok(hex_encode(&spk))
+        Ok(hex::encode(spk))
     })();
 
     match result {
@@ -150,15 +127,15 @@ pub extern "C" fn ark_forfeit_spend_info(
     let result = (|| -> Result<String, String> {
         let server_hex = read_cstr(server_pk_hex).ok_or("null server_pk_hex")?;
         let owner_hex = read_cstr(owner_pk_hex).ok_or("null owner_pk_hex")?;
-        let server_pk = hex_to_32(&server_hex)?;
-        let owner_pk = hex_to_32(&owner_hex)?;
+        let server_pk = crate::from_hex::<[u8; 32]>(&server_hex)?;
+        let owner_pk = crate::from_hex::<[u8; 32]>(&owner_hex)?;
 
         let (script, cb) = ark::forfeit_spend_info(&server_pk, &owner_pk, exit_delay)
             .ok_or("forfeit_spend_info failed")?;
         let json = format!(
             r#"{{"script_hex":"{}","control_block_hex":"{}"}}"#,
-            hex_encode(&script),
-            hex_encode(&cb.serialize()),
+            hex::encode(&script),
+            hex::encode(cb.serialize()),
         );
         Ok(json)
     })();
@@ -181,15 +158,15 @@ pub extern "C" fn ark_exit_spend_info(
     let result = (|| -> Result<String, String> {
         let server_hex = read_cstr(server_pk_hex).ok_or("null server_pk_hex")?;
         let owner_hex = read_cstr(owner_pk_hex).ok_or("null owner_pk_hex")?;
-        let server_pk = hex_to_32(&server_hex)?;
-        let owner_pk = hex_to_32(&owner_hex)?;
+        let server_pk = crate::from_hex::<[u8; 32]>(&server_hex)?;
+        let owner_pk = crate::from_hex::<[u8; 32]>(&owner_hex)?;
 
         let (script, cb) = ark::exit_spend_info(&server_pk, &owner_pk, exit_delay)
             .ok_or("exit_spend_info failed")?;
         let json = format!(
             r#"{{"script_hex":"{}","control_block_hex":"{}"}}"#,
-            hex_encode(&script),
-            hex_encode(&cb.serialize()),
+            hex::encode(&script),
+            hex::encode(cb.serialize()),
         );
         Ok(json)
     })();
@@ -211,11 +188,11 @@ pub extern "C" fn ark_multisig_script(
     let result = (|| -> Result<String, String> {
         let server_hex = read_cstr(server_pk_hex).ok_or("null server_pk_hex")?;
         let owner_hex = read_cstr(owner_pk_hex).ok_or("null owner_pk_hex")?;
-        let server_pk = hex_to_32(&server_hex)?;
-        let owner_pk = hex_to_32(&owner_hex)?;
+        let server_pk = crate::from_hex::<[u8; 32]>(&server_hex)?;
+        let owner_pk = crate::from_hex::<[u8; 32]>(&owner_hex)?;
 
         let script = ark::multisig_script(&server_pk, &owner_pk);
-        Ok(hex_encode(&script))
+        Ok(hex::encode(&script))
     })();
 
     match result {
@@ -234,10 +211,10 @@ pub extern "C" fn ark_csv_sig_script(
 ) -> *mut FfiResult {
     let result = (|| -> Result<String, String> {
         let owner_hex = read_cstr(owner_pk_hex).ok_or("null owner_pk_hex")?;
-        let owner_pk = hex_to_32(&owner_hex)?;
+        let owner_pk = crate::from_hex::<[u8; 32]>(&owner_hex)?;
 
         let script = ark::csv_sig_script(exit_delay, &owner_pk);
-        Ok(hex_encode(&script))
+        Ok(hex::encode(&script))
     })();
 
     match result {
@@ -255,10 +232,10 @@ pub extern "C" fn ark_tapleaf_hash(
 ) -> *mut FfiResult {
     let result = (|| -> Result<String, String> {
         let hex_str = read_cstr(script_hex).ok_or("null script_hex")?;
-        let script_bytes = hex_decode(&hex_str)?;
+        let script_bytes = crate::from_hex::<Vec<u8>>(&hex_str)?;
 
         let leaf = TapLeaf::new(script_bytes);
-        Ok(hex_encode(&leaf.hash()))
+        Ok(hex::encode(leaf.hash()))
     })();
 
     match result {

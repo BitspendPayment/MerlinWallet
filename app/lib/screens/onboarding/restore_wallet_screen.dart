@@ -36,8 +36,8 @@ class _RestoreWalletScreenState extends State<RestoreWalletScreen> {
     try {
       await context.read<MpcService>().restoreWallet();
       // The exits are this device's copies of transactions signed for the old one, so they do not
-      // come back with everything else. The address is asked for again and the next seal reissues
-      // them — which is why restore ends where onboarding does.
+      // come back with everything else. The address is asked for again and the next delegate
+      // renewal reissues them — which is why restore ends where onboarding does.
       if (mounted) context.push('/onboarding/exit-address');
     } catch (e) {
       if (mounted) setState(() => _error = '$e');

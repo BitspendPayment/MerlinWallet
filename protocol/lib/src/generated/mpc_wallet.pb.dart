@@ -491,7 +491,7 @@ class GetServerInfoResponse extends $pb.GeneratedMessage {
 }
 
 /// The ASP's parameters, as its `GetInfo` reports them. Supplied by the caller, because the caller is
-/// the one talking to the ASP — see `SettleOpen` in cosign_session.proto for why a wrong one cannot
+/// the one talking to the ASP — see `RenewOpen` in cosign_session.proto for why a wrong one cannot
 /// redirect funds.
 class ArkInfo extends $pb.GeneratedMessage {
   factory ArkInfo({
