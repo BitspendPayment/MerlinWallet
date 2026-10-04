@@ -12,13 +12,14 @@
 //!
 //! ## What a background task can and cannot do
 //!
-//! It reaches exactly what its image allows, and nothing else. `wasmtime_wasi`'s `SocketAddrCheck`
-//! refuses every address by default; a deployment overrides it with an origin allowlist that is
-//! image configuration, measured into PCR0 — so a client learns where this guest may send traffic
-//! from the same attestation that tells it what the guest is. This deployment allows the ASP.
+//! It reaches the public internet over `wasi:http`, and nothing else: the runtime refuses, by
+//! address, the metadata service, its own network, this machine and the operator's. Where it sends
+//! is this code's decision, and of the settings written into the guest file at deployment — both
+//! measured into PCR16, so a client learns them from the same attestation that tells it what the
+//! guest is. This deployment names the ASP.
 //!
 //! So a settle that has come due is executed in the task itself rather than handed back to a phone;
-//! see `crate::asp`. Where the image names no ASP, the task falls back on the thing it can always
+//! see `crate::asp`. Where the settings name no ASP, the task falls back on the thing it can always
 //! do without a connection: read its own sealed state, compare a deadline to the clock, and *wake
 //! its owner*, with the delegate already signed and waiting for the app to drive over the attested
 //! channel. `notify.wit` names that as the primary use: "a finished task telling its owner to come
@@ -72,7 +73,7 @@ pub trait Host: Send + Sync {
     //
     // Outbound: each message from a service is one invocation.
 
-    /// Hold a connection to `origin`, which the image must allow. Survives a restart.
+    /// Hold a connection to `origin`, on the public internet. Survives a restart.
     fn stream_open(&self, id: &str, origin: &str) -> Result<(), String>;
 
     /// Stop maintaining it. Idempotent.

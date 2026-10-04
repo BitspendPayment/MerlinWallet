@@ -221,7 +221,7 @@ fn deal(store: Arc<cosigner::store::Store>) -> Dealt {
     );
 
     // The cosigner's half went to the service, over the connection the runtime holds to the origin
-    // the image names — once.
+    // the deployment names — once.
     let FromCosigner::Paired(paired) = next(&mut reply, 3) else { panic!("expected the pairing") };
     assert_eq!(paired.service_origin, ORIGIN);
     let stream = service_stream_id(&service_hex);

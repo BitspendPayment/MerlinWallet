@@ -3,19 +3,20 @@
 #
 #   infrastructure/mutinynet-qemu/deploy.sh [--staging]
 #
-# Builds here, runs there: the host has no Nix, no cargo and no checkout. This builds the cosigner,
-# packs the enclave image with MutinyNet's configuration (`dev-enclave.sh --pack`), ships everything
-# to the stack's bucket, and has the instance install it and restart over SSM. Tenants resume — the
-# store is on its own volume — and the new measurements and trust root are published to pins/ once
-# the enclave is serving.
+# Builds here, runs there: the host has no Nix, no cargo and no checkout. This builds the cosigner
+# and writes MutinyNet's settings into it, packs the enclave image (`dev-enclave.sh --pack`), ships
+# everything to the stack's bucket, and has the instance install it and restart over SSM. Tenants
+# resume — the store is on its own volume — and the new measurements and trust root are published
+# to pins/ once the enclave is serving.
 #
 #   --staging   certificates from Let's Encrypt's staging CA. For a first deploy, or after changing
 #               the domain: it proves issuance without spending the production rate limit (five
 #               duplicate certificates a week). Nothing trusts a staging certificate, so the app
 #               cannot use the host until a deploy without it.
 #
-# Needs: the stack applied (tofu/), the AWS profile, enclave-runtime at $ENCLAVE_RUNTIME with its
-# QEMU image built, and the Firebase key in secrets/.
+# Needs: the stack applied (tofu/) and its push application's FCM channel loaded (README), the AWS
+# profile, and enclave-runtime at $ENCLAVE_RUNTIME with its QEMU image built. No Firebase key: it
+# lives on the push application's channel, in AWS.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,14 +32,17 @@ case "${1:-}" in
     *) echo "usage: ${0##*/} [--staging]" >&2; exit 2 ;;
 esac
 
+[[ -x "$runtime/deploy/qemu-nitro/dev-enclave.sh" ]] \
+    || { echo "no enclave-runtime at $runtime — set ENCLAVE_RUNTIME" >&2; exit 1; }
+bucket="$(tofu -chdir="$here/tofu" output -raw bucket)"
+instance="$(tofu -chdir="$here/tofu" output -raw instance_id)"
+push_app_id="$(tofu -chdir="$here/tofu" output -raw push_app_id)"
+
 # --- What MutinyNet's image is ---------------------------------------------------------------------
 #
 # All of it is baked into the image, so all of it is PCR0: change any and the app's pins change with
 # the next boot, which publishes them.
 domain=mutiny.vtxos.network
-asp=https://mutinynet.arkade.sh
-fcm_project=vtxos-7afb3
-fcm_key="$here/secrets/fcm-service-account.json"
 image_args=(
     --domain "$domain" "${staging[@]}"
     # Passkeys for vtxos.com, whose assetlinks.json names com.vtxos.app; the app claims its signing
@@ -47,25 +51,22 @@ image_args=(
     --rp-id vtxos.com
     --allowed-origin android:apk-key-hash:Lf1QIwQnlPBYPwDFhloUkYC-0tYAKSpKCQbEiyz118s
     --allowed-origin android:apk-key-hash:u1pNepeObJUpSkSqH964HvFRqbhC_ejQP3GHA3-lreI
-    # The cosigner runs sealed delegates itself, against arkade's ASP, from background tasks that
-    # wait on a batch round. The renewal margin is the cosigner's default (1800s).
-    --guest-egress "$asp"
-    --guest-env "ASP_URL=$asp"
-    --guest-env BITCOIN_NETWORK=mutinynet
-    --background-timeout 600
-    --fcm-project "$fcm_project" --fcm-service-account "$fcm_key"
+    # Wakes through this stack's push application, signed as the host's role.
+    --push-app-id "$push_app_id"
 )
 
-[[ -x "$runtime/deploy/qemu-nitro/dev-enclave.sh" ]] \
-    || { echo "no enclave-runtime at $runtime — set ENCLAVE_RUNTIME" >&2; exit 1; }
-[[ -f "$fcm_key" ]] || { echo "missing $fcm_key (the Firebase service account key)" >&2; exit 1; }
+# --- What MutinyNet's cosigner is ---------------------------------------------------------------
+#
+# Written into the cosigner's file before it ships, so the enclave measures them into PCR16 with its
+# code. It runs sealed delegates itself, against arkade's ASP, from background tasks that wait on a
+# batch round. The renewal margin is the cosigner's default (1800s).
+asp=https://mutinynet.arkade.sh
+guest_settings=("ASP_URL=$asp" BITCOIN_NETWORK=mutinynet)
 docker image inspect s3fs-qemu-nitro:latest >/dev/null 2>&1 \
     || { echo "build the QEMU image first: docker build -t s3fs-qemu-nitro:latest $runtime/deploy/qemu-nitro" >&2; exit 1; }
 
 say() { printf '\n== %s ==\n' "$*"; }
 
-bucket="$(tofu -chdir="$here/tofu" output -raw bucket)"
-instance="$(tofu -chdir="$here/tofu" output -raw instance_id)"
 out="$(mktemp -d)"
 trap 'rm -rf "$out"' EXIT
 
@@ -73,6 +74,7 @@ say "building the cosigner"
 make -C "$repo" cosigner-wasm
 mkdir -p "$out/guest"
 cp "$repo/cosigner/target/wasm32-wasip2/release/cosigner.wasm" "$out/guest/"
+python3 "$runtime/deploy/qemu-nitro/guest-env.py" "$out/guest/cosigner.wasm" "${guest_settings[@]}"
 
 say "packing the enclave image"
 "$runtime/deploy/qemu-nitro/dev-enclave.sh" --name mutinynet-pack --pack "$out/bundle" "${image_args[@]}"

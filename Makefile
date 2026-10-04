@@ -22,7 +22,7 @@
 	regtest-up regtest-down bitcoin-init mine-loop adb-reverse \
 	runtime-run runtime-stop \
 	arkd-up arkd-down arkd-init db-reset \
-	proto proto-check wit-drift threshold-test enclave-bundle enclave-bundle-args wasi-sdk \
+	proto proto-check wit-drift threshold-test enclave-bundle wasi-sdk \
 	flutter flutter-32 flutter-x86 ark-newaddress crypto-bench \
 	stress-test load-test \
 	mutinynet-deploy mutinynet-smoke \
@@ -275,8 +275,9 @@ cosigner-check: wit-drift
 
 # The prebuilt dev enclave: a release of enclave-runtime, pinned by name and sha256 in
 # enclave-bundle.lock, unpacked into .enclave/. Bumping the pin is editing that file; making a new
-# bundle is the runtime's "Publish a dev enclave" workflow, dispatched with the image options
-# `make enclave-bundle-args` prints — the harness checks a bundle against those before booting.
+# bundle is the runtime's "Publish a dev enclave" workflow, with no image options: the bundle
+# carries nothing of this repository's. The e2e gives the cosigner its settings when it boots one
+# (e2e/lib/e2e_profile.dart), and the enclave measures them into PCR16 with the component.
 BUNDLE_URL ?= https://github.com/BitspendPayment/enclave-runtime/releases/download
 
 enclave-bundle: .enclave/image.env
@@ -290,10 +291,6 @@ enclave-bundle: .enclave/image.env
 	echo "$$SHA256  $$t" | sha256sum -c - && \
 	rm -rf .enclave && mkdir .enclave && tar xzf $$t -C .enclave --strip-components=1 && rm $$t && \
 	echo "unpacked into .enclave ($$(. .enclave/image.env; echo runtime $$ENCLAVE_RUNTIME_REV))"
-
-# The image options the e2e boots with, as the publish workflow's `image_args` input.
-enclave-bundle-args:
-	@cd e2e && dart pub get >/dev/null && dart run bin/bundle_args.dart
 
 # wasi-sdk, pinned by the runtime (its scripts/wasi-sdk.sh ships in a bundle too), for cosigner-wasm.
 wasi-sdk:

@@ -64,7 +64,7 @@ flowchart TB
     App <-->|Interactive Ark operations| ASP[Ark Service Provider]
     Guest <-->|Allowed origin: delegated work| ASP
     Workers <-->|SSE and POST| Service[Paired escrow service]
-    Workers -->|Content-free wake| Push[FCM]
+    Workers -->|Content-free wake| Push[AWS push → FCM]
     Push --> App
 ```
 
@@ -89,9 +89,9 @@ Merlin is a concrete consumer of the runtime's capabilities. Its [`Host` trait](
 | Keep each wallet's files and execution separate | Tenant-scoped preopen and per-tenant execution lock | [`open_cosigner`](cosigner/src/main.rs), [`store.rs`](cosigner/src/store.rs) |
 | Preserve state beyond an invocation or restart | Copy-on-write encrypted filesystem and durable sync/rename operations | [`SnapshotState`](cosigner/src/types.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
 | Execute an already authorized renewal later | `enclave:tasks/queue` and the `run-task` callback | [`renew.rs`](cosigner/src/renew.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
-| Reach the ASP during unattended work | Exact-origin guest egress policy | [`asp/`](cosigner/src/asp/), [`up-enclave.sh`](scripts/up-enclave.sh) |
+| Reach the ASP during unattended work | The ASP named in the cosigner's measured settings; the runtime admits only public addresses (and the emulator's host) | [`asp/`](cosigner/src/asp/), [`up-enclave.sh`](scripts/up-enclave.sh) |
 | Let a paired service initiate an exchange | `enclave:streams/connection` and `on-message` | [`escrow.rs`](cosigner/src/escrow.rs) |
-| Notify the owner without putting private details in a push | Runtime-owned device enrollment and FCM wake queue | [`host.rs`](cosigner/src/host.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
+| Notify the owner without putting private details in a push | Runtime-owned device enrollment and a wake queue sent through AWS End User Messaging Push | [`host.rs`](cosigner/src/host.rs), [`cosigner.rs`](cosigner/src/cosigner.rs) |
 
 ### Persistent wallet state
 
@@ -133,7 +133,7 @@ For a presentation, show the approval, original and refreshed outpoints, the abs
 The client checks three identities together:
 
 - **PCR0:** the runtime image and its measured configuration.
-- **PCR16:** the cosigner component measured by that runtime before key release.
+- **PCR16:** the cosigner component, with the settings written into it at deployment, measured by that runtime before key release.
 - **TLS leaf certificate:** the certificate of the connection that delivered the attested authentication response.
 
 Each authentication request carries a fresh nonce. The client verifies the document's signature/chain, pinned root, expected measurements, nonce, timestamp, and connection binding through [`crates/enclave-client`](crates/enclave-client/) and FFI. [`PinnedTransportConnector`](app-core/lib/enclave/pinned_transport.dart) then checks the certificate before handing a socket to the gRPC transport.
@@ -199,7 +199,7 @@ The runtime's [development guide](https://github.com/BitspendPayment/enclave-run
 make up
 ```
 
-`make up` aliases `up-enclave`. It builds `cosigner.wasm` and the host FFI, starts Bitcoin/Electrs and arkd, initializes the regtest chain and ASP, then runs the enclave in the foreground. The script mines regtest blocks while running and configures allowed ASP egress and a development renewal margin.
+`make up` aliases `up-enclave`. It builds `cosigner.wasm` and the host FFI, starts Bitcoin/Electrs and arkd, initializes the regtest chain and ASP, then runs the enclave in the foreground. The script mines regtest blocks while running and gives the cosigner its settings — the ASP and a development renewal margin — at boot.
 
 The default enclave name is `merlin`, the host TLS port is `8443`, and the store is retained across starts. Artifacts and pins live under `$ENCLAVE_RUNTIME/target/qemu-nitro/merlin`. The image includes the configured Android relying-party/origin settings; a custom app signing key requires the corresponding origin and domain association.
 
@@ -253,7 +253,7 @@ This checks the vendored WIT interfaces against the runtime before compiling. Th
 
 ### MutinyNet development deployment
 
-The [MutinyNet runbook](infrastructure/mutinynet-qemu/README.md) describes a QEMU enclave on EC2, public-domain ACME, the external ASP, retained MinIO storage, real Firebase wakes, and republished client pins. After completing its prerequisites and infrastructure setup, from the repository root:
+The [MutinyNet runbook](infrastructure/mutinynet-qemu/README.md) describes a QEMU enclave on EC2, public-domain ACME, the external ASP, retained MinIO storage, real wakes through AWS End User Messaging Push, and republished client pins. After completing its prerequisites and infrastructure setup, from the repository root:
 
 ```bash
 make mutinynet-deploy
@@ -285,9 +285,9 @@ For a complete E2E run, let the harness configure its own enclave. An existing o
 make e2e-enclave ENCLAVE_RUN="$ENCLAVE_RUNTIME/target/qemu-nitro/merlin"
 ```
 
-An attached image must also allow the suite's escrow-service fixture and use a renewal margin suitable for the test timeout. The delegate test reports a skip if the deadline is too far away. A bundle boots as it was packed, so the harness checks its `image.env` against the options in `e2e/lib/e2e_profile.dart` first and refuses a mismatch by name; `make enclave-bundle-args` prints the options a bundle for this suite is packed with. Only one emulator stack can own the fixed MinIO port/vsock configuration at a time.
+An attached enclave's cosigner must also name the suite's escrow-service fixture and use a renewal margin suitable for the test timeout. The delegate test reports a skip if the deadline is too far away. A bundle carries nothing of this suite's: the harness gives the cosigner the settings in `e2e/lib/e2e_profile.dart` when it boots one (`--guest-env`), written into the component and measured into PCR16 with it. Only one emulator stack can own the fixed MinIO port/vsock configuration at a time.
 
-CI (`.github/workflows/ci.yml`) runs the cosigner's, threshold's and FFI's `cargo test`, every Dart package's analysis, `app-core`'s tests against the built FFI, the app's `flutter analyze` and `flutter test`, and the enclave e2e: the `enclave-e2e` job fetches the bundle pinned in `enclave-bundle.lock`, boots it on the runner's KVM (hosted runners have nested virtualisation; the runtime's own CI relies on the same) and runs the suite. Moving to a newer runtime is: dispatch the runtime's "Publish a dev enclave" workflow with `make enclave-bundle-args` as its image options, then put the release name and the sha256 from its `.sha256` asset into `enclave-bundle.lock`. A change to a ceremony is still run locally before it is called done. Host tests, QEMU integration tests, Android device tests, and real Nitro validation establish different properties.
+CI (`.github/workflows/ci.yml`) runs the cosigner's, threshold's and FFI's `cargo test`, every Dart package's analysis, `app-core`'s tests against the built FFI, the app's `flutter analyze` and `flutter test`, and the enclave e2e: the `enclave-e2e` job fetches the bundle pinned in `enclave-bundle.lock`, boots it on the runner's KVM (hosted runners have nested virtualisation; the runtime's own CI relies on the same) and runs the suite. Moving to a newer runtime is: dispatch the runtime's "Publish a dev enclave" workflow, with no image options, then put the release name and the sha256 from its `.sha256` asset into `enclave-bundle.lock`. A change to a ceremony is still run locally before it is called done. Host tests, QEMU integration tests, Android device tests, and real Nitro validation establish different properties.
 
 ## Repository guide
 

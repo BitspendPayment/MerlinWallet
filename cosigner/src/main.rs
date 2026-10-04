@@ -78,8 +78,8 @@ fn open_cosigner(cfg: &config::Config) -> Result<Cosigner, Status> {
     // enclave-runtime scopes each tenant's filesystem before the guest sees it, so the store this
     // instance opened already belongs to exactly one wallet; there is nothing here to route
     // between and this string is only the key the seal is filed under. Requiring it also could not
-    // work: the image's environment is all `S3FS_*`, which the runtime strips, so nothing reaches
-    // the guest to set it and the instance refused to start at all.
+    // work: nothing the deployment sets names it, so nothing reaches the guest to set it and the
+    // instance refused to start at all.
     //
     // Safe to default because it is *not* the wallet's identity. DKG installs the real group key
     // into the policy inside the seal (`install_key` writes `key.group_key`, not this), so
@@ -179,7 +179,7 @@ mod runtime {
     ///
     /// The runtime calls this on its own schedule with no request in flight, so it opens the wallet
     /// itself rather than sharing one — there is no instance kept between a request and a task to
-    /// share. When the sealed delegate has come due it runs it against the ASP the image names —
+    /// share. When the sealed delegate has come due it runs it against the ASP its settings name —
     /// see `Cosigner::run_task_with` — and wakes the owner only when it cannot.
     struct Background;
 
@@ -191,7 +191,7 @@ mod runtime {
             let run = || {
                 let cfg = cosigner::config::Config::from_environment();
                 let mut wallet = super::open_cosigner(&cfg).map_err(|e| e.to_string())?;
-                // The ASP, when the image names one — a due delegate is then run here, not handed
+                // The ASP, when the settings name one — a due delegate is then run here, not handed
                 // back to a phone.
                 let mut asp = cosigner::asp::rest::AspRest::from_env();
                 wstd::runtime::block_on(wallet.run_task_with(&task_id, &payload, asp.as_mut()))

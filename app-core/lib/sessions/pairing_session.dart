@@ -15,7 +15,7 @@
 /// reconstruct the service's share; it checks the point against public data instead.
 ///
 /// **And it never sees the cosigner's half.** That travels from the enclave straight to the
-/// service, over an origin the image names — a wallet names a service id, never a URL.
+/// service, over an origin the deployment names — a wallet names a service id, never a URL.
 ///
 /// But the wallet's own half has to get there too, and it must not go through the cosigner: one
 /// that saw both terms could sign as the service. So it goes **directly from this device to the

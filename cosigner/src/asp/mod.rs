@@ -6,9 +6,9 @@
 //! already signed the intent and the forfeits, so executing it needs only the cosigner's own key —
 //! and a connection to the ASP, which is what this module is.
 //!
-//! The enclave admits exactly the ASP's origin (`guestEgressOrigins` in the runtime's deployment),
-//! and the guest learns the address from `ASP_URL` in its environment. Both are image configuration,
-//! measured into PCR0.
+//! The guest learns the address from `ASP_URL` in its environment, a setting written into the guest
+//! file at deployment and measured into PCR16 with the code. The runtime lets a guest reach the
+//! public internet and, in the emulator, its host — an ASP on either.
 //!
 //! It speaks arkd's REST gateway over HTTP/1.1 — the only version a guest's `wasi:http` offers —
 //! with the event stream as server-sent events. [`AspApi`] is the seam: the executor is written
@@ -59,7 +59,7 @@ pub trait EventSource {
 
 /// An ASP that is not there.
 ///
-/// Not a fallback so much as the truth for a build or a deployment whose image allowlists no ASP:
+/// Not a fallback so much as the truth for a build or a deployment that names no ASP:
 /// every call fails, so a path that needed one says so instead of quietly doing less. The task
 /// watch and the escrow release both take `Option<impl AspApi>` and this is what stands in when
 /// there is none.

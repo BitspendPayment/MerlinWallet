@@ -97,7 +97,7 @@ resource "aws_security_group" "host" {
   }
 
   egress {
-    description = "ASP, Firebase, Lets Encrypt, package mirrors, SSM"
+    description = "ASP, AWS push, Lets Encrypt, package mirrors, SSM"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -192,6 +192,20 @@ data "aws_iam_policy_document" "host" {
     actions   = ["s3:PutObject"]
     resources = ["${aws_s3_bucket.enclave.arn}/pins/*"]
   }
+  # The enclave signs its wakes as this role, through the metadata service gvproxy maps for the
+  # runtime alone. This one application, and only sending and reading its FCM channel.
+  statement {
+    sid       = "SendWakes"
+    actions   = ["mobiletargeting:SendMessages", "mobiletargeting:GetGcmChannel"]
+    resources = [aws_pinpoint_app.push.arn, "${aws_pinpoint_app.push.arn}/*"]
+  }
+}
+
+# The push application wakes go through (AWS End User Messaging Push). Its FCM channel, which holds
+# the Firebase service account, is loaded once from the CLI rather than here — see the README — so
+# the key never reaches tofu state, the image, or the bundle.
+resource "aws_pinpoint_app" "push" {
+  name = "${local.name}-wakes"
 }
 
 resource "aws_iam_role_policy" "host" {

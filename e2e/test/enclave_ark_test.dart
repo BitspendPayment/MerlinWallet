@@ -101,10 +101,10 @@ void main() {
   EscrowService? service;
 
   setUpAll(() async {
-    // Before the enclave: the image has to name where this service is, and it cannot be told
+    // Before the enclave: the deployment has to name where this service is, and it cannot be told
     // afterwards.
-    // The service, its port and its origin as the image names them: `lib/e2e_profile.dart`, the
-    // one place they are decided, because a prebuilt bundle has to have been packed with them.
+    // The service, its port and its origin as the deployment names them: `lib/e2e_profile.dart`,
+    // the one place they are decided, given to the cosigner when the enclave boots.
     service = EscrowService(identifier: serviceIdentifier);
     await service!.start(port: servicePort);
     harness = await startE2eEnclave();
@@ -1197,8 +1197,8 @@ void main() {
       }
     }, timeout: const Timeout(Duration(minutes: 15)));
 
-    /// A service this image was not built to reach is refused before anything is dealt.
-    test('a service the image does not name is refused before anything is dealt', () async {
+    /// A service this deployment does not name is refused before anything is dealt.
+    test('a service the deployment does not name is refused before anything is dealt', () async {
       final dave = await wallet('pair_dave');
       try {
         await dave.client.doDkg();

@@ -3,7 +3,7 @@
 The cosigner at **`mutiny.vtxos.network`**, running as a wasm guest in an **emulated** Nitro enclave
 (QEMU's `nitro-enclave` machine) on one small EC2 instance. It is the same image and harness as
 `make up-enclave`, with a real domain, a Let's Encrypt certificate, arkade's MutinyNet ASP and real
-Firebase wakes.
+wakes through AWS End User Messaging Push.
 
 > **Test coins only.** On an emulator, whoever controls the instance can read every tenant's data
 > (the master key is static) and sign attestation documents (the chain is minted inside the image).
@@ -15,8 +15,8 @@ phone ──https──▶ mutiny.vtxos.network:443 (EIP) ──▶ c8i.large (n
                                                      ├─ gvproxy :443 ──▶ QEMU nitro-enclave ─▶ runtime ─▶ cosigner.wasm
                                                      ├─ MinIO 127.0.0.1:9000  (the store, on its own EBS volume)
                                                      └─ publish-pins ──▶ s3://vtxos-mutinynet-enclave/pins/deployment.json
-cosigner ──egress──▶ https://mutinynet.arkade.sh   (runs sealed delegates itself)
-runtime  ──────────▶ Let's Encrypt, Firebase
+cosigner ──────────▶ https://mutinynet.arkade.sh   (runs sealed delegates itself)
+runtime  ──────────▶ Let's Encrypt, AWS push (signed as the host's role) ──▶ FCM
 app      ──────────▶ pins/deployment.json          (PCR0, PCR16, trust root)
 ```
 
@@ -28,7 +28,7 @@ app      ──────────▶ pins/deployment.json          (PCR0, 
 | `deploy.sh` | runs on your machine: builds, packs, uploads, installs over SSM |
 | `host/` | what runs on the instance: `install.sh`, `run-enclave.sh`, `publish-pins.sh`, the systemd units |
 | `qemu-slim.Dockerfile` | the QEMU image without its toolchain (~100 MB compressed instead of 3.7 GB) |
-| `secrets/` | gitignored. `fcm-service-account.json`: the Firebase key for project `vtxos-7afb3` |
+| `secrets/` | gitignored. `fcm-service-account.json`: the Firebase key for project `vtxos-7afb3`, loaded once onto the push application's FCM channel (step 2) and used nowhere else |
 
 On the instance, everything lives in `/srv/merlin`. The enclave's store and run directory are
 `/srv/merlin/work` (the EBS volume): `work/mutinynet-store` holds tenants, `work/mutinynet/console.log`
@@ -53,7 +53,8 @@ IPv4 address.
    longer serves `minio/minio`; if they are missing, load them from wherever you have them. The
    instance never pulls them itself; deploy ships them.
 6. **The Firebase key** at `infrastructure/mutinynet-qemu/secrets/fcm-service-account.json`. It is a
-   service account JSON for project `vtxos-7afb3`, with messaging rights.
+   service account JSON for project `vtxos-7afb3`, with messaging rights. Only step 2 reads it, to
+   load it onto the push application; no image or bundle carries it.
 7. **The cosigner toolchain** used by `make cosigner-wasm` (wasm32-wasip2 target, wasi-sdk).
 
 ### 1. The state bucket (once per account; already done)
@@ -86,6 +87,20 @@ aws ssm send-command --profile mpc-deployer --instance-ids "$(tofu output -raw i
     --document-name AWS-RunShellScript --parameters 'commands=["cloud-init status","ls -l /dev/kvm /dev/vsock","df -h /srv/merlin/work"]'
 ```
 
+It also creates the push application wakes go through. Load its FCM channel once, from the CLI, so
+the Firebase key never reaches tofu state, an image or a bundle. `TOKEN` because the channel
+defaults to the legacy server key, which Google has turned off; the enclave refuses to boot
+against a channel that would use it:
+
+```
+aws pinpoint update-gcm-channel --profile mpc-deployer --region us-east-1 \
+    --application-id "$(tofu output -raw push_app_id)" \
+    --gcm-channel-request "$(jq -n --rawfile s ../secrets/fcm-service-account.json \
+        '{ServiceJson: $s, DefaultAuthenticationMethod: "TOKEN", Enabled: true}')"
+```
+
+After the first good deploy with it, rotate that Firebase key: images built before this carried it.
+
 ### 3. First deploy: prove the certificate on staging
 
 ```
@@ -93,9 +108,10 @@ infrastructure/mutinynet-qemu/deploy.sh --staging
 ```
 
 `deploy.sh` then does the following:
-1. Builds `cosigner.wasm`.
+1. Builds `cosigner.wasm` and writes MutinyNet's settings into it — arkade's ASP and
+   `BITCOIN_NETWORK=mutinynet` — so the enclave measures them into PCR16 with its code.
 2. Packs the enclave image with MutinyNet's configuration: domain, relying party `vtxos.com` and
-   both Android signing keys, egress to arkade, `BITCOIN_NETWORK=mutinynet`, Firebase.
+   both Android signing keys, and the push application.
 3. Uploads the image, the harness, the host scripts and the container images to `artifacts/`.
    Images already there are skipped.
 4. Runs `install.sh` on the instance over SSM, which starts `merlin-enclave.service`.
@@ -160,5 +176,6 @@ The ASP is `mutinynet.arkade.sh` and Electrum is `electrum.mutinynet.com:50001`.
 | `too many certificates already issued` | Let's Encrypt's weekly limit. Wait, or deploy with `--staging` meanwhile |
 | app: `attestation refused` | pins stale or wrong: compare `pins/deployment.json` with `console.log` (`pcr16=`, `trust_root=`) |
 | app: passkey refused | the image's `--rp-id` and `--allowed-origin` in `deploy.sh`, against the APK's signing key hash |
-| delegates never run | `console.log` for egress to `mutinynet.arkade.sh`, and the cosigner's `ASP_URL` |
+| delegates never run | `console.log` for the cosigner's requests to `mutinynet.arkade.sh`, and its `ASP_URL` (the settings `deploy.sh` wrote) |
+| boot refused: the push application cannot deliver | the FCM channel (step 2): `aws pinpoint get-gcm-channel --application-id …` must say `Enabled`, `HasFcmServiceCredentials` and `TOKEN` |
 | out of memory | `run-enclave.sh --memory` (1536M) and `free -m`; the instance has 2 GB of swap |

@@ -29,9 +29,10 @@
 - `make up-enclave` boots a dev enclave (docker regtest + arkd + QEMU from the `~/enclave-runtime`
   checkout); `make e2e-enclave` runs the suite against one (or attaches with `ENCLAVE_RUN=`); `make cli`.
 - `make enclave-bundle` fetches the prebuilt dev enclave pinned in `enclave-bundle.lock` into
-  `.enclave/`, which then is the default `ENCLAVE_RUNTIME` for the e2e and the WIT check. The image
-  options the suite needs live in `e2e/lib/e2e_profile.dart`; changing them means a new bundle
-  (`make enclave-bundle-args` → the runtime's "Publish a dev enclave" workflow → the lock).
+  `.enclave/`, which then is the default `ENCLAVE_RUNTIME` for the e2e and the WIT check. The bundle
+  is generic: the cosigner's settings the suite needs live in `e2e/lib/e2e_profile.dart` and are
+  given at boot (`--guest-env`, measured into PCR16 with the component). Only a newer runtime
+  means a new bundle (the runtime's "Publish a dev enclave" workflow → the lock).
 - CI is `.github/workflows/ci.yml`; its `enclave-e2e` job runs the suite from the pinned bundle on a
   hosted runner. Run it locally too before merging a change to a ceremony.
 

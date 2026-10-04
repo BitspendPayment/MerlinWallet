@@ -33,55 +33,45 @@ allowed_origins="${ENCLAVE_ALLOWED_ORIGINS-android:apk-key-hash:Lf1QIwQnlPBYPwDF
 store=(--keep-store)
 [[ -n "${FRESH:-}" ]] && store+=(--fresh)
 
+# The cosigner's settings. They go into the component as it is uploaded, so the enclave measures
+# them into PCR16 with its code; the image carries none of them.
+#
 # The cosigner reaches the ASP itself — to run a sealed delegate from a background task when its
 # deadline comes, with no phone involved. arkd from docker-compose.ark.yml listens on the host's
-# :7070, which is 192.168.127.254 from inside the enclave; nothing else is reachable. A batch round
-# waits on the ASP's schedule, so a background task gets minutes rather than the default 30 seconds.
+# :7070, which is 192.168.127.254 from inside the enclave. A guest reaches the public internet and,
+# in the emulator, this host; the runtime's own services here are refused to it.
 #
 # The safety margin decides when a delegate runs: at the earliest expiry less the margin. Regtest
 # VTXOs live 15360s, so the production-like 1800 would mean hours before anything visible happens;
 # 15060 runs a delegate about five minutes after the VTXOs it covers were made, which is what makes
 # the feature observable while developing. ENCLAVE_DELEGATE_MARGIN overrides it.
 asp_origin="${ENCLAVE_ASP_ORIGIN:-http://192.168.127.254:7070}"
-egress=(--guest-egress "$asp_origin"
-        --guest-env "ASP_URL=$asp_origin"
-        --guest-env "AUTO_SETTLE_SAFETY_MARGIN_SECS=${ENCLAVE_DELEGATE_MARGIN:-15060}"
-        --background-timeout "${ENCLAVE_TASK_TIMEOUT:-600}")
+settings=(--guest-env "ASP_URL=$asp_origin"
+          --guest-env "AUTO_SETTLE_SAFETY_MARGIN_SECS=${ENCLAVE_DELEGATE_MARGIN:-15060}")
 
-# The payout platform, when `make platform-up` started one (scripts/platform.sh): the image names it
-# as a service, lets the cosigner reach the fake Grid it pays through, and binds the fake's view-only
-# token to that origin so it is sent nowhere else. Measured into PCR0 like the rest.
+# The payout platform, when `make platform-up` started one (scripts/platform.sh): the cosigner names
+# it as a service, and binds the fake Grid's view-only token to the fake's origin so it is sent
+# nowhere else.
 platform_pid="$repo/.platform/run/platform.pid"
 platform_id=""
 if [[ -f "$platform_pid" ]] && kill -0 "$(cat "$platform_pid")" 2>/dev/null; then
     platform_id="$("$repo/scripts/platform.sh" id)"
     ENCLAVE_SERVICE_ORIGINS="${ENCLAVE_SERVICE_ORIGINS:+${ENCLAVE_SERVICE_ORIGINS}_}$platform_id:http://192.168.127.254:7200"
     grid_origin="http://192.168.127.254:7300"
-    egress+=(--guest-egress "$grid_origin"
-             --guest-env "SERVICE_CREDENTIALS_GRID=dev-view:dev-view-secret"
-             --guest-env "SERVICE_CREDENTIAL_ORIGIN_GRID=$grid_origin")
+    settings+=(--guest-env "SERVICE_CREDENTIALS_GRID=dev-view:dev-view-secret"
+               --guest-env "SERVICE_CREDENTIAL_ORIGIN_GRID=$grid_origin")
 fi
 
 platform_hint="none — no MerlinPlatform running, so the app has no bank sends"
 [[ -n "$platform_id" ]] && platform_hint="MerlinPlatform on :7200, paying through the fake Grid (logs in .platform/run)"
 
-# Escrow services this image may pair with, as `<service id hex>=<origin>,…`. A wallet names a
-# service by id and never by URL, so the set of reachable services is decided here, in the image,
-# and is measured into PCR0 like every other choice — see cosigner/src/handlers/delivery.rs. Each
-# one needs an egress allowance too: naming a service the guest cannot dial would fail at delivery
-# rather than at configuration, which is the wrong place to find out.
+# Escrow services the cosigner may pair with, as `<service id hex>:<origin>_…`. A wallet names a
+# service by id and never by URL, so the set of reachable services is decided here, at deployment,
+# and is measured into PCR16 with the cosigner — see `ServiceRegistry` in cosigner/src/escrow.rs.
+# `dev-enclave.sh` validates a --guest-env value against [A-Za-z0-9:/._-], which admits neither `=`
+# nor `,` — so entries are separated by `_` and an id from its origin by `:`.
 if [[ -n "${ENCLAVE_SERVICE_ORIGINS:-}" ]]; then
-    egress+=(--guest-env "SERVICE_ORIGINS=$ENCLAVE_SERVICE_ORIGINS")
-    # `dev-enclave.sh` validates a --guest-env value against [A-Za-z0-9:/._-], which admits neither
-    # `=` nor `,` — so entries are separated by `_` and an id from its origin by `:`. The cosigner's
-    # parser takes either spelling; see cosigner/src/handlers/delivery.rs.
-    IFS=_ read -ra services <<<"$ENCLAVE_SERVICE_ORIGINS"
-    for entry in "${services[@]}"; do
-        origin="${entry#*:}"
-        [[ -n "$origin" && "$origin" != "$entry" ]] || {
-            echo "ENCLAVE_SERVICE_ORIGINS entry '$entry' is not <service id>:<origin>" >&2; exit 1; }
-        egress+=(--guest-egress "$origin")
-    done
+    settings+=(--guest-env "SERVICE_ORIGINS=$ENCLAVE_SERVICE_ORIGINS")
 fi
 
 webauthn=()
@@ -132,7 +122,7 @@ hints() {
   e2e        make e2e-enclave ENCLAVE_RUN=$run
   app        make adb-reverse && make flutter           (pins this boot's root and PCRs into the build)
   rp id      ${rp_id:-enclave.test}
-  egress     $asp_origin (the ASP)${platform_id:+, and the fake Grid at 192.168.127.254:7300}
+  ASP        $asp_origin
   platform   $platform_hint
   delegates  run by the cosigner ${ENCLAVE_DELEGATE_MARGIN:-15060}s before the earliest expiry
   store      kept in $run-store${FRESH:+ (started fresh)} — make up-enclave FRESH=1 discards it
@@ -164,4 +154,5 @@ HINTS
 watcher=$!
 
 cd "$runtime"
-./deploy/qemu-nitro/dev-enclave.sh --guest "$wasm" --name "$name" --port "$port" "${webauthn[@]}" "${store[@]}" "${egress[@]}"
+./deploy/qemu-nitro/dev-enclave.sh --guest "$wasm" --name "$name" --port "$port" \
+    "${webauthn[@]}" "${store[@]}" "${settings[@]}"

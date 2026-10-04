@@ -34,9 +34,9 @@
 //! # Credentials
 //!
 //! A policy names a credential by **key**, never by value: `credentials: "diva"` resolves to
-//! `SERVICE_CREDENTIALS_DIVA` in the guest's environment, which is image configuration and measured
-//! into PCR0 like the egress list. A sealed policy therefore cannot be edited into one that
-//! exfiltrates a secret, because it never contains one.
+//! `SERVICE_CREDENTIALS_DIVA` in the guest's environment, a setting written into the guest file at
+//! deployment and measured into PCR16 with the code. A sealed policy therefore cannot be edited
+//! into one that exfiltrates a secret, because it never contains one.
 //!
 //! **A credential is presented to exactly one origin.** The provider is a policy field, the
 //! reference is substituted into a path segment and nowhere else, and a response that is a redirect
@@ -49,7 +49,8 @@ use serde::{Deserialize, Serialize};
 /// What the cosigner must go and fetch before it can decide.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EvidenceRequest {
-    /// Scheme, host and port, from the policy. Must be an origin the image allows.
+    /// Scheme, host and port, from the policy. Reached only if it is on the public internet (or, in
+    /// the emulator, its host): the runtime refuses anything else by address.
     pub provider: String,
     /// The path, with the reference already substituted.
     pub path: String,
@@ -354,8 +355,9 @@ pub struct ReleaseFacts {
 /// A condition satisfied by evidence the cosigner fetches itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpGet {
-    /// Scheme, host and port. **From the sealed policy**, and admitted by the image's egress list
-    /// when fetched — a policy naming somewhere the image does not allow fetches nothing.
+    /// Scheme, host and port. **From the sealed policy**, fetched only from the public internet —
+    /// the runtime refuses anything else by address — and with a credential only if it is bound to
+    /// exactly this origin.
     pub provider: String,
     /// A path, with `{reference}` where the claimed payment's reference goes. That is the only
     /// substitution, and it is the only thing a request contributes to the URL.
@@ -522,18 +524,18 @@ pub trait FetchEvidence {
 /// Why a credential was not handed over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoCredential {
-    /// The image carries nothing under that name.
+    /// The deployment carries nothing under that name.
     Unknown,
-    /// The image carries it, but it is bound to a different origin than the one being asked.
+    /// The deployment carries it, but it is bound to a different origin than the one being asked.
     WrongOrigin { bound_to: String },
-    /// The image carries it and did not say where it may go.
+    /// The deployment carries it and did not say where it may go.
     Unbound,
 }
 
 impl NoCredential {
     pub fn message(&self, key: &str, provider: &str) -> String {
         match self {
-            NoCredential::Unknown => format!("this image carries no credential named {key:?}"),
+            NoCredential::Unknown => format!("this deployment carries no credential named {key:?}"),
             NoCredential::WrongOrigin { bound_to } => format!(
                 "the credential {key:?} belongs to {bound_to} and this policy points it at \
                  {provider}; a credential is not sent anywhere but to the provider it is for"
@@ -557,12 +559,12 @@ impl NoCredential {
 ///
 /// A policy names a provider AND a credential, and both come from the same sealed document — which
 /// a wallet's owner writes. Without this binding, a policy could point the operator's provider
-/// credential at any *other* origin the image allows, and the enclave would authenticate to it with
-/// a secret that was never meant for it. The credential belongs to the deployment, not to the owner
-/// of one wallet, so the deployment is what decides where it goes.
+/// credential at any *other* origin the enclave can reach, and the enclave would authenticate to it
+/// with a secret that was never meant for it. The credential belongs to the deployment, not to the
+/// owner of one wallet, so the deployment is what decides where it goes.
 ///
-/// Fail closed: a credential the image did not bind has no safe destination and is not sent. That
-/// is a deployment error, and the refusal names the variable to set.
+/// Fail closed: a credential the deployment did not bind has no safe destination and is not sent.
+/// That is a deployment error, and the refusal names the variable to set.
 pub fn credential(key: &str, provider: &str) -> Result<String, NoCredential> {
     let upper = key.to_ascii_uppercase();
     let secret = std::env::var(format!("SERVICE_CREDENTIALS_{upper}"))
@@ -580,7 +582,7 @@ pub fn credential(key: &str, provider: &str) -> Result<String, NoCredential> {
     Ok(secret)
 }
 
-/// Fetching over the guest's `wasi:http`, to a provider the image allows.
+/// Fetching over the guest's `wasi:http`, from the provider the policy names.
 #[cfg(target_arch = "wasm32")]
 pub struct HttpEvidence;
 
@@ -662,7 +664,7 @@ impl FetchEvidence for HttpEvidence {
 /// A fetcher with nowhere to fetch from. Mirrors [`NoAsp`](crate::asp::NoAsp).
 ///
 /// Not gated off the component target, although [`HttpEvidence`] is: the release path takes a
-/// fetcher whichever build it is in, and a guest whose image allowlists no provider is in exactly
+/// fetcher whichever build it is in, and a guest that can reach no provider is in exactly
 /// the position this describes. Unreachable evidence is then judged by the policy's
 /// [`OnUnavailable`], which is the point — a provider that cannot be reached must not read as one
 /// that answered.

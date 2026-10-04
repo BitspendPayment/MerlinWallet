@@ -185,7 +185,7 @@
 //! - **The timeouts are the runtime's, not a task's.** A dial has 60 seconds to first byte, which
 //!   is generous on purpose: a service with nothing to say yet is the normal case. The held
 //!   connection has no lifetime of its own. One `on-message` invocation runs under the same
-//!   deadline an inbound request does, NOT `--background-timeout` — it is a call with a
+//!   deadline an inbound request does, NOT a background task's 600 seconds — it is a call with a
 //!   counterparty waiting, not work scheduled for later.
 //! - **After a restart it is `StreamRegistry::open_registry`.** It reads every record off disk
 //!   before anything is served, and `run` starts a supervisor for each. The guest is not consulted
@@ -224,8 +224,8 @@
 //! ## One stream per service, not per escrow
 //!
 //! A tenant may hold eight connections and a wallet may hold sixty-four escrows, so a stream per
-//! escrow would run out. A stream per *service* does not: the image names the services it will
-//! talk to, and that list is what bounds this. Every message therefore names the escrow it is
+//! escrow would run out. A stream per *service* does not: the deployment names the services it
+//! will talk to, and that list is what bounds this. Every message therefore names the escrow it is
 //! about, and the escrow's pairing must resolve back to the stream it arrived on.
 //!
 //! ## What authenticates the far side
@@ -295,28 +295,28 @@
 //! [`service_poly_commitment`](threshold::service_poly::service_poly_commitment) refuses it on the
 //! finished package.
 //!
-//! ## Where a service is: the image says, never the caller
+//! ## Where a service is: the deployment says, never the caller
 //!
 //! A pairing produces two halves. The wallet deals one straight to the service; this cosigner deals
 //! the other, and a party holding both holds the service's share — so this half must travel from
 //! here to the service and nowhere else, least of all back through the wallet.
 //!
-//! The obvious shape, a URL on the request, is the one thing that cannot be allowed. A guest
-//! reaches exactly the origins its image names, and that list is image environment **measured into
-//! PCR0** — so a client verifying this enclave learns from the same attestation where its traffic
-//! can go. A caller-supplied URL would trade that for an SSRF gadget speaking with an attested
-//! enclave's identity, and it would make the attestation's answer to "where does this send traffic"
-//! be "anywhere".
+//! The obvious shape, a URL on the request, is the one thing that cannot be allowed. The services a
+//! cosigner may pair with are named in its settings, written into the guest file at deployment and
+//! **measured into PCR16** with the code — so a client verifying this enclave learns from the same
+//! attestation where a pairing's traffic can go. A caller-supplied URL would trade that for an SSRF
+//! gadget speaking with an attested enclave's identity, and it would make the attestation's answer
+//! to "where does this send traffic" be "anywhere".
 //!
-//! So a wallet names a **service id**, and the image decides what that means:
+//! So a wallet names a **service id**, and the deployment decides what that means:
 //!
 //! ```text
 //!   SERVICE_ORIGINS="<service id hex>=https://a.example,<service id hex>=https://b.example"
 //! ```
 //!
 //! Two spellings are accepted, and the second one is not cosmetic. `dev-enclave.sh` validates a
-//! `--guest-env` value against `[A-Za-z0-9:/._-]`, which admits neither `=` nor `,` — so an image
-//! built through that script cannot carry the natural form at all. Entries may therefore be
+//! `--guest-env` value against `[A-Za-z0-9:/._-]`, which admits neither `=` nor `,` — so a guest
+//! deployed through that script cannot carry the natural form at all. Entries may therefore be
 //! separated by `_` as well as `,`, and an id from its origin by `:` as well as `=`:
 //!
 //! ```text
@@ -327,9 +327,9 @@
 //! contains neither.
 //!
 //! An id with no entry is refused before anything is dealt. The cost is honest and worth stating:
-//! **a new service is a new image, a new PCR0 and republished pins.** That is the same cost the ASP
-//! already carries, and it is what keeps "this enclave talks to these services" a thing a client
-//! can check rather than a thing it is told.
+//! **a new service is a new deployment, a new PCR16 and republished pins.** That is the same cost
+//! the ASP already carries, and it is what keeps "this enclave talks to these services" a thing a
+//! client can check rather than a thing it is told.
 //!
 //! ## Two routes, one share
 //!
@@ -935,8 +935,8 @@ impl ServiceRegistry {
             .map(String::as_str)
             .ok_or_else(|| {
                 Status::failed_precondition(
-                    "this enclave does not know that service: an image names the services it may \
-                     reach, and adding one is a new image rather than a new request",
+                    "this enclave does not know that service: a deployment names the services it \
+                     may reach, and adding one is a new deployment rather than a new request",
                 )
             })
     }

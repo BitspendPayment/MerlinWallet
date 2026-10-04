@@ -48,11 +48,11 @@ const MAX_RELEASED_REFERENCES: usize = 1024;
 // When a sealed delegate comes due, the cosigner runs it. A VTXO expires. The wallet signs a
 // delegate to refresh it while it is here — see `crate::renew` — and the cosigner seals it and
 // enqueues this watch for the moment it becomes valid. Then, with no request in flight and nobody
-// connected, the task opens the wallet, registers the sealed intent with the ASP over the enclave's
-// one allowed origin, follows the round, and signs the tree with the cosigner's own key. See
+// connected, the task opens the wallet, registers the sealed intent with the ASP its settings name,
+// follows the round, and signs the tree with the cosigner's own key. See
 // [`Cosigner::run_task_with`].
 //
-// Waking the owner is the fallback, for when it cannot: the image names no ASP, or the round
+// Waking the owner is the fallback, for when it cannot: the settings name no ASP, or the round
 // failed. A failure is a conclusion of this run, not an error — an error is retried five times and
 // then the task is dead, and a watch that died would renew nothing ever again. So it reports,
 // wakes, and the next interval tries again.

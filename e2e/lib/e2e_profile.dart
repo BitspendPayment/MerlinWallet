@@ -1,11 +1,10 @@
-/// The one image this suite runs against, named in one place.
+/// The one cosigner deployment this suite runs against, named in one place.
 ///
-/// Everything here is measured into the enclave's PCR0 — the escrow service's identifier and
-/// origin, the ASP's, the renewal margin, the background-task budget — so it has to be decided
-/// before the enclave boots, and a prebuilt bundle has to have been packed with exactly it. The
-/// harness passes these options when it builds the image itself, checks a bundle's `image.env`
-/// against them when it does not, and `bin/bundle_args.dart` prints them for the runtime's
-/// "Publish a dev enclave" workflow. One definition, three readers, no drift.
+/// These are the cosigner's settings — the escrow services' identifiers and origins, the ASP, the
+/// renewal margin, the fake Grid's credential — and they travel in the guest file: the harness
+/// passes them as `--guest-env` when it boots an enclave, `dev-enclave.sh` writes them into the
+/// component before uploading it, and the enclave measures them into PCR16 with the code. So any
+/// dev bundle serves this suite; nothing about it is baked into the image.
 library;
 
 import 'dart:convert';
@@ -40,9 +39,9 @@ String get platformIdentifierHex => _hex(platformIdentifier.serialize());
 /// provider, and it is the only origin the cosigner sends its Grid credential to.
 const gridOriginFromEnclave = 'http://192.168.127.254:$fakeGridPort';
 
-/// The fake Grid's view-only token, `id:secret`. It goes into the image, which is measured and
+/// The fake Grid's view-only token, `id:secret`. It goes into the guest file, which is measured and
 /// readable like everything else here — a fake has nothing to protect, and a real token never goes
-/// into a test image.
+/// into a test deployment.
 const fakeGridViewToken = 'dev-view:dev-view-secret';
 
 /// `<id>:<origin>` per service, `_` between them, with the host as the guest sees it. `:` rather
@@ -51,22 +50,21 @@ const fakeGridViewToken = 'dev-view:dev-view-secret';
 String get serviceOrigins => '$serviceIdentifierHex:http://192.168.127.254:$servicePort'
     '_$platformIdentifierHex:http://192.168.127.254:$platformPort';
 
-/// What the cosigner may reach besides the services: the fake Grid, for its evidence.
-const e2eExtraEgress = [gridOriginFromEnclave];
-
-/// The Grid credential, bound to the fake's origin so it is sent there and nowhere else.
-const e2eExtraEnv = {
-  'SERVICE_CREDENTIALS_GRID': fakeGridViewToken,
-  'SERVICE_CREDENTIAL_ORIGIN_GRID': gridOriginFromEnclave,
-};
-
-/// The image options, exactly as [startE2eEnclave] passes them.
-List<String> e2eImageOptions() => EnclaveHarness.imageOptions(
-    serviceOrigins: serviceOrigins, extraEgress: e2eExtraEgress, extraEnv: e2eExtraEnv);
+/// The cosigner's settings, as [startE2eEnclave] deploys it with.
+Map<String, String> get e2eSettings => {
+      // The cosigner runs sealed delegates itself, against arkd on the host — 192.168.127.254 from
+      // inside the enclave. The margin makes a delegate come due about five minutes after its
+      // VTXOs were made (regtest VTXOs live 15360s), so a test can watch one run.
+      'ASP_URL': 'http://192.168.127.254:7070',
+      'AUTO_SETTLE_SAFETY_MARGIN_SECS': '15060',
+      'SERVICE_ORIGINS': serviceOrigins,
+      // The Grid credential, bound to the fake's origin so it is sent there and nowhere else.
+      'SERVICE_CREDENTIALS_GRID': fakeGridViewToken,
+      'SERVICE_CREDENTIAL_ORIGIN_GRID': gridOriginFromEnclave,
+    };
 
 /// Boot (or attach to) the one enclave every e2e test and walkthrough runs against.
-Future<EnclaveHarness> startE2eEnclave() => EnclaveHarness.start(
-    serviceOrigins: serviceOrigins, extraEgress: e2eExtraEgress, extraEnv: e2eExtraEnv);
+Future<EnclaveHarness> startE2eEnclave() => EnclaveHarness.start(settings: e2eSettings);
 
 String _hex(List<int> bytes) => bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 

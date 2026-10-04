@@ -14,3 +14,8 @@ output "pins_url" {
   description = "What the app fetches for this host."
   value       = "https://${aws_s3_bucket.enclave.bucket_regional_domain_name}/pins/deployment.json"
 }
+
+output "push_app_id" {
+  description = "The push application deploy.sh names in the image."
+  value       = aws_pinpoint_app.push.application_id
+}

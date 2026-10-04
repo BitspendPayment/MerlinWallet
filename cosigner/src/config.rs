@@ -2,10 +2,11 @@ use std::env;
 
 /// What the runtime passes the guest, as environment variables.
 ///
-/// Three values, and none of them is an endpoint — though not for want of anywhere to go. A guest
-/// reaches exactly the origins its image allowlists, and `ASP_URL` is one of them; it is read where
-/// it is used (`asp::rest::AspRest::from_env`) rather than here, so a deployment naming no ASP has
-/// no connection at all rather than a half-configured one. `COSIGNER_GROUP_KEY` — which wallet this
+/// Three values, and none of them is an endpoint — though not for want of anywhere to go. Every
+/// setting here comes from the guest file, written at deployment and measured into PCR16 with the
+/// code. `ASP_URL` is one of them, and it is read where it is used
+/// (`asp::rest::AspRest::from_env`) rather than here, so a deployment naming no ASP has no
+/// connection at all rather than a half-configured one. `COSIGNER_GROUP_KEY` — which wallet this
 /// instance serves — is read in `main` rather than here, because a missing one is a refusal to
 /// serve rather than a default.
 #[derive(Debug, Clone)]
